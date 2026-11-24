@@ -2236,7 +2236,7 @@ dependencies = [
 
 [[package]]
 name = "wanderlan"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2255,7 +2255,7 @@ dependencies = [
 
 [[package]]
 name = "wanderlan-core"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "futures-util",
  "humantime",
@@ -2275,7 +2275,7 @@ dependencies = [
 
 [[package]]
 name = "wanderland"
-version = "0.2.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",

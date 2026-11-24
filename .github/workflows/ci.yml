@@ -28,17 +28,14 @@ jobs:
       version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # scripts/version.sh counts commits
       - id: v
         name: Version of this build
-        # main: <Cargo.toml version>+<run number>.g<commit>, newer with every
-        # run; elsewhere the plain Cargo.toml version (never published).
+        # The Cargo.toml version with its last number raised by the commits
+        # since it was set: every commit on main has a higher one.
         run: |
-          base=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
-            version="${base}+${GITHUB_RUN_NUMBER}.g${GITHUB_SHA::7}"
-          else
-            version="$base"
-          fi
+          version=$(scripts/version.sh)
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "### wanderlan $version" >> "$GITHUB_STEP_SUMMARY"
 
@@ -60,6 +57,8 @@ jobs:
           cache-to: type=gha,mode=max,scope=check
       - name: APT repository script (retention, indices, signatures)
         run: scripts/test-apt-repo.sh
+      - name: Version numbering
+        run: scripts/test-version.sh
 
   build:
     name: build

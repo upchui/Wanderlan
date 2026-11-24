@@ -2,10 +2,17 @@
 
 All notable changes to wanderlan are documented in this file.
 
-## [0.2.0] - 2026-11-24
+## [1.0.0] - 2026-11-25
 
 Simpler: the sites behave like one switch, and a new site joins with a
-single command. Update all sites; 0.1 and 0.2 do not sync with each other.
+single command. Update all sites; 0.1 and 1.0 do not sync with each other.
+
+### Version numbers
+
+- wanderlan is 1.0.0, and every commit on `main` raises the last number:
+  1.0.1, 1.0.2, ... (`scripts/version.sh` counts the commits since the
+  version in `Cargo.toml` was set; CI, packages and `--version` show it).
+  The APT repository keeps the newest 20 and every tagged release.
 
 ### network.toml
 

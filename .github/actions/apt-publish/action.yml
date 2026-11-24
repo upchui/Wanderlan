@@ -1,8 +1,9 @@
 name: Publish to the APT repository
 description: >-
   Adds the .deb packages of a directory to the signed APT repository on the
-  gh-pages branch (scripts/apt-repo.sh, retention of commit builds) and
-  pushes the result as a single commit. Needs contents: write.
+  gh-pages branch (scripts/apt-repo.sh: the newest builds and every tagged
+  release stay) and pushes the result as a single commit. Needs contents:
+  write and a checkout with the tags (fetch-depth: 0).
 
 inputs:
   dist:

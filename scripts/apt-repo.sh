@@ -11,9 +11,11 @@
 # <pages>/apt/pool/main/w/wanderlan/*.deb. Older packages stay in the pool,
 # so `apt install wanderlan=<version>` can downgrade.
 #
-# Retention: builds of commits on main have a "+" in their version
-# (0.1.0+57.gc256ea5-1); per architecture only the newest KEEP of them
-# (default 20) stay. Tagged releases (no "+", e.g. 0.1.0-1) stay forever.
+# Retention: every commit on main is a version of its own (1.0.7-1, see
+# scripts/version.sh); per architecture only the newest KEEP of them
+# (default 20) stay. Tagged releases, listed in KEEP_FOREVER without the
+# Debian revision ("0.1.0 1.0.7"), stay forever. Builds of the old scheme
+# (0.2.0+57.gc256ea5-1) are older than every 1.x and go first.
 set -euo pipefail
 
 pages="${1:?usage: apt-repo.sh <pages-dir> <deb>...}"
@@ -22,6 +24,7 @@ mkdir -p "$pages"
 pages=$(cd "$pages" && pwd)   # absolute: the script changes directories below
 : "${APT_GPG_PRIVATE_KEY:?the armored private signing key must be in APT_GPG_PRIVATE_KEY}"
 keep="${KEEP:-20}"
+forever=" ${KEEP_FOREVER:-} "
 
 pool="$pages/apt/pool/main/w/wanderlan"
 mkdir -p "$pool"
@@ -60,7 +63,7 @@ newest_first() {
 for arch in amd64 arm64; do
   n=0
   while read -r v; do
-    case "$v" in *+*) ;; *) continue ;; esac
+    case "$forever" in *" ${v%-*} "*) continue ;; esac
     n=$((n + 1))
     if [ "$n" -gt "$keep" ]; then
       rm -v "$pool/wanderlan_${v}_${arch}.deb"

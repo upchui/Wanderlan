@@ -1,6 +1,7 @@
 name: Release
 
-# Optional: a tag v<version> (matching Cargo.toml) creates a GitHub release
+# Optional: a tag v<version> (the version of the tagged commit, see
+# scripts/version.sh) creates a GitHub release
 # with binaries, packages and SHA256SUMS, and puts <version>-1 into the APT
 # repository, where tagged versions are kept forever. Builds and tests run
 # through the same build.yml as CI.
@@ -24,12 +25,14 @@ jobs:
       deb_version: ${{ steps.v.outputs.deb_version }}
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # scripts/version.sh counts commits
       - id: v
-        name: Tag must match the workspace version
+        name: Tag must match the version of the commit
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          version=$(scripts/version.sh)
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            echo "::error::tag $GITHUB_REF_NAME does not match the version of this commit, $version (scripts/version.sh)"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -79,6 +82,8 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0   # the tags: tagged releases stay in the repository
       - uses: actions/download-artifact@v8
         with:
           pattern: dist-*

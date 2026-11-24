@@ -155,12 +155,12 @@ sudo apt update && sudo apt install wanderlan
 
 (On minimal installations first `sudo apt install curl gpg`.)
 
-Every commit on `main` that passes all tests is published as
-`<version>+<build>.g<commit>-1`, so `sudo apt upgrade` always brings the
-newest build. The last 20 builds and every tagged release stay in the
-repository: `apt-cache madison wanderlan` lists them,
-`sudo apt install wanderlan=<version>` goes back. Update all sites to the
-same build. Older builds kept the shared configuration under another file
+Every commit on `main` that passes all tests is published with a version of
+its own: 1.0.0, 1.0.1, 1.0.2 and so on (`wanderlan --version` shows it), so
+`sudo apt upgrade` always brings the newest one. The last 20 versions and
+every tagged release stay in the repository: `apt-cache madison wanderlan`
+lists them, `sudo apt install wanderlan=<version>` goes back. Update all
+sites to the same version. Older builds kept the shared configuration under another file
 name; the first start of a new build moves it to `network.toml`.
 
 The package installs the daemon `wanderland` (systemd service, enabled and
@@ -645,19 +645,22 @@ Publishing is automatic: every push to `main` whose CI run is green (fmt,
 clippy, tests, packages for amd64 and arm64 with a smoke test, integration
 tests, systemd test) is published by `publish.yml`:
 
-* as version `<Cargo.toml version>+<CI run>.g<commit>`, package version with
-  `-1`, so every build is newer than the one before;
+* as the version of the commit (`scripts/version.sh`): the version in
+  `Cargo.toml` with its last number raised by the commits since that line
+  last changed, so the commit that sets 1.0.0 is 1.0.0 and the next one
+  1.0.1; package version with `-1`;
 * into the signed repository on the branch `gh-pages` (one commit without
-  history), suite `stable`; the newest 20 builds per architecture stay,
+  history), suite `stable`; the newest 20 versions per architecture stay,
   tagged releases forever;
 * `verify-apt.yml` then installs it from GitHub Pages with the commands above
   on Debian 13, Debian 12 and Ubuntu 24.04, also exactly this version and a
   downgrade, and runs two hosts with an invitation.
 
-A tag `v<version>` (equal to the version in `Cargo.toml`) additionally makes
-`release.yml` create a GitHub release with binaries, packages and
-`SHA256SUMS` and keeps `<version>-1` in the repository forever. To start a
-new version line, raise the version in `Cargo.toml`.
+A tag `v<version>` on a commit, with that commit's version (e.g. `v1.0.7`),
+additionally makes `release.yml` create a GitHub release with binaries,
+packages and `SHA256SUMS` and keeps `<version>-1` in the repository forever.
+To start a new version line, set e.g. `1.1.0` in `Cargo.toml`: that commit
+is 1.1.0, the next 1.1.1.
 
 One-time setup (done for this repository):
 

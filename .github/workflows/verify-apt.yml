@@ -8,7 +8,7 @@ on:
   workflow_call:
     inputs:
       deb_version:
-        description: Published package version, e.g. 0.1.0+57.gc256ea5-1
+        description: Published package version, e.g. 1.0.7-1
         required: true
         type: string
 

@@ -9,7 +9,7 @@
 #      group, systemd unit, `wanderlan init`.
 #
 # Usage: scripts/smoke-test.sh <dist-dir> <deb-version> [testnode-image]
-# <deb-version> is the full package version, e.g. 0.1.0+57.gc256ea5-1. The
+# <deb-version> is the full package version, e.g. 1.0.7-1. The
 # package for the native architecture is tested. Without [testnode-image]
 # the testnode image is built here with the matching WANDERLAN_VERSION.
 set -euo pipefail

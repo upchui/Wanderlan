@@ -22,6 +22,15 @@ if [ "${#debs[@]}" -eq 0 ]; then
   exit 1
 fi
 
+# Tagged releases stay in the repository forever (scripts/apt-repo.sh); the
+# checkout must have the tags (fetch-depth: 0).
+KEEP_FOREVER=$(git tag -l 'v*' | sed 's/^v//' | tr '\n' ' ')
+if [ -z "${KEEP_FOREVER// /}" ]; then
+  echo "::error::no release tags in the checkout (fetch-depth: 0 missing?); refusing to publish, the retention would remove tagged releases"
+  exit 1
+fi
+export KEEP_FOREVER
+
 for attempt in 1 2 3 4 5; do
   git worktree remove --force "$pages" 2>/dev/null || rm -rf "$pages"
   git worktree prune
@@ -35,7 +44,7 @@ for attempt in 1 2 3 4 5; do
   fi
 
   docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/w" -w /w \
-    -e APT_GPG_PRIVATE_KEY -e APT_GPG_PASSPHRASE -e KEEP \
+    -e APT_GPG_PRIVATE_KEY -e APT_GPG_PASSPHRASE -e KEEP -e KEEP_FOREVER \
     wanderlan-aptrepo scripts/apt-repo.sh "$pages" "${debs[@]}"
 
   git -C "$pages" add -A
