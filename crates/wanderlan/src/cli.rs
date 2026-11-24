@@ -144,6 +144,17 @@ pub enum Command {
         #[arg(long)]
         confirm: bool,
     },
+    /// Bridge the tunnel to a site with a trunk of its own (a segment of its
+    /// own on this site), or with the default trunk again ("default").
+    Trunk {
+        /// The site at the other end of the tunnel.
+        site: String,
+        /// Local interface, or "default".
+        interface: String,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Join an existing network with an invitation.
     ///
     /// Run on a new site: `wanderlan join <address> <code>` as printed by
@@ -289,6 +300,11 @@ pub async fn run(args: Args) -> Result<ExitCode> {
         Some(Command::Offline { site, confirm }) => {
             set_online(&socket, &site, false, confirm).await
         }
+        Some(Command::Trunk {
+            site,
+            interface,
+            confirm,
+        }) => set_trunk(&socket, &site, &interface, confirm).await,
         Some(Command::Manage {
             site,
             by,
@@ -503,6 +519,76 @@ async fn set_online(socket: &Path, site: &str, online: bool, confirm: bool) -> R
         Ok(format!("{site} is {word}"))
     })
     .await
+}
+
+/// Sets the trunk of the tunnel to `site` (local.toml) and applies it.
+async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) -> Result<ExitCode> {
+    let client = connect(socket).await?;
+    settle(&client).await?;
+    let running: ConfigTexts = client.call(Request::GetConfig).await?;
+    if !running.configured {
+        bail!("this site is not part of a network");
+    }
+    let mesh = config::parse_mesh(&running.mesh)
+        .ok()
+        .and_then(|p| p.mesh)
+        .context("cannot read the running configuration")?;
+    let mut local = config::parse_local(&running.local)
+        .map_err(|_| anyhow!("cannot read the running local.toml"))?
+        .local;
+    if mesh.site(site).is_none() || local.self_name.as_deref() == Some(site) {
+        bail!("there is no tunnel to \"{site}\"");
+    }
+    let before = local.tunnel_trunks.clone();
+    let default = local.trunk.clone().unwrap_or_default();
+    if interface == "default" || interface == default {
+        local.tunnel_trunks.remove(site);
+    } else {
+        if let Some(msg) = config::ifname_error(interface) {
+            bail!("{interface}: {msg}");
+        }
+        if let Some(peer) = mesh.site(site)
+            && hostinfo::route_interface(peer.address).as_deref() == Some(interface)
+        {
+            bail!(
+                "{interface} leads to {site} ({}); bridging it would cut the connection",
+                peer.address
+            );
+        }
+        local
+            .tunnel_trunks
+            .insert(site.to_string(), interface.to_string());
+    }
+    let now = local.trunk_for(site).unwrap_or_default().to_string();
+    if local.tunnel_trunks == before {
+        println!("The tunnel to {site} already uses {now}.");
+        return Ok(ExitCode::SUCCESS);
+    }
+    let applied: Applied = client
+        .call(Request::Apply(ApplyParams {
+            config: ConfigInput {
+                mesh: running.mesh,
+                local: config::render_local(&local),
+            },
+            base_revision: Some(running.revision),
+            timeout_secs: None,
+        }))
+        .await?;
+    let done = if now == default {
+        format!("The tunnel to {site} uses the default trunk {default}")
+    } else {
+        format!("The tunnel to {site} uses its own trunk {now} (a segment of its own)")
+    };
+    if confirm {
+        let _: Confirmed = client.call(Request::Confirm).await?;
+        println!("{done}.");
+    } else {
+        println!(
+            "{done} now. Run `wanderlan confirm` within {} seconds to keep it, otherwise it is rolled back.",
+            applied.confirm_within_secs
+        );
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Changes one site of the running configuration and applies the change.

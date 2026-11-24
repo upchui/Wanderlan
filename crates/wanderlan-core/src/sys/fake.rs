@@ -270,6 +270,15 @@ impl NetOps for FakeNet {
             match master {
                 None => s.detach(index),
                 Some(bridge) => {
+                    // Like the kernel: moving a port to another bridge
+                    // first removes it (and its VLANs) from the old one.
+                    if s.links
+                        .get(&index)
+                        .and_then(|l| l.master)
+                        .is_some_and(|m| m != bridge)
+                    {
+                        s.detach(index);
+                    }
                     let pvid = match s.links.get(&bridge).map(|l| &l.kind) {
                         Some(LinkKind::Bridge(o)) => o.default_pvid,
                         _ => return Err(err("attach", "master is not a bridge")),

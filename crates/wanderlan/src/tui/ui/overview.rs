@@ -114,6 +114,24 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
         }
         spans.push(Span::styled("  (Enter: details)", theme::dim()));
         lines.push(Line::from(spans));
+        // Further trunks (tunnels with a trunk of their own).
+        for t in status.trunks.iter().skip(1) {
+            let peers: Vec<&str> = status
+                .peers
+                .iter()
+                .filter(|p| p.trunk == t.name)
+                .map(|p| p.name.as_str())
+                .collect();
+            lines.push(Line::from(vec![
+                Span::styled(format!(" trunk {} ", t.name), theme::dim()),
+                Span::raw(format!(
+                    "in {}bit/s out {}bit/s",
+                    format::rate(t.rx_bps),
+                    format::rate(t.tx_bps)
+                )),
+                Span::styled(format!("  segment of {}", peers.join(", ")), theme::dim()),
+            ]));
+        }
     }
     match (&app.invitation, status.invites) {
         (_, 0) => {}

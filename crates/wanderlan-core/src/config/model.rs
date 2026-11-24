@@ -149,9 +149,21 @@ pub struct Local {
     pub self_name: Option<String>,
     /// Local trunk interface that is added to the bridge.
     pub trunk: Option<String>,
+    /// Trunks of single tunnels (peer site → interface). Each such trunk is
+    /// a segment of its own at this site (own bridge); all other tunnels use
+    /// `trunk`.
+    pub tunnel_trunks: std::collections::BTreeMap<String, String>,
 }
 
 impl Local {
+    /// The trunk of the tunnel to `peer`.
+    pub fn trunk_for(&self, peer: &str) -> Option<&str> {
+        self.tunnel_trunks
+            .get(peer)
+            .map(String::as_str)
+            .or(self.trunk.as_deref())
+    }
+
     /// Returns true if this site has been configured (`self` is set).
     pub fn is_configured(&self) -> bool {
         self.self_name.is_some()

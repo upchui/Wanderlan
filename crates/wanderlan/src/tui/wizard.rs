@@ -448,6 +448,7 @@ impl Wizard {
         let local = Local {
             self_name: Some(name),
             trunk: Some(self.trunk(interfaces)),
+            ..Default::default()
         };
         let diags = validate(&mesh, Some(&local));
         if has_errors(&diags) {

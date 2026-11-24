@@ -3,7 +3,7 @@ source: crates/wanderlan/src/tui/ui/tests.rs
 expression: render(&app)
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
-"┌ Settings (Enter: change) ────────────────────────────────────────────────────┐"
+"┌ Settings (Enter: change, Up/Down: more) ─────────────────────────────────────┐"
 "│Network (all sites)                                                           │"
 "│  VLANs                10-50 (41 VLANs)                                       │"
 "│  Commit timeout       1m                                                     │"
@@ -17,10 +17,10 @@ expression: render(&app)
 "│Permissions            who may change VLANs: Sites (2), Enter, Changes        │"
 "│  This site            not managed by another site                            │"
 "│  Manages              -                                                      │"
+"│Trunk per tunnel       this host only; another trunk = own segment            │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 " Every change must be confirmed (c) within this time, otherwise it is rolled    "
 " back, so nobody locks themselves out. 10 s to 1 h.                             "
-"                                                                                "
 " Changes go into the draft; a reviews and applies them, c confirms.             "
 "                                                                                "
 "                                                                                "

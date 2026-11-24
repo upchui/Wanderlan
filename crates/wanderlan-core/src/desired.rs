@@ -17,7 +17,13 @@ pub const OWNER_ALIAS: &str = "wanderlan";
 /// encapsulated packets if the transport path is smaller.
 pub const GRETAP_MTU: u32 = 1500;
 
-/// Options wanderlan sets on its bridge.
+/// Prefix of the bridges of additional trunks (`wl-<trunk>`). The default
+/// trunk is in [`BRIDGE_NAME`].
+pub const SEGMENT_PREFIX: &str = "wl-";
+/// Longest interface name Linux accepts.
+const IFNAME_MAX: usize = 15;
+
+/// Options wanderlan sets on its bridges.
 pub const BRIDGE_OPTIONS: BridgeOptions = BridgeOptions {
     vlan_filtering: true,
     stp: false,
@@ -25,11 +31,13 @@ pub const BRIDGE_OPTIONS: BridgeOptions = BridgeOptions {
     nf_call: false,
 };
 
-/// The trunk port.
+/// A trunk port and its bridge: one segment of this site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrunkSpec {
     /// Interface name.
     pub name: String,
+    /// The bridge of this trunk and its tunnels.
+    pub bridge: String,
     /// VLAN membership.
     pub vlans: PortVlans,
     /// VLAN translation rules (tc), sorted.
@@ -43,6 +51,8 @@ pub struct TunnelSpec {
     pub name: String,
     /// Remote site name.
     pub peer: String,
+    /// The bridge (segment) the tunnel belongs to: that of its trunk.
+    pub bridge: String,
     /// GRETAP parameters.
     pub params: GretapParams,
     /// Split horizon: isolated ports do not forward to each other. Every
@@ -57,18 +67,46 @@ pub struct TunnelSpec {
 /// Everything wanderlan manages on one site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Desired {
-    /// Bridge name.
-    pub bridge: String,
-    /// Bridge options.
+    /// Bridge options (the same for every bridge).
     pub bridge_options: BridgeOptions,
-    /// The local trunk.
-    pub trunk: TrunkSpec,
+    /// The trunks, each with a bridge of its own: the default trunk (in
+    /// [`BRIDGE_NAME`]) first, then the trunks of single tunnels by name.
+    pub trunks: Vec<TrunkSpec>,
     /// Tunnels to the peer sites, sorted by name.
     pub tunnels: Vec<TunnelSpec>,
     /// Local address of the site (GRE source).
     pub local_address: Ipv4Addr,
     /// TCP MSS clamping rules (nftables).
     pub mss: BTreeSet<MssRule>,
+}
+
+impl Desired {
+    /// Names of the bridges.
+    pub fn bridges(&self) -> impl Iterator<Item = &str> {
+        self.trunks.iter().map(|t| t.bridge.as_str())
+    }
+
+    /// The default trunk.
+    pub fn default_trunk(&self) -> Option<&TrunkSpec> {
+        self.trunks.first()
+    }
+}
+
+/// The bridge of `trunk`: [`BRIDGE_NAME`] for the default trunk,
+/// `wl-<trunk>` for every other (`wl-` and a hash if the name is too long).
+pub fn bridge_for(trunk: &str, default_trunk: &str) -> String {
+    if trunk == default_trunk {
+        return BRIDGE_NAME.to_string();
+    }
+    let name = format!("{SEGMENT_PREFIX}{trunk}");
+    if name.len() <= IFNAME_MAX {
+        return name;
+    }
+    // FNV-1a: stable across versions and platforms.
+    let hash = trunk.bytes().fold(0x811c_9dc5_u32, |h, b| {
+        (h ^ u32::from(b)).wrapping_mul(0x0100_0193)
+    });
+    format!("{SEGMENT_PREFIX}{:08x}", hash)
 }
 
 /// Runtime information that, besides the configuration, shapes the desired
@@ -106,6 +144,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
         })
         .collect();
     let (trunk_vlans, tc) = trunk_mapping(cfg, &shared);
+    let default_trunk = cfg.trunk();
 
     let self_online = cfg.self_site().is_none_or(|s| s.online);
     let tunnels: Vec<TunnelSpec> = topology::tunnels_for(mesh, me)
@@ -119,6 +158,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
                 enabled: !blocked.contains(&name) && self_online && t.peer.online,
                 name,
                 peer: t.peer.name.clone(),
+                bridge: bridge_for(cfg.trunk_for(&t.peer.name), default_trunk),
                 params: GretapParams {
                     local: local_address,
                     remote: t.peer.address,
@@ -135,14 +175,30 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
         })
         .collect();
 
+    // Every trunk carries the same VLANs and mappings; the default trunk
+    // always exists, the others only while a tunnel uses them.
+    let mut trunk_names: Vec<&str> = vec![default_trunk];
+    let mut extra: Vec<&str> = tunnels
+        .iter()
+        .map(|t| cfg.trunk_for(&t.peer))
+        .filter(|t| *t != default_trunk)
+        .collect();
+    extra.sort_unstable();
+    extra.dedup();
+    trunk_names.extend(extra);
+    let trunks = trunk_names
+        .into_iter()
+        .map(|name| TrunkSpec {
+            name: name.to_string(),
+            bridge: bridge_for(name, default_trunk),
+            vlans: trunk_vlans.clone(),
+            tc: tc.clone(),
+        })
+        .collect();
+
     Desired {
-        bridge: BRIDGE_NAME.to_string(),
         bridge_options: BRIDGE_OPTIONS,
-        trunk: TrunkSpec {
-            name: cfg.trunk().to_string(),
-            vlans: trunk_vlans,
-            tc,
-        },
+        trunks,
         mss: mss_rules(cfg, &tunnels, runtime),
         tunnels,
         local_address,
@@ -244,6 +300,14 @@ fn trunk_mapping(cfg: &Config, shared: &PortVlans) -> (PortVlans, Vec<TcRule>) {
 }
 
 #[cfg(test)]
+impl Desired {
+    /// The default trunk (tests only).
+    fn trunk(&self) -> &TrunkSpec {
+        &self.trunks[0]
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{Loaded, load};
@@ -261,7 +325,7 @@ mod tests {
     #[test]
     fn every_site_gets_an_isolated_tunnel_to_every_other_site() {
         let d = derive(&config("heim"), &Runtime::default());
-        assert_eq!(d.bridge, "br0");
+        assert_eq!(d.bridges().collect::<Vec<_>>(), ["br0"]);
         assert_eq!(d.local_address, Ipv4Addr::new(10, 8, 0, 1));
         let summary: Vec<_> = d
             .tunnels
@@ -280,9 +344,9 @@ mod tests {
             assert!(t.params.ignore_df && !t.params.pmtudisc);
             assert_eq!(t.params.local, d.local_address);
         }
-        assert_eq!(d.trunk.vlans.len(), 41);
-        assert!(d.trunk.vlans.values().all(|f| *f == VlanFlags::TAGGED));
-        assert!(!d.trunk.vlans.contains_key(&1));
+        assert_eq!(d.trunk().vlans.len(), 41);
+        assert!(d.trunk().vlans.values().all(|f| *f == VlanFlags::TAGGED));
+        assert!(!d.trunk().vlans.contains_key(&1));
     }
 
     #[test]
@@ -299,7 +363,7 @@ mod tests {
         assert_eq!(vids(&heim, "gt-haus2"), vec![20, 30]);
         let haus2 = derive(&config("haus2"), &Runtime::default());
         assert_eq!(
-            haus2.trunk.vlans.keys().copied().collect::<Vec<_>>(),
+            haus2.trunk().vlans.keys().copied().collect::<Vec<_>>(),
             vec![20, 30]
         );
         assert_eq!(vids(&haus2, "gt-heim"), vec![20, 30]);
@@ -344,9 +408,9 @@ mod tests {
             panic!("configured");
         };
         let d = derive(&cfg, &Runtime::default());
-        assert_eq!(d.trunk.vlans.get(&1), Some(&VlanFlags::NATIVE));
-        assert_eq!(d.trunk.vlans.get(&4094), Some(&VlanFlags::TAGGED));
-        assert_eq!(d.trunk.vlans.len(), 4094);
+        assert_eq!(d.trunk().vlans.get(&1), Some(&VlanFlags::NATIVE));
+        assert_eq!(d.trunk().vlans.get(&4094), Some(&VlanFlags::TAGGED));
+        assert_eq!(d.trunk().vlans.len(), 4094);
         let tunnel = |name: &str| {
             d.tunnels
                 .iter()
@@ -364,16 +428,16 @@ mod tests {
             panic!("configured");
         };
         let d = derive(&cfg, &Runtime::default());
-        assert_eq!(d.trunk.vlans.get(&1), None);
-        assert_eq!(d.trunk.vlans.get(&20), Some(&VlanFlags::NATIVE));
+        assert_eq!(d.trunk().vlans.get(&1), None);
+        assert_eq!(d.trunk().vlans.get(&20), Some(&VlanFlags::NATIVE));
     }
 
     #[test]
     fn native_mapping_and_translation_shape_the_trunk() {
         let d = derive(&config("haus3"), &Runtime::default());
-        assert_eq!(d.trunk.vlans.get(&20), Some(&VlanFlags::NATIVE));
-        assert_eq!(d.trunk.vlans.get(&30), Some(&VlanFlags::TAGGED));
-        assert!(!d.trunk.vlans.contains_key(&130));
+        assert_eq!(d.trunk().vlans.get(&20), Some(&VlanFlags::NATIVE));
+        assert_eq!(d.trunk().vlans.get(&30), Some(&VlanFlags::TAGGED));
+        assert!(!d.trunk().vlans.contains_key(&130));
         assert_eq!(d.tunnels.len(), 3);
         assert!(d.tunnels.iter().all(|t| t.isolated));
     }
@@ -381,11 +445,11 @@ mod tests {
     #[test]
     fn translation_rules_for_haus3() {
         let d = derive(&config("haus3"), &Runtime::default());
-        let rules: Vec<String> = d.trunk.tc.iter().map(TcRule::cookie).collect();
+        let rules: Vec<String> = d.trunk().tc.iter().map(TcRule::cookie).collect();
         assert_eq!(rules, vec!["wl:i30x", "wl:i130>30", "wl:e30>130"]);
         assert!(
             derive(&config("heim"), &Runtime::default())
-                .trunk
+                .trunk()
                 .tc
                 .is_empty()
         );
@@ -401,9 +465,9 @@ mod tests {
             panic!("configured");
         };
         let d = derive(&cfg, &Runtime::default());
-        assert_eq!(d.trunk.vlans.get(&30), Some(&VlanFlags::TAGGED));
-        assert_eq!(d.trunk.vlans.get(&40), Some(&VlanFlags::TAGGED));
-        let rules: Vec<String> = d.trunk.tc.iter().map(TcRule::cookie).collect();
+        assert_eq!(d.trunk().vlans.get(&30), Some(&VlanFlags::TAGGED));
+        assert_eq!(d.trunk().vlans.get(&40), Some(&VlanFlags::TAGGED));
+        let rules: Vec<String> = d.trunk().tc.iter().map(TcRule::cookie).collect();
         assert_eq!(
             rules,
             vec![
@@ -424,8 +488,8 @@ mod tests {
             panic!("configured");
         };
         let d = derive(&cfg, &Runtime::default());
-        assert!(!d.trunk.vlans.contains_key(&15));
-        assert_eq!(d.trunk.vlans.get(&30), Some(&VlanFlags::TAGGED));
+        assert!(!d.trunk().vlans.contains_key(&15));
+        assert_eq!(d.trunk().vlans.get(&30), Some(&VlanFlags::TAGGED));
     }
 
     #[test]
@@ -500,5 +564,38 @@ mod tests {
             enabled,
             vec![("gt-buero", true), ("gt-haus2", false), ("gt-haus3", true)]
         );
+    }
+
+    #[test]
+    fn bridges_of_further_trunks() {
+        assert_eq!(bridge_for("ens19", "ens19"), "br0");
+        assert_eq!(bridge_for("ens20", "ens19"), "wl-ens20");
+        assert_eq!(bridge_for("enp0s31f6", "ens19"), "wl-enp0s31f6");
+        let long = bridge_for("enp0s31f6.1000", "ens19");
+        assert!(long.starts_with("wl-") && long.len() <= 15, "{long}");
+        assert_eq!(long, bridge_for("enp0s31f6.1000", "ens19"), "stable");
+        assert_ne!(long, bridge_for("enp0s31f6.1001", "ens19"));
+    }
+
+    #[test]
+    fn a_tunnel_with_its_own_trunk_gets_its_own_bridge() {
+        let local = "self = \"heim\"\ntrunk = \"ens19\"\n\n[tunnels.haus2]\ntrunk = \"ens20\"\n[tunnels.haus3]\ntrunk = \"ens19\"\n";
+        let cfg = match load(MESH, local).unwrap().loaded {
+            Loaded::Configured(cfg) => cfg,
+            Loaded::Unconfigured { .. } => panic!("configured"),
+        };
+        let d = derive(&cfg, &Runtime::default());
+        assert_eq!(
+            d.trunks
+                .iter()
+                .map(|t| (t.name.as_str(), t.bridge.as_str()))
+                .collect::<Vec<_>>(),
+            [("ens19", "br0"), ("ens20", "wl-ens20")]
+        );
+        assert_eq!(d.trunks[0].vlans, d.trunks[1].vlans);
+        for t in &d.tunnels {
+            let expected = if t.peer == "haus2" { "wl-ens20" } else { "br0" };
+            assert_eq!(t.bridge, expected, "{}", t.peer);
+        }
     }
 }

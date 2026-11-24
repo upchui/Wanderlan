@@ -38,6 +38,8 @@ pub enum FormKind {
     Local,
     /// Rules for a new invitation (the draft is not changed).
     Invite,
+    /// The trunk of the tunnel to one site (index in the mesh), local.toml.
+    TunnelTrunk(usize),
 }
 
 /// The editable value of a field.
@@ -395,6 +397,33 @@ impl Form {
         Self::new(FormKind::Local, "This site (local.toml)", fields, draft)
     }
 
+    /// Form for the trunk of the tunnel to the site `site` (local.toml).
+    pub fn tunnel_trunk(draft: &Draft, site: usize, interfaces: &[Interface]) -> Self {
+        let name = draft
+            .mesh
+            .sites
+            .get(site)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        let fields = vec![Field::text(
+            "trunk",
+            "Trunk",
+            tunnel_trunk_hint(draft, interfaces),
+            draft
+                .local
+                .tunnel_trunks
+                .get(&name)
+                .cloned()
+                .unwrap_or_default(),
+        )];
+        Self::new(
+            FormKind::TunnelTrunk(site),
+            format!("Trunk of the tunnel to {name}"),
+            fields,
+            draft,
+        )
+    }
+
     /// Looks up a field by key.
     pub fn field(&self, key: &str) -> Option<&Field> {
         self.fields.iter().find(|f| f.key == key)
@@ -415,6 +444,13 @@ impl Form {
         self.field(key)
             .map(|f| f.value().trim().to_string())
             .unwrap_or_default()
+    }
+
+    /// Marks a field as wrong for a reason only the caller knows (e.g. the
+    /// interface leads to the other sites); shown right away.
+    pub fn reject(&mut self, key: &str, message: impl Into<String>) {
+        self.set_error(key, message);
+        self.submitted = true;
     }
 
     fn set_error(&mut self, key: &str, message: impl Into<String>) {
@@ -551,7 +587,7 @@ impl Form {
             FormKind::Site(i) => Some(i.unwrap_or(draft.mesh.sites.len())),
             FormKind::Invite => Some(draft.mesh.sites.len()),
             FormKind::Map(i) => Some(i.unwrap_or(draft.mesh.maps.len())),
-            FormKind::Mesh | FormKind::Vlans | FormKind::Local => None,
+            FormKind::Mesh | FormKind::Vlans | FormKind::Local | FormKind::TunnelTrunk(_) => None,
         }
     }
 
@@ -560,7 +596,7 @@ impl Form {
         match self.kind {
             FormKind::Site(_) | FormKind::Invite => Some(FieldPath::site(i)),
             FormKind::Map(_) => Some(FieldPath::map(i)),
-            FormKind::Mesh | FormKind::Vlans | FormKind::Local => None,
+            FormKind::Mesh | FormKind::Vlans | FormKind::Local | FormKind::TunnelTrunk(_) => None,
         }
     }
 
@@ -572,6 +608,10 @@ impl Form {
             FormKind::Map(_) => FieldPath::map_field(i, key),
             FormKind::Mesh | FormKind::Vlans => FieldPath::mesh(key),
             FormKind::Local => FieldPath::local(key),
+            FormKind::TunnelTrunk(site) => {
+                let name = draft.mesh.sites.get(site).map_or("", |s| s.name.as_str());
+                FieldPath::local(&format!("tunnels.{name}.{key}"))
+            }
         }
     }
 
@@ -626,6 +666,18 @@ impl Form {
                 candidate.mesh.vlans = self.guard_network_vlans(draft, vlans)?;
             }
             FormKind::Invite => self.build_invite(&mut candidate)?,
+            FormKind::TunnelTrunk(site) => {
+                let name = candidate.mesh.sites.get(site)?.name.clone();
+                let trunk = self.value("trunk");
+                if trunk.is_empty() || Some(trunk.as_str()) == candidate.local.trunk.as_deref() {
+                    candidate.local.tunnel_trunks.remove(&name);
+                } else if let Some(msg) = ifname_error(&trunk) {
+                    self.set_error("trunk", msg);
+                    return None;
+                } else {
+                    candidate.local.tunnel_trunks.insert(name, trunk);
+                }
+            }
             FormKind::Local => {
                 let own = self.value("self");
                 let trunk = self.value("trunk");
@@ -939,6 +991,15 @@ fn parse_changes(value: &str) -> (Option<String>, bool) {
         Some((manager, _)) => (Some(manager.to_string()), true),
         None => (None, false),
     }
+}
+
+/// Help text of the trunk field of a tunnel.
+pub fn tunnel_trunk_hint(draft: &Draft, interfaces: &[Interface]) -> String {
+    format!(
+        "empty: the default trunk ({}); {}",
+        draft.local.trunk.as_deref().unwrap_or("-"),
+        trunk_hint(interfaces)
+    )
 }
 
 /// Help text of the trunk field: the usable interfaces.

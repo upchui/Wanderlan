@@ -128,7 +128,16 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, area: Rect) {
                 peer.macs
             )),
         ]),
-        Line::from(vec![label("VLANs"), Span::raw(peer.vlans.clone())]),
+        Line::from(vec![
+            label("VLANs"),
+            Span::raw(peer.vlans.clone()),
+            Span::styled("   trunk ", theme::dim()),
+            Span::raw(if peer.trunk.is_empty() {
+                "-".to_string()
+            } else {
+                peer.trunk.clone()
+            }),
+        ]),
         Line::from(vec![
             label("Received"),
             Span::styled(format!("{}bit/s", format::rate(peer.rx_bps)), theme::ok()),

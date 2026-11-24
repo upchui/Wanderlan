@@ -283,6 +283,34 @@ and `hub` still load; these keys are ignored with a warning.
   never merge; if L is itself a shared VLAN, it is not available as shared
   VLAN at that site (the validator warns about it).
 
+### Trunk per tunnel
+
+Normally all tunnels of a site share its trunk: the site is one switch.
+A tunnel can get a trunk of its own (`local.toml`, only on this host; TUI:
+Settings, "Trunk per tunnel"; CLI: `wanderlan trunk <site> <interface>`):
+
+```
+heim
+  ens19 ── br0 ───────┬── gt-haus2 ══ haus2
+                      └── gt-haus3 ══ haus3
+  ens20 ── wl-ens20 ───── gt-buero ══ buero
+```
+
+```toml
+trunk = "ens19"
+
+[tunnels.buero]
+trunk = "ens20"
+```
+
+Each further trunk is a segment of its own at this site (bridge
+`wl-<trunk>`, with the same VLANs and mappings as the default trunk): the
+network on ens20 reaches buero, the network on ens19 reaches haus2 and
+haus3, and the two do not see each other at heim. buero, haus2 and haus3
+still reach each other over their own tunnels. `wanderlan trunk <site>
+default` puts the tunnel back on the default trunk; the extra bridge is
+removed. The interface that leads to the other site (transport) is refused.
+
 ### Changes, rollback and synchronisation
 
 Every change of the running configuration (TUI, `wanderlan apply`, or a
@@ -367,6 +395,7 @@ discards the draft, `?` shows all keys, `q` quits.
 | `wanderlan join <address>[:port] <code> [--name N] [--trunk IF]` | Join a network (on an unconfigured site) |
 | `wanderlan online <site> [--confirm]` / `wanderlan offline <site> [--confirm]` | Take a site online (its tunnels come up) or offline |
 | `wanderlan manage <site> [--by S \| --anyone] [--self-managed yes\|no] [--confirm]` | Who may change a site's VLANs, mappings and online state |
+| `wanderlan trunk <site> <interface\|default> [--confirm]` | Give the tunnel to a site a trunk of its own (a segment of its own here), or the default trunk again |
 | `wanderlan reset [--yes]` | Remove everything wanderlan set up on this site; unconfigured again |
 
 The socket can be changed with `--socket` or `WANDERLAN_SOCKET`.

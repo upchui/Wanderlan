@@ -447,3 +447,93 @@ async fn mss_rules_follow_measurements() {
     teardown(&net, |_| {}).await.unwrap();
     assert_eq!(net.state().mss, None);
 }
+
+fn config_with_local(local: &str) -> Config {
+    match load(MESH, local).unwrap().loaded {
+        Loaded::Configured(cfg) => cfg,
+        Loaded::Unconfigured { .. } => panic!("configured"),
+    }
+}
+
+#[tokio::test]
+async fn a_tunnel_with_its_own_trunk_is_a_segment_of_its_own() {
+    let net = fresh();
+    net.add_physical("ens20");
+    let local = "self = \"heim\"\ntrunk = \"ens19\"\n\n[tunnels.haus2]\ntrunk = \"ens20\"\n";
+    let d = derive(&config_with_local(local), &Runtime::default());
+    assert_eq!(d.bridges().collect::<Vec<_>>(), ["br0", "wl-ens20"]);
+    run(&net, &d).await;
+
+    let br0 = net.link("br0").unwrap().index;
+    let segment = net.link("wl-ens20").unwrap();
+    assert_eq!(segment.alias.as_deref(), Some(OWNER_ALIAS));
+    assert_eq!(segment.kind, LinkKind::Bridge(BRIDGE_OPTIONS));
+    assert_eq!(net.link("ens20").unwrap().master, Some(segment.index));
+    assert_eq!(net.link("gt-haus2").unwrap().master, Some(segment.index));
+    assert_eq!(net.link("gt-buero").unwrap().master, Some(br0));
+    assert_eq!(net.link("ens19").unwrap().master, Some(br0));
+    assert_eq!(
+        net.vlans("ens20"),
+        net.vlans("ens19"),
+        "every trunk carries the same VLANs"
+    );
+    assert_eq!(
+        net.vlans("gt-haus2").keys().copied().collect::<Vec<_>>(),
+        vec![20, 30]
+    );
+    assert!(
+        run(&net, &d).await.is_empty(),
+        "nothing to do the second time"
+    );
+
+    // Back to the default trunk: the segment disappears, the tunnel moves.
+    run(&net, &desired("heim")).await;
+    assert!(net.link("wl-ens20").is_none());
+    assert_eq!(net.link("gt-haus2").unwrap().master, Some(br0));
+    assert_eq!(net.link("ens20").unwrap().master, None);
+    assert_eq!(
+        net.vlans("gt-haus2").keys().copied().collect::<Vec<_>>(),
+        vec![20, 30]
+    );
+
+    // Teardown removes every bridge of wanderlan.
+    run(&net, &d).await;
+    teardown(&net, |_| {}).await.unwrap();
+    assert!(net.link("br0").is_none() && net.link("wl-ens20").is_none());
+    assert_eq!(net.link("ens20").unwrap().master, None);
+}
+
+#[tokio::test]
+async fn a_trunk_in_a_foreign_bridge_is_refused() {
+    let net = fresh();
+    let ens20 = net.add_physical("ens20");
+    let vmbr = net.insert_link(LinkState {
+        index: 0,
+        name: "vmbr1".into(),
+        kind: LinkKind::Bridge(BRIDGE_OPTIONS),
+        alias: None,
+        master: None,
+        admin_up: true,
+        oper_up: true,
+        mtu: 1500,
+        isolated: None,
+        traffic: crate::api::Traffic::default(),
+    });
+    net.update_link(
+        ens20,
+        &LinkUpdate {
+            master: Some(Some(vmbr)),
+            ..LinkUpdate::default()
+        },
+    )
+    .await
+    .unwrap();
+    let local = "self = \"heim\"\ntrunk = \"ens19\"\n\n[tunnels.haus2]\ntrunk = \"ens20\"\n";
+    let d = derive(&config_with_local(local), &Runtime::default());
+    let err = plan(&d, &Actual::observe(&net).await.unwrap()).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("ens20 is already attached to vmbr1"),
+        "{err}"
+    );
+}

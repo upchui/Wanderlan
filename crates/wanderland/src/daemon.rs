@@ -240,9 +240,7 @@ pub async fn run(args: Args) -> Result<()> {
                 if let Some(at) = next_flush {
                     ctl.flushes.remove(&at);
                 }
-                if let Err(e) = reconcile::flush_learned(&ctl.sys, wanderlan_core::BRIDGE_NAME).await {
-                    warn!("{e}");
-                }
+                ctl.flush_bridges().await;
             }
             _ = sighup.recv() => {
                 info!("SIGHUP: reloading the configuration files");
@@ -273,6 +271,17 @@ pub async fn run(args: Args) -> Result<()> {
     let _ = std::fs::remove_file(&args.socket);
     info!("Stopped ({} changes undone)", removed.len());
     Ok(())
+}
+
+/// wanderlan's bridges (index, name): br0 and those of further trunks.
+fn owned_bridges(links: &[wanderlan_core::sys::LinkState]) -> Vec<(u32, String)> {
+    links
+        .iter()
+        .filter(|l| {
+            l.alias.as_deref() == Some(OWNER_ALIAS) && matches!(l.kind, LinkKind::Bridge(_))
+        })
+        .map(|l| (l.index, l.name.clone()))
+        .collect()
 }
 
 /// Waits until one of the background services ends (they never should).
@@ -1090,6 +1099,7 @@ impl Controller {
         let local = config::Local {
             self_name: Some(site.clone()),
             trunk: Some(params.trunk.clone()),
+            ..Default::default()
         };
         let cfg = sync::accept(mesh, &local).map_err(|e| {
             ApiError::new(format!(
@@ -1478,12 +1488,15 @@ impl Controller {
         let key = topology::forwarding_key(&cfg.mesh);
         let mesh_changed = self.applied_key.as_ref().is_some_and(|k| *k != key);
         if mesh_changed || reconcile::ports_changed(&changes) {
+            let bridges: Vec<&str> = desired.bridges().collect();
             info!(
                 "Flushing learned MAC addresses of {} because the topology changed",
-                desired.bridge
+                bridges.join(", ")
             );
-            if let Err(e) = reconcile::flush_learned(&self.sys, &desired.bridge).await {
-                warn!("{e}");
+            for bridge in bridges {
+                if let Err(e) = reconcile::flush_learned(&self.sys, bridge).await {
+                    warn!("{e}");
+                }
             }
             let now = Instant::now();
             self.flushes
@@ -1502,23 +1515,32 @@ impl Controller {
         Ok(changes)
     }
 
-    /// Tells the loop guard which interfaces are tunnel ports.
+    /// Forgets the learned MAC addresses of all of wanderlan's bridges.
+    async fn flush_bridges(&self) {
+        let Ok(links) = self.sys.links().await else {
+            return;
+        };
+        for (_, name) in owned_bridges(&links) {
+            if let Err(e) = reconcile::flush_learned(&self.sys, &name).await {
+                warn!("{e}");
+            }
+        }
+    }
+
+    /// Tells the loop guard which interfaces are bridges and tunnel ports.
     async fn update_port_map(&self) {
         let Ok(links) = self.sys.links().await else {
             return;
         };
-        let bridge = links
-            .iter()
-            .find(|l| {
-                l.name == wanderlan_core::BRIDGE_NAME && l.alias.as_deref() == Some(OWNER_ALIAS)
-            })
-            .map(|l| l.index);
+        let bridges: BTreeSet<u32> = owned_bridges(&links).into_iter().map(|(i, _)| i).collect();
         let tunnels = links
             .iter()
-            .filter(|l| l.name.starts_with(GRETAP_PREFIX) && bridge.is_some() && l.master == bridge)
+            .filter(|l| {
+                l.name.starts_with(GRETAP_PREFIX) && l.master.is_some_and(|m| bridges.contains(&m))
+            })
             .map(|l| (l.index, (l.name.clone(), l.isolated.unwrap_or(false))))
             .collect();
-        let new = PortMap { bridge, tunnels };
+        let new = PortMap { bridges, tunnels };
         self.ports.send_if_modified(|m| {
             let changed = *m != new;
             if changed {
@@ -1553,10 +1575,7 @@ impl Controller {
     async fn mac_table(&self) -> Result<Vec<MacEntry>, ApiError> {
         let links = self.sys.links().await.map_err(api_err)?;
         let fdb = self.sys.fdb().await.map_err(api_err)?;
-        let bridge = links
-            .iter()
-            .find(|l| l.name == wanderlan_core::BRIDGE_NAME)
-            .map(|l| l.index);
+        let bridges: BTreeSet<u32> = owned_bridges(&links).into_iter().map(|(i, _)| i).collect();
         let name_of = |i: u32| {
             links
                 .iter()
@@ -1565,7 +1584,7 @@ impl Controller {
         };
         let mut out: Vec<MacEntry> = fdb
             .into_iter()
-            .filter(|e| !e.permanent && bridge.is_some() && e.bridge == bridge)
+            .filter(|e| !e.permanent && e.bridge.is_some_and(|b| bridges.contains(&b)))
             .map(|e| MacEntry {
                 mac: format_mac(&e.mac),
                 vlan: e.vlan,
@@ -1613,6 +1632,7 @@ impl Controller {
                 blocked,
                 invites: 0,
                 trunk_traffic: None,
+                trunks: Vec::new(),
             };
         };
         let desired = desired::derive(cfg, &self.runtime);
@@ -1667,6 +1687,7 @@ impl Controller {
                     port,
                     port_state,
                     vlans,
+                    trunk: cfg.trunk_for(&t.peer.name).to_string(),
                     reachable: probe.is_some_and(|p| p.reachable),
                     last_reply_secs: probe
                         .and_then(|p| p.last_reply)
@@ -1698,6 +1719,20 @@ impl Controller {
                 direct: direct.contains(s.name.as_str()),
             })
             .collect();
+        let trunks: Vec<PortTraffic> = desired
+            .trunks
+            .iter()
+            .filter_map(|t| links.iter().find(|l| l.name == t.name))
+            .map(|l| {
+                let (rx_bps, tx_bps) = rates.get(&l.name).copied().unwrap_or_default();
+                PortTraffic {
+                    name: l.name.clone(),
+                    rx_bps,
+                    tx_bps,
+                    traffic: l.traffic,
+                }
+            })
+            .collect();
         Status {
             version: wanderlan_core::VERSION.into(),
             state: if self.last_error.is_some() {
@@ -1718,15 +1753,8 @@ impl Controller {
             sites,
             blocked,
             invites: self.invites.list().len(),
-            trunk_traffic: links.iter().find(|l| l.name == cfg.trunk()).map(|l| {
-                let (rx_bps, tx_bps) = rates.get(&l.name).copied().unwrap_or_default();
-                PortTraffic {
-                    name: l.name.clone(),
-                    rx_bps,
-                    tx_bps,
-                    traffic: l.traffic,
-                }
-            }),
+            trunk_traffic: trunks.first().cloned(),
+            trunks,
         }
     }
 }

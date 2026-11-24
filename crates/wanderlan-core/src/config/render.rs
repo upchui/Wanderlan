@@ -92,6 +92,22 @@ pub fn render_local(local: &Local) -> String {
     if let Some(trunk) = &local.trunk {
         let _ = writeln!(out, "trunk = {}", quote(trunk));
     }
+    for (site, trunk) in &local.tunnel_trunks {
+        // Site names are valid bare keys; anything else is quoted.
+        let key = if site
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            site.clone()
+        } else {
+            quote(site)
+        };
+        let _ = write!(
+            out,
+            "\n# The tunnel to \"{site}\" has its own trunk (a segment of its own).\n[tunnels.{key}]\ntrunk = {}\n",
+            quote(trunk)
+        );
+    }
     out
 }
 

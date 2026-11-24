@@ -2,7 +2,8 @@
 #
 # Every site has its own underlay network; a router connects them. The
 # underlay stands in for the transport network (usually a VPN) that wanderlan
-# expects to exist. Every site also has a trunk network with one client.
+# expects to exist. Every site also has a trunk network with one client;
+# site1 has a second trunk (trunk1) with a client for "trunk per tunnel".
 name: wanderlan-it
 
 x-common: &common
@@ -37,10 +38,12 @@ services:
     environment:
       ROLE: site
       TRUNK_NET: "10.200.1."
+      TRUNK_NET_B: "10.200.21."
       GATEWAY: 10.100.1.254
     networks:
       ul-site1: { ipv4_address: 10.100.1.10 }
       tr-site1: { ipv4_address: 10.200.1.10 }
+      tr-site1b: { ipv4_address: 10.200.21.10 }
 
   c-site1:
     <<: *common
@@ -50,6 +53,15 @@ services:
       TRUNK_NET: "10.200.1."
     networks:
       tr-site1: { ipv4_address: 10.200.1.20 }
+
+  c-site1b:
+    <<: *common
+    hostname: c-site1b
+    environment:
+      ROLE: client
+      TRUNK_NET: "10.200.21."
+    networks:
+      tr-site1b: { ipv4_address: 10.200.21.20 }
 
   site2:
     <<: *common
@@ -171,6 +183,10 @@ networks:
     internal: true
     ipam:
       config: [{ subnet: 10.200.1.0/24 }]
+  tr-site1b:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.200.21.0/24 }]
   tr-site2:
     internal: true
     ipam:

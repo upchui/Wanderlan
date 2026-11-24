@@ -132,6 +132,15 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
             ),
         };
         lines.push(Line::styled(text, theme::dim()));
+        if let Some(trunk) = draft.local.tunnel_trunks.get(&site.name) {
+            lines.push(Line::styled(
+                format!(
+                    " The tunnel to {} has its own trunk {trunk} here (Settings, 7).",
+                    site.name
+                ),
+                theme::dim(),
+            ));
+        }
     }
     if lines.is_empty() {
         let marks = "+ new, * changed (not applied yet). a: review and apply the draft.";

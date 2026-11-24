@@ -128,11 +128,13 @@ mod tests {
         let local = Local {
             self_name: Some("haus2".into()),
             trunk: Some("ens19".into()),
+            ..Default::default()
         };
         assert!(accept(mesh.clone(), &local).is_ok());
         let stranger = Local {
             self_name: Some("haus9".into()),
             trunk: Some("ens19".into()),
+            ..Default::default()
         };
         assert_eq!(
             accept(mesh, &stranger).unwrap_err(),

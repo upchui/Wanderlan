@@ -244,35 +244,52 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
     let mut vlan_adds = Vec::new();
     let mut ups = Vec::new();
 
-    // Bridge.
-    let bridge = actual.links.get(&desired.bridge);
-    match bridge {
-        Some(link) if !is_owned(link) => return Err(PlanError::Foreign(link.name.clone())),
-        Some(link) => match &link.kind {
-            LinkKind::Bridge(options) if *options == desired.bridge_options => {}
-            LinkKind::Bridge(_) => bridge_changes.push(Change::SetBridgeOptions {
-                name: link.name.clone(),
-                options: desired.bridge_options,
-            }),
-            _ => {
-                deletes.push(Change::DeleteLink {
-                    name: link.name.clone(),
-                    reason: "it is not a bridge".into(),
-                });
-                bridge_changes.push(Change::CreateBridge {
-                    name: desired.bridge.clone(),
-                    options: desired.bridge_options,
-                });
-            }
-        },
-        None => bridge_changes.push(Change::CreateBridge {
-            name: desired.bridge.clone(),
+    // Bridges: one per trunk (segment).
+    let wanted_bridges: BTreeSet<&str> = desired.bridges().collect();
+    let mut bridge_index: BTreeMap<&str, u32> = BTreeMap::new();
+    for name in desired.bridges() {
+        let create = Change::CreateBridge {
+            name: name.to_string(),
             options: desired.bridge_options,
-        }),
+        };
+        match actual.links.get(name) {
+            Some(link) if !is_owned(link) => return Err(PlanError::Foreign(link.name.clone())),
+            Some(link) => match &link.kind {
+                LinkKind::Bridge(options) => {
+                    bridge_index.insert(name, link.index);
+                    if *options != desired.bridge_options {
+                        bridge_changes.push(Change::SetBridgeOptions {
+                            name: link.name.clone(),
+                            options: desired.bridge_options,
+                        });
+                    }
+                }
+                _ => {
+                    deletes.push(Change::DeleteLink {
+                        name: link.name.clone(),
+                        reason: "it is not a bridge".into(),
+                    });
+                    bridge_changes.push(create);
+                }
+            },
+            None => bridge_changes.push(create),
+        }
     }
-    let bridge_index = bridge
-        .filter(|l| matches!(l.kind, LinkKind::Bridge(_)))
-        .map(|l| l.index);
+    // Our bridges: ports may move between them. Bridges whose trunk is no
+    // longer used are removed.
+    let mut owned_bridges: BTreeSet<u32> = BTreeSet::new();
+    for link in actual.links.values() {
+        if !is_owned(link) || !matches!(link.kind, LinkKind::Bridge(_)) {
+            continue;
+        }
+        owned_bridges.insert(link.index);
+        if !wanted_bridges.contains(link.name.as_str()) {
+            deletes.push(Change::DeleteLink {
+                name: link.name.clone(),
+                reason: "no tunnel uses its trunk any more".into(),
+            });
+        }
+    }
 
     // Stale or changed tunnels.
     let wanted: BTreeMap<&str, _> = desired
@@ -313,40 +330,42 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
         })
         .collect();
 
-    // Trunk.
-    let trunk = actual
-        .links
-        .get(&desired.trunk.name)
-        .ok_or_else(|| PlanError::TrunkMissing(desired.trunk.name.clone()))?;
-    if let Some(master) = trunk.master
-        && Some(master) != bridge_index
-    {
-        let master = actual
-            .by_index(master)
-            .map_or_else(|| format!("interface #{master}"), |l| l.name.clone());
-        return Err(PlanError::TrunkEnslaved {
-            trunk: trunk.name.clone(),
-            master,
-        });
+    // Trunks.
+    for spec in &desired.trunks {
+        let trunk = actual
+            .links
+            .get(&spec.name)
+            .ok_or_else(|| PlanError::TrunkMissing(spec.name.clone()))?;
+        if let Some(master) = trunk.master
+            && !owned_bridges.contains(&master)
+        {
+            let master = actual
+                .by_index(master)
+                .map_or_else(|| format!("interface #{master}"), |l| l.name.clone());
+            return Err(PlanError::TrunkEnslaved {
+                trunk: trunk.name.clone(),
+                master,
+            });
+        }
+        port_changes(
+            PortWanted {
+                name: &spec.name,
+                mtu: None,
+                isolated: false,
+                up: true,
+                up_reason: None,
+                vlans: &spec.vlans,
+            },
+            trunk,
+            bridge_index.get(spec.bridge.as_str()).copied(),
+            &spec.bridge,
+            actual,
+            &mut settings,
+            &mut vlan_dels,
+            &mut vlan_adds,
+            &mut ups,
+        );
     }
-    port_changes(
-        PortWanted {
-            name: &desired.trunk.name,
-            mtu: None,
-            isolated: false,
-            up: true,
-            up_reason: None,
-            vlans: &desired.trunk.vlans,
-        },
-        trunk,
-        bridge_index,
-        &desired.bridge,
-        actual,
-        &mut settings,
-        &mut vlan_dels,
-        &mut vlan_adds,
-        &mut ups,
-    );
 
     // Tunnels.
     for spec in &desired.tunnels {
@@ -362,8 +381,8 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
                     vlans: &spec.vlans,
                 },
                 link,
-                bridge_index,
-                &desired.bridge,
+                bridge_index.get(spec.bridge.as_str()).copied(),
+                &spec.bridge,
                 actual,
                 &mut settings,
                 &mut vlan_dels,
@@ -378,8 +397,8 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
         }
     }
 
-    // The bridge device itself carries no VLANs (it has no address).
-    if let Some(link) = bridge.filter(|l| bridge_index == Some(l.index)) {
+    // The bridge devices themselves carry no VLANs (they have no address).
+    for link in bridge_index.values().filter_map(|i| actual.by_index(*i)) {
         let current = actual.vlans_of(link);
         if !current.is_empty() {
             vlan_dels.push(Change::DelVlans {
@@ -396,7 +415,7 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
         }
     }
 
-    let tc_changes = tc_changes(desired, actual, trunk);
+    let tc_changes = tc_changes(desired, actual);
     let nft_changes = match (&actual.mss, desired.mss.is_empty()) {
         (None, true) => Vec::new(),
         (Some(_), true) => vec![Change::DeleteNftTable],
@@ -418,43 +437,50 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
     Ok(out)
 }
 
-/// VLAN translation rules: the trunk gets exactly the desired rules; rules
-/// of ours on other interfaces (e.g. a former trunk) are removed.
-fn tc_changes(desired: &Desired, actual: &Actual, trunk: &LinkState) -> Vec<Change> {
+/// VLAN translation rules: every trunk gets exactly the desired rules;
+/// rules of ours on other interfaces (e.g. a former trunk) are removed.
+fn tc_changes(desired: &Desired, actual: &Actual) -> Vec<Change> {
     let mut dels = Vec::new();
     let mut adds = Vec::new();
     let mut qdisc_adds = Vec::new();
     let mut qdisc_dels = Vec::new();
+    let mut trunks: BTreeSet<u32> = BTreeSet::new();
 
-    let wanted: BTreeSet<TcRule> = desired.trunk.tc.iter().copied().collect();
-    let current = actual.tc.get(&trunk.index).cloned().unwrap_or_default();
-    let have: BTreeSet<TcRule> = current.ours.iter().copied().collect();
-    for rule in have.difference(&wanted) {
-        dels.push(Change::DelTcRule {
-            dev: trunk.name.clone(),
-            rule: *rule,
-        });
-    }
-    let missing: Vec<&TcRule> = wanted.difference(&have).collect();
-    if !missing.is_empty() && !current.clsact {
-        qdisc_adds.push(Change::AddClsact {
-            dev: trunk.name.clone(),
-        });
-    }
-    for rule in missing {
-        adds.push(Change::AddTcRule {
-            dev: trunk.name.clone(),
-            rule: *rule,
-        });
-    }
-    if wanted.is_empty() && !have.is_empty() && current.foreign == 0 {
-        qdisc_dels.push(Change::DelClsact {
-            dev: trunk.name.clone(),
-        });
+    for spec in &desired.trunks {
+        let Some(trunk) = actual.links.get(&spec.name) else {
+            continue;
+        };
+        trunks.insert(trunk.index);
+        let wanted: BTreeSet<TcRule> = spec.tc.iter().copied().collect();
+        let current = actual.tc.get(&trunk.index).cloned().unwrap_or_default();
+        let have: BTreeSet<TcRule> = current.ours.iter().copied().collect();
+        for rule in have.difference(&wanted) {
+            dels.push(Change::DelTcRule {
+                dev: trunk.name.clone(),
+                rule: *rule,
+            });
+        }
+        let missing: Vec<&TcRule> = wanted.difference(&have).collect();
+        if !missing.is_empty() && !current.clsact {
+            qdisc_adds.push(Change::AddClsact {
+                dev: trunk.name.clone(),
+            });
+        }
+        for rule in missing {
+            adds.push(Change::AddTcRule {
+                dev: trunk.name.clone(),
+                rule: *rule,
+            });
+        }
+        if wanted.is_empty() && !have.is_empty() && current.foreign == 0 {
+            qdisc_dels.push(Change::DelClsact {
+                dev: trunk.name.clone(),
+            });
+        }
     }
 
     for (index, state) in &actual.tc {
-        if *index == trunk.index || state.ours.is_empty() {
+        if trunks.contains(index) || state.ours.is_empty() {
             continue;
         }
         let Some(link) = actual.by_index(*index) else {

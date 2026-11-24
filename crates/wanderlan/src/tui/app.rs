@@ -23,7 +23,7 @@ use wanderlan_core::topology::gretap_name;
 
 use super::diff::{self, DiffLine};
 use super::draft::{Draft, Running};
-use super::form::{Form, FormEvent, FormKind, trunk_hint};
+use super::form::{Form, FormEvent, FormKind, trunk_hint, tunnel_trunk_hint};
 use super::log::LogState;
 use super::macs::MacState;
 use super::wizard::{self, Mode, Step, Wizard};
@@ -885,6 +885,11 @@ impl App {
         {
             form.set_hint("trunk", trunk_hint(&self.interfaces));
         }
+        if let (Some(Modal::Form(form)), Some(draft)) = (&mut self.modal, &self.draft)
+            && let FormKind::TunnelTrunk(_) = form.kind
+        {
+            form.set_hint("trunk", tunnel_trunk_hint(draft, &self.interfaces));
+        }
     }
 
     fn on_applied(&mut self, applied: Applied, fx: &mut Vec<Effect>) {
@@ -1468,6 +1473,10 @@ impl App {
                     }
                 }
             }
+            FormEvent::Submit if self.trunk_leads_to_peer(&form).is_some() => {
+                let msg = self.trunk_leads_to_peer(&form).unwrap_or_default();
+                form.reject("trunk", msg);
+            }
             FormEvent::Submit => {
                 if let Some(new) = form.submit(draft) {
                     match form.kind {
@@ -1491,6 +1500,23 @@ impl App {
             }
         }
         Some(Modal::Form(form))
+    }
+
+    /// For the trunk form of a tunnel: why the chosen interface cannot be
+    /// the trunk because the transport to the peer runs over it.
+    fn trunk_leads_to_peer(&self, form: &Form) -> Option<String> {
+        let FormKind::TunnelTrunk(site) = form.kind else {
+            return None;
+        };
+        let peer = self.draft.as_ref()?.mesh.sites.get(site)?;
+        let trunk = form.field("trunk")?.value().trim().to_string();
+        let route = hostinfo::route_interface(peer.address)?;
+        (route == trunk).then(|| {
+            format!(
+                "{trunk} leads to {} ({}); bridging it would cut the connection",
+                peer.name, peer.address
+            )
+        })
     }
 
     fn on_review_key(
@@ -1665,36 +1691,50 @@ impl App {
     }
 
     fn on_settings_key(&mut self, key: &KeyEvent, fx: &mut Vec<Effect>) {
-        let rows = super::ui::settings::ROWS.len();
+        use super::ui::settings::{ROWS, Setting, settings};
+        let all = settings(self.draft.as_ref());
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.settings_selected = self.settings_selected.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.settings_selected = (self.settings_selected + 1).min(rows.saturating_sub(1));
+                self.settings_selected =
+                    (self.settings_selected + 1).min(all.len().saturating_sub(1));
             }
             KeyCode::Enter | KeyCode::Char('e') => {
-                let Some(row) = super::ui::settings::ROWS.get(self.settings_selected) else {
-                    return;
-                };
                 if self.draft.is_none() {
                     self.not_configured();
                     return;
                 }
-                if row.local {
-                    self.request_interfaces(fx);
+                match all.get(self.settings_selected).copied() {
+                    Some(Setting::Fixed(i)) => {
+                        let Some(row) = ROWS.get(i) else { return };
+                        if row.local {
+                            self.request_interfaces(fx);
+                        }
+                        if row.key == "vlans" && !self.may_change_network_vlans() {
+                            return;
+                        }
+                        let Some(draft) = &self.draft else { return };
+                        let mut form = if row.local {
+                            Form::local(draft, &self.interfaces)
+                        } else {
+                            Form::mesh(draft)
+                        };
+                        form.focus_on(row.key);
+                        self.modal = Some(Modal::Form(form));
+                    }
+                    Some(Setting::TunnelTrunk(site)) => {
+                        self.request_interfaces(fx);
+                        let Some(draft) = &self.draft else { return };
+                        self.modal = Some(Modal::Form(Form::tunnel_trunk(
+                            draft,
+                            site,
+                            &self.interfaces,
+                        )));
+                    }
+                    None => {}
                 }
-                if row.key == "vlans" && !self.may_change_network_vlans() {
-                    return;
-                }
-                let Some(draft) = &self.draft else { return };
-                let mut form = if row.local {
-                    Form::local(draft, &self.interfaces)
-                } else {
-                    Form::mesh(draft)
-                };
-                form.focus_on(row.key);
-                self.modal = Some(Modal::Form(form));
             }
             _ => {}
         }

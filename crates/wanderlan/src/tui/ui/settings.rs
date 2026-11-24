@@ -7,7 +7,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use wanderlan_core::config::FieldPath;
-use wanderlan_core::desired::GRETAP_MTU;
+use wanderlan_core::desired::{GRETAP_MTU, bridge_for};
 use wanderlan_core::policy;
 
 use super::{not_configured, severity_style, titled};
@@ -121,12 +121,62 @@ fn permissions(draft: &Draft) -> [(&'static str, String); 2] {
     [("This site", this), ("Manages", manages)]
 }
 
+/// A row of the settings list that can be selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setting {
+    /// One of [`ROWS`].
+    Fixed(usize),
+    /// The trunk of the tunnel to a site (index in the mesh).
+    TunnelTrunk(usize),
+}
+
+/// Every selectable setting: the fixed ones, then the trunk of every tunnel.
+pub fn settings(draft: Option<&Draft>) -> Vec<Setting> {
+    let mut out: Vec<Setting> = (0..ROWS.len()).map(Setting::Fixed).collect();
+    if let Some(d) = draft {
+        let me = d.local.self_name.as_deref();
+        out.extend(
+            d.mesh
+                .sites
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| Some(s.name.as_str()) != me)
+                .map(|(i, _)| Setting::TunnelTrunk(i)),
+        );
+    }
+    out
+}
+
+/// The trunk of the tunnel to `site`, for display.
+fn tunnel_trunk(draft: &Draft, site: &str) -> String {
+    let default = draft.local.trunk.as_deref().unwrap_or("-");
+    match draft.local.tunnel_trunks.get(site) {
+        Some(t) if t != default => format!("{t} (own segment {})", bridge_for(t, default)),
+        _ => format!("default ({default})"),
+    }
+}
+
+fn help_text(draft: &Draft, setting: Option<Setting>) -> String {
+    match setting {
+        Some(Setting::Fixed(i)) => ROWS.get(i).map_or("", |r| r.help).to_string(),
+        Some(Setting::TunnelTrunk(i)) => {
+            let name = draft.mesh.sites.get(i).map_or("", |s| s.name.as_str());
+            format!(
+                "The local interface the tunnel to {name} is bridged with; empty: the default trunk. Another interface makes it a segment of its own here (bridge wl-<interface>): only that network reaches {name}."
+            )
+        }
+        None => String::new(),
+    }
+}
+
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let Some(draft) = &app.draft else {
         not_configured(frame, area);
         return;
     };
-    let [table, help] = Layout::vertical([Constraint::Length(15), Constraint::Min(4)]).areas(area);
+    let [table, help] = Layout::vertical([Constraint::Min(8), Constraint::Length(5)]).areas(area);
+    let selectable = settings(Some(draft));
+    let selected = selectable.get(app.settings_selected).copied();
     let mut rows = vec![Row::new(vec![Cell::from(Span::styled(
         "Network (all sites)",
         theme::header(),
@@ -139,7 +189,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 theme::header(),
             ))]));
         }
-        if i == app.settings_selected {
+        if selected == Some(Setting::Fixed(i)) {
             selected_row = rows.len();
         }
         let path = if row.local {
@@ -175,29 +225,50 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             Cell::from(Span::styled(value, theme::dim())),
         ]));
     }
+    rows.push(Row::new(vec![
+        Cell::from(Span::styled("Trunk per tunnel", theme::header())),
+        Cell::from(Span::styled(
+            "this host only; another trunk = own segment",
+            theme::dim(),
+        )),
+    ]));
+    for setting in &selectable {
+        let Setting::TunnelTrunk(i) = *setting else {
+            continue;
+        };
+        let Some(site) = draft.mesh.sites.get(i) else {
+            continue;
+        };
+        if selected == Some(*setting) {
+            selected_row = rows.len();
+        }
+        let path = FieldPath::local(&format!("tunnels.{}.trunk", site.name));
+        rows.push(
+            Row::new(vec![
+                Cell::from(format!("  to {}", site.name)),
+                Cell::from(tunnel_trunk(draft, &site.name)),
+            ])
+            .style(severity_style(draft.worst_at(&path))),
+        );
+    }
     let widths = [Constraint::Length(22), Constraint::Min(20)];
     let mut state = TableState::default().with_selected(Some(selected_row));
     frame.render_stateful_widget(
         Table::new(rows, widths)
-            .block(titled(" Settings (Enter: change) "))
+            .block(titled(" Settings (Enter: change, Up/Down: more) "))
             .row_highlight_style(theme::selected()),
         table,
         &mut state,
     );
-    let text = ROWS
-        .get(app.settings_selected)
-        .map_or("", |r| r.help)
-        .to_string();
+    let text = help_text(draft, selected);
     let mut lines: Vec<Line> = format::wrap(&text, usize::from(help.width.saturating_sub(2)))
         .into_iter()
         .map(|l| Line::raw(format!(" {l}")))
         .collect();
-    lines.extend([
-        Line::raw(""),
-        Line::styled(
-            " Changes go into the draft; a reviews and applies them, c confirms.",
-            theme::dim(),
-        ),
-    ]);
+    lines.truncate(3);
+    lines.extend([Line::styled(
+        " Changes go into the draft; a reviews and applies them, c confirms.",
+        theme::dim(),
+    )]);
     frame.render_widget(Paragraph::new(lines), help);
 }

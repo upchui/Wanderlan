@@ -167,6 +167,20 @@ fn settings_view() {
 }
 
 #[test]
+fn settings_trunk_per_tunnel() {
+    let mut app = connected();
+    if let Some(d) = &mut app.draft {
+        d.local.tunnel_trunks.insert("haus2".into(), "ens20".into());
+    }
+    key(&mut app, KeyCode::Char('7'));
+    // Down to "to haus2": the fixed rows, then buero, then haus2.
+    for _ in 0..super::settings::ROWS.len() + 1 {
+        key(&mut app, KeyCode::Down);
+    }
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
 fn peer_details() {
     let mut app = connected();
     for _ in 0..30 {

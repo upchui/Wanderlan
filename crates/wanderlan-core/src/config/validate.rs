@@ -295,7 +295,7 @@ impl Validator {
             Some(trunk) => {
                 if let Some(msg) = ifname_error(trunk) {
                     push("trunk", format!("trunk: {msg}"));
-                } else if trunk.starts_with(GRETAP_PREFIX) || trunk == crate::BRIDGE_NAME {
+                } else if is_managed_name(trunk) {
                     push(
                         "trunk",
                         format!("trunk \"{trunk}\" is an interface managed by wanderlan"),
@@ -303,7 +303,42 @@ impl Validator {
                 }
             }
         }
+        let me = local.self_name.as_deref();
+        let mut unused = Vec::new();
+        for (site, trunk) in &local.tunnel_trunks {
+            let path = format!("tunnels.{site}.trunk");
+            if let Some(msg) = ifname_error(trunk) {
+                push(&path, format!("trunk of the tunnel to \"{site}\": {msg}"));
+            } else if is_managed_name(trunk) {
+                push(
+                    &path,
+                    format!(
+                        "trunk \"{trunk}\" of the tunnel to \"{site}\" is an interface managed by wanderlan"
+                    ),
+                );
+            }
+            if mesh.site(site).is_none() || Some(site.as_str()) == me {
+                unused.push((
+                    path,
+                    format!("there is no tunnel to \"{site}\" (not a peer of this site); this trunk is not used"),
+                ));
+            }
+        }
+        for (path, msg) in unused {
+            self.diags.push(Diagnostic::warning(
+                ConfigFile::Local,
+                FieldPath::local(&path),
+                msg,
+            ));
+        }
     }
+}
+
+/// True for names of interfaces wanderlan creates itself.
+fn is_managed_name(name: &str) -> bool {
+    name.starts_with(GRETAP_PREFIX)
+        || name == crate::BRIDGE_NAME
+        || name.starts_with(crate::desired::SEGMENT_PREFIX)
 }
 
 #[cfg(test)]

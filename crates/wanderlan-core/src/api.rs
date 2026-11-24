@@ -458,6 +458,9 @@ pub struct PeerStatus {
     /// VLANs carried by the tunnel (both sites take part in them).
     #[serde(default)]
     pub vlans: String,
+    /// The local trunk this tunnel is bridged with.
+    #[serde(default)]
+    pub trunk: String,
     /// The peer answers control probes.
     pub reachable: bool,
     /// Seconds since the last answered probe.
@@ -540,9 +543,13 @@ pub struct Status {
     /// Open invitations of this site.
     #[serde(default)]
     pub invites: usize,
-    /// Traffic of the trunk.
+    /// Traffic of the (default) trunk.
     #[serde(default)]
     pub trunk_traffic: Option<PortTraffic>,
+    /// Every trunk with its traffic: the default trunk first, then the
+    /// trunks of single tunnels (each a segment of its own).
+    #[serde(default)]
+    pub trunks: Vec<PortTraffic>,
 }
 
 fn online_default() -> bool {
@@ -611,10 +618,9 @@ impl Interface {
     /// bridge or bond (attached to wanderlan's own bridge is fine).
     pub fn is_trunk_candidate(&self) -> bool {
         let kind_ok = matches!(self.kind.as_str(), "" | "vlan" | "bond" | "veth");
-        let master_ok = self
-            .master
-            .as_deref()
-            .is_none_or(|m| m == crate::BRIDGE_NAME);
+        let master_ok = self.master.as_deref().is_none_or(|m| {
+            m == crate::BRIDGE_NAME || m.starts_with(crate::desired::SEGMENT_PREFIX)
+        });
         self.is_listed() && kind_ok && master_ok
     }
 }

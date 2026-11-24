@@ -3,3 +3,9 @@
 
 self = "haus2"     # name of this site in mesh.toml
 trunk = "ens19"    # local interface carrying the VLANs (tagged trunk)
+
+# Optional: a tunnel with a trunk of its own. It becomes a segment of its own
+# at this site (bridge wl-ens20): only the network on ens20 reaches "heim"
+# through this site; all other tunnels use the trunk above.
+# [tunnels.heim]
+# trunk = "ens20"

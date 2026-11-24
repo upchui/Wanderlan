@@ -89,6 +89,14 @@ struct RawLocal {
     #[serde(rename = "self")]
     self_name: Option<Spanned<String>>,
     trunk: Option<Spanned<String>>,
+    tunnels: Option<std::collections::BTreeMap<String, RawLocalTunnel>>,
+}
+
+/// `[tunnels.<site>]` in `local.toml`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawLocalTunnel {
+    trunk: Option<Spanned<String>>,
 }
 
 /// Result of parsing `mesh.toml`.
@@ -439,7 +447,18 @@ pub fn parse_local(text: &str) -> Result<ParsedLocal, Vec<Diagnostic>> {
     let self_name = lw.take(&self_path, raw.self_name);
     let trunk_path = FieldPath::local("trunk");
     let trunk = lw.take(&trunk_path, raw.trunk);
-    let local = Local { self_name, trunk };
+    let mut tunnel_trunks = std::collections::BTreeMap::new();
+    for (site, tunnel) in raw.tunnels.unwrap_or_default() {
+        let path = FieldPath::local(&format!("tunnels.{site}.trunk"));
+        if let Some(t) = lw.take(&path, tunnel.trunk) {
+            tunnel_trunks.insert(site, t);
+        }
+    }
+    let local = Local {
+        self_name,
+        trunk,
+        tunnel_trunks,
+    };
     if lw.diags.is_empty() {
         Ok(ParsedLocal {
             local,

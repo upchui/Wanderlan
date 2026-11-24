@@ -59,6 +59,7 @@ pub fn config_texts() -> ConfigTexts {
     let local = Local {
         self_name: Some("heim".into()),
         trunk: Some("ens19".into()),
+        ..Default::default()
     };
     ConfigTexts {
         configured: true,
@@ -87,6 +88,7 @@ fn peer(name: &str, address: &str) -> PeerStatus {
         port: format!("gt-{name}"),
         port_state: PortState::Up,
         vlans: "10-50".into(),
+        trunk: "ens19".into(),
         reachable: true,
         last_reply_secs: Some(1),
         rtt_ms: Some(12.4),
@@ -197,6 +199,7 @@ pub fn status() -> Status {
         blocked: vec!["gt-haus2".into()],
         invites: 1,
         trunk_traffic: None,
+        trunks: Vec::new(),
     }
 }
 
@@ -219,6 +222,7 @@ pub fn unconfigured_status() -> Status {
         blocked: Vec::new(),
         invites: 0,
         trunk_traffic: None,
+        trunks: Vec::new(),
     }
 }
 

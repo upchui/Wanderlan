@@ -46,6 +46,11 @@ impl Config {
     pub fn trunk(&self) -> &str {
         self.local.trunk.as_deref().unwrap_or_default()
     }
+
+    /// The trunk of the tunnel to `peer` (its own, or the default trunk).
+    pub fn trunk_for(&self, peer: &str) -> &str {
+        self.local.trunk_for(peer).unwrap_or_default()
+    }
 }
 
 /// What was found on disk.

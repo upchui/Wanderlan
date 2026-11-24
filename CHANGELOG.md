@@ -118,6 +118,24 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
 - Sites added by hand are managed by the site that added them (field
   "Changes").
 
+### Trunk per tunnel
+
+- A tunnel can have a trunk of its own (`local.toml`: `[tunnels.<site>]
+  trunk = "ens20"`): it becomes a segment of its own at this site, with a
+  bridge `wl-<trunk>` that carries the same VLANs and mappings as the
+  default trunk. Only that network reaches the site at the other end through
+  this site. The default trunk stays in `br0`, so existing installations do
+  not change.
+- TUI: Settings lists the trunk of every tunnel ("Trunk per tunnel"),
+  Enter changes it; the overview shows the traffic of every trunk, the peer
+  details the trunk of the tunnel. CLI: `wanderlan trunk <site>
+  <interface|default>`. The interface that leads to the other site is
+  refused.
+- The loop guard watches every bridge of wanderlan; the MAC table, the
+  flushes after topology changes and the cleanup cover all of them.
+- Renaming a site in the TUI also renames it where it manages other sites
+  (`managed_by`) and in `[tunnels.<site>]`.
+
 ### More to see
 
 - Settings view (7): every setting with an explanation.

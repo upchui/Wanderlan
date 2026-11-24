@@ -1,0 +1,28 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+"┌ Settings (Enter: change, Up/Down: more) ─────────────────────────────────────┐"
+"│  Commit timeout       1m                                                     │"
+"│  Path MTU check       every 5m                                               │"
+"│  TCP MSS              from the path MTU                                      │"
+"│  Control port         51821                                                  │"
+"│This host                                                                     │"
+"│  This site            heim                                                   │"
+"│  Trunk                ens19                                                  │"
+"│  Tunnel MTU           1500 (fixed; GRE fragments if the path is smaller)     │"
+"│Permissions            who may change VLANs: Sites (2), Enter, Changes        │"
+"│  This site            not managed by another site                            │"
+"│  Manages              -                                                      │"
+"│Trunk per tunnel       this host only; another trunk = own segment            │"
+"│  to buero             default (ens19)                                        │"
+"│  to haus2             ens20 (own segment wl-ens20)                           │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" The local interface the tunnel to haus2 is bridged with; empty: the default    "
+" trunk. Another interface makes it a segment of its own here (bridge            "
+" wl-<interface>): only that network reaches haus2.                              "
+" Changes go into the draft; a reviews and applies them, c confirms.             "
+"                                                                                "
+"                                                       draft: modified  heim r7 "
+" Up/Down  choose   Enter  change   a  apply   x  discard   ?  help   q  quit    "

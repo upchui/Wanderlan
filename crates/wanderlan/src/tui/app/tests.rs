@@ -511,3 +511,31 @@ fn settings_open_the_form_at_the_chosen_setting() {
         other => panic!("expected the network form, got {other:?}"),
     }
 }
+
+#[test]
+fn a_tunnel_gets_its_own_trunk_in_the_settings() {
+    let mut app = connected();
+    app.update(ch('7'));
+    // The fixed settings come first, then one row per tunnel (buero, haus2, ...).
+    app.settings_selected = crate::tui::ui::settings::ROWS.len() + 1;
+    app.update(key(KeyCode::Enter));
+    assert!(matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::TunnelTrunk(2)));
+    for c in "ens20".chars() {
+        app.update(ch(c));
+    }
+    app.update(key(KeyCode::Enter));
+    assert!(app.modal.is_none(), "saved");
+    let draft = app.draft.as_ref().unwrap();
+    assert_eq!(
+        draft.local.tunnel_trunks.get("haus2").map(String::as_str),
+        Some("ens20")
+    );
+    assert!(app.draft_dirty());
+    // Empty again: back to the default trunk.
+    app.update(key(KeyCode::Enter));
+    for _ in 0..5 {
+        app.update(key(KeyCode::Backspace));
+    }
+    app.update(key(KeyCode::Enter));
+    assert!(app.draft.as_ref().unwrap().local.tunnel_trunks.is_empty());
+}

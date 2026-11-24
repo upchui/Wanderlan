@@ -435,3 +435,48 @@ fn mesh_model_validation_without_text() {
     assert_eq!(diags[0].path.as_str(), "site[0].vlans");
     assert_eq!(diags[0].line, None);
 }
+
+#[test]
+fn a_tunnel_can_have_its_own_trunk() {
+    let local = "self = \"haus2\"\ntrunk = \"ens19\"\n\n[tunnels.heim]\ntrunk = \"ens20\"\n";
+    let outcome = load(EXAMPLE_MESH, local).expect("valid");
+    let Loaded::Configured(cfg) = outcome.loaded else {
+        panic!("configured")
+    };
+    assert_eq!(cfg.trunk_for("heim"), "ens20");
+    assert_eq!(cfg.trunk_for("buero"), "ens19");
+    // The canonical form keeps it and reads back the same.
+    let rendered = render_local(&cfg.local);
+    assert!(
+        rendered.contains("[tunnels.heim]\ntrunk = \"ens20\""),
+        "{rendered}"
+    );
+    let again = load(EXAMPLE_MESH, &rendered).expect("valid");
+    let Loaded::Configured(again) = again.loaded else {
+        panic!("configured")
+    };
+    assert_eq!(again.local, cfg.local);
+}
+
+#[test]
+fn the_trunk_of_a_tunnel_is_checked() {
+    let local = "self = \"haus2\"\ntrunk = \"ens19\"\n\n[tunnels.heim]\ntrunk = \"gt-heim\"\n";
+    let err = single_error(EXAMPLE_MESH, local);
+    assert_eq!(err.file, ConfigFile::Local);
+    assert!(err.message.contains("managed by wanderlan"), "{err}");
+    assert_eq!(err.line, Some(5));
+    let local = "self = \"haus2\"\ntrunk = \"ens19\"\n\n[tunnels.heim]\nport = 1\n";
+    assert_eq!(errors(EXAMPLE_MESH, local).len(), 1, "unknown key");
+    // A site that is no peer: a warning, the entry is not used.
+    let local = "self = \"haus2\"\ntrunk = \"ens19\"\n\n[tunnels.nowhere]\ntrunk = \"ens20\"\n";
+    let outcome = load(EXAMPLE_MESH, local).expect("only a warning");
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.severity == Severity::Warning
+                && w.message.contains("no tunnel to \"nowhere\"")),
+        "{:?}",
+        outcome.warnings
+    );
+}

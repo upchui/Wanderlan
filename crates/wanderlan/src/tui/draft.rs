@@ -180,8 +180,16 @@ impl Draft {
                 map.site = new.to_string();
             }
         }
+        for site in &mut self.mesh.sites {
+            if site.managed_by.as_deref() == Some(old) {
+                site.managed_by = Some(new.to_string());
+            }
+        }
         if self.local.self_name.as_deref() == Some(old) {
             self.local.self_name = Some(new.to_string());
+        }
+        if let Some(trunk) = self.local.tunnel_trunks.remove(old) {
+            self.local.tunnel_trunks.insert(new.to_string(), trunk);
         }
     }
 
@@ -284,6 +292,10 @@ mod tests {
     fn rename_updates_references() {
         let running = Running::parse(&fixtures::config_texts()).unwrap();
         let mut draft = Draft::from_running(&running).unwrap();
+        draft
+            .local
+            .tunnel_trunks
+            .insert("haus3".into(), "ens20".into());
         let haus3 = draft
             .mesh
             .sites
@@ -294,10 +306,19 @@ mod tests {
         draft.rename_references("haus3", "haus33");
         draft.mesh.sites[0].name = "home".into();
         draft.rename_references("heim", "home");
+        // buero manages haus6.
+        draft.mesh.sites[1].name = "office".into();
+        draft.rename_references("buero", "office");
         draft.revalidate();
         assert_eq!(draft.errors(), 0, "{:?}", draft.diagnostics);
         assert_eq!(draft.local.self_name.as_deref(), Some("home"));
         assert!(draft.mesh.maps.iter().all(|m| m.site == "haus33"));
+        assert_eq!(
+            draft.local.tunnel_trunks.get("haus33").map(String::as_str),
+            Some("ens20")
+        );
+        let haus6 = draft.mesh.site("haus6").unwrap();
+        assert_eq!(haus6.managed_by.as_deref(), Some("office"));
     }
 
     #[test]

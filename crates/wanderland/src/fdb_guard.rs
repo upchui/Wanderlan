@@ -1,5 +1,6 @@
-//! Loop guard: watches the bridge FDB and reports MAC addresses that keep
-//! moving between tunnel ports.
+//! Loop guard: watches the FDB of wanderlan's bridges and reports MAC
+//! addresses that keep moving between ports of one bridge (tunnels, or a
+//! tunnel and the trunk).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -13,11 +14,11 @@ use wanderlan_core::sys::observe::{FdbEvent, ObserveOps as _};
 
 use crate::daemon::Input;
 
-/// The bridge and its tunnel ports, by interface index.
+/// The bridges and their tunnel ports, by interface index.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PortMap {
-    /// Index of br0.
-    pub bridge: Option<u32>,
+    /// Indices of wanderlan's bridges (br0 and the bridges of further trunks).
+    pub bridges: std::collections::BTreeSet<u32>,
     /// Tunnel ports: index → (name, isolated).
     pub tunnels: BTreeMap<u32, (String, bool)>,
 }
@@ -43,7 +44,8 @@ pub fn spawn(
 ) -> JoinHandle<()> {
     let sys = sys.clone();
     tokio::spawn(async move {
-        let mut guard = LoopGuard::default();
+        // One guard per bridge: the same MAC in two segments is no loop.
+        let mut guards: BTreeMap<u32, LoopGuard> = BTreeMap::new();
         let mut failing = false;
         loop {
             match sys.watch_fdb() {
@@ -53,7 +55,7 @@ pub fn spawn(
                         failing = false;
                     }
                     while let Some(event) = events.recv().await {
-                        if !handle(&mut guard, event, &ports, &inputs).await {
+                        if !handle(&mut guards, event, &ports, &inputs).await {
                             return;
                         }
                     }
@@ -66,7 +68,7 @@ pub fn spawn(
                     }
                 }
             }
-            guard.reset();
+            guards.clear();
             tokio::time::sleep(RESTART_DELAY).await;
         }
     })
@@ -74,7 +76,7 @@ pub fn spawn(
 
 /// Processes one FDB event. Returns false once the controller is gone.
 async fn handle(
-    guard: &mut LoopGuard,
+    guards: &mut BTreeMap<u32, LoopGuard>,
     event: FdbEvent,
     ports: &watch::Receiver<PortMap>,
     inputs: &mpsc::Sender<Input>,
@@ -82,14 +84,21 @@ async fn handle(
     let entry = match event {
         FdbEvent::Learned(entry) => entry,
         FdbEvent::Removed { mac, vlan } => {
-            guard.forget(mac, vlan);
+            for guard in guards.values_mut() {
+                guard.forget(mac, vlan);
+            }
             return true;
         }
     };
     let map = ports.borrow().clone();
-    if entry.permanent || entry.bridge != map.bridge || map.bridge.is_none() {
+    guards.retain(|b, _| map.bridges.contains(b));
+    let Some(bridge) = entry.bridge.filter(|b| map.bridges.contains(b)) else {
+        return true;
+    };
+    if entry.permanent {
         return true;
     }
+    let guard = guards.entry(bridge).or_default();
     let detected = guard.learned(Instant::now(), entry.mac, entry.vlan, entry.port, |p| {
         map.tunnels.contains_key(&p)
     });
