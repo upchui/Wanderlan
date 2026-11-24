@@ -106,6 +106,28 @@ pub fn edges(mesh: &Mesh) -> BTreeSet<(String, String)> {
     out
 }
 
+/// Everything about the mesh that determines how frames are forwarded:
+/// the tunnels and the role of every site. Two meshes with the same key have
+/// the same layer-2 paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardingKey {
+    edges: BTreeSet<(String, String)>,
+    roles: BTreeSet<(String, Role)>,
+}
+
+/// Computes the [`ForwardingKey`] of a mesh.
+pub fn forwarding_key(mesh: &Mesh) -> ForwardingKey {
+    let roles = mesh
+        .sites
+        .iter()
+        .map(|s| (s.name.clone(), s.role))
+        .collect();
+    ForwardingKey {
+        edges: edges(mesh),
+        roles,
+    }
+}
+
 /// Checks the topology invariants that make split horizon loop-free:
 /// hubs are fully meshed, every spoke has exactly one tunnel and it leads to a
 /// hub, there are no spoke-to-spoke tunnels and the mesh is connected.

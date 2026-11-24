@@ -4,6 +4,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
+use tokio::time::Instant;
+
 use anyhow::{Context as _, Result};
 use tokio::signal::unix::{SignalKind, signal};
 use tracing::{error, info, warn};
@@ -11,6 +13,7 @@ use wanderlan_core::config::{self, Config, ConfigFile, Loaded};
 use wanderlan_core::desired;
 use wanderlan_core::reconcile;
 use wanderlan_core::sys::netlink::Netlink;
+use wanderlan_core::topology::{self, ForwardingKey};
 
 use crate::Args;
 
@@ -26,12 +29,29 @@ pub async fn run(args: Args) -> Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_secs(args.reconcile_interval.max(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_error: Option<String> = None;
+    let mut applied_key = None;
+    // Follow-up flushes of the learned MAC addresses after a topology change.
+    let mut flushes: BTreeSet<Instant> = BTreeSet::new();
 
     loop {
+        let next_flush = flushes.first().copied();
         tokio::select! {
             _ = ticker.tick() => {
                 if let Some(cfg) = &current {
-                    last_error = apply(&net, cfg, last_error).await;
+                    let (error, changed) = apply(&net, cfg, last_error, &mut applied_key).await;
+                    last_error = error;
+                    if changed {
+                        let now = Instant::now();
+                        flushes.extend(FOLLOW_UP_FLUSHES.iter().map(|d| now + *d));
+                    }
+                }
+            }
+            () = sleep_until_opt(next_flush) => {
+                if let Some(at) = next_flush {
+                    flushes.remove(&at);
+                }
+                if let Err(e) = reconcile::flush_learned(&net, wanderlan_core::BRIDGE_NAME).await {
+                    warn!("{e}");
                 }
             }
             _ = sighup.recv() => {
@@ -55,12 +75,44 @@ pub async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Delays of the extra flushes after a topology change. Sites apply a new
+/// configuration a few seconds apart; until all have switched, a bridge can
+/// learn addresses behind ports that are wrong in the new topology.
+const FOLLOW_UP_FLUSHES: [Duration; 2] = [Duration::from_secs(10), Duration::from_secs(30)];
+
+/// Sleeps until the instant, or forever if there is none.
+async fn sleep_until_opt(at: Option<Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
 /// Reconciles once. Logs errors only when they change, so a missing trunk
-/// does not flood the log every 30 seconds.
-async fn apply(net: &Netlink, cfg: &Config, last_error: Option<String>) -> Option<String> {
+/// does not flood the log every 30 seconds. Returns the error (if any) and
+/// whether the forwarding topology changed.
+async fn apply(
+    net: &Netlink,
+    cfg: &Config,
+    last_error: Option<String>,
+    applied_key: &mut Option<ForwardingKey>,
+) -> (Option<String>, bool) {
     let desired = desired::derive(cfg, &BTreeSet::new());
     match reconcile::reconcile(net, &desired, |c| info!("{c}")).await {
         Ok(changes) => {
+            let key = topology::forwarding_key(&cfg.mesh);
+            let mesh_changed = applied_key.as_ref().is_some_and(|k| *k != key);
+            let topology_changed = mesh_changed || reconcile::ports_changed(&changes);
+            if topology_changed {
+                info!(
+                    "Flushing learned MAC addresses of {} because the topology changed",
+                    desired.bridge
+                );
+                if let Err(e) = reconcile::flush_learned(net, &desired.bridge).await {
+                    warn!("{e}");
+                }
+            }
+            *applied_key = Some(key);
             if last_error.is_some() || !changes.is_empty() {
                 info!(
                     "Site \"{}\" is up to date ({} tunnels, VLANs {})",
@@ -69,14 +121,14 @@ async fn apply(net: &Netlink, cfg: &Config, last_error: Option<String>) -> Optio
                     cfg.mesh.vlans
                 );
             }
-            None
+            (None, topology_changed)
         }
         Err(e) => {
             let msg = e.to_string();
             if last_error.as_deref() != Some(msg.as_str()) {
                 error!("Cannot apply the configuration: {msg}");
             }
-            Some(msg)
+            (Some(msg), false)
         }
     }
 }

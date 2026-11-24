@@ -4,6 +4,19 @@ All notable changes to wanderlan are documented in this file.
 
 ## [Unreleased]
 
+### Milestone 3 – Hubs and spokes
+
+- Five-site integration topology: two hubs, two spokes at the first hub, one
+  spoke at the second hub, each site with its own underlay network behind a
+  router (standing in for the existing transport network/VPN).
+- Tests: VLAN 20 between spokes at the same hub and at different hubs, split
+  horizon (`isolated` on hub-to-hub ports, own broadcasts never return, also
+  with three fully meshed hubs), topology check via `wanderlan validate`,
+  hub container restart, daemon crash with adoption of existing interfaces.
+- After a topology change the daemon flushes the learned MAC addresses of
+  the bridge, immediately and again after 10 s and 30 s, so that entries
+  learned while the sites switch one after another do not blackhole traffic.
+
 ### Milestone 2 – Two hubs
 
 - System access behind the `NetOps` trait: an rtnetlink backend for links,

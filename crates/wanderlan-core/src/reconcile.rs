@@ -610,6 +610,29 @@ async fn mark_owned<N: NetOps>(net: &N, name: &str) -> Result<(), SysError> {
     Ok(())
 }
 
+/// Returns true if the changes alter which tunnel ports exist or how they
+/// forward (creation, deletion, isolation, attaching).
+pub fn ports_changed(changes: &[Change]) -> bool {
+    changes.iter().any(|c| match c {
+        Change::CreateGretap { .. } | Change::SetIsolated { .. } | Change::Attach { .. } => true,
+        Change::DeleteLink { name, .. } => name.starts_with(GRETAP_PREFIX),
+        Change::SetUp { name, .. } => name.starts_with(GRETAP_PREFIX),
+        _ => false,
+    })
+}
+
+/// Flushes the learned MAC addresses of the bridge. After a topology change
+/// entries can point to a port through which the address is no longer
+/// reachable (split horizon would drop the frames there); flushing makes the
+/// bridge flood once and learn the new paths.
+pub async fn flush_learned<N: NetOps>(net: &N, bridge: &str) -> Result<(), SysError> {
+    let links = net.links().await?;
+    if let Some(link) = links.iter().find(|l| l.name == bridge && is_owned(l)) {
+        net.flush_fdb(link.index, bridge).await?;
+    }
+    Ok(())
+}
+
 /// Removes everything wanderlan created.
 pub async fn teardown<N: NetOps>(
     net: &N,

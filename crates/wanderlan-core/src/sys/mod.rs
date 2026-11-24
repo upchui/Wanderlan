@@ -210,6 +210,9 @@ pub trait NetOps: Send + Sync {
         vlans: &[(u16, VlanFlags)],
     ) -> impl Future<Output = SysResult<()>> + Send;
 
+    /// Removes all dynamically learned MAC addresses of a bridge.
+    fn flush_fdb(&self, bridge: u32, name: &str) -> impl Future<Output = SysResult<()>> + Send;
+
     /// Removes VLAN entries.
     fn del_vlans(
         &self,

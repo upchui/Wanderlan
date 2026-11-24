@@ -352,6 +352,16 @@ impl NetOps for Netlink {
             .map_err(|e| SysError::new(format!("add VLANs to interface #{index}"), e))
     }
 
+    async fn flush_fdb(&self, bridge: u32, name: &str) -> SysResult<()> {
+        let msg = LinkBridge::new(name).index(bridge).fdb_flush().build();
+        self.handle
+            .link()
+            .change(msg)
+            .execute()
+            .await
+            .map_err(|e| SysError::new(format!("flush learned MAC addresses of {name}"), e))
+    }
+
     async fn del_vlans(&self, index: u32, bridge_self: bool, vids: &[u16]) -> SysResult<()> {
         if vids.is_empty() {
             return Ok(());

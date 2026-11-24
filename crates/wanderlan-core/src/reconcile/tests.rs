@@ -319,3 +319,32 @@ fn change_descriptions_are_readable() {
     };
     assert!(c.to_string().contains("split horizon"));
 }
+
+#[tokio::test]
+async fn port_changes_are_detected_for_fdb_flush() {
+    let net = fresh();
+    let changes = run(&net, &desired("heim")).await;
+    assert!(ports_changed(&changes));
+    let mesh = MESH.replace("vlans = \"10-50\"", "vlans = \"10-40\"");
+    let d = derive(&config_from(&mesh, "heim"), &BTreeSet::new());
+    let changes = run(&net, &d).await;
+    assert!(!ports_changed(&changes), "VLAN changes do not move MACs");
+    flush_learned(&net, "br0").await.unwrap();
+    assert!(net.take_calls().iter().any(|c| c == "flush_fdb br0"));
+}
+
+#[test]
+fn forwarding_key_reflects_roles_and_tunnels() {
+    use crate::topology::forwarding_key;
+    let a = config_from(MESH, "heim").mesh;
+    let mut b = a.clone();
+    assert_eq!(forwarding_key(&a), forwarding_key(&b));
+    b.vlans = crate::config::VlanSet::from_range(10, 20);
+    assert_eq!(
+        forwarding_key(&a),
+        forwarding_key(&b),
+        "VLANs do not matter"
+    );
+    b.sites[3].hub = Some("heim".into());
+    assert_ne!(forwarding_key(&a), forwarding_key(&b));
+}

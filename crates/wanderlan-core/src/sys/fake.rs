@@ -313,6 +313,11 @@ impl NetOps for FakeNet {
         Ok(())
     }
 
+    async fn flush_fdb(&self, _bridge: u32, name: &str) -> SysResult<()> {
+        self.lock().calls.push(format!("flush_fdb {name}"));
+        Ok(())
+    }
+
     async fn del_vlans(&self, index: u32, _bridge_self: bool, vids: &[u16]) -> SysResult<()> {
         let mut s = self.lock();
         let name = s
