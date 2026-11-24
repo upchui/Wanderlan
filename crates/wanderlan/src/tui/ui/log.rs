@@ -70,6 +70,9 @@ pub fn draw(frame: &mut Frame, log: &LogState, area: Rect) {
     let skip = lines.len().saturating_sub(height);
     let lines: Vec<Line> = lines.into_iter().skip(skip).collect();
     frame.render_widget(Paragraph::new(lines).block(block), list);
+    // By events: how many lie above the window and how many it shows.
+    let shown = end - start;
+    super::list::scrollbar(frame, list, 1, 1, events.len(), start, shown);
 }
 
 fn event_lines(event: &Event, time: &str, width: usize) -> Vec<Line<'static>> {

@@ -7,11 +7,11 @@ use ratatui::style::Style;
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Sparkline, Table, TableState,
+    Axis, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Sparkline, Table,
 };
 use wanderlan_core::api::{PeerStatus, Traffic};
 
-use super::{health_style, port_state, titled};
+use super::{health_style, list, port_state, titled};
 use crate::tui::app::{App, HISTORY_LEN};
 use crate::tui::{format, theme};
 
@@ -91,12 +91,6 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, area: Rect) {
     ));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let [facts, graph, rtt] = Layout::vertical([
-        Constraint::Length(8),
-        Constraint::Min(5),
-        Constraint::Length(2),
-    ])
-    .areas(inner);
 
     let config = match (&peer.refused, peer.revision, peer.in_sync) {
         (Some(_), _, _) => "change REFUSED".to_string(),
@@ -170,6 +164,13 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, area: Rect) {
             Span::styled(reason.clone(), theme::bad()),
         ]));
     }
+    // As many fact lines as there are, the graph gets the rest.
+    let [facts, graph, rtt] = Layout::vertical([
+        Constraint::Length(u16::try_from(lines.len() + 1).unwrap_or(9)),
+        Constraint::Min(5),
+        Constraint::Length(2),
+    ])
+    .areas(inner);
     frame.render_widget(Paragraph::new(lines), facts);
 
     let samples: Vec<_> = app
@@ -247,7 +248,7 @@ pub fn invites(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
     let block = titled(" Open invitations ");
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    let [list, command] =
+    let [rows_area, command] =
         Layout::vertical([Constraint::Min(2), Constraint::Length(2)]).areas(inner);
     let table_rows: Vec<Row> = if app.invitations.is_empty() {
         vec![Row::new(vec![Cell::from("no open invitations")]).style(theme::dim())]
@@ -267,16 +268,20 @@ pub fn invites(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
             })
             .collect()
     };
-    let mut state = TableState::default();
-    if !app.invitations.is_empty() {
-        state.select(Some(selected));
-    }
-    frame.render_stateful_widget(
+    let total = table_rows.len();
+    list::show(
+        frame,
         Table::new(table_rows, [Constraint::Length(12), Constraint::Min(20)])
             .header(Row::new(vec!["CODE", "RULES FOR THE NEW SITE"]).style(theme::header()))
             .row_highlight_style(theme::selected()),
-        list,
-        &mut state,
+        rows_area,
+        &app.scrolls.invites,
+        (!app.invitations.is_empty()).then_some(selected),
+        total,
+        list::Chrome {
+            bordered: false,
+            header: true,
+        },
     );
     let cmd = app
         .invitations

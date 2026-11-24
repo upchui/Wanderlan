@@ -1,0 +1,28 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+"┌ Sites (draft): 6 ────────────────────────────────────────────────────────────┐"
+"│  NAME         ADDRESS         VLANS     ROLE            MANAGED BY TUNNEL    │"
+"│ ┌ New site ────────────────────────────────────────────────────────────────┐ │"
+"│ │ Name                                                                     │ │"
+"│ │                  a-z, 0-9 and '-', at most 12 characters                 │ │"
+"│ │ Address                                                                  │ │"
+"│ │                  IPv4 address in the transport network (e.g. the VPN)    │ │"
+"│ │ VLANs                                                                    │ │"
+"│ │                  empty: the network's VLANs (10-50); or e.g.             │ │"
+"│ │                  native,20,30                                            │ │"
+"│ │ Changes            only heim                                             │ │"
+"│ │                  who may change its VLANs, mappings and online state     │ │"
+"│ │ Own VLANs                                                                │ │"
+"│ │                  its trunk and its own clients only, never its server;   │ │"
+"│ │                  empty: none                                             │ │"
+"│ │ Connected to     < client of heim >  7 choices                           │ │"
+"│ │                  a client has one tunnel, to its server; servers connect │ │"
+"└─│                  with each other                                         │─┘"
+" h│                                                                          │  "
+"  └──────────────────────────────────────────────────────────────────────────┘  "
+"                                                                                "
+"                                  1 blocked (see 1)  draft: no changes  heim r7 "
+" Tab  next field   Left/Right  choose   Enter  save to draft   Esc  cancel      "

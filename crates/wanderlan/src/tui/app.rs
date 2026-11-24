@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, VecDeque};
 use wanderlan_core::api::{
     ApiError, Applied, ApplyParams, ChangeSource, ConfigInput, ConfigTexts, Confirmed, Event,
     Interface, Invitation, InviteParams, Joined, MacEntry, PeerStatus, PendingChange, PortState,
-    Request, ResetReport, SiteState, Status, UnblockParams,
+    Request, ResetReport, SiteState, SiteSummary, Status, UnblockParams,
 };
 use wanderlan_core::config::{Diagnostic, has_errors, render_local, render_network};
 use wanderlan_core::policy;
@@ -26,6 +26,7 @@ use super::draft::{Draft, Running};
 use super::form::{Form, FormEvent, FormKind, trunk_hint, tunnel_trunk_hint};
 use super::log::LogState;
 use super::macs::MacState;
+use super::ui::list;
 use super::wizard::{self, Mode, Step, Wizard};
 use crate::client::ClientError;
 use crate::hostinfo;
@@ -394,6 +395,45 @@ struct InFlight {
     interfaces: bool,
 }
 
+/// Scroll positions of the lists (see [`list::Scroll`]).
+#[derive(Debug, Clone, Default)]
+pub struct Scrolls {
+    /// Overview: direct peers.
+    pub peers: list::Scroll,
+    /// Overview: the sites of the network.
+    pub network: list::Scroll,
+    /// Sites view.
+    pub sites: list::Scroll,
+    /// VLAN mappings.
+    pub maps: list::Scroll,
+    /// Tunnels in the VLAN view.
+    pub tunnels: list::Scroll,
+    /// MAC table.
+    pub macs: list::Scroll,
+    /// Settings view.
+    pub settings: list::Scroll,
+    /// Open invitations.
+    pub invites: list::Scroll,
+    /// Largest scroll offset of the help screen at its last size.
+    pub help_max: std::cell::Cell<u16>,
+}
+
+/// Moves a selection in a list of `count` rows: Up/Down (j/k) one row,
+/// PgUp/PgDn a `page`, Home/End to the ends. `None` if `code` does not
+/// move.
+pub fn nav(code: KeyCode, selected: usize, count: usize, page: usize) -> Option<usize> {
+    let last = count.saturating_sub(1);
+    Some(match code {
+        KeyCode::Up | KeyCode::Char('k') => selected.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => (selected + 1).min(last),
+        KeyCode::PageUp => selected.saturating_sub(page.max(1)),
+        KeyCode::PageDown => (selected + page.max(1)).min(last),
+        KeyCode::Home => 0,
+        KeyCode::End => last,
+        _ => return None,
+    })
+}
+
 /// The whole state of the TUI.
 #[derive(Debug, Clone)]
 pub struct App {
@@ -453,6 +493,8 @@ pub struct App {
     pub settings_selected: usize,
     /// Popup, if any.
     pub modal: Option<Modal>,
+    /// Scroll positions of the lists.
+    pub scrolls: Scrolls,
     /// Status line message.
     pub message: Option<Message>,
     /// The last messages, newest first (`M`).
@@ -496,6 +538,7 @@ impl App {
             history: BTreeMap::new(),
             settings_selected: 0,
             modal: None,
+            scrolls: Scrolls::default(),
             message: None,
             messages: VecDeque::new(),
             busy: None,
@@ -832,7 +875,7 @@ impl App {
         }
         self.overview_selected = self
             .overview_selected
-            .min(status.peers.len().saturating_sub(1));
+            .min((status.peers.len() + status.sites.len()).saturating_sub(1));
         self.status = Some(status);
     }
 
@@ -1442,10 +1485,16 @@ impl App {
                     KeyCode::PageUp => scroll.saturating_sub(10),
                     KeyCode::PageDown => scroll.saturating_add(10),
                     KeyCode::Home => 0,
+                    KeyCode::End => u16::MAX,
                     _ => scroll,
                 };
+                // Known once the help was drawn at the current size.
+                let max = match self.scrolls.help_max.get() {
+                    0 => super::help::max_scroll(),
+                    m => m,
+                };
                 Some(Modal::Help {
-                    scroll: scroll.min(super::help::max_scroll()),
+                    scroll: scroll.min(max),
                 })
             }
             Modal::Ask(ask) => match key.code {
@@ -1483,10 +1532,11 @@ impl App {
         fx: &mut Vec<Effect>,
     ) -> Option<Modal> {
         let count = self.invitations.len();
+        if let Some(n) = nav(key.code, selected, count, self.scrolls.invites.page()) {
+            return Some(Modal::Invites { selected: n });
+        }
         let selected = match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return None,
-            KeyCode::Up | KeyCode::Char('k') => selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => (selected + 1).min(count.saturating_sub(1)),
             KeyCode::Char('n' | 'i') => {
                 self.invite();
                 return self.modal.take();
@@ -1720,15 +1770,37 @@ impl App {
         }));
     }
 
+    /// The sites of the overview's network list, in its order (servers
+    /// with their clients below).
+    pub fn overview_sites(&self) -> Vec<&SiteSummary> {
+        let Some(status) = &self.status else {
+            return Vec::new();
+        };
+        let pairs: Vec<(&str, Option<&str>)> = status
+            .sites
+            .iter()
+            .map(|s| (s.name.as_str(), s.uplink.as_deref()))
+            .collect();
+        topology::tree_order_by(&pairs)
+            .into_iter()
+            .filter_map(|(i, _)| status.sites.get(i))
+            .collect()
+    }
+
     fn on_overview_key(&mut self, key: &KeyEvent, fx: &mut Vec<Effect>) {
+        // One cursor over both lists: the peers, then the sites.
         let peers = self.status.as_ref().map_or(0, |s| s.peers.len());
+        let count = peers + self.overview_sites().len();
+        let page = if self.overview_selected < peers {
+            self.scrolls.peers.page()
+        } else {
+            self.scrolls.network.page()
+        };
+        if let Some(n) = nav(key.code, self.overview_selected, count, page) {
+            self.overview_selected = n;
+            return;
+        }
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.overview_selected = self.overview_selected.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.overview_selected = (self.overview_selected + 1).min(peers.saturating_sub(1));
-            }
             KeyCode::Char('u') => {
                 let port = self.selected_peer().map(|p| (p.port.clone(), p.port_state));
                 self.ask_unblock(port);
@@ -1741,23 +1813,43 @@ impl App {
                     self.modal = Some(Modal::Peer {
                         name: peer.name.clone(),
                     });
+                } else if let Some(site) = self
+                    .overview_sites()
+                    .get(self.overview_selected.saturating_sub(peers))
+                    .map(|s| s.name.clone())
+                {
+                    self.show_site(&site, fx);
                 }
             }
             _ => {}
         }
     }
 
+    /// Shows a site: the Sites view with it selected.
+    fn show_site(&mut self, name: &str, fx: &mut Vec<Effect>) {
+        if let Some(i) = self
+            .draft
+            .as_ref()
+            .and_then(|d| d.network.sites.iter().position(|s| s.name == name))
+        {
+            self.sites_selected = i;
+        }
+        self.set_view(View::Sites, fx);
+    }
+
     fn on_settings_key(&mut self, key: &KeyEvent, fx: &mut Vec<Effect>) {
         use super::ui::settings::{ROWS, Setting, settings};
         let all = settings(self.draft.as_ref());
+        if let Some(n) = nav(
+            key.code,
+            self.settings_selected,
+            all.len(),
+            self.scrolls.settings.page(),
+        ) {
+            self.settings_selected = n;
+            return;
+        }
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.settings_selected = self.settings_selected.saturating_sub(1);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.settings_selected =
-                    (self.settings_selected + 1).min(all.len().saturating_sub(1));
-            }
             KeyCode::Enter | KeyCode::Char('e') => {
                 if self.draft.is_none() {
                     self.not_configured();
@@ -1851,16 +1943,11 @@ impl App {
             .iter()
             .position(|i| *i == selected)
             .unwrap_or_default();
+        if let Some(n) = nav(key.code, row, order.len(), self.scrolls.sites.page()) {
+            self.sites_selected = order.get(n).copied().unwrap_or(0);
+            return;
+        }
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.sites_selected = order.get(row.saturating_sub(1)).copied().unwrap_or(0);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.sites_selected = order
-                    .get((row + 1).min(order.len().saturating_sub(1)))
-                    .copied()
-                    .unwrap_or(0);
-            }
             KeyCode::Char('n') => self.modal = Some(Modal::Form(Form::site(draft, None))),
             KeyCode::Enter | KeyCode::Char('e') if selected < count => {
                 self.modal = Some(Modal::Form(Form::site(draft, Some(selected))));
@@ -1949,11 +2036,11 @@ impl App {
         };
         let selected = self.maps_selected;
         let count = draft.network.maps.len();
+        if let Some(n) = nav(key.code, selected, count, self.scrolls.maps.page()) {
+            self.maps_selected = n;
+            return;
+        }
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.maps_selected = selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.maps_selected = (selected + 1).min(count.saturating_sub(1));
-            }
             KeyCode::Char('v') => {
                 if self.may_change_network_vlans()
                     && let Some(draft) = &self.draft
@@ -2002,11 +2089,11 @@ impl App {
             return;
         };
         let [a, b] = row.sites.clone();
+        if let Some(n) = nav(key.code, selected, count, self.scrolls.tunnels.page()) {
+            self.tunnels_selected = n;
+            return;
+        }
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.tunnels_selected = selected.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => {
-                self.tunnels_selected = (selected + 1).min(count.saturating_sub(1));
-            }
             KeyCode::Enter | KeyCode::Char('e') => {
                 if row.servers.is_none() {
                     self.say(

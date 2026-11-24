@@ -5,12 +5,12 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use wanderlan_core::config::FieldPath;
 use wanderlan_core::desired::bridge_for;
 use wanderlan_core::policy;
 
-use super::{not_configured, severity_style, titled};
+use super::{list, not_configured, severity_style, titled};
 use crate::tui::app::App;
 use crate::tui::draft::Draft;
 use crate::tui::{format, theme};
@@ -271,13 +271,25 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         );
     }
     let widths = [Constraint::Length(22), Constraint::Min(20)];
-    let mut state = TableState::default().with_selected(Some(selected_row));
-    frame.render_stateful_widget(
+    let total = rows.len();
+    let title = if total > usize::from(table.height.saturating_sub(2)) {
+        " Settings (Enter: change, Up/Down: more) "
+    } else {
+        " Settings (Enter: change) "
+    };
+    list::show(
+        frame,
         Table::new(rows, widths)
-            .block(titled(" Settings (Enter: change, Up/Down: more) "))
+            .block(titled(title))
             .row_highlight_style(theme::selected()),
         table,
-        &mut state,
+        &app.scrolls.settings,
+        Some(selected_row),
+        total,
+        list::Chrome {
+            bordered: true,
+            header: false,
+        },
     );
     let text = help_text(draft, selected);
     let mut lines: Vec<Line> = format::wrap(&text, usize::from(help.width.saturating_sub(2)))

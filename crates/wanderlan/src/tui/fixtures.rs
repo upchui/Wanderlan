@@ -119,7 +119,7 @@ fn peer(name: &str, address: &str) -> PeerStatus {
     }
 }
 
-fn summary(name: &str, address: &str, vlans: &str) -> SiteSummary {
+pub fn summary(name: &str, address: &str, vlans: &str) -> SiteSummary {
     SiteSummary {
         name: name.into(),
         address: address.into(),

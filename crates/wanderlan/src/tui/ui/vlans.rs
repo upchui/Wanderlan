@@ -5,10 +5,10 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 use wanderlan_core::config::{FieldPath, LocalVid, Severity, VlanMap, VlanSet};
 
-use super::{diagnostic_line, not_configured, severity_style, titled};
+use super::{diagnostic_line, list, not_configured, severity_style, titled};
 use crate::tui::app::App;
 use crate::tui::draft::Draft;
 use crate::tui::{format, theme};
@@ -186,13 +186,20 @@ fn draw_tunnels(frame: &mut Frame, app: &App, draft: &Draft, area: Rect, detail:
             Constraint::Min(10),
             Constraint::Length(14),
         ];
+        let total = table_rows.len();
         let table = Table::new(table_rows, widths)
             .header(header)
             .block(titled(title))
             .row_highlight_style(theme::selected());
-        let mut state = TableState::default();
-        state.select(Some(selected));
-        frame.render_stateful_widget(table, area, &mut state);
+        list::show(
+            frame,
+            table,
+            area,
+            &app.scrolls.tunnels,
+            Some(selected),
+            total,
+            list::BOXED,
+        );
     }
     let mut lines: Vec<Line> = rows
         .get(selected)
@@ -294,11 +301,11 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
     } else {
         format!(" VLAN mappings: {} ", draft.network.maps.len())
     };
+    let total = rows.len();
     let table = Table::new(rows, widths)
         .header(header)
         .block(titled(title))
         .row_highlight_style(theme::selected());
-    let mut state = TableState::default();
     if empty {
         frame.render_widget(
             Paragraph::new(" No mappings: every site uses the shared VLAN IDs. n adds one.")
@@ -307,7 +314,14 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
             area,
         );
     } else {
-        state.select(Some(app.maps_selected));
-        frame.render_stateful_widget(table, area, &mut state);
+        list::show(
+            frame,
+            table,
+            area,
+            &app.scrolls.maps,
+            Some(app.maps_selected),
+            total,
+            list::BOXED,
+        );
     }
 }

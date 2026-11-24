@@ -18,29 +18,20 @@ const LABEL_WIDTH: u16 = 17;
 const MAX_NOTES: usize = 3;
 
 pub fn form(frame: &mut Frame, form: &Form, area: Rect) {
-    let notes = form.notes.len().min(MAX_NOTES);
-    let height = 2 + form.fields.len() * 2 + notes + 2;
-    let popup = area.centered(
-        Constraint::Max(76),
-        Constraint::Max(u16::try_from(height).unwrap_or(u16::MAX)),
-    );
-    frame.render_widget(Clear, popup);
-    let block = titled(format!(" {} ", form.title));
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-
-    let value_width = inner.width.saturating_sub(LABEL_WIDTH + 1);
+    let popup_width = area.width.min(76);
+    let inner_width = popup_width.saturating_sub(2);
+    let value_width = inner_width.saturating_sub(LABEL_WIDTH + 1);
+    let pad = " ".repeat(usize::from(LABEL_WIDTH + 1));
     let mut lines = Vec::new();
+    // Line of the cursor, and the lines of the focused field.
     let mut cursor = None;
+    let mut focus_lines = (0, 0);
     for (i, field) in form.fields.iter().enumerate() {
         let focused = i == form.focus;
-        let row = inner.y + u16::try_from(lines.len()).unwrap_or_default();
+        let first = lines.len();
         let (value, cursor_col) = field_value(field, focused, usize::from(value_width));
         if let Some(col) = cursor_col {
-            cursor = Some(Position::new(
-                inner.x + LABEL_WIDTH + 1 + u16::try_from(col).unwrap_or_default(),
-                row,
-            ));
+            cursor = Some((first, col));
         }
         let label_style = if focused { theme::bold() } else { theme::dim() };
         let mut spans = vec![Span::styled(
@@ -49,14 +40,19 @@ pub fn form(frame: &mut Frame, form: &Form, area: Rect) {
         )];
         spans.extend(value);
         lines.push(Line::from(spans));
-        let pad = " ".repeat(usize::from(LABEL_WIDTH + 1));
-        let below = match (field.visible_error(form.submitted), &field.warning) {
-            _ if !field.enabled => Line::styled(format!("{pad}not used here"), theme::dim()),
-            (Some(e), _) => Line::styled(format!("{pad}{e}"), theme::bad()),
-            (None, Some(w)) => Line::styled(format!("{pad}{w}"), theme::warn()),
-            (None, None) => Line::styled(format!("{pad}{}", field.hint), theme::dim()),
+        // Hints, errors and warnings wrap below the value.
+        let (below, style) = match (field.visible_error(form.submitted), &field.warning) {
+            _ if !field.enabled => ("not used here".to_string(), theme::dim()),
+            (Some(e), _) => (e.to_string(), theme::bad()),
+            (None, Some(w)) => (w.clone(), theme::warn()),
+            (None, None) => (field.hint.clone(), theme::dim()),
         };
-        lines.push(below);
+        for part in format::wrap(&below, usize::from(value_width.saturating_sub(1)).max(10)) {
+            lines.push(Line::styled(format!("{pad}{part}"), style));
+        }
+        if focused {
+            focus_lines = (first, lines.len());
+        }
     }
     lines.push(Line::raw(""));
     for note in form.notes.iter().take(MAX_NOTES) {
@@ -70,9 +66,32 @@ pub fn form(frame: &mut Frame, form: &Form, area: Rect) {
             theme::bad(),
         ));
     }
-    frame.render_widget(Paragraph::new(lines), inner);
-    if let Some(pos) = cursor {
-        frame.set_cursor_position(pos);
+    let total = lines.len();
+    let popup = area.centered(
+        Constraint::Length(popup_width),
+        Constraint::Max(u16::try_from(total + 2).unwrap_or(u16::MAX)),
+    );
+    frame.render_widget(Clear, popup);
+    let block = titled(format!(" {} ", form.title));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    // A form taller than the screen scrolls with the focus.
+    let visible = usize::from(inner.height);
+    let (first, end) = focus_lines;
+    let offset = end.saturating_sub(visible).min(first);
+    frame.render_widget(
+        Paragraph::new(lines).scroll((u16::try_from(offset).unwrap_or_default(), 0)),
+        inner,
+    );
+    super::list::scrollbar(frame, popup, 1, 1, total, offset, visible);
+    if let Some((line, col)) = cursor
+        && line >= offset
+        && line < offset + visible
+    {
+        frame.set_cursor_position(Position::new(
+            inner.x + LABEL_WIDTH + 1 + u16::try_from(col).unwrap_or_default(),
+            inner.y + u16::try_from(line - offset).unwrap_or_default(),
+        ));
     }
 }
 
@@ -171,7 +190,7 @@ pub fn messages(frame: &mut Frame, app: &App, scroll: u16, area: Rect) {
     );
 }
 
-pub fn help(frame: &mut Frame, scroll: u16, area: Rect) {
+pub fn help(frame: &mut Frame, app: &App, scroll: u16, area: Rect) {
     frame.render_widget(Clear, area);
     let lines: Vec<Line> = help::lines()
         .into_iter()
@@ -185,6 +204,13 @@ pub fn help(frame: &mut Frame, scroll: u16, area: Rect) {
             HelpLine::Blank => Line::raw(""),
         })
         .collect();
+    // Wrapped lines decide how far it scrolls.
+    let width = usize::from(area.width.saturating_sub(2).max(1));
+    let total: usize = lines.iter().map(|l| l.width().div_ceil(width).max(1)).sum();
+    let visible = usize::from(area.height.saturating_sub(2));
+    let max = u16::try_from(total.saturating_sub(visible)).unwrap_or(u16::MAX);
+    app.scrolls.help_max.set(max.max(1));
+    let scroll = scroll.min(max);
     frame.render_widget(
         Paragraph::new(lines)
             .block(titled(" Help (Esc closes, Up/Down scrolls) "))
@@ -192,4 +218,5 @@ pub fn help(frame: &mut Frame, scroll: u16, area: Rect) {
             .scroll((scroll, 0)),
         area,
     );
+    super::list::scrollbar(frame, area, 1, 1, total, usize::from(scroll), visible);
 }

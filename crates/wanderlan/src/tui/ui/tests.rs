@@ -386,3 +386,41 @@ fn messages_window() {
 fn terminal_too_small() {
     insta::assert_snapshot!(render_size(&connected(), 60, 20));
 }
+
+/// The fixture network with six more clients of heim.
+fn crowded() -> App {
+    let mut app = connected();
+    let mut status = fixtures::status();
+    for i in 0..6 {
+        let mut s = fixtures::summary(&format!("lab{i}"), &format!("10.8.1.{i}"), "10-50");
+        s.uplink = Some("heim".into());
+        status.sites.push(s);
+    }
+    reply(&mut app, Request::Status, Reply::Status(Box::new(status)));
+    app
+}
+
+#[test]
+fn overview_with_many_sites_scrolls() {
+    let mut app = crowded();
+    // Down through the five peers into the sites, to the last one.
+    key(&mut app, KeyCode::End);
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
+fn overview_on_a_wide_terminal() {
+    insta::assert_snapshot!(render_size(&crowded(), 120, 40));
+}
+
+#[test]
+fn a_long_form_hint_wraps() {
+    let mut app = connected();
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Char('n'));
+    // Down to "Connected to", whose hint is longer than a line.
+    for _ in 0..5 {
+        key(&mut app, KeyCode::Tab);
+    }
+    insta::assert_snapshot!(render(&app));
+}

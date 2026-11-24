@@ -4,11 +4,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 use wanderlan_core::api::{PeerStatus, PortState, SiteState, SiteSummary, Status};
 use wanderlan_core::topology;
 
-use super::{health_style, port_state, titled};
+use super::{health_style, list, port_state, titled};
 use crate::tui::app::App;
 use crate::tui::{format, theme};
 
@@ -43,16 +43,37 @@ pub fn health(peer: &PeerStatus) -> Health {
 
 pub fn draw(frame: &mut Frame, app: &App, status: &Status, area: Rect) {
     let header = header_lines(app, status);
-    let peer_rows = u16::try_from(status.peers.len().max(1)).unwrap_or(u16::MAX);
+    // Header lines wrap instead of being cut.
+    let width = usize::from(area.width.max(1));
+    let head_height: usize = header
+        .iter()
+        .map(|l| l.width().div_ceil(width).max(1))
+        .sum();
+    let head_height = u16::try_from(head_height).unwrap_or_default();
+    let rest = area.height.saturating_sub(head_height);
+    // Both lists get what they need if it fits, otherwise a share of it.
+    let want_peers = u16::try_from(status.peers.len().max(1) + 3).unwrap_or(u16::MAX);
+    let want_sites = u16::try_from(status.sites.len().max(1) + 3).unwrap_or(u16::MAX);
+    let peers_height = if want_peers.saturating_add(want_sites) <= rest {
+        want_peers
+    } else {
+        let share = u32::from(rest) * u32::from(want_peers)
+            / (u32::from(want_peers) + u32::from(want_sites)).max(1);
+        // The peers (the live state) get at least half.
+        u16::try_from(share)
+            .unwrap_or(want_peers)
+            .max(rest / 2)
+            .clamp(4.min(rest), want_peers)
+    };
     let [head, peers, sites] = Layout::vertical([
-        Constraint::Length(u16::try_from(header.len()).unwrap_or_default()),
-        Constraint::Length(peer_rows.saturating_add(3)),
+        Constraint::Length(head_height),
+        Constraint::Length(peers_height),
         Constraint::Min(4),
     ])
     .areas(area);
-    frame.render_widget(Paragraph::new(header), head);
+    frame.render_widget(Paragraph::new(header).wrap(Wrap { trim: false }), head);
     draw_peers(frame, app, status, peers);
-    draw_sites(frame, status, sites);
+    draw_sites(frame, app, status, sites);
 }
 
 fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
@@ -180,14 +201,14 @@ fn config_cell(peer: &PeerStatus) -> String {
     }
 }
 
-fn peer_row(peer: &PeerStatus) -> Row<'static> {
+fn peer_row(peer: &PeerStatus, wide: bool) -> Row<'static> {
     let opt = |v: Option<String>| v.unwrap_or_else(|| "-".into());
     let reply = if peer.reachable {
         opt(peer.last_reply_secs.map(format::age))
     } else {
         "lost".into()
     };
-    Row::new(vec![
+    let mut cells = vec![
         Cell::from(peer.name.clone()),
         Cell::from(port_state(peer.port_state)),
         Cell::from(reply),
@@ -198,21 +219,32 @@ fn peer_row(peer: &PeerStatus) -> Row<'static> {
         Cell::from(Line::raw(format::rate(peer.rx_bps)).right_aligned()),
         Cell::from(Line::raw(format::rate(peer.tx_bps)).right_aligned()),
         Cell::from(config_cell(peer)),
-    ])
-    .style(health_style(peer))
+    ];
+    if wide {
+        cells.push(Cell::from(peer.vlans.clone()));
+        cells.push(Cell::from(peer.trunk.clone()));
+    }
+    Row::new(cells).style(health_style(peer))
 }
 
+/// From this width on, the peer table also shows VLANs and trunk.
+const WIDE: u16 = 110;
+
 fn draw_peers(frame: &mut Frame, app: &App, status: &Status, area: Rect) {
-    let header = Row::new(vec![
+    let wide = area.width >= WIDE;
+    let mut names = vec![
         "PEER", "PORT", "REPLY", "RTT", "PMTU", "MSS", "MACS", "RX b/s", "TX b/s", "CONFIG",
-    ])
-    .style(theme::header());
+    ];
+    if wide {
+        names.extend(["VLANS", "TRUNK"]);
+    }
+    let header = Row::new(names).style(theme::header());
     let rows: Vec<Row> = if status.peers.is_empty() {
         vec![Row::new(vec![Cell::from("no direct peers")]).style(theme::dim())]
     } else {
-        status.peers.iter().map(peer_row).collect()
+        status.peers.iter().map(|p| peer_row(p, wide)).collect()
     };
-    let widths = [
+    let mut widths = vec![
         Constraint::Length(12),
         Constraint::Length(7),
         Constraint::Length(5),
@@ -222,17 +254,29 @@ fn draw_peers(frame: &mut Frame, app: &App, status: &Status, area: Rect) {
         Constraint::Length(4),
         Constraint::Length(6),
         Constraint::Length(6),
-        Constraint::Min(7),
+        if wide {
+            Constraint::Length(12)
+        } else {
+            Constraint::Min(7)
+        },
     ];
+    if wide {
+        widths.extend([Constraint::Length(14), Constraint::Min(8)]);
+    }
     let table = Table::new(rows, widths)
         .header(header)
         .block(titled(" Direct peers (live) "))
         .row_highlight_style(theme::selected());
-    let mut state = TableState::default();
-    if !status.peers.is_empty() {
-        state.select(Some(app.overview_selected));
-    }
-    frame.render_stateful_widget(table, area, &mut state);
+    let selected = (app.overview_selected < status.peers.len()).then_some(app.overview_selected);
+    list::show(
+        frame,
+        table,
+        area,
+        &app.scrolls.peers,
+        selected,
+        status.peers.len(),
+        list::BOXED,
+    );
 }
 
 /// How traffic reaches a site from here.
@@ -255,7 +299,7 @@ fn link(status: &Status, site: &SiteSummary) -> (String, Style) {
     }
 }
 
-fn draw_sites(frame: &mut Frame, status: &Status, area: Rect) {
+fn draw_sites(frame: &mut Frame, app: &App, status: &Status, area: Rect) {
     let header = Row::new(vec!["SITE", "ADDRESS", "VLANS", "ROLE", "LINK"]).style(theme::header());
     let pairs: Vec<(&str, Option<&str>)> = status
         .sites
@@ -283,10 +327,24 @@ fn draw_sites(frame: &mut Frame, status: &Status, area: Rect) {
         Constraint::Length(17),
         Constraint::Min(10),
     ];
-    let title = format!(" Network: {} sites ", status.sites.len());
-    frame.render_widget(
-        Table::new(rows, widths).header(header).block(titled(title)),
+    let title = format!(" Network: {} sites (Enter: show) ", status.sites.len());
+    let total = rows.len();
+    let selected = app
+        .overview_selected
+        .checked_sub(status.peers.len())
+        .filter(|i| *i < total);
+    let table = Table::new(rows, widths)
+        .header(header)
+        .block(titled(title))
+        .row_highlight_style(theme::selected());
+    list::show(
+        frame,
+        table,
         area,
+        &app.scrolls.network,
+        selected,
+        total,
+        list::BOXED,
     );
 }
 

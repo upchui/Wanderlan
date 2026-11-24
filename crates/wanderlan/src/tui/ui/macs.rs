@@ -3,16 +3,16 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Cell, Paragraph, Row, Table};
 
-use super::titled;
+use super::{list, titled};
 use crate::tui::macs::{MacState, port_site};
 use crate::tui::{format, theme};
 
 /// Width of the filter input.
 const FILTER_WIDTH: u16 = 24;
 
-pub fn draw(frame: &mut Frame, state: &MacState, area: Rect) {
+pub fn draw(frame: &mut Frame, state: &MacState, scroll: &list::Scroll, area: Rect) {
     let [filter, table] = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(area);
     let visible = state.visible();
     let (text, cursor) = state.filter.window(usize::from(FILTER_WIDTH - 1));
@@ -76,16 +76,17 @@ pub fn draw(frame: &mut Frame, state: &MacState, area: Rect) {
         Constraint::Length(12),
         Constraint::Min(5),
     ];
-    let mut table_state = TableState::default();
-    if !visible.is_empty() {
-        table_state.select(Some(state.selected));
-    }
-    frame.render_stateful_widget(
+    let total = rows.len();
+    list::show(
+        frame,
         Table::new(rows, widths)
             .header(header)
             .block(block)
             .row_highlight_style(theme::selected()),
         table,
-        &mut table_state,
+        scroll,
+        (!visible.is_empty()).then_some(state.selected),
+        total,
+        list::BOXED,
     );
 }

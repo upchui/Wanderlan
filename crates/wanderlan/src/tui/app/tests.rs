@@ -606,3 +606,37 @@ fn a_server_managed_by_itself_edits_vlans_and_mappings() {
         app.message
     );
 }
+
+#[test]
+fn page_keys_and_the_overview_cursor() {
+    let press = |app: &mut App, code| {
+        app.update(key(code));
+    };
+    let mut app = connected();
+    // The cursor runs from the peers into the sites of the network.
+    let peers = app.status.as_ref().map_or(0, |s| s.peers.len());
+    press(&mut app, KeyCode::End);
+    let sites = app.overview_sites().len();
+    assert_eq!(app.overview_selected, peers + sites - 1);
+    press(&mut app, KeyCode::Home);
+    assert_eq!(app.overview_selected, 0);
+    // Enter on a site shows it in the Sites view.
+    for _ in 0..peers {
+        press(&mut app, KeyCode::Down);
+    }
+    press(&mut app, KeyCode::Enter);
+    assert_eq!(app.view, View::Sites);
+    let first = app.overview_sites()[0].name.clone();
+    assert_eq!(
+        app.draft.as_ref().unwrap().network.sites[app.sites_selected].name,
+        first
+    );
+    // End and Home in the sites (tree order: haus6 is the second row).
+    press(&mut app, KeyCode::End);
+    assert_eq!(
+        app.draft.as_ref().unwrap().network.sites[app.sites_selected].name,
+        "haus5"
+    );
+    press(&mut app, KeyCode::Home);
+    assert_eq!(app.sites_selected, 0);
+}

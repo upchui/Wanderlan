@@ -1,14 +1,15 @@
-//! View 2: the sites of the draft, the network settings and the local settings.
+//! View 2: the sites of the draft (network and host settings: Settings, 7).
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
-use wanderlan_core::config::{FieldPath, Severity};
+use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
+use wanderlan_core::config::FieldPath;
 use wanderlan_core::{policy, topology};
 
-use super::{diagnostic_line, health_style, not_configured, port_state, severity_style, titled};
+use super::{
+    diagnostic_line, health_style, list, not_configured, port_state, severity_style, titled,
+};
 use crate::tui::app::App;
 use crate::tui::draft::{Draft, is_within};
 use crate::tui::{format, theme};
@@ -18,19 +19,12 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         not_configured(frame, area);
         return;
     };
-    let [table, detail, settings] = Layout::vertical([
-        Constraint::Min(4),
-        Constraint::Length(3),
-        Constraint::Length(7),
-    ])
-    .areas(area);
+    let [table, detail] = Layout::vertical([Constraint::Min(4), Constraint::Length(3)]).areas(area);
     draw_table(frame, app, draft, table);
-    frame.render_widget(Paragraph::new(detail_lines(app, draft)), detail);
-    let [network, local] =
-        Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .areas(settings);
-    draw_network(frame, draft, network);
-    draw_local(frame, draft, local);
+    frame.render_widget(
+        Paragraph::new(detail_lines(app, draft)).wrap(Wrap { trim: false }),
+        detail,
+    );
 }
 
 fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
@@ -123,8 +117,15 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         .iter()
         .position(|(i, _)| *i == app.sites_selected)
         .unwrap_or_default();
-    let mut state = TableState::default().with_selected(Some(row));
-    frame.render_stateful_widget(table, area, &mut state);
+    list::show(
+        frame,
+        table,
+        area,
+        &app.scrolls.sites,
+        Some(row),
+        order.len(),
+        list::BOXED,
+    );
 }
 
 /// Problems of the selected site, then other problems of the draft.
@@ -165,85 +166,9 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
         }
     }
     if lines.is_empty() {
-        let marks = "+ new, * changed (not applied yet). a: review and apply the draft.";
+        let marks = "+ new, * changed (not applied yet). a: review and apply the draft. Network and host settings: m, l or Settings (7).";
         lines.push(Line::styled(format!(" {marks}"), theme::dim()));
     }
     lines.truncate(3);
     lines
-}
-
-fn setting(label: &str, value: String, severity: Option<Severity>) -> Line<'static> {
-    let style = match severity {
-        Some(s) => theme::severity(s),
-        None => Style::new(),
-    };
-    Line::from(vec![
-        Span::styled(format!(" {label:<16}"), theme::dim()),
-        Span::styled(value, style),
-    ])
-}
-
-fn draw_network(frame: &mut Frame, draft: &Draft, area: Rect) {
-    let m = &draft.network;
-    let at = |key: &str| draft.worst_at(&FieldPath::network(key));
-    let lines = vec![
-        setting(
-            "Default VLANs",
-            format!("{} ({} VLANs)", m.vlans, m.vlans.len()),
-            at("vlans"),
-        ),
-        setting(
-            "Control port",
-            m.control_port.to_string(),
-            at("control_port"),
-        ),
-        setting(
-            "MTU probe every",
-            format::duration(m.mtu_probe_interval),
-            at("mtu_probe_interval"),
-        ),
-        setting(
-            "Commit timeout",
-            format::duration(m.commit_timeout),
-            at("commit_timeout"),
-        ),
-        setting(
-            "MSS",
-            m.mss
-                .map_or_else(|| "from path MTU".to_string(), |v| format!("fixed {v}")),
-            at("mss"),
-        ),
-    ];
-    frame.render_widget(
-        Paragraph::new(lines).block(titled(" Network settings (m) ")),
-        area,
-    );
-}
-
-fn draw_local(frame: &mut Frame, draft: &Draft, area: Rect) {
-    let local = &draft.local;
-    let at = |key: &str| draft.worst_at(&FieldPath::local(key));
-    let mut lines = vec![
-        setting(
-            "This site",
-            local.self_name.clone().unwrap_or_else(|| "-".into()),
-            at("self"),
-        ),
-        setting(
-            "Trunk",
-            local.trunk.clone().unwrap_or_else(|| "-".into()),
-            at("trunk"),
-        ),
-    ];
-    for key in ["self", "trunk"] {
-        lines.extend(draft.at(&FieldPath::local(key)).map(diagnostic_line));
-    }
-    if lines.len() == 2 {
-        lines.push(Line::raw(""));
-        lines.push(Line::styled(
-            " Only on this host (local.toml).",
-            theme::dim(),
-        ));
-    }
-    frame.render_widget(Paragraph::new(lines).block(titled(" This host (l) ")), area);
 }

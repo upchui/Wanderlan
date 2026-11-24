@@ -80,7 +80,17 @@ pub fn draw(frame: &mut Frame, app: &App, review: &Review, area: Rect) {
             })
             .collect(),
     };
+    let total = lines.len();
     frame.render_widget(Paragraph::new(lines).scroll((review.scroll, 0)), main);
+    super::list::scrollbar(
+        frame,
+        main,
+        0,
+        0,
+        total,
+        usize::from(review.scroll),
+        usize::from(main.height),
+    );
 }
 
 fn footer_texts(app: &App, review: &Review) -> Vec<(String, Style)> {
