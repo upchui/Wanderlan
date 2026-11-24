@@ -3,7 +3,7 @@
 
 begin "VLAN mappings: native VLAN and VLAN translation"
 
-MESH_EXTRA='[[map]]
+NETWORK_EXTRA='[[map]]
 site = "site5"
 local = "native"
 shared = 20
@@ -11,10 +11,10 @@ shared = 20
 [[map]]
 site = "site5"
 local = 130
-shared = 30' mesh_toml "10-50" site1 site2 site3 site4 site5 \
-  >"$RUN_DIR/mesh-map.toml"
+shared = 30' network_toml "10-50" site1 site2 site3 site4 site5 \
+  >"$RUN_DIR/network-map.toml"
 for s in site1 site2 site3 site4 site5; do
-  configure "$s" "$RUN_DIR/mesh-map.toml"
+  configure "$s" "$RUN_DIR/network-map.toml"
   x "$s" "wl-daemon reload"
 done
 
@@ -51,7 +51,7 @@ client_vlan_del c-site5 30
 client_vlan c-site5 130 10.30.0.13/24
 
 # Conflicting mappings are rejected.
-MESH_EXTRA='[[map]]
+NETWORK_EXTRA='[[map]]
 site = "site5"
 local = "native"
 shared = 20
@@ -59,10 +59,10 @@ shared = 20
 [[map]]
 site = "site5"
 local = "native"
-shared = 21' mesh_toml "10-50" site1 site2 site5 >"$RUN_DIR/mesh-conflict.toml"
-put site1 /tmp/mesh-conflict.toml <"$RUN_DIR/mesh-conflict.toml"
+shared = 21' network_toml "10-50" site1 site2 site5 >"$RUN_DIR/network-conflict.toml"
+put site1 /tmp/network-conflict.toml <"$RUN_DIR/network-conflict.toml"
 check "wanderlan validate rejects two native mappings at one site" \
-  x site1 "wanderlan validate /tmp/mesh-conflict.toml 2>&1 | grep -q 'more than one native mapping'"
+  x site1 "wanderlan validate /tmp/network-conflict.toml 2>&1 | grep -q 'more than one native mapping'"
 
 # Idempotence with translation rules.
 mark=$(daemon_log_lines site5)

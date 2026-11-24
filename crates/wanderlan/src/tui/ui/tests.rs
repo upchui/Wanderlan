@@ -85,7 +85,7 @@ fn vlans_with_conflict() {
     let mut app = connected();
     if let Some(d) = &mut app.draft {
         // Two local VLANs onto shared VLAN 20 at haus3.
-        d.mesh.maps[1].shared = 20;
+        d.network.maps[1].shared = 20;
         d.revalidate();
     }
     key(&mut app, KeyCode::Char('3'));
@@ -118,7 +118,7 @@ fn help() {
 fn review_diff() {
     let mut app = connected();
     if let Some(d) = &mut app.draft {
-        d.mesh.vlans = VlanSet::from_range(10, 60);
+        d.network.vlans = VlanSet::from_range(10, 60);
         d.revalidate();
     }
     key(&mut app, KeyCode::Char('a'));
@@ -272,7 +272,7 @@ fn sites_as_tree() {
     let mut app = connected();
     if let Some(d) = &mut app.draft {
         // haus2 becomes a client of heim: it moves up below heim, next to haus6.
-        d.mesh.sites[2].uplink = Some("heim".into());
+        d.network.sites[2].uplink = Some("heim".into());
         d.revalidate();
     }
     key(&mut app, KeyCode::Char('2'));

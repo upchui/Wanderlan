@@ -1,6 +1,6 @@
 //! Validated, typed configuration model.
 //!
-//! The model is produced by [`super::parse_mesh`] and [`super::parse_local`]
+//! The model is produced by [`super::parse_network`] and [`super::parse_local`]
 //! and checked by [`super::validate`]. It is also what the TUI edits; the
 //! canonical TOML form is produced by [`super::render`].
 //!
@@ -25,9 +25,9 @@ pub const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Maximum length of a site name (`gt-` + name must fit into IFNAMSIZ - 1).
 pub const MAX_SITE_NAME_LEN: usize = 12;
 
-/// The shared mesh configuration (`mesh.toml`).
+/// The shared network configuration (`network.toml`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Mesh {
+pub struct Network {
     /// Revision counter, maintained by the daemon and used for config sync.
     pub revision: u64,
     /// Daemon control port (UDP probes, TCP config sync) on the site addresses.
@@ -40,14 +40,14 @@ pub struct Mesh {
     pub mss: Option<u16>,
     /// Time to confirm a change before it is rolled back.
     pub commit_timeout: Duration,
-    /// All sites of the mesh.
+    /// All sites of the network.
     pub sites: Vec<Site>,
     /// Per-site VLAN mappings.
     pub maps: Vec<VlanMap>,
 }
 
-impl Mesh {
-    /// Creates a mesh with default settings and no sites.
+impl Network {
+    /// Creates a network with default settings and no sites.
     pub fn new(vlans: VlanSet) -> Self {
         Self {
             revision: 0,
@@ -66,7 +66,7 @@ impl Mesh {
         self.sites.iter().find(|s| s.name == name)
     }
 
-    /// Shared VLANs a site takes part in: its own list, or the mesh default.
+    /// Shared VLANs a site takes part in: its own list, or the network default.
     pub fn vlans_of<'a>(&'a self, site: &'a Site) -> &'a VlanSet {
         site.vlans.as_ref().unwrap_or(&self.vlans)
     }
@@ -105,7 +105,7 @@ impl Mesh {
     }
 }
 
-/// One site of the mesh.
+/// One site of the network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Site {
     /// Unique name, also used in interface names (`gt-<name>`).
@@ -114,7 +114,7 @@ pub struct Site {
     /// address). GRETAP tunnels run between these addresses.
     pub address: Ipv4Addr,
     /// Shared VLANs this site takes part in, like the allowed VLANs of a
-    /// switch port; `None` means the mesh default (`mesh.vlans`).
+    /// switch port; `None` means the network default (`network.vlans`).
     pub vlans: Option<VlanSet>,
     /// VLANs of the site's own, set by the site itself: on its trunk and
     /// towards its own clients, never towards its uplink.
@@ -165,7 +165,7 @@ pub struct VlanMap {
 /// The site-local configuration (`local.toml`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Local {
-    /// Name of this site in `mesh.toml`. `None` means "not configured yet".
+    /// Name of this site in `network.toml`. `None` means "not configured yet".
     pub self_name: Option<String>,
     /// Local trunk interface that is added to the bridge.
     pub trunk: Option<String>,
@@ -195,9 +195,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mesh_lookups_and_site_vlans() {
-        let mut mesh = Mesh::new(VlanSet::from_range(10, 20));
-        mesh.sites.push(Site {
+    fn network_lookups_and_site_vlans() {
+        let mut network = Network::new(VlanSet::from_range(10, 20));
+        network.sites.push(Site {
             name: "a".into(),
             address: Ipv4Addr::new(10, 0, 0, 1),
             vlans: None,
@@ -207,7 +207,7 @@ mod tests {
             self_managed: false,
             uplink: None,
         });
-        mesh.sites.push(Site {
+        network.sites.push(Site {
             name: "b".into(),
             address: Ipv4Addr::new(10, 0, 0, 2),
             vlans: Some(VlanSet::from_range(14, 14)),
@@ -217,10 +217,10 @@ mod tests {
             self_managed: false,
             uplink: None,
         });
-        assert!(mesh.site("c").is_none());
-        let a = mesh.site("a").unwrap();
-        let b = mesh.site("b").unwrap();
-        assert_eq!(mesh.vlans_of(a).len(), 11);
-        assert_eq!(mesh.vlans_of(b).iter().collect::<Vec<_>>(), [14]);
+        assert!(network.site("c").is_none());
+        let a = network.site("a").unwrap();
+        let b = network.site("b").unwrap();
+        assert_eq!(network.vlans_of(a).len(), 11);
+        assert_eq!(network.vlans_of(b).iter().collect::<Vec<_>>(), [14]);
     }
 }

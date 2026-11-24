@@ -1,5 +1,5 @@
 [Unit]
-Description=wanderlan layer-2 mesh daemon
+Description=wanderlan layer-2 site connector daemon
 Documentation=https://github.com/upchui/Wanderlan
 After=network-online.target
 Wants=network-online.target

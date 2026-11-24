@@ -194,7 +194,7 @@ fn quit_asks_first_when_the_draft_has_changes() {
 
     let mut app = connected();
     if let Some(d) = &mut app.draft {
-        d.mesh.vlans = VlanSet::from_range(10, 60);
+        d.network.vlans = VlanSet::from_range(10, 60);
         d.revalidate();
     }
     assert!(app.draft_dirty());
@@ -208,7 +208,7 @@ fn quit_asks_first_when_the_draft_has_changes() {
 fn review_shows_the_diff_and_applies_with_the_base_revision() {
     let mut app = connected();
     if let Some(d) = &mut app.draft {
-        d.mesh.vlans = VlanSet::from_range(10, 60);
+        d.network.vlans = VlanSet::from_range(10, 60);
         d.revalidate();
     }
     app.update(ch('a'));
@@ -227,7 +227,7 @@ fn review_shows_the_diff_and_applies_with_the_base_revision() {
         })
         .expect("apply request");
     assert_eq!(apply.base_revision, Some(7));
-    assert!(apply.config.mesh.contains("vlans = \"10-60\""));
+    assert!(apply.config.network.contains("vlans = \"10-60\""));
     assert!(apply.config.local.contains("self = \"heim\""));
     assert_eq!(app.busy, Some(Busy::Applying));
 }
@@ -236,7 +236,7 @@ fn review_shows_the_diff_and_applies_with_the_base_revision() {
 fn invalid_draft_is_not_applied() {
     let mut app = connected();
     if let Some(d) = &mut app.draft {
-        d.mesh.sites[2].vlans = Some(wanderlan_core::config::VlanSet::new());
+        d.network.sites[2].vlans = Some(wanderlan_core::config::VlanSet::new());
         d.revalidate();
         assert!(d.errors() > 0);
     }
@@ -307,7 +307,7 @@ fn live_events_reach_the_log() {
 fn lost_connection_while_applying_marks_the_review_failed() {
     let mut app = connected();
     if let Some(d) = &mut app.draft {
-        d.mesh.vlans = VlanSet::from_range(10, 60);
+        d.network.vlans = VlanSet::from_range(10, 60);
         d.revalidate();
     }
     app.update(ch('a'));
@@ -383,12 +383,12 @@ fn a_site_goes_online_through_the_draft() {
     let haus3 = app
         .draft
         .as_ref()
-        .and_then(|d| d.mesh.sites.iter().position(|s| s.name == "haus3"))
+        .and_then(|d| d.network.sites.iter().position(|s| s.name == "haus3"))
         .unwrap();
     app.sites_selected = haus3;
     app.update(ch('o'));
     assert!(app.draft_dirty());
-    let site = app.draft.as_ref().unwrap().mesh.site("haus3").unwrap();
+    let site = app.draft.as_ref().unwrap().network.site("haus3").unwrap();
     assert!(!site.online);
 }
 
@@ -399,7 +399,7 @@ fn a_site_managed_elsewhere_cannot_be_changed_here() {
     let haus6 = app
         .draft
         .as_ref()
-        .and_then(|d| d.mesh.sites.iter().position(|s| s.name == "haus6"))
+        .and_then(|d| d.network.sites.iter().position(|s| s.name == "haus6"))
         .unwrap();
     app.sites_selected = haus6;
     app.update(ch('o'));
@@ -418,9 +418,9 @@ fn restricted() -> App {
     let mut app = connected();
     let mut texts = fixtures::config_texts();
     let heim = "name = \"heim\"\naddress = \"10.8.0.1\"\n";
-    assert!(texts.mesh.contains(heim), "{}", texts.mesh);
-    texts.mesh = texts
-        .mesh
+    assert!(texts.network.contains(heim), "{}", texts.network);
+    texts.network = texts
+        .network
         .replace(heim, &format!("{heim}managed_by = \"buero\"\n"));
     app.update(reply(Request::GetConfig, Reply::Config(texts)));
     app
@@ -505,7 +505,7 @@ fn settings_open_the_form_at_the_chosen_setting() {
     app.update(key(KeyCode::Enter));
     match &app.modal {
         Some(Modal::Form(form)) => {
-            assert_eq!(form.kind, FormKind::Mesh);
+            assert_eq!(form.kind, FormKind::Network);
             assert_eq!(form.fields[form.focus].key, "commit_timeout");
         }
         other => panic!("expected the network form, got {other:?}"),
@@ -555,7 +555,7 @@ fn a_restricted_site_sets_its_own_vlans() {
         .draft
         .as_ref()
         .unwrap()
-        .mesh
+        .network
         .site("heim")
         .unwrap()
         .clone();
@@ -574,8 +574,8 @@ fn managed_by_itself() -> App {
     let mut app = connected();
     let mut texts = fixtures::config_texts();
     let heim = "name = \"heim\"\naddress = \"10.8.0.1\"\n";
-    texts.mesh = texts
-        .mesh
+    texts.network = texts
+        .network
         .replace(heim, &format!("{heim}managed_by = \"heim\"\n"));
     app.update(reply(Request::GetConfig, Reply::Config(texts)));
     app

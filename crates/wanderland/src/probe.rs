@@ -4,7 +4,7 @@
 //! echo requests of its direct peers. Requests are sent with the DF bit set
 //! (`IP_PMTUDISC_PROBE`), so a binary search over the request size finds the
 //! largest packet that reaches the peer unfragmented. Requests and replies
-//! also announce the sender's mesh revision for the configuration sync.
+//! also announce the sender's network revision for the configuration sync.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -42,13 +42,13 @@ pub struct ProbeConfig {
     /// Direct peers by name.
     pub peers: BTreeMap<String, Ipv4Addr>,
     /// Further sites whose probes are answered but which are not probed
-    /// (peers removed recently, so they can still fetch the new mesh).
+    /// (peers removed recently, so they can still fetch the new network).
     pub responders: BTreeMap<String, Ipv4Addr>,
     /// Incremented to request an immediate path MTU measurement.
     pub generation: u64,
     /// Interval between path MTU measurements; `None` disables them (fixed MSS).
     pub mtu_interval: Option<Duration>,
-    /// What this site announces (mesh revision and fingerprint).
+    /// What this site announces (network revision and fingerprint).
     pub announce: wire::Announce,
     /// What this site announces to single peers instead: to a client the
     /// version of the client's view of the network.
@@ -132,7 +132,7 @@ pub type ProbeTable = Arc<RwLock<BTreeMap<String, PeerProbe>>>;
 pub enum ProbeEvent {
     /// The measured path MTU of a peer changed.
     Pmtu { peer: String, pmtu: Option<u16> },
-    /// A peer announced a mesh revision.
+    /// A peer announced a network revision.
     Announce {
         peer: String,
         announce: wire::Announce,

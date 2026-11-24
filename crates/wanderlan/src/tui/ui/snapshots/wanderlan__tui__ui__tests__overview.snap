@@ -4,7 +4,7 @@ expression: render(&connected())
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
 " heim  server  address 10.8.0.1  trunk ens19  VLANs 10-50                       "
-" state running  mesh revision 7 (3f2a9c1b04de)  daemon 0.1.0                    "
+" state running  network revision 7 (3f2a9c1b04de)  daemon 0.1.0                 "
 " tunnels in 1.4Mbit/s  out 394.6kbit/s  (Enter: details)                        "
 " 1 open invitation(s)  (Sites: I)                                               "
 " Blocked by the loop guard: gt-haus2  (select the peer, press u)                "

@@ -37,7 +37,7 @@ docker run --rm -v "$dist:/dist:ro" -e DEB_VERSION="$deb_version" -e VERSION="$v
       [ "$out" = "$bin $VERSION" ] || { echo "$bin reports \"$out\", expected \"$bin $VERSION\"" >&2; exit 1; }
     done
     ex=/pkg/usr/share/doc/wanderlan/examples
-    /pkg/usr/bin/wanderlan validate "$ex/mesh.toml" --local "$ex/local.toml"
+    /pkg/usr/bin/wanderlan validate "$ex/network.toml" --local "$ex/local.toml"
     echo "package content OK"
   '
 
@@ -55,7 +55,7 @@ docker run --rm --entrypoint sh -e DEB_VERSION="$deb_version" -e VERSION="$versi
   [ "$(wanderlan --version)" = "wanderlan $VERSION" ]
   getent group wanderlan >/dev/null
   test -f /usr/lib/systemd/system/wanderland.service -o -f /lib/systemd/system/wanderland.service
-  wanderlan init | grep -q "^\[mesh\]"
+  wanderlan init | grep -q "^\[network\]"
   echo "installation OK"
 '
 echo "smoke test passed: wanderlan ${deb_version}"

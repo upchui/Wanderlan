@@ -74,7 +74,7 @@ pub const ROWS: [SettingRow; 7] = [
 ];
 
 fn value(draft: &Draft, key: &str) -> String {
-    let m = &draft.mesh;
+    let m = &draft.network;
     match key {
         "vlans" => {
             if m.vlans.is_all() {
@@ -98,9 +98,9 @@ fn value(draft: &Draft, key: &str) -> String {
 /// The role of this site, who manages it, which sites it manages and which
 /// sites are its clients.
 fn permissions(draft: &Draft) -> [(&'static str, String); 4] {
-    let mesh = &draft.mesh;
+    let network = &draft.network;
     let me = draft.local.self_name.as_deref().unwrap_or_default();
-    let site = mesh.site(me);
+    let site = network.site(me);
     let role = site.map_or_else(
         || "-".to_string(),
         |s| match s.uplink.as_deref() {
@@ -108,9 +108,9 @@ fn permissions(draft: &Draft) -> [(&'static str, String); 4] {
             None => "server (connected with the other servers)".to_string(),
         },
     );
-    let managed = match (site, policy::restricted_by(mesh, me)) {
+    let managed = match (site, policy::restricted_by(network, me)) {
         (_, Some(m)) => format!("{m}: no VLAN changes here"),
-        (Some(site), None) => match policy::manager(mesh, site) {
+        (Some(site), None) => match policy::manager(network, site) {
             Some(m) => format!("{m}, may change its own VLANs"),
             None => "- (not managed by another site)".to_string(),
         },
@@ -124,14 +124,16 @@ fn permissions(draft: &Draft) -> [(&'static str, String); 4] {
         }
     };
     let manages = list(
-        mesh.sites
+        network
+            .sites
             .iter()
-            .filter(|s| s.name != me && policy::manager(mesh, s) == Some(me))
+            .filter(|s| s.name != me && policy::manager(network, s) == Some(me))
             .map(|s| s.name.as_str())
             .collect(),
     );
     let clients = list(
-        mesh.sites
+        network
+            .sites
             .iter()
             .filter(|s| s.uplink.as_deref() == Some(me))
             .map(|s| s.name.as_str())
@@ -150,7 +152,7 @@ fn permissions(draft: &Draft) -> [(&'static str, String); 4] {
 pub enum Setting {
     /// One of [`ROWS`].
     Fixed(usize),
-    /// The trunk of the tunnel to a site (index in the mesh).
+    /// The trunk of the tunnel to a site (index in the network).
     TunnelTrunk(usize),
 }
 
@@ -160,7 +162,7 @@ pub fn settings(draft: Option<&Draft>) -> Vec<Setting> {
     if let Some(d) = draft {
         let me = d.local.self_name.as_deref();
         out.extend(
-            d.mesh
+            d.network
                 .sites
                 .iter()
                 .enumerate()
@@ -184,7 +186,7 @@ fn help_text(draft: &Draft, setting: Option<Setting>) -> String {
     match setting {
         Some(Setting::Fixed(i)) => ROWS.get(i).map_or("", |r| r.help).to_string(),
         Some(Setting::TunnelTrunk(i)) => {
-            let name = draft.mesh.sites.get(i).map_or("", |s| s.name.as_str());
+            let name = draft.network.sites.get(i).map_or("", |s| s.name.as_str());
             format!(
                 "The local interface the tunnel to {name} is bridged with; empty: the default trunk. Another interface makes it a segment of its own here (bridge wl-<interface>): only that network reaches {name}."
             )
@@ -219,7 +221,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         let path = if row.local {
             FieldPath::local(row.key)
         } else {
-            FieldPath::mesh(row.key)
+            FieldPath::network(row.key)
         };
         rows.push(
             Row::new(vec![
@@ -253,7 +255,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         let Setting::TunnelTrunk(i) = *setting else {
             continue;
         };
-        let Some(site) = draft.mesh.sites.get(i) else {
+        let Some(site) = draft.network.sites.get(i) else {
             continue;
         };
         if selected == Some(*setting) {

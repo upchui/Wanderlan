@@ -1,4 +1,4 @@
-//! View 2: the sites of the draft, the mesh settings and the local settings.
+//! View 2: the sites of the draft, the network settings and the local settings.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -26,15 +26,15 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     .areas(area);
     draw_table(frame, app, draft, table);
     frame.render_widget(Paragraph::new(detail_lines(app, draft)), detail);
-    let [mesh, local] =
+    let [network, local] =
         Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
             .areas(settings);
-    draw_mesh(frame, draft, mesh);
+    draw_network(frame, draft, network);
     draw_local(frame, draft, local);
 }
 
 fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
-    let running = app.running.as_ref().and_then(|r| r.mesh.as_ref());
+    let running = app.running.as_ref().and_then(|r| r.network.as_ref());
     let own = draft.local.self_name.as_deref();
     let header = Row::new(vec![
         "",
@@ -46,10 +46,10 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         "TUNNEL",
     ])
     .style(theme::header());
-    let order = topology::tree_order(&draft.mesh);
+    let order = topology::tree_order(&draft.network);
     let rows: Vec<Row> = order
         .iter()
-        .filter_map(|(i, depth)| draft.mesh.sites.get(*i).map(|s| (*i, *depth, s)))
+        .filter_map(|(i, depth)| draft.network.sites.get(*i).map(|s| (*i, *depth, s)))
         .map(|(i, depth, site)| {
             let marker = match running.and_then(|m| m.site(&site.name)) {
                 None => Span::styled("+", theme::ok()),
@@ -63,10 +63,12 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
             } else {
                 match app.peer(&site.name) {
                     Some(peer) => (port_state(peer.port_state).to_string(), health_style(peer)),
-                    None => match own.and_then(|me| topology::via(&draft.mesh, me, &site.name)) {
-                        Some(hop) => (format!("via {hop}"), theme::dim()),
-                        None => ("-".to_string(), theme::dim()),
-                    },
+                    None => {
+                        match own.and_then(|me| topology::via(&draft.network, me, &site.name)) {
+                            Some(hop) => (format!("via {hop}"), theme::dim()),
+                            None => ("-".to_string(), theme::dim()),
+                        }
+                    }
                 }
             };
             let style = severity_style(draft.worst_within(&FieldPath::site(i)));
@@ -82,13 +84,13 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
                     match &site.vlans {
                         Some(v) => Cell::from(format!("{v}{own}")),
                         None => Cell::from(Span::styled(
-                            format!("{}{own}", draft.mesh.vlans),
+                            format!("{}{own}", draft.network.vlans),
                             theme::dim(),
                         )),
                     }
                 },
                 Cell::from(format::role(site.uplink.as_deref())),
-                Cell::from(policy::managed_label(&draft.mesh, site)),
+                Cell::from(policy::managed_label(&draft.network, site)),
                 Cell::from(tunnel).style(tunnel_style),
             ])
             .style(style)
@@ -97,10 +99,10 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
     let removed = running.map_or(0, |m| {
         m.sites
             .iter()
-            .filter(|s| draft.mesh.site(&s.name).is_none())
+            .filter(|s| draft.network.site(&s.name).is_none())
             .count()
     });
-    let mut title = format!(" Sites (draft): {} ", draft.mesh.sites.len());
+    let mut title = format!(" Sites (draft): {} ", draft.network.sites.len());
     if removed > 0 {
         title.push_str(&format!("- {removed} removed "));
     }
@@ -144,12 +146,12 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
         line.push_span(Span::styled(more, theme::dim()));
         lines.push(line);
     }
-    if let Some(site) = draft.mesh.sites.get(app.sites_selected) {
+    if let Some(site) = draft.network.sites.get(app.sites_selected) {
         let text = format!(
             " {}: {}; VLANs and online state changed by {} (Enter: edit).",
             site.name,
             format::role(site.uplink.as_deref()),
-            policy::managed_label(&draft.mesh, site)
+            policy::managed_label(&draft.network, site)
         );
         lines.push(Line::styled(text, theme::dim()));
         if let Some(trunk) = draft.local.tunnel_trunks.get(&site.name) {
@@ -181,9 +183,9 @@ fn setting(label: &str, value: String, severity: Option<Severity>) -> Line<'stat
     ])
 }
 
-fn draw_mesh(frame: &mut Frame, draft: &Draft, area: Rect) {
-    let m = &draft.mesh;
-    let at = |key: &str| draft.worst_at(&FieldPath::mesh(key));
+fn draw_network(frame: &mut Frame, draft: &Draft, area: Rect) {
+    let m = &draft.network;
+    let at = |key: &str| draft.worst_at(&FieldPath::network(key));
     let lines = vec![
         setting(
             "Default VLANs",

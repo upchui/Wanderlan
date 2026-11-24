@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use super::diag::{ConfigFile, Diagnostic, FieldPath};
-use super::model::{Local, LocalVid, MAX_SITE_NAME_LEN, Mesh};
+use super::model::{Local, LocalVid, MAX_SITE_NAME_LEN, Network};
 use super::vlan::NATIVE_VID;
 use crate::topology::GRETAP_PREFIX;
 
@@ -20,18 +20,18 @@ pub const COMMIT_TIMEOUT_RANGE: (Duration, Duration) =
 /// Maximum interface name length (IFNAMSIZ - 1).
 pub const IFNAME_MAX: usize = 15;
 
-/// Validates the mesh and, if given and configured, the local configuration.
+/// Validates the network and, if given and configured, the local configuration.
 ///
 /// The returned diagnostics have no line numbers; [`super::load`] fills them
 /// in from the source spans. The TUI uses the [`FieldPath`]s directly.
-pub fn validate(mesh: &Mesh, local: Option<&Local>) -> Vec<Diagnostic> {
+pub fn validate(network: &Network, local: Option<&Local>) -> Vec<Diagnostic> {
     let mut v = Validator::default();
-    v.mesh_settings(mesh);
-    v.sites(mesh);
-    v.uplinks(mesh);
-    v.maps(mesh);
+    v.network_settings(network);
+    v.sites(network);
+    v.uplinks(network);
+    v.maps(network);
     if let Some(local) = local.filter(|l| l.is_configured()) {
-        v.local(mesh, local);
+        v.local(network, local);
     }
     v.diags
 }
@@ -90,57 +90,57 @@ struct Validator {
 impl Validator {
     fn error(&mut self, path: FieldPath, message: impl Into<String>) {
         self.diags
-            .push(Diagnostic::error(ConfigFile::Mesh, path, message));
+            .push(Diagnostic::error(ConfigFile::Network, path, message));
     }
 
     fn warning(&mut self, path: FieldPath, message: impl Into<String>) {
         self.diags
-            .push(Diagnostic::warning(ConfigFile::Mesh, path, message));
+            .push(Diagnostic::warning(ConfigFile::Network, path, message));
     }
 
-    fn mesh_settings(&mut self, mesh: &Mesh) {
-        if mesh.vlans.is_empty() {
+    fn network_settings(&mut self, network: &Network) {
+        if network.vlans.is_empty() {
             self.error(
-                FieldPath::mesh("vlans"),
-                "mesh.vlans must contain at least one VLAN",
+                FieldPath::network("vlans"),
+                "network.vlans must contain at least one VLAN",
             );
         }
-        if mesh.mtu_probe_interval < PROBE_INTERVAL_MIN {
+        if network.mtu_probe_interval < PROBE_INTERVAL_MIN {
             self.error(
-                FieldPath::mesh("mtu_probe_interval"),
+                FieldPath::network("mtu_probe_interval"),
                 format!(
-                    "mesh.mtu_probe_interval must be at least {}",
+                    "network.mtu_probe_interval must be at least {}",
                     humantime::format_duration(PROBE_INTERVAL_MIN)
                 ),
             );
         }
         let (min, max) = COMMIT_TIMEOUT_RANGE;
-        if mesh.commit_timeout < min || mesh.commit_timeout > max {
+        if network.commit_timeout < min || network.commit_timeout > max {
             self.error(
-                FieldPath::mesh("commit_timeout"),
+                FieldPath::network("commit_timeout"),
                 format!(
-                    "mesh.commit_timeout must be between {} and {}",
+                    "network.commit_timeout must be between {} and {}",
                     humantime::format_duration(min),
                     humantime::format_duration(max)
                 ),
             );
         }
-        if let Some(mss) = mesh.mss.filter(|m| !(MSS_MIN..=MSS_MAX).contains(m)) {
+        if let Some(mss) = network.mss.filter(|m| !(MSS_MIN..=MSS_MAX).contains(m)) {
             self.error(
-                FieldPath::mesh("mss"),
-                format!("mesh.mss must be between {MSS_MIN} and {MSS_MAX}, got {mss}"),
+                FieldPath::network("mss"),
+                format!("network.mss must be between {MSS_MIN} and {MSS_MAX}, got {mss}"),
             );
         }
     }
 
-    fn sites(&mut self, mesh: &Mesh) {
-        if mesh.sites.is_empty() {
-            self.error(FieldPath::root(), "mesh.toml defines no [[site]]");
+    fn sites(&mut self, network: &Network) {
+        if network.sites.is_empty() {
+            self.error(FieldPath::root(), "network.toml defines no [[site]]");
             return;
         }
         let mut names: BTreeMap<&str, usize> = BTreeMap::new();
         let mut addresses: BTreeMap<std::net::Ipv4Addr, &str> = BTreeMap::new();
-        for (i, site) in mesh.sites.iter().enumerate() {
+        for (i, site) in network.sites.iter().enumerate() {
             let name = site.name.as_str();
             if let Some(msg) = site_name_error(name) {
                 self.error(FieldPath::site_field(i, "name"), msg);
@@ -185,7 +185,7 @@ impl Validator {
             }
             if let Some(own) = &site.own_vlans {
                 let path = FieldPath::site_field(i, "own_vlans");
-                let native = mesh
+                let native = network
                     .maps_of(name)
                     .find(|m| m.local == LocalVid::Native)
                     .map(|m| m.shared);
@@ -201,7 +201,7 @@ impl Validator {
                 }
                 let both: super::vlan::VlanSet = own
                     .iter()
-                    .filter(|v| mesh.vlans_of(site).contains(*v))
+                    .filter(|v| network.vlans_of(site).contains(*v))
                     .collect();
                 if !both.is_empty() {
                     self.warning(
@@ -217,8 +217,8 @@ impl Validator {
 
     /// Every uplink names another site, and following the uplinks always
     /// ends at a server (no loop).
-    fn uplinks(&mut self, mesh: &Mesh) {
-        for (i, site) in mesh.sites.iter().enumerate() {
+    fn uplinks(&mut self, network: &Network) {
+        for (i, site) in network.sites.iter().enumerate() {
             let Some(up) = site.uplink.as_deref() else {
                 continue;
             };
@@ -230,7 +230,7 @@ impl Validator {
                 );
                 continue;
             }
-            if mesh.site(up).is_none() {
+            if network.site(up).is_none() {
                 self.error(
                     path,
                     format!(
@@ -252,7 +252,7 @@ impl Validator {
                     break;
                 }
                 chain.push(current);
-                match mesh.site(current).and_then(|s| s.uplink.as_deref()) {
+                match network.site(current).and_then(|s| s.uplink.as_deref()) {
                     Some(next) => current = next,
                     None => break,
                 }
@@ -260,13 +260,13 @@ impl Validator {
         }
     }
 
-    fn maps(&mut self, mesh: &Mesh) {
+    fn maps(&mut self, network: &Network) {
         // Per site: local side -> map index, shared VID -> map index.
         let mut locals: BTreeMap<(&str, LocalVid), usize> = BTreeMap::new();
         let mut shareds: BTreeMap<(&str, u16), usize> = BTreeMap::new();
-        for (i, map) in mesh.maps.iter().enumerate() {
+        for (i, map) in network.maps.iter().enumerate() {
             let site = map.site.as_str();
-            let site_vlans = mesh.site(site).map(|s| mesh.vlans_of(s));
+            let site_vlans = network.site(site).map(|s| network.vlans_of(s));
             match site_vlans {
                 None => self.error(
                     FieldPath::map_field(i, "site"),
@@ -341,7 +341,7 @@ impl Validator {
         }
     }
 
-    fn local(&mut self, mesh: &Mesh, local: &Local) {
+    fn local(&mut self, network: &Network, local: &Local) {
         let mut push = |path: &str, msg: String| {
             self.diags.push(Diagnostic::error(
                 ConfigFile::Local,
@@ -350,14 +350,14 @@ impl Validator {
             ));
         };
         if let Some(name) = local.self_name.as_deref()
-            && mesh.site(name).is_none()
+            && network.site(name).is_none()
         {
-            let known: BTreeSet<&str> = mesh.sites.iter().map(|s| s.name.as_str()).collect();
+            let known: BTreeSet<&str> = network.sites.iter().map(|s| s.name.as_str()).collect();
             let known: Vec<&str> = known.into_iter().collect();
             push(
                 "self",
                 format!(
-                    "self = \"{name}\" is not a site in mesh.toml (known sites: {})",
+                    "self = \"{name}\" is not a site in network.toml (known sites: {})",
                     known.join(", ")
                 ),
             );
@@ -392,7 +392,7 @@ impl Validator {
                     ),
                 );
             }
-            if mesh.site(site).is_none() || Some(site.as_str()) == me {
+            if network.site(site).is_none() || Some(site.as_str()) == me {
                 unused.push((
                     path,
                     format!("there is no tunnel to \"{site}\" (not a peer of this site); this trunk is not used"),

@@ -6,7 +6,7 @@ need a decision by the project owner.
 1. **IPv6 in the transport network.** Site addresses are IPv4 only (GRETAP
    over IPv4, path MTU probes and sync over IPv4). IPv6 would need ip6gretap,
    different overhead in the MSS formula (40 instead of 20 bytes outer
-   header) and IPv6 addresses in `mesh.toml`. Traffic *inside* the stretched
+   header) and IPv6 addresses in `network.toml`. Traffic *inside* the stretched
    VLANs may of course be IPv6 (it is layer 2); its TCP MSS is clamped too.
 2. **Configurable interface names** for hosts that already use `br0`,
    `wl-*` or `gt-*` for something else.

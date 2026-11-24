@@ -1,7 +1,7 @@
 //! Layer-2 tunnel topology: servers and clients.
 //!
 //! A site without `uplink` is a **server**. All servers are connected with
-//! each other (full mesh); loop freedom among them comes from split horizon:
+//! each other directly; loop freedom among them comes from split horizon:
 //! server-to-server ports are `isolated`, so a frame received from one server
 //! is never forwarded to another server, only to the local trunk and to
 //! clients.
@@ -19,7 +19,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::{Mesh, Site};
+use crate::config::{Network, Site};
 
 /// Prefix of the GRETAP interfaces created by wanderlan.
 pub const GRETAP_PREFIX: &str = "gt-";
@@ -69,12 +69,12 @@ pub fn is_server(site: &Site) -> bool {
 
 /// The tunnels the given site has to build, sorted by peer name: to its
 /// uplink, to its clients and, as a server, to every other server. A site
-/// that is not part of the mesh has none.
-pub fn tunnels_for<'a>(mesh: &'a Mesh, local: &str) -> Vec<Tunnel<'a>> {
-    let Some(me) = mesh.site(local) else {
+/// that is not part of the network has none.
+pub fn tunnels_for<'a>(network: &'a Network, local: &str) -> Vec<Tunnel<'a>> {
+    let Some(me) = network.site(local) else {
         return Vec::new();
     };
-    let mut out: Vec<Tunnel<'a>> = mesh
+    let mut out: Vec<Tunnel<'a>> = network
         .sites
         .iter()
         .filter(|peer| peer.name != local)
@@ -95,12 +95,12 @@ pub fn tunnels_for<'a>(mesh: &'a Mesh, local: &str) -> Vec<Tunnel<'a>> {
     out
 }
 
-/// All tunnels of the mesh as unordered site pairs (smaller name first),
+/// All tunnels of the network as unordered site pairs (smaller name first),
 /// with `true` for tunnels between servers.
-pub fn edges(mesh: &Mesh) -> BTreeSet<(String, String, bool)> {
+pub fn edges(network: &Network) -> BTreeSet<(String, String, bool)> {
     let mut out = BTreeSet::new();
-    for site in &mesh.sites {
-        for t in tunnels_for(mesh, &site.name) {
+    for site in &network.sites {
+        for t in tunnels_for(network, &site.name) {
             let (a, b) = if site.name <= t.peer.name {
                 (site.name.clone(), t.peer.name.clone())
             } else {
@@ -114,11 +114,11 @@ pub fn edges(mesh: &Mesh) -> BTreeSet<(String, String, bool)> {
 
 /// The chain from `site` up to its server: the site, its uplink, the uplink
 /// of that, ... Stops at a loop or an unknown site (invalid configurations).
-fn ancestors<'a>(mesh: &'a Mesh, site: &'a str) -> Vec<&'a str> {
+fn ancestors<'a>(network: &'a Network, site: &'a str) -> Vec<&'a str> {
     let mut chain = vec![site];
     let mut current = site;
-    while let Some(up) = mesh.site(current).and_then(|s| s.uplink.as_deref()) {
-        if chain.contains(&up) || mesh.site(up).is_none() {
+    while let Some(up) = network.site(current).and_then(|s| s.uplink.as_deref()) {
+        if chain.contains(&up) || network.site(up).is_none() {
             break;
         }
         chain.push(up);
@@ -129,17 +129,17 @@ fn ancestors<'a>(mesh: &'a Mesh, site: &'a str) -> Vec<&'a str> {
 
 /// The neighbour through which `from` reaches `to`, if `to` is neither
 /// `from` itself nor a direct neighbour: shown as "via …".
-pub fn via<'a>(mesh: &'a Mesh, from: &str, to: &str) -> Option<&'a str> {
-    let from = mesh.site(from)?.name.as_str();
-    let to = mesh.site(to)?.name.as_str();
+pub fn via<'a>(network: &'a Network, from: &str, to: &str) -> Option<&'a str> {
+    let from = network.site(from)?.name.as_str();
+    let to = network.site(to)?.name.as_str();
     if from == to {
         return None;
     }
-    let up_from_target = ancestors(mesh, to);
+    let up_from_target = ancestors(network, to);
     let next = match up_from_target.iter().position(|s| *s == from) {
         // `to` hangs (indirectly) off `from`: towards that client.
         Some(pos) => *up_from_target.get(pos.checked_sub(1)?)?,
-        None => match mesh.site(from).and_then(|s| s.uplink.as_deref()) {
+        None => match network.site(from).and_then(|s| s.uplink.as_deref()) {
             // Up towards the own server.
             Some(up) => up,
             // A server: to the server `to` hangs off.
@@ -198,9 +198,9 @@ pub fn tree_name(name: &str, depth: usize) -> String {
     }
 }
 
-/// [`tree_order_by`] for the sites of a mesh.
-pub fn tree_order(mesh: &Mesh) -> Vec<(usize, usize)> {
-    let sites: Vec<(&str, Option<&str>)> = mesh
+/// [`tree_order_by`] for the sites of a network.
+pub fn tree_order(network: &Network) -> Vec<(usize, usize)> {
+    let sites: Vec<(&str, Option<&str>)> = network
         .sites
         .iter()
         .map(|s| (s.name.as_str(), s.uplink.as_deref()))
@@ -208,8 +208,8 @@ pub fn tree_order(mesh: &Mesh) -> Vec<(usize, usize)> {
     tree_order_by(&sites)
 }
 
-/// Everything about the mesh that determines over which ports frames
-/// travel: the tunnels and whether they connect servers. Two meshes with the
+/// Everything about the network that determines over which ports frames
+/// travel: the tunnels and whether they connect servers. Two networks with the
 /// same key have the same layer-2 paths, so learned MAC addresses stay
 /// valid; VLAN changes do not move addresses between ports.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,9 +217,11 @@ pub struct ForwardingKey {
     edges: BTreeSet<(String, String, bool)>,
 }
 
-/// Computes the [`ForwardingKey`] of a mesh.
-pub fn forwarding_key(mesh: &Mesh) -> ForwardingKey {
-    ForwardingKey { edges: edges(mesh) }
+/// Computes the [`ForwardingKey`] of a network.
+pub fn forwarding_key(network: &Network) -> ForwardingKey {
+    ForwardingKey {
+        edges: edges(network),
+    }
 }
 
 #[cfg(test)]
@@ -249,27 +251,27 @@ mod tests {
         }
     }
 
-    fn example() -> Mesh {
-        let mut mesh = Mesh::new(VlanSet::from_range(10, 50));
-        mesh.sites = vec![site("heim", 1), site("buero", 2), site("haus2", 11)];
-        mesh
+    fn example() -> Network {
+        let mut network = Network::new(VlanSet::from_range(10, 50));
+        network.sites = vec![site("heim", 1), site("buero", 2), site("haus2", 11)];
+        network
     }
 
     /// Two servers; alex has the clients marcel and site2, marcel has x.
-    fn with_clients() -> Mesh {
-        let mut mesh = Mesh::new(VlanSet::from_range(10, 50));
-        mesh.sites = vec![
+    fn with_clients() -> Network {
+        let mut network = Network::new(VlanSet::from_range(10, 50));
+        network.sites = vec![
             site("alex", 1),
             site("dc", 2),
             client("marcel", 3, "alex"),
             client("site2", 4, "alex"),
             client("x", 5, "marcel"),
         ];
-        mesh
+        network
     }
 
-    fn peers(mesh: &Mesh, site: &str) -> Vec<(String, TunnelKind)> {
-        tunnels_for(mesh, site)
+    fn peers(network: &Network, site: &str) -> Vec<(String, TunnelKind)> {
+        tunnels_for(network, site)
             .iter()
             .map(|t| (t.peer.name.clone(), t.kind))
             .collect()
@@ -277,23 +279,23 @@ mod tests {
 
     #[test]
     fn servers_have_a_tunnel_to_every_other_server() {
-        let mesh = example();
-        let names: Vec<String> = tunnels_for(&mesh, "heim")
+        let network = example();
+        let names: Vec<String> = tunnels_for(&network, "heim")
             .iter()
             .map(Tunnel::ifname)
             .collect();
         assert_eq!(names, vec!["gt-buero", "gt-haus2"]);
-        assert!(tunnels_for(&mesh, "heim").iter().all(Tunnel::isolated));
-        assert_eq!(tunnels_for(&mesh, "haus2").len(), 2);
-        assert!(tunnels_for(&mesh, "unknown").is_empty());
+        assert!(tunnels_for(&network, "heim").iter().all(Tunnel::isolated));
+        assert_eq!(tunnels_for(&network, "haus2").len(), 2);
+        assert!(tunnels_for(&network, "unknown").is_empty());
     }
 
     #[test]
     fn a_client_has_one_tunnel_to_its_uplink_and_none_to_other_clients() {
-        let mesh = with_clients();
+        let network = with_clients();
         use TunnelKind::{Client, Server, Uplink};
         assert_eq!(
-            peers(&mesh, "alex"),
+            peers(&network, "alex"),
             [
                 ("dc".to_string(), Server),
                 ("marcel".to_string(), Client),
@@ -301,38 +303,38 @@ mod tests {
             ]
         );
         assert_eq!(
-            peers(&mesh, "marcel"),
+            peers(&network, "marcel"),
             [("alex".to_string(), Uplink), ("x".to_string(), Client)]
         );
-        assert_eq!(peers(&mesh, "site2"), [("alex".to_string(), Uplink)]);
-        assert_eq!(peers(&mesh, "x"), [("marcel".to_string(), Uplink)]);
-        assert_eq!(peers(&mesh, "dc"), [("alex".to_string(), Server)]);
+        assert_eq!(peers(&network, "site2"), [("alex".to_string(), Uplink)]);
+        assert_eq!(peers(&network, "x"), [("marcel".to_string(), Uplink)]);
+        assert_eq!(peers(&network, "dc"), [("alex".to_string(), Server)]);
         assert!(
-            !tunnels_for(&mesh, "marcel").iter().any(Tunnel::isolated),
+            !tunnels_for(&network, "marcel").iter().any(Tunnel::isolated),
             "client ports are ordinary ports"
         );
     }
 
     #[test]
     fn via_names_the_next_hop() {
-        let mesh = with_clients();
-        assert_eq!(via(&mesh, "marcel", "site2"), Some("alex"));
-        assert_eq!(via(&mesh, "marcel", "dc"), Some("alex"));
-        assert_eq!(via(&mesh, "marcel", "alex"), None, "direct");
-        assert_eq!(via(&mesh, "alex", "x"), Some("marcel"));
-        assert_eq!(via(&mesh, "dc", "x"), Some("alex"));
-        assert_eq!(via(&mesh, "dc", "site2"), Some("alex"));
-        assert_eq!(via(&mesh, "x", "site2"), Some("marcel"));
-        assert_eq!(via(&mesh, "x", "x"), None);
-        assert_eq!(via(&mesh, "x", "nowhere"), None);
+        let network = with_clients();
+        assert_eq!(via(&network, "marcel", "site2"), Some("alex"));
+        assert_eq!(via(&network, "marcel", "dc"), Some("alex"));
+        assert_eq!(via(&network, "marcel", "alex"), None, "direct");
+        assert_eq!(via(&network, "alex", "x"), Some("marcel"));
+        assert_eq!(via(&network, "dc", "x"), Some("alex"));
+        assert_eq!(via(&network, "dc", "site2"), Some("alex"));
+        assert_eq!(via(&network, "x", "site2"), Some("marcel"));
+        assert_eq!(via(&network, "x", "x"), None);
+        assert_eq!(via(&network, "x", "nowhere"), None);
     }
 
     #[test]
     fn the_tree_order_puts_clients_under_their_server() {
-        let mesh = with_clients();
-        let order: Vec<(&str, usize)> = tree_order(&mesh)
+        let network = with_clients();
+        let order: Vec<(&str, usize)> = tree_order(&network)
             .into_iter()
-            .map(|(i, d)| (mesh.sites[i].name.as_str(), d))
+            .map(|(i, d)| (network.sites[i].name.as_str(), d))
             .collect();
         assert_eq!(
             order,
@@ -370,10 +372,10 @@ mod tests {
 
     #[test]
     fn a_single_site_has_no_tunnels() {
-        let mut mesh = Mesh::new(VlanSet::from_range(10, 50));
-        mesh.sites = vec![site("first", 1)];
-        assert!(tunnels_for(&mesh, "first").is_empty());
-        assert!(edges(&mesh).is_empty());
+        let mut network = Network::new(VlanSet::from_range(10, 50));
+        network.sites = vec![site("first", 1)];
+        assert!(tunnels_for(&network, "first").is_empty());
+        assert!(edges(&network).is_empty());
     }
 
     #[test]

@@ -8,18 +8,18 @@ use crate::sys::fake::FakeNet;
 use crate::sys::tc::{IfTc, TcRule};
 use crate::sys::{LinkKind, LinkState, NetOps, VlanFlags};
 
-const MESH: &str = include_str!("../../../../packaging/examples/mesh.toml");
+const NETWORK: &str = include_str!("../../../../packaging/examples/network.toml");
 
-fn config_from(mesh: &str, self_name: &str) -> Config {
+fn config_from(network: &str, self_name: &str) -> Config {
     let local = format!("self = \"{self_name}\"\ntrunk = \"ens19\"\n");
-    match load(mesh, &local).unwrap().loaded {
+    match load(network, &local).unwrap().loaded {
         Loaded::Configured(cfg) => cfg,
         Loaded::Unconfigured { .. } => panic!("configured"),
     }
 }
 
 fn desired(self_name: &str) -> Desired {
-    derive(&config_from(MESH, self_name), &Runtime::default())
+    derive(&config_from(NETWORK, self_name), &Runtime::default())
 }
 
 async fn run(net: &FakeNet, d: &Desired) -> Vec<Change> {
@@ -108,14 +108,14 @@ async fn removed_peer_is_deleted_and_changed_address_recreated() {
     run(&net, &desired("heim")).await;
 
     // haus2 leaves the network, buero gets a new address.
-    let mesh = MESH
+    let network = NETWORK
         .replace(
             "[[site]]\nname = \"haus2\"\naddress = \"10.8.0.11\"\nvlans = \"20,30\"               # haus2 only takes part in VLANs 20 and 30\n",
             "",
         )
         .replace("10.8.0.2\"", "10.8.0.22\"");
-    assert!(!mesh.contains("haus2"));
-    let d = derive(&config_from(&mesh, "heim"), &Runtime::default());
+    assert!(!network.contains("haus2"));
+    let d = derive(&config_from(&network, "heim"), &Runtime::default());
     let changes = run(&net, &d).await;
     let text: Vec<String> = changes.iter().map(ToString::to_string).collect();
     assert!(
@@ -139,8 +139,8 @@ async fn removed_peer_is_deleted_and_changed_address_recreated() {
 async fn vlan_range_change_only_touches_vlans() {
     let net = fresh();
     run(&net, &desired("heim")).await;
-    let mesh = MESH.replace("vlans = \"10-50\"", "vlans = \"10-40,60\"");
-    let d = derive(&config_from(&mesh, "heim"), &Runtime::default());
+    let network = NETWORK.replace("vlans = \"10-50\"", "vlans = \"10-40,60\"");
+    let d = derive(&config_from(&network, "heim"), &Runtime::default());
     let changes = run(&net, &d).await;
     assert!(
         changes
@@ -256,7 +256,7 @@ async fn blocked_tunnel_is_brought_down_and_back_up() {
         blocked: BTreeSet::from(["gt-haus2".to_string()]),
         ..Runtime::default()
     };
-    let d = derive(&config_from(MESH, "heim"), &runtime);
+    let d = derive(&config_from(NETWORK, "heim"), &runtime);
     let changes = run(&net, &d).await;
     assert_eq!(changes.len(), 1);
     assert_eq!(
@@ -341,8 +341,8 @@ async fn port_changes_are_detected_for_fdb_flush() {
     let net = fresh();
     let changes = run(&net, &desired("heim")).await;
     assert!(ports_changed(&changes));
-    let mesh = MESH.replace("vlans = \"10-50\"", "vlans = \"10-40\"");
-    let d = derive(&config_from(&mesh, "heim"), &Runtime::default());
+    let network = NETWORK.replace("vlans = \"10-50\"", "vlans = \"10-40\"");
+    let d = derive(&config_from(&network, "heim"), &Runtime::default());
     let changes = run(&net, &d).await;
     assert!(!ports_changed(&changes), "VLAN changes do not move MACs");
     flush_learned(&net, "br0").await.unwrap();
@@ -352,7 +352,7 @@ async fn port_changes_are_detected_for_fdb_flush() {
 #[test]
 fn forwarding_key_reflects_tunnels() {
     use crate::topology::forwarding_key;
-    let a = config_from(MESH, "heim").mesh;
+    let a = config_from(NETWORK, "heim").network;
     let mut b = a.clone();
     assert_eq!(forwarding_key(&a), forwarding_key(&b));
     b.vlans = crate::config::VlanSet::from_range(10, 20);
@@ -384,8 +384,8 @@ async fn translation_rules_are_installed_once() {
 async fn removing_the_mapping_removes_rules_and_qdisc() {
     let net = fresh();
     run(&net, &desired("haus3")).await;
-    let mesh = MESH.replace("local = 130\nshared = 30\n", "local = 131\nshared = 31\n");
-    let d = derive(&config_from(&mesh, "haus3"), &Runtime::default());
+    let network = NETWORK.replace("local = 130\nshared = 30\n", "local = 131\nshared = 31\n");
+    let d = derive(&config_from(&network, "haus3"), &Runtime::default());
     let changes = run(&net, &d).await;
     let text: Vec<String> = changes.iter().map(ToString::to_string).collect();
     assert!(
@@ -397,8 +397,8 @@ async fn removing_the_mapping_removes_rules_and_qdisc() {
     cookies.sort();
     assert_eq!(cookies, vec!["wl:e31>131", "wl:i131>31", "wl:i31x"]);
 
-    let mesh = MESH.replace("[[map]]\nsite = \"haus3\"\nlocal = 130\nshared = 30\n", "");
-    let d = derive(&config_from(&mesh, "haus3"), &Runtime::default());
+    let network = NETWORK.replace("[[map]]\nsite = \"haus3\"\nlocal = 130\nshared = 30\n", "");
+    let d = derive(&config_from(&network, "haus3"), &Runtime::default());
     run(&net, &d).await;
     assert_eq!(net.tc("ens19"), IfTc::default());
 }
@@ -434,7 +434,7 @@ async fn mss_rules_follow_measurements() {
     assert_eq!(net.state().mss, None, "no measurement, no table");
     let mut runtime = Runtime::default();
     runtime.pmtu.insert("buero".into(), 1400);
-    let d = derive(&config_from(MESH, "heim"), &runtime);
+    let d = derive(&config_from(NETWORK, "heim"), &runtime);
     let changes = run(&net, &d).await;
     assert_eq!(changes.len(), 1);
     assert!(
@@ -449,7 +449,7 @@ async fn mss_rules_follow_measurements() {
 }
 
 fn config_with_local(local: &str) -> Config {
-    match load(MESH, local).unwrap().loaded {
+    match load(NETWORK, local).unwrap().loaded {
         Loaded::Configured(cfg) => cfg,
         Loaded::Unconfigured { .. } => panic!("configured"),
     }

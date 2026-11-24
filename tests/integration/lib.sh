@@ -103,18 +103,18 @@ check_not() {
 
 # ---- configuration -------------------------------------------------------
 
-# Revision of the generated meshes. Every new configuration gets a higher
+# Revision of the generated networks. Every new configuration gets a higher
 # revision so the sync between the daemons never prefers an older one.
-MESH_REVISION=${MESH_REVISION:-100}
+NETWORK_REVISION=${NETWORK_REVISION:-100}
 
-# mesh_toml <vlans> <site[=vlans]>... prints a mesh.toml; `site=20,30`
+# network_toml <vlans> <site[=vlans]>... prints a network.toml; `site=20,30`
 # limits a site to some of the VLANs.
-mesh_toml() {
+network_toml() {
   local vlans="$1"
   shift
-  MESH_REVISION=$((MESH_REVISION + 1))
-  printf '[mesh]\nrevision = %s\nvlans = "%s"\nmtu_probe_interval = "%s"\ncommit_timeout = "%s"\n' \
-    "${REVISION:-$MESH_REVISION}" "$vlans" "${PROBE_INTERVAL:-15s}" "${COMMIT_TIMEOUT:-60s}"
+  NETWORK_REVISION=$((NETWORK_REVISION + 1))
+  printf '[network]\nrevision = %s\nvlans = "%s"\nmtu_probe_interval = "%s"\ncommit_timeout = "%s"\n' \
+    "${REVISION:-$NETWORK_REVISION}" "$vlans" "${PROBE_INTERVAL:-15s}" "${COMMIT_TIMEOUT:-60s}"
   local spec name site_vlans
   for spec in "$@"; do
     name="${spec%%=*}"
@@ -125,22 +125,22 @@ mesh_toml() {
       printf 'vlans = "%s"\n' "$site_vlans"
     fi
   done
-  if [ -n "${MESH_EXTRA:-}" ]; then
-    printf '\n%s\n' "$MESH_EXTRA"
+  if [ -n "${NETWORK_EXTRA:-}" ]; then
+    printf '\n%s\n' "$NETWORK_EXTRA"
   fi
 }
 
-# renew <mesh-file>: gives a previously generated mesh a new, higher revision
+# renew <network-file>: gives a previously generated network a new, higher revision
 # (reusing an old file would let the sync bring back a newer configuration).
 renew() {
-  MESH_REVISION=$((MESH_REVISION + 1))
-  sed -i "s/^revision = .*/revision = $MESH_REVISION/" "$1"
+  NETWORK_REVISION=$((NETWORK_REVISION + 1))
+  sed -i "s/^revision = .*/revision = $NETWORK_REVISION/" "$1"
 }
 
-# configure <site> <mesh-file>: writes mesh.toml and local.toml of a site.
+# configure <site> <network-file>: writes network.toml and local.toml of a site.
 configure() {
-  local site="$1" mesh="$2"
-  put "$site" /etc/wanderlan/mesh.toml <"$mesh"
+  local site="$1" network="$2"
+  put "$site" /etc/wanderlan/network.toml <"$network"
   printf 'self = "%s"\ntrunk = "trunk0"\n' "$site" | put "$site" /etc/wanderlan/local.toml
 }
 

@@ -1,7 +1,7 @@
-# wanderlan mesh configuration, shared by all sites.
+# wanderlan network configuration, shared by all sites.
 #
 # This site is not configured yet. Run `wanderlan` to start a new network,
 # or join an existing one with an invitation from any of its sites:
 #   wanderlan join <address> <code>      (create it there: wanderlan invite)
-# The daemon writes this file; see /usr/share/doc/wanderlan/examples/mesh.toml
+# The daemon writes this file; see /usr/share/doc/wanderlan/examples/network.toml
 # (or `wanderlan init`) for its format.

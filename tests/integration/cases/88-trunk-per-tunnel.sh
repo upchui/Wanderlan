@@ -30,7 +30,7 @@ check "local.toml names the trunk of the tunnel" \
 check "the status shows the trunk of the tunnel" \
   test "$(jqs site1 '.peers[] | select(.name == "site2") | .trunk')" = trunk1
 check "the status lists both trunks" test "$(jqs site1 '[.trunks[].name] | join(" ")')" = "trunk0 trunk1"
-check "the mesh revision did not change (a local setting)" \
+check "the network revision did not change (a local setting)" \
   test "$(jqs site1 .revision)" = "$(jqs site2 .revision)"
 expect_ping c-site1b 10.20.0.2 "VLAN 20: the client at trunk1 reaches site2"
 expect_no_ping c-site1b 10.20.0.11 "VLAN 20: the client at trunk1 does not reach site3"

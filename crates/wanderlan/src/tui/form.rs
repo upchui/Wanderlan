@@ -1,4 +1,4 @@
-//! Modal forms that edit the draft: sites, VLAN mappings, mesh settings and
+//! Modal forms that edit the draft: sites, VLAN mappings, network settings and
 //! the local settings.
 //!
 //! Every change re-runs the field parsers and then the full validation on a
@@ -30,17 +30,17 @@ pub enum FormKind {
     Site(Option<usize>),
     /// A VLAN mapping; `None` adds a new one.
     Map(Option<usize>),
-    /// The `[mesh]` settings.
-    Mesh,
+    /// The `[network]` settings.
+    Network,
     /// Only the shared VLANs.
     Vlans,
     /// `local.toml`.
     Local,
     /// Rules for a new invitation (the draft is not changed).
     Invite,
-    /// The trunk of the tunnel to one site (index in the mesh), local.toml.
+    /// The trunk of the tunnel to one site (index in the network), local.toml.
     TunnelTrunk(usize),
-    /// The own VLANs of one site (index in the mesh): on its trunk and
+    /// The own VLANs of one site (index in the network): on its trunk and
     /// towards its own clients only.
     OwnVlans(usize),
 }
@@ -180,7 +180,7 @@ impl Form {
 
     /// Form for a new site (`None`) or an existing one.
     pub fn site(draft: &Draft, index: Option<usize>) -> Self {
-        let existing = index.and_then(|i| draft.mesh.sites.get(i));
+        let existing = index.and_then(|i| draft.network.sites.get(i));
         let (name, address, vlans) = match existing {
             Some(s) => (
                 s.name.clone(),
@@ -199,7 +199,7 @@ impl Form {
         let me = draft.local.self_name.clone().unwrap_or_default();
         let (choices, current) = match existing {
             Some(s) => {
-                let manager = policy::manager(&draft.mesh, s).map(str::to_string);
+                let manager = policy::manager(&draft.network, s).map(str::to_string);
                 let choices = changes_choices(manager.as_deref().unwrap_or(&me), &s.name);
                 let current = match (manager, s.self_managed) {
                     (None, _) => ANY_SITE.to_string(),
@@ -228,7 +228,7 @@ impl Form {
                 "VLANs",
                 format!(
                     "empty: the network's VLANs ({}); or e.g. native,20,30",
-                    draft.mesh.vlans
+                    draft.network.vlans
                 ),
                 vlans,
             ),
@@ -261,7 +261,7 @@ impl Form {
             Field::text(
                 "vlans",
                 "VLANs",
-                format!("empty: the network's VLANs ({})", draft.mesh.vlans),
+                format!("empty: the network's VLANs ({})", draft.network.vlans),
                 "",
             ),
             Field::text(
@@ -315,10 +315,10 @@ impl Form {
 
     /// Form for a new VLAN mapping (`None`) or an existing one.
     pub fn map(draft: &Draft, index: Option<usize>, site_hint: Option<&str>) -> Self {
-        let existing = index.and_then(|i| draft.mesh.maps.get(i));
+        let existing = index.and_then(|i| draft.network.maps.get(i));
         // "marcel (client)": where the mapped traffic comes from.
         let sites: Vec<String> = draft
-            .mesh
+            .network
             .sites
             .iter()
             .map(format::site_with_kind)
@@ -328,7 +328,10 @@ impl Form {
             .or_else(|| site_hint.map(str::to_string))
             .or_else(|| draft.local.self_name.clone())
             .unwrap_or_default();
-        let site = draft.mesh.site(&site).map_or(site, format::site_with_kind);
+        let site = draft
+            .network
+            .site(&site)
+            .map_or(site, format::site_with_kind);
         let (local, shared) = existing.map_or_else(
             || ("native".to_string(), String::new()),
             |m| (m.local.to_string(), m.shared.to_string()),
@@ -354,16 +357,16 @@ impl Form {
             Field::text(
                 "shared",
                 "Shared VLAN",
-                "VLAN ID in the shared network (one of mesh.vlans)",
+                "VLAN ID in the shared network (one of network.vlans)",
                 shared,
             ),
         ];
         Self::new(FormKind::Map(index), title, fields, draft)
     }
 
-    /// Form for the `[mesh]` settings.
-    pub fn mesh(draft: &Draft) -> Self {
-        let m = &draft.mesh;
+    /// Form for the `[network]` settings.
+    pub fn network(draft: &Draft) -> Self {
+        let m = &draft.network;
         let fields = vec![
             vlans_field(&m.vlans),
             Field::text(
@@ -391,13 +394,18 @@ impl Form {
                 m.mss.map(|v| v.to_string()).unwrap_or_default(),
             ),
         ];
-        Self::new(FormKind::Mesh, "Mesh settings (all sites)", fields, draft)
+        Self::new(
+            FormKind::Network,
+            "Network settings (all sites)",
+            fields,
+            draft,
+        )
     }
 
     /// Form for the shared VLANs only.
-    /// Form for the own VLANs of the site `site` (index in the mesh).
+    /// Form for the own VLANs of the site `site` (index in the network).
     pub fn own_vlans(draft: &Draft, site: usize) -> Self {
-        let s = draft.mesh.sites.get(site);
+        let s = draft.network.sites.get(site);
         let name = s.map(|s| s.name.clone()).unwrap_or_default();
         let fields = vec![own_vlans_field(s)];
         Self::new(
@@ -409,19 +417,19 @@ impl Form {
     }
 
     pub fn vlans(draft: &Draft) -> Self {
-        let fields = vec![vlans_field(&draft.mesh.vlans)];
+        let fields = vec![vlans_field(&draft.network.vlans)];
         Self::new(FormKind::Vlans, "VLANs of the network", fields, draft)
     }
 
     /// Form for `local.toml`.
     pub fn local(draft: &Draft, interfaces: &[Interface]) -> Self {
-        let sites: Vec<String> = draft.mesh.sites.iter().map(|s| s.name.clone()).collect();
+        let sites: Vec<String> = draft.network.sites.iter().map(|s| s.name.clone()).collect();
         let own = draft.local.self_name.clone().unwrap_or_default();
         let fields = vec![
             Field::choice(
                 "self",
                 "This site",
-                "which site of the mesh this host is",
+                "which site of the network this host is",
                 sites,
                 &own,
             ),
@@ -438,7 +446,7 @@ impl Form {
     /// Form for the trunk of the tunnel to the site `site` (local.toml).
     pub fn tunnel_trunk(draft: &Draft, site: usize, interfaces: &[Interface]) -> Self {
         let name = draft
-            .mesh
+            .network
             .sites
             .get(site)
             .map(|s| s.name.clone())
@@ -622,11 +630,13 @@ impl Form {
     /// Index of the edited entity in the candidate draft.
     fn index(&self, draft: &Draft) -> Option<usize> {
         match self.kind {
-            FormKind::Site(i) => Some(i.unwrap_or(draft.mesh.sites.len())),
+            FormKind::Site(i) => Some(i.unwrap_or(draft.network.sites.len())),
             FormKind::OwnVlans(i) => Some(i),
-            FormKind::Invite => Some(draft.mesh.sites.len()),
-            FormKind::Map(i) => Some(i.unwrap_or(draft.mesh.maps.len())),
-            FormKind::Mesh | FormKind::Vlans | FormKind::Local | FormKind::TunnelTrunk(_) => None,
+            FormKind::Invite => Some(draft.network.sites.len()),
+            FormKind::Map(i) => Some(i.unwrap_or(draft.network.maps.len())),
+            FormKind::Network | FormKind::Vlans | FormKind::Local | FormKind::TunnelTrunk(_) => {
+                None
+            }
         }
     }
 
@@ -637,7 +647,9 @@ impl Form {
                 Some(FieldPath::site(i))
             }
             FormKind::Map(_) => Some(FieldPath::map(i)),
-            FormKind::Mesh | FormKind::Vlans | FormKind::Local | FormKind::TunnelTrunk(_) => None,
+            FormKind::Network | FormKind::Vlans | FormKind::Local | FormKind::TunnelTrunk(_) => {
+                None
+            }
         }
     }
 
@@ -649,10 +661,14 @@ impl Form {
                 FieldPath::site_field(i, key)
             }
             FormKind::Map(_) => FieldPath::map_field(i, key),
-            FormKind::Mesh | FormKind::Vlans => FieldPath::mesh(key),
+            FormKind::Network | FormKind::Vlans => FieldPath::network(key),
             FormKind::Local => FieldPath::local(key),
             FormKind::TunnelTrunk(site) => {
-                let name = draft.mesh.sites.get(site).map_or("", |s| s.name.as_str());
+                let name = draft
+                    .network
+                    .sites
+                    .get(site)
+                    .map_or("", |s| s.name.as_str());
                 FieldPath::local(&format!("tunnels.{name}.{key}"))
             }
         }
@@ -667,7 +683,7 @@ impl Form {
                 let (managed_by, self_managed) = parse_changes(&self.value("changes"));
                 let uplink = parse_connection(&self.value("uplink"));
                 let own_vlans = self.parse_own_vlans()?;
-                match index.and_then(|i| candidate.mesh.sites.get_mut(i)) {
+                match index.and_then(|i| candidate.network.sites.get_mut(i)) {
                     Some(slot) => {
                         let mut site = site;
                         site.online = slot.online;
@@ -680,7 +696,7 @@ impl Form {
                             candidate.rename_references(&old.name, &site.name);
                         }
                     }
-                    None => candidate.mesh.sites.push(Site {
+                    None => candidate.network.sites.push(Site {
                         managed_by,
                         self_managed,
                         uplink,
@@ -691,36 +707,36 @@ impl Form {
             }
             FormKind::Map(index) => {
                 let map = self.parse_map()?;
-                match index.and_then(|i| candidate.mesh.maps.get_mut(i)) {
+                match index.and_then(|i| candidate.network.maps.get_mut(i)) {
                     Some(slot) => *slot = map,
-                    None => candidate.mesh.maps.push(map),
+                    None => candidate.network.maps.push(map),
                 }
             }
-            FormKind::Mesh => {
+            FormKind::Network => {
                 let vlans = self.parse_vlans();
                 let port = self.parse_port();
                 let interval = self.parse_duration("mtu_probe_interval");
                 let timeout = self.parse_duration("commit_timeout");
                 let mss = self.parse_mss();
                 let vlans = vlans.and_then(|v| self.guard_network_vlans(draft, v));
-                let mesh = &mut candidate.mesh;
-                mesh.vlans = vlans?;
-                mesh.control_port = port?;
-                mesh.mtu_probe_interval = interval?;
-                mesh.commit_timeout = timeout?;
-                mesh.mss = mss?;
+                let network = &mut candidate.network;
+                network.vlans = vlans?;
+                network.control_port = port?;
+                network.mtu_probe_interval = interval?;
+                network.commit_timeout = timeout?;
+                network.mss = mss?;
             }
             FormKind::Vlans => {
                 let vlans = self.parse_vlans()?;
-                candidate.mesh.vlans = self.guard_network_vlans(draft, vlans)?;
+                candidate.network.vlans = self.guard_network_vlans(draft, vlans)?;
             }
             FormKind::Invite => self.build_invite(&mut candidate)?,
             FormKind::OwnVlans(site) => {
                 let own = self.parse_own_vlans()?;
-                candidate.mesh.sites.get_mut(site)?.own_vlans = own;
+                candidate.network.sites.get_mut(site)?.own_vlans = own;
             }
             FormKind::TunnelTrunk(site) => {
-                let name = candidate.mesh.sites.get(site)?.name.clone();
+                let name = candidate.network.sites.get(site)?.name.clone();
                 let trunk = self.value("trunk");
                 if trunk.is_empty() || Some(trunk.as_str()) == candidate.local.trunk.as_deref() {
                     candidate.local.tunnel_trunks.remove(&name);
@@ -796,16 +812,16 @@ impl Form {
         let site_name = if name.is_empty() {
             (1..)
                 .map(|n| format!("new-site{n}"))
-                .find(|n| candidate.mesh.site(n).is_none())
+                .find(|n| candidate.network.site(n).is_none())
                 .unwrap_or_default()
         } else {
             name.to_string()
         };
         let address = (1..=254u8)
             .map(|last| Ipv4Addr::new(192, 0, 2, last))
-            .find(|a| candidate.mesh.sites.iter().all(|s| s.address != *a))
+            .find(|a| candidate.network.sites.iter().all(|s| s.address != *a))
             .unwrap_or(Ipv4Addr::new(198, 51, 100, 1));
-        candidate.mesh.sites.push(Site {
+        candidate.network.sites.push(Site {
             name: site_name.clone(),
             address,
             vlans,
@@ -816,14 +832,14 @@ impl Form {
             self_managed: false,
         });
         if let Some(shared) = native {
-            candidate.mesh.maps.push(VlanMap {
+            candidate.network.maps.push(VlanMap {
                 site: site_name.clone(),
                 local: LocalVid::Native,
                 shared,
             });
         }
         for t in translations {
-            candidate.mesh.maps.push(VlanMap {
+            candidate.network.maps.push(VlanMap {
                 site: site_name.clone(),
                 local: LocalVid::Vid(t.local),
                 shared: t.shared,
@@ -889,7 +905,7 @@ impl Form {
             .unwrap_or_default()
             .to_string();
         if site.is_empty() {
-            self.set_error("site", "the mesh has no sites");
+            self.set_error("site", "the network has no sites");
         }
         let local_text = self.value("local");
         let local = if local_text.eq_ignore_ascii_case("native") {
@@ -925,8 +941,8 @@ impl Form {
     /// (see [`policy`]).
     fn guard_network_vlans(&mut self, draft: &Draft, vlans: VlanSet) -> Option<VlanSet> {
         let me = draft.local.self_name.as_deref().unwrap_or_default();
-        if vlans != draft.mesh.vlans && !policy::may_change_network_vlans(&draft.mesh, me) {
-            self.set_error("vlans", policy::why_not_network(&draft.mesh, me));
+        if vlans != draft.network.vlans && !policy::may_change_network_vlans(&draft.network, me) {
+            self.set_error("vlans", policy::why_not_network(&draft.network, me));
             return None;
         }
         Some(vlans)
@@ -1064,7 +1080,7 @@ fn connection_choices(draft: &Draft, site: Option<&str>) -> Vec<String> {
     let mut choices = vec![SERVER.to_string()];
     choices.extend(
         draft
-            .mesh
+            .network
             .sites
             .iter()
             .filter(|s| Some(s.name.as_str()) != site)
@@ -1184,7 +1200,12 @@ mod tests {
     #[test]
     fn the_changes_field_sets_who_manages_a_site() {
         let d = draft();
-        let haus6 = d.mesh.sites.iter().position(|s| s.name == "haus6").unwrap();
+        let haus6 = d
+            .network
+            .sites
+            .iter()
+            .position(|s| s.name == "haus6")
+            .unwrap();
         let form = Form::site(&d, Some(haus6));
         assert_eq!(form.value("changes"), "only buero");
         assert_eq!(
@@ -1206,7 +1227,7 @@ mod tests {
         press(&mut form, &d, KeyCode::Tab);
         type_text(&mut form, &d, "10.8.0.99");
         let candidate = form.submit(&d).unwrap();
-        let neu = candidate.mesh.site("neu").unwrap();
+        let neu = candidate.network.site("neu").unwrap();
         assert_eq!(neu.managed_by.as_deref(), Some("heim"));
         assert!(!neu.self_managed);
     }
@@ -1214,7 +1235,12 @@ mod tests {
     #[test]
     fn the_connected_to_field_makes_servers_and_clients() {
         let d = draft();
-        let haus6 = d.mesh.sites.iter().position(|s| s.name == "haus6").unwrap();
+        let haus6 = d
+            .network
+            .sites
+            .iter()
+            .position(|s| s.name == "haus6")
+            .unwrap();
         let form = Form::site(&d, Some(haus6));
         assert_eq!(form.value("uplink"), "client of heim");
         let buero = Form::site(&d, Some(1));
@@ -1233,7 +1259,7 @@ mod tests {
         type_text(&mut form, &d, "10.8.0.99");
         let candidate = form.submit(&d).unwrap();
         assert_eq!(
-            candidate.mesh.site("neu").unwrap().uplink.as_deref(),
+            candidate.network.site("neu").unwrap().uplink.as_deref(),
             Some("heim")
         );
     }
@@ -1262,7 +1288,7 @@ mod tests {
         form.focus = 1;
         type_text(&mut form, &d, "10.8.0.14");
         let new = form.submit(&d).expect("valid");
-        let site = new.mesh.site("haus4").unwrap();
+        let site = new.network.site("haus4").unwrap();
         assert_eq!(site.vlans, None);
         assert_eq!(new.errors(), 0);
     }
@@ -1271,7 +1297,7 @@ mod tests {
     fn site_vlans_are_parsed_and_checked_against_mappings() {
         let d = draft();
         // haus3 maps native traffic to VLAN 20 and local 130 to 30.
-        let index = d.mesh.sites.iter().position(|s| s.name == "haus3");
+        let index = d.network.sites.iter().position(|s| s.name == "haus3");
         let mut form = Form::site(&d, index);
         form.focus = 2;
         type_text(&mut form, &d, "x");
@@ -1326,9 +1352,9 @@ mod tests {
     }
 
     #[test]
-    fn mesh_settings_parse_and_validate() {
+    fn network_settings_parse_and_validate() {
         let d = draft();
-        let mut form = Form::mesh(&d);
+        let mut form = Form::network(&d);
         form.focus = 4;
         type_text(&mut form, &d, "100");
         let mss = form.field("mss").unwrap();
@@ -1343,7 +1369,7 @@ mod tests {
         press(&mut form, &d, KeyCode::Backspace);
         type_text(&mut form, &d, "1300");
         let new = form.submit(&d).expect("valid");
-        assert_eq!(new.mesh.mss, Some(1300));
+        assert_eq!(new.network.mss, Some(1300));
     }
 
     #[test]

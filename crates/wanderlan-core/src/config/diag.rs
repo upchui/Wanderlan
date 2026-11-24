@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ConfigFile {
-    /// The shared `mesh.toml`.
-    Mesh,
+    /// The shared `network.toml`.
+    Network,
     /// The site-local `local.toml`.
     Local,
 }
@@ -20,7 +20,7 @@ impl ConfigFile {
     /// Default file name.
     pub const fn file_name(self) -> &'static str {
         match self {
-            Self::Mesh => "mesh.toml",
+            Self::Network => "network.toml",
             Self::Local => "local.toml",
         }
     }
@@ -50,12 +50,12 @@ impl FieldPath {
         Self(String::new())
     }
 
-    /// A key in the `[mesh]` table, or the table itself for `""`.
-    pub fn mesh(field: &str) -> Self {
+    /// A key in the `[network]` table, or the table itself for `""`.
+    pub fn network(field: &str) -> Self {
         if field.is_empty() {
-            Self("mesh".into())
+            Self("network".into())
         } else {
-            Self(format!("mesh.{field}"))
+            Self(format!("network.{field}"))
         }
     }
 
@@ -280,17 +280,17 @@ mod tests {
         assert_eq!(parent.parent().unwrap(), FieldPath::root());
         assert_eq!(FieldPath::root().parent(), None);
         assert_eq!(
-            FieldPath::mesh("vlans").parent().unwrap(),
-            FieldPath::mesh("")
+            FieldPath::network("vlans").parent().unwrap(),
+            FieldPath::network("")
         );
     }
 
     #[test]
     fn display() {
-        let mut d = Diagnostic::error(ConfigFile::Mesh, FieldPath::root(), "boom");
-        assert_eq!(d.to_string(), "mesh.toml: error: boom");
+        let mut d = Diagnostic::error(ConfigFile::Network, FieldPath::root(), "boom");
+        assert_eq!(d.to_string(), "network.toml: error: boom");
         d.line = Some(3);
-        assert_eq!(d.to_string(), "mesh.toml:3: error: boom");
+        assert_eq!(d.to_string(), "network.toml:3: error: boom");
         assert_eq!(
             d.display_with("/etc/x.toml").to_string(),
             "/etc/x.toml:3: error: boom"

@@ -79,14 +79,14 @@ pub fn file_diff(
         .collect()
 }
 
-/// Diff of both configuration files: `mesh.toml` first, then `local.toml`.
+/// Diff of both configuration files: `network.toml` first, then `local.toml`.
 pub fn config_diff(
     old: (&str, &str),
     new: (&str, &str),
     old_label: &str,
     new_label: &str,
 ) -> Vec<DiffLine> {
-    let mut lines = file_diff("mesh.toml", old.0, new.0, old_label, new_label);
+    let mut lines = file_diff("network.toml", old.0, new.0, old_label, new_label);
     lines.push(DiffLine::new(DiffKind::Note, ""));
     lines.extend(file_diff("local.toml", old.1, new.1, old_label, new_label));
     lines
@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn classifies_lines() {
-        let lines = file_diff("mesh.toml", "a\nb\nc\n", "a\nB\nc\n", "running", "draft");
+        let lines = file_diff("network.toml", "a\nb\nc\n", "a\nB\nc\n", "running", "draft");
         let kinds: Vec<DiffKind> = lines.iter().map(|l| l.kind).collect();
         assert_eq!(
             kinds,
@@ -112,8 +112,8 @@ mod tests {
                 DiffKind::Context,
             ]
         );
-        assert_eq!(lines[0].text, "--- mesh.toml (running)");
-        assert_eq!(lines[1].text, "+++ mesh.toml (draft)");
+        assert_eq!(lines[0].text, "--- network.toml (running)");
+        assert_eq!(lines[1].text, "+++ network.toml (draft)");
         assert_eq!(lines[4].text, "-b");
         assert_eq!(lines[5].text, "+B");
     }
@@ -123,7 +123,7 @@ mod tests {
         let lines = config_diff(("m", "l\n"), ("m", "l2\n"), "a", "b");
         assert_eq!(
             lines[0],
-            DiffLine::new(DiffKind::Note, "mesh.toml: unchanged")
+            DiffLine::new(DiffKind::Note, "network.toml: unchanged")
         );
         assert!(lines.iter().any(|l| l.text == "+l2"));
     }

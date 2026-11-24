@@ -86,9 +86,9 @@ pub mod wire {
     /// Configuration state announced with every probe (used by the sync).
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
     pub struct Announce {
-        /// Mesh revision of the sender.
+        /// Network revision of the sender.
         pub revision: u64,
-        /// SHA-256 fingerprint of the sender's mesh.
+        /// SHA-256 fingerprint of the sender's network.
         pub fingerprint: [u8; 32],
     }
 

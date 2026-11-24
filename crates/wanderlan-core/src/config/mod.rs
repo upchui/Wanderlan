@@ -1,6 +1,6 @@
-//! Configuration: `mesh.toml` (shared by all sites) and `local.toml`.
+//! Configuration: `network.toml` (shared by all sites) and `local.toml`.
 //!
-//! Loading happens in two steps: [`parse_mesh`]/[`parse_local`] turn the TOML
+//! Loading happens in two steps: [`parse_network`]/[`parse_local`] turn the TOML
 //! text into the typed model (reporting syntax and type errors with line
 //! numbers), then [`validate`] checks the semantic rules. [`load`] combines
 //! both and attaches line numbers to all diagnostics.
@@ -14,8 +14,8 @@ mod vlan;
 
 pub use diag::{ConfigFile, Diagnostic, FieldPath, LineIndex, Severity, SpanMap, has_errors};
 pub use model::*;
-pub use raw::{ParsedLocal, ParsedMesh, parse_local, parse_mesh};
-pub use render::{fingerprint, render_local, render_mesh, unified_diff};
+pub use raw::{ParsedLocal, ParsedNetwork, parse_local, parse_network};
+pub use render::{fingerprint, render_local, render_network, unified_diff};
 pub use validate::{
     COMMIT_TIMEOUT_RANGE, IFNAME_MAX, MSS_MAX, MSS_MIN, PROBE_INTERVAL_MIN, ifname_error,
     site_name_error, validate,
@@ -25,8 +25,8 @@ pub use vlan::{NATIVE_VID, VID_MAX, VID_MIN, VlanSet, VlanSetError};
 /// A complete, valid configuration of a configured site.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// The shared mesh configuration.
-    pub mesh: Mesh,
+    /// The shared network configuration.
+    pub network: Network,
     /// The local configuration; `self_name` and `trunk` are guaranteed set.
     pub local: Local,
 }
@@ -39,7 +39,7 @@ impl Config {
 
     /// The local site entry.
     pub fn self_site(&self) -> Option<&Site> {
-        self.mesh.site(self.self_name())
+        self.network.site(self.self_name())
     }
 
     /// Name of the trunk interface.
@@ -60,8 +60,8 @@ pub enum Loaded {
     Unconfigured {
         /// Local settings found so far.
         local: Local,
-        /// A mesh, if `mesh.toml` already contains one.
-        mesh: Option<Mesh>,
+        /// A network, if `network.toml` already contains one.
+        network: Option<Network>,
     },
     /// A complete, valid configuration.
     Configured(Config),
@@ -78,10 +78,10 @@ pub struct LoadOutcome {
 
 /// Parses and validates both files. On failure, returns all diagnostics
 /// (errors and warnings) with line numbers.
-pub fn load(mesh_text: &str, local_text: &str) -> Result<LoadOutcome, Vec<Diagnostic>> {
-    let parsed_mesh = parse_mesh(mesh_text);
+pub fn load(network_text: &str, local_text: &str) -> Result<LoadOutcome, Vec<Diagnostic>> {
+    let parsed_network = parse_network(network_text);
     let parsed_local = parse_local(local_text);
-    let (parsed_mesh, parsed_local) = match (parsed_mesh, parsed_local) {
+    let (parsed_network, parsed_local) = match (parsed_network, parsed_local) {
         (Ok(m), Ok(l)) => (m, l),
         (m, l) => {
             let mut diags = Vec::new();
@@ -96,25 +96,25 @@ pub fn load(mesh_text: &str, local_text: &str) -> Result<LoadOutcome, Vec<Diagno
     };
 
     let local = parsed_local.local;
-    let mut diags = match (&parsed_mesh.mesh, local.is_configured()) {
+    let mut diags = match (&parsed_network.network, local.is_configured()) {
         (None, false) => Vec::new(),
         (None, true) => vec![Diagnostic::error(
-            ConfigFile::Mesh,
+            ConfigFile::Network,
             FieldPath::root(),
-            "mesh.toml contains no mesh configuration, but local.toml sets `self`",
+            "network.toml contains no network configuration, but local.toml sets `self`",
         )],
-        (Some(mesh), _) => validate(mesh, Some(&local)),
+        (Some(network), _) => validate(network, Some(&local)),
     };
-    diags.extend(parsed_mesh.warnings.iter().cloned());
-    parsed_mesh.spans.locate(ConfigFile::Mesh, &mut diags);
+    diags.extend(parsed_network.warnings.iter().cloned());
+    parsed_network.spans.locate(ConfigFile::Network, &mut diags);
     parsed_local.spans.locate(ConfigFile::Local, &mut diags);
 
     if has_errors(&diags) {
         return Err(diags);
     }
-    let loaded = match (parsed_mesh.mesh, local.is_configured()) {
-        (Some(mesh), true) => Loaded::Configured(Config { mesh, local }),
-        (mesh, _) => Loaded::Unconfigured { local, mesh },
+    let loaded = match (parsed_network.network, local.is_configured()) {
+        (Some(network), true) => Loaded::Configured(Config { network, local }),
+        (network, _) => Loaded::Unconfigured { local, network },
     };
     Ok(LoadOutcome {
         loaded,
@@ -122,26 +122,26 @@ pub fn load(mesh_text: &str, local_text: &str) -> Result<LoadOutcome, Vec<Diagno
     })
 }
 
-/// Validates a `mesh.toml` text on its own, optionally together with a
+/// Validates a `network.toml` text on its own, optionally together with a
 /// `local.toml` text. Returns all diagnostics with line numbers; the
 /// configuration is valid if none of them is an error.
-pub fn check(mesh_text: &str, local_text: Option<&str>) -> Vec<Diagnostic> {
+pub fn check(network_text: &str, local_text: Option<&str>) -> Vec<Diagnostic> {
     match local_text {
-        Some(local_text) => match load(mesh_text, local_text) {
+        Some(local_text) => match load(network_text, local_text) {
             Ok(outcome) => outcome.warnings,
             Err(diags) => diags,
         },
-        None => match parse_mesh(mesh_text) {
+        None => match parse_network(network_text) {
             Err(diags) => diags,
-            Ok(parsed) => match &parsed.mesh {
+            Ok(parsed) => match &parsed.network {
                 None => vec![Diagnostic::error(
-                    ConfigFile::Mesh,
+                    ConfigFile::Network,
                     FieldPath::root(),
-                    "the file contains no mesh configuration",
+                    "the file contains no network configuration",
                 )],
-                Some(mesh) => {
-                    let mut diags = validate(mesh, None);
-                    parsed.spans.locate(ConfigFile::Mesh, &mut diags);
+                Some(network) => {
+                    let mut diags = validate(network, None);
+                    parsed.spans.locate(ConfigFile::Network, &mut diags);
                     diags.extend(parsed.warnings.iter().cloned());
                     diags
                 }

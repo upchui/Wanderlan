@@ -17,7 +17,7 @@ use wanderlan_core::api::{
     Interface, Invitation, InviteParams, Joined, MacEntry, PeerStatus, PendingChange, PortState,
     Request, ResetReport, SiteState, Status, UnblockParams,
 };
-use wanderlan_core::config::{Diagnostic, has_errors, render_local, render_mesh};
+use wanderlan_core::config::{Diagnostic, has_errors, render_local, render_network};
 use wanderlan_core::policy;
 use wanderlan_core::topology::{self, gretap_name};
 
@@ -47,7 +47,7 @@ pub const URGENT_SECS: u64 = 10;
 pub enum View {
     /// Sites and live peer status.
     Overview,
-    /// Sites, mesh and local settings.
+    /// Sites, network and local settings.
     Sites,
     /// Shared VLANs and mappings.
     Vlans,
@@ -221,8 +221,8 @@ pub enum ReviewState {
 pub struct Review {
     /// Source of the configuration.
     pub origin: Origin,
-    /// `mesh.toml` to apply.
-    pub mesh: String,
+    /// `network.toml` to apply.
+    pub network: String,
     /// `local.toml` to apply.
     pub local: String,
     /// Revision the change is based on.
@@ -863,7 +863,7 @@ impl App {
         if !keep {
             self.draft = Draft::from_running(&running);
         }
-        let configured = running.mesh.is_some();
+        let configured = running.network.is_some();
         self.running = Some(running);
         self.clamp_selection();
         if configured && std::mem::take(&mut self.invite_after_setup) {
@@ -933,7 +933,7 @@ impl App {
             self.say(
                 MessageKind::Success,
                 format!(
-                    "Confirmed: mesh revision {} is in effect.",
+                    "Confirmed: network revision {} is in effect.",
                     confirmed.revision
                 ),
             );
@@ -1005,13 +1005,13 @@ impl App {
     pub fn restricted_by(&self) -> Option<String> {
         let running = self.running.as_ref()?;
         let me = running.local.self_name.as_deref()?;
-        policy::restricted_by(running.mesh.as_ref()?, me).map(str::to_string)
+        policy::restricted_by(running.network.as_ref()?, me).map(str::to_string)
     }
 
     /// True if this site may change the rules of `site` (VLANs, mappings,
     /// online); otherwise says who may.
     fn may_change(&mut self, site: &str) -> bool {
-        let Some(running) = self.running.as_ref().and_then(|r| r.mesh.as_ref()) else {
+        let Some(running) = self.running.as_ref().and_then(|r| r.network.as_ref()) else {
             return true;
         };
         let Some(entry) = running.site(site) else {
@@ -1036,14 +1036,15 @@ impl App {
         let Some(running) = self.running.as_ref() else {
             return true;
         };
-        let (Some(mesh), Some(me)) = (running.mesh.as_ref(), running.local.self_name.as_deref())
+        let (Some(network), Some(me)) =
+            (running.network.as_ref(), running.local.self_name.as_deref())
         else {
             return true;
         };
-        if policy::may_change_network_vlans(mesh, me) {
+        if policy::may_change_network_vlans(network, me) {
             return true;
         }
-        let text = policy::why_not_network(mesh, me);
+        let text = policy::why_not_network(network, me);
         self.say(MessageKind::Error, text);
         false
     }
@@ -1053,7 +1054,7 @@ impl App {
         let Some(name) = self
             .draft
             .as_ref()
-            .and_then(|d| d.mesh.sites.get(self.sites_selected))
+            .and_then(|d| d.network.sites.get(self.sites_selected))
             .map(|s| s.name.clone())
         else {
             return;
@@ -1062,7 +1063,7 @@ impl App {
             return;
         }
         let Some(draft) = &mut self.draft else { return };
-        let Some(site) = draft.mesh.sites.iter_mut().find(|s| s.name == name) else {
+        let Some(site) = draft.network.sites.iter_mut().find(|s| s.name == name) else {
             return;
         };
         site.online = !site.online;
@@ -1160,8 +1161,10 @@ impl App {
         if let Some(d) = &self.draft {
             self.sites_selected = self
                 .sites_selected
-                .min(d.mesh.sites.len().saturating_sub(1));
-            self.maps_selected = self.maps_selected.min(d.mesh.maps.len().saturating_sub(1));
+                .min(d.network.sites.len().saturating_sub(1));
+            self.maps_selected = self
+                .maps_selected
+                .min(d.network.maps.len().saturating_sub(1));
         }
     }
 
@@ -1337,9 +1340,9 @@ impl App {
             return;
         }
         if let Some(running) = &self.running
-            && let Some(old) = &running.mesh
+            && let Some(old) = &running.network
             && let Some(me) = &running.local.self_name
-            && let Err(e) = policy::check_edit(old, &draft.mesh, me)
+            && let Err(e) = policy::check_edit(old, &draft.network, me)
         {
             self.say(MessageKind::Error, e);
             return;
@@ -1347,10 +1350,10 @@ impl App {
         let Some(draft) = &self.draft else { return };
         self.modal = Some(Modal::Review(Review {
             origin: Origin::Draft,
-            mesh: draft.mesh_text(),
+            network: draft.network_text(),
             local: draft.local_text(),
             base_revision: draft.base_revision,
-            commit_timeout: draft.mesh.commit_timeout,
+            commit_timeout: draft.network.commit_timeout,
             lines: draft.diff(self.running.as_ref()),
             problems: draft.diagnostics.clone(),
             scroll: 0,
@@ -1481,10 +1484,10 @@ impl App {
                 if let Some(new) = form.submit(draft) {
                     match form.kind {
                         FormKind::Site(None) => {
-                            self.sites_selected = new.mesh.sites.len().saturating_sub(1);
+                            self.sites_selected = new.network.sites.len().saturating_sub(1);
                         }
                         FormKind::Map(None) => {
-                            self.maps_selected = new.mesh.maps.len().saturating_sub(1);
+                            self.maps_selected = new.network.maps.len().saturating_sub(1);
                         }
                         _ => {}
                     }
@@ -1508,7 +1511,7 @@ impl App {
         let FormKind::TunnelTrunk(site) = form.kind else {
             return None;
         };
-        let peer = self.draft.as_ref()?.mesh.sites.get(site)?;
+        let peer = self.draft.as_ref()?.network.sites.get(site)?;
         let trunk = form.field("trunk")?.value().trim().to_string();
         let route = hostinfo::route_interface(peer.address)?;
         (route == trunk).then(|| {
@@ -1559,7 +1562,7 @@ impl App {
         self.busy = Some(Busy::Applying);
         fx.push(Effect::Request(Request::Apply(ApplyParams {
             config: ConfigInput {
-                mesh: review.mesh.clone(),
+                network: review.network.clone(),
                 local: review.local.clone(),
             },
             base_revision: Some(review.base_revision),
@@ -1626,18 +1629,18 @@ impl App {
         if self.blocked_by_pending() {
             return;
         }
-        let (mesh, local) = match self.wizard.build(&self.interfaces) {
+        let (network, local) = match self.wizard.build(&self.interfaces) {
             Ok(built) => built,
             Err(e) => {
                 self.wizard.error = Some(e);
                 return;
             }
         };
-        let (mesh_text, local_text) = (render_mesh(&mesh), render_local(&local));
-        let (old_mesh, old_local) = self
+        let (network_text, local_text) = (render_network(&network), render_local(&local));
+        let (old_network, old_local) = self
             .running
             .as_ref()
-            .map(|r| (r.mesh_text(), r.local_text()))
+            .map(|r| (r.network_text(), r.local_text()))
             .unwrap_or_default();
         let base_revision = self
             .running
@@ -1648,16 +1651,16 @@ impl App {
         self.modal = Some(Modal::Review(Review {
             origin: Origin::Wizard,
             lines: diff::config_diff(
-                (&old_mesh, &old_local),
-                (&mesh_text, &local_text),
+                (&old_network, &old_local),
+                (&network_text, &local_text),
                 "running",
                 "setup",
             ),
-            mesh: mesh_text,
+            network: network_text,
             local: local_text,
             base_revision,
-            commit_timeout: mesh.commit_timeout,
-            problems: wanderlan_core::config::validate(&mesh, Some(&local)),
+            commit_timeout: network.commit_timeout,
+            problems: wanderlan_core::config::validate(&network, Some(&local)),
             scroll: 0,
             state: ReviewState::Ready,
         }));
@@ -1719,7 +1722,7 @@ impl App {
                         let mut form = if row.local {
                             Form::local(draft, &self.interfaces)
                         } else {
-                            Form::mesh(draft)
+                            Form::network(draft)
                         };
                         form.focus_on(row.key);
                         self.modal = Some(Modal::Form(form));
@@ -1767,7 +1770,7 @@ impl App {
         let selected_site = self
             .draft
             .as_ref()
-            .and_then(|d| d.mesh.sites.get(self.sites_selected))
+            .and_then(|d| d.network.sites.get(self.sites_selected))
             .map(|s| s.name.clone());
         let edits = matches!(
             key.code,
@@ -1784,9 +1787,9 @@ impl App {
             return;
         };
         let selected = self.sites_selected;
-        let count = draft.mesh.sites.len();
+        let count = draft.network.sites.len();
         // Up/Down follow the tree shown (servers with their clients below).
-        let order: Vec<usize> = topology::tree_order(&draft.mesh)
+        let order: Vec<usize> = topology::tree_order(&draft.network)
             .into_iter()
             .map(|(i, _)| i)
             .collect();
@@ -1808,7 +1811,7 @@ impl App {
             KeyCode::Enter | KeyCode::Char('e') if selected < count => {
                 self.modal = Some(Modal::Form(Form::site(draft, Some(selected))));
             }
-            KeyCode::Char('m') => self.modal = Some(Modal::Form(Form::mesh(draft))),
+            KeyCode::Char('m') => self.modal = Some(Modal::Form(Form::network(draft))),
             KeyCode::Char('i') => self.invite(),
             KeyCode::Char('I') => self.show_invites(fx),
             KeyCode::Char('o') if selected < count => self.toggle_online(),
@@ -1817,7 +1820,7 @@ impl App {
                 self.request_interfaces(fx);
             }
             KeyCode::Char('d') | KeyCode::Delete if selected < count => {
-                let Some(site) = draft.mesh.sites.get(selected) else {
+                let Some(site) = draft.network.sites.get(selected) else {
                     return;
                 };
                 if draft.local.self_name.as_deref() == Some(site.name.as_str()) {
@@ -1828,7 +1831,7 @@ impl App {
                     self.say(MessageKind::Error, text);
                     return;
                 }
-                let maps = draft.mesh.maps_of(&site.name).count();
+                let maps = draft.network.maps_of(&site.name).count();
                 let extra = if maps > 0 {
                     format!(" Its {maps} VLAN mapping(s) are removed too.")
                 } else {
@@ -1842,7 +1845,7 @@ impl App {
             }
             KeyCode::Char('u') if selected < count => {
                 let port = draft
-                    .mesh
+                    .network
                     .sites
                     .get(selected)
                     .map(|s| gretap_name(&s.name))
@@ -1865,7 +1868,7 @@ impl App {
         let selected_map_site = self
             .draft
             .as_ref()
-            .and_then(|d| d.mesh.maps.get(self.maps_selected))
+            .and_then(|d| d.network.maps.get(self.maps_selected))
             .map(|m| m.site.clone());
         let edits = matches!(
             key.code,
@@ -1882,7 +1885,7 @@ impl App {
             return;
         };
         let selected = self.maps_selected;
-        let count = draft.mesh.maps.len();
+        let count = draft.network.maps.len();
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.maps_selected = selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => {
@@ -1899,7 +1902,7 @@ impl App {
                 // Its own VLANs: always this site's own business.
                 let me = draft.local.self_name.as_deref();
                 match draft
-                    .mesh
+                    .network
                     .sites
                     .iter()
                     .position(|s| Some(s.name.as_str()) == me)

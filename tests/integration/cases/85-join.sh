@@ -36,7 +36,7 @@ check "no bridge and no tunnels are left" x site5 "! ip link show br0 2>/dev/nul
 check "no nftables table is left" x site5 "! nft list table bridge wanderlan 2>/dev/null"
 check "no tc rules are left on the trunk" x site5 "[ -z \"\$(tc filter show dev trunk0 ingress 2>/dev/null)\" ]"
 check "the configuration files are the package templates again" \
-  x site5 "grep -q 'This site is not configured yet' /etc/wanderlan/mesh.toml && grep -q 'not configured yet' /etc/wanderlan/local.toml && ! grep -q '^self' /etc/wanderlan/local.toml"
+  x site5 "grep -q 'This site is not configured yet' /etc/wanderlan/network.toml && grep -q 'not configured yet' /etc/wanderlan/local.toml && ! grep -q '^self' /etc/wanderlan/local.toml"
 check "the state is gone" x site5 "[ ! -e /var/lib/wanderlan/confirmed ]"
 check "the state directory itself stays (systemd's StateDirectory)" x site5 "[ -d /var/lib/wanderlan ]"
 check "a second reset changes nothing and succeeds" x site5 "wanderlan reset --yes"
@@ -45,10 +45,10 @@ begin "Reset: a new network while the old one still lists this site"
 
 # The other sites still list site5 and probe it with a newer revision; that
 # must not block a new network on site5 (it did: stale announcements).
-x site5 "printf '[mesh]\n\n[[site]]\nname = \"solo\"\naddress = \"10.100.13.10\"\n' > /tmp/solo-mesh.toml"
+x site5 "printf '[network]\n\n[[site]]\nname = \"solo\"\naddress = \"10.100.13.10\"\n' > /tmp/solo-network.toml"
 x site5 "printf 'self = \"solo\"\ntrunk = \"trunk0\"\n' > /tmp/solo-local.toml"
 check "site5 starts its own network" \
-  x site5 "wanderlan apply --mesh /tmp/solo-mesh.toml --local /tmp/solo-local.toml >/dev/null && wanderlan confirm >/dev/null"
+  x site5 "wanderlan apply --network /tmp/solo-network.toml --local /tmp/solo-local.toml >/dev/null && wanderlan confirm >/dev/null"
 check "site5 runs its own network" \
   test "$(jqs site5 '"\(.state) \(.site) \(.sites | length)"')" = "running solo 1"
 check "site5 ignores the probes of its old network" \
@@ -56,9 +56,9 @@ check "site5 ignores the probes of its old network" \
 check "and resets again" x site5 "wanderlan reset --yes"
 
 # The other sites remove site5 (and its VLAN mappings).
-mesh_toml "10-50" site1 site2 site3 site4 >"$RUN_DIR/mesh-4.toml"
-put site1 /tmp/mesh-4.toml <"$RUN_DIR/mesh-4.toml"
-x site1 "wanderlan apply --mesh /tmp/mesh-4.toml >/dev/null && wanderlan confirm >/dev/null"
+network_toml "10-50" site1 site2 site3 site4 >"$RUN_DIR/network-4.toml"
+put site1 /tmp/network-4.toml <"$RUN_DIR/network-4.toml"
+x site1 "wanderlan apply --network /tmp/network-4.toml >/dev/null && wanderlan confirm >/dev/null"
 rev=$(jqs site1 .revision)
 for s in site2 site3 site4; do
   wait_eq 60 "$s has 4 sites (revision $rev)" "$rev 4" jqs "$s" '"\(.revision) \(.sites | length)"'
@@ -86,8 +86,8 @@ for s in site1 site2 site3 site4; do
 done
 wait_eq 60 "site5 knows only site2 and itself (revision $rev)" "$rev site2 site5" \
   jqs site5 '"\(.revision) \([.sites[].name] | sort | join(" "))"'
-check "site5's mesh.toml names no other site" \
-  x site5 "! grep -qE 'name = \"site(1|3|4)\"' /etc/wanderlan/mesh.toml && grep -q 'name = \"site2\"' /etc/wanderlan/mesh.toml"
+check "site5's network.toml names no other site" \
+  x site5 "! grep -qE 'name = \"site(1|3|4)\"' /etc/wanderlan/network.toml && grep -q 'name = \"site2\"' /etc/wanderlan/network.toml"
 check "site5 sees site2 as its server" \
   test "$(jqs site5 '.sites[] | select(.name == "site2") | .uplink')" = null
 check "site2 confirmed the new site automatically" test "$(jqs site2 .pending)" = null
@@ -97,8 +97,8 @@ check "the invitation is used up" x site2 "! wanderlan invite list | grep -q '$c
 check "site2's log tells who joined" x site2 "wanderlan log | grep -q 'Site \"site5\" joined the network'"
 wait_for 30 "site5 is a client of site2: its only tunnel leads there" \
   x site5 "[ \"\$(ip -j link show master br0 | jq -r '[.[].ifname | select(startswith(\"gt-\"))] | join(\" \")')\" = gt-site2 ]"
-check "the mesh says so (uplink)" \
-  test "$(x site2 "grep -A8 'name = \"site5\"' /etc/wanderlan/mesh.toml | grep -c 'uplink = \"site2\"'")" = 1
+check "the network says so (uplink)" \
+  test "$(x site2 "grep -A8 'name = \"site5\"' /etc/wanderlan/network.toml | grep -c 'uplink = \"site2\"'")" = 1
 check "site1 shows site5 as a client of site2, reached via site2" \
   test "$(jqs site1 '.sites[] | select(.name == "site5") | "\(.uplink) \(.via) \(.direct)"')" = "site2 site2 false"
 check "site1 and site3 have no tunnel to site5" \
@@ -108,7 +108,7 @@ check "the client port at site2 is not isolated, the server ports are" \
 check "site5 got the rules of the invitation (untagged is VLAN 20)" \
   test "$(vlan_summary site5 trunk0)" = "10-19,20:pu,21-50"
 check "site5 is managed by site2" \
-  test "$(x site2 "grep -A6 'name = \"site5\"' /etc/wanderlan/mesh.toml | grep -c 'managed_by = \"site2\"'")" = 1
+  test "$(x site2 "grep -A6 'name = \"site5\"' /etc/wanderlan/network.toml | grep -c 'managed_by = \"site2\"'")" = 1
 
 begin "Online/offline: a new site starts offline until it is taken online"
 
@@ -138,15 +138,15 @@ expect_ping c-site3 10.20.0.13 "VLAN 20: site3's client reaches the new site (th
 client_vlan c-site1 45 10.45.0.1/24
 client_vlan c-site5 45 10.45.0.13/24
 expect_ping c-site5 10.45.0.1 "VLAN 45: site5 reaches site1 while site2 has VLAN 45"
-x site2 "sed '/^name = \"site2\"\$/a vlans = \"10-40\"' /etc/wanderlan/mesh.toml > /tmp/site2-vlans.toml"
+x site2 "sed '/^name = \"site2\"\$/a vlans = \"10-40\"' /etc/wanderlan/network.toml > /tmp/site2-vlans.toml"
 check "site2 limits itself to VLANs 10-40" \
-  x site2 "wanderlan apply --mesh /tmp/site2-vlans.toml >/dev/null && wanderlan confirm >/dev/null"
+  x site2 "wanderlan apply --network /tmp/site2-vlans.toml >/dev/null && wanderlan confirm >/dev/null"
 wait_eq 30 "the tunnel site2-site5 no longer carries VLAN 45" "10-40" vlan_summary site2 gt-site5
 expect_no_ping c-site5 10.45.0.1 "VLAN 45: no way from site5 to site1 without site2"
 # The daemon writes the file in canonical order (name, address, vlans, ...).
-x site2 "sed '/^name = \"site2\"\$/,/^\[/{/^vlans = \"10-40\"\$/d;}' /etc/wanderlan/mesh.toml > /tmp/site2-all.toml"
+x site2 "sed '/^name = \"site2\"\$/,/^\[/{/^vlans = \"10-40\"\$/d;}' /etc/wanderlan/network.toml > /tmp/site2-all.toml"
 check "site2 takes part in all VLANs again" \
-  x site2 "wanderlan apply --mesh /tmp/site2-all.toml >/dev/null && wanderlan confirm >/dev/null"
+  x site2 "wanderlan apply --network /tmp/site2-all.toml >/dev/null && wanderlan confirm >/dev/null"
 expect_ping c-site5 10.45.0.1 "VLAN 45: site5 reaches site1 again"
 client_vlan_del c-site1 45
 client_vlan_del c-site5 45
@@ -165,15 +165,15 @@ begin "Permissions: a joined site changes no VLANs unless it is released"
 
 rev=$(jqs site2 .revision)
 wait_eq 60 "site5 has revision $rev" "$rev" jqs site5 .revision
-x site5 "sed 's/^vlans = .*/vlans = \"10-40\"/' /etc/wanderlan/mesh.toml > /tmp/net-vlans.toml"
-out=$(x site5 "wanderlan apply --mesh /tmp/net-vlans.toml" 2>&1)
+x site5 "sed 's/^vlans = .*/vlans = \"10-40\"/' /etc/wanderlan/network.toml > /tmp/net-vlans.toml"
+out=$(x site5 "wanderlan apply --network /tmp/net-vlans.toml" 2>&1)
 if grep -q 'may not change the VLANs of the network' <<<"$out" && grep -q 'managed by "site2"' <<<"$out"; then
   pass "site5 may not change the network's VLANs"
 else
   fail "unexpected output when site5 changes the network's VLANs: $out"
 fi
-x site5 "sed '/^name = \"site2\"\$/a vlans = \"20\"' /etc/wanderlan/mesh.toml > /tmp/site2-vlans.toml"
-out=$(x site5 "wanderlan apply --mesh /tmp/site2-vlans.toml" 2>&1)
+x site5 "sed '/^name = \"site2\"\$/a vlans = \"20\"' /etc/wanderlan/network.toml > /tmp/site2-vlans.toml"
+out=$(x site5 "wanderlan apply --network /tmp/site2-vlans.toml" 2>&1)
 if grep -q 'is a client of "site2": it may only change itself and its own clients' <<<"$out"; then
   pass "site5 may not change its server site2"
 else
@@ -238,9 +238,9 @@ begin "Sync: a server refuses a change of its client"
 
 # site5 (a client of site2) adds a client of its own named like a site it
 # does not see: valid on site5, but the name is taken in the network.
-x site5 "printf '\n[[site]]\nname = \"site1\"\naddress = \"10.100.99.10\"\nuplink = \"site5\"\n' | cat /etc/wanderlan/mesh.toml - > /tmp/taken-name.toml"
+x site5 "printf '\n[[site]]\nname = \"site1\"\naddress = \"10.100.99.10\"\nuplink = \"site5\"\n' | cat /etc/wanderlan/network.toml - > /tmp/taken-name.toml"
 check "site5 adds a client named \"site1\"" \
-  x site5 "wanderlan apply --mesh /tmp/taken-name.toml >/dev/null && wanderlan confirm >/dev/null"
+  x site5 "wanderlan apply --network /tmp/taken-name.toml >/dev/null && wanderlan confirm >/dev/null"
 wait_for 15 "site2 marks the change of site5 as refused" \
   x site2 "wanderlan status --json | jq -e '.peers[] | select(.name == \"site5\") | .refused | test(\"already used\")'"
 check "site2's log says why" \

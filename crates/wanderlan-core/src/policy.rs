@@ -20,7 +20,7 @@
 //! edited files). It is an agreement between the daemons, not a
 //! cryptographic protection.
 
-use crate::config::{Mesh, Site, VlanMap};
+use crate::config::{Network, Site, VlanMap};
 
 /// The parts of a site that only its managers may change.
 #[derive(Debug, PartialEq, Eq)]
@@ -34,8 +34,8 @@ struct Rules<'a> {
     maps: Vec<&'a VlanMap>,
 }
 
-fn rules<'a>(mesh: &'a Mesh, site: &'a Site) -> Rules<'a> {
-    let mut maps: Vec<&VlanMap> = mesh.maps_of(&site.name).collect();
+fn rules<'a>(network: &'a Network, site: &'a Site) -> Rules<'a> {
+    let mut maps: Vec<&VlanMap> = network.maps_of(&site.name).collect();
     maps.sort_by_key(|m| (m.local, m.shared));
     Rules {
         address: site.address,
@@ -49,51 +49,51 @@ fn rules<'a>(mesh: &'a Mesh, site: &'a Site) -> Rules<'a> {
 }
 
 /// The manager of `site` if it is still part of the network.
-pub fn manager<'a>(mesh: &Mesh, site: &'a Site) -> Option<&'a str> {
+pub fn manager<'a>(network: &Network, site: &'a Site) -> Option<&'a str> {
     site.managed_by
         .as_deref()
-        .filter(|m| mesh.site(m).is_some())
+        .filter(|m| network.site(m).is_some())
 }
 
 /// The site that manages `editor` if `editor` is restricted (joined with an
 /// invitation and not allowed to manage itself). A site that is managed by
 /// itself ("only alex may change alex") is never restricted.
-pub fn restricted_by<'a>(mesh: &'a Mesh, editor: &str) -> Option<&'a str> {
-    let site = mesh.site(editor)?;
+pub fn restricted_by<'a>(network: &'a Network, editor: &str) -> Option<&'a str> {
+    let site = network.site(editor)?;
     if site.self_managed {
         return None;
     }
-    manager(mesh, site).filter(|m| *m != editor)
+    manager(network, site).filter(|m| *m != editor)
 }
 
-/// True if `editor` may change the rules of `site` in `mesh`.
-pub fn may_change(mesh: &Mesh, site: &Site, editor: &str) -> bool {
+/// True if `editor` may change the rules of `site` in `network`.
+pub fn may_change(network: &Network, site: &Site, editor: &str) -> bool {
     // A client only changes itself and its own clients, never its server.
-    if client_of(mesh, editor).is_some()
+    if client_of(network, editor).is_some()
         && site.name != editor
         && site.uplink.as_deref() != Some(editor)
     {
         return false;
     }
-    match manager(mesh, site) {
+    match manager(network, site) {
         Some(m) => editor == m || (editor == site.name && site.self_managed),
-        None => restricted_by(mesh, editor).is_none(),
+        None => restricted_by(network, editor).is_none(),
     }
 }
 
 /// The site `editor` is a client of, if it is a client.
-pub fn client_of<'a>(mesh: &'a Mesh, editor: &str) -> Option<&'a str> {
-    mesh.site(editor)?.uplink.as_deref()
+pub fn client_of<'a>(network: &'a Network, editor: &str) -> Option<&'a str> {
+    network.site(editor)?.uplink.as_deref()
 }
 
-/// True if `editor` may change the VLANs of the network (`mesh.vlans`).
-pub fn may_change_network_vlans(mesh: &Mesh, editor: &str) -> bool {
-    restricted_by(mesh, editor).is_none()
+/// True if `editor` may change the VLANs of the network (`network.vlans`).
+pub fn may_change_network_vlans(network: &Network, editor: &str) -> bool {
+    restricted_by(network, editor).is_none()
 }
 
 /// Explains who may change `site`, for displays.
-pub fn managers(mesh: &Mesh, site: &Site) -> String {
-    match (manager(mesh, site), site.self_managed) {
+pub fn managers(network: &Network, site: &Site) -> String {
+    match (manager(network, site), site.self_managed) {
         (None, _) => "every site that is not managed by another".into(),
         (Some(m), false) => format!("only \"{m}\""),
         (Some(m), true) => format!("\"{m}\" and \"{}\" itself", site.name),
@@ -101,8 +101,8 @@ pub fn managers(mesh: &Mesh, site: &Site) -> String {
 }
 
 /// Short form for tables: `anyone`, `a`, `a+self`.
-pub fn managed_label(mesh: &Mesh, site: &Site) -> String {
-    match (manager(mesh, site), site.self_managed) {
+pub fn managed_label(network: &Network, site: &Site) -> String {
+    match (manager(network, site), site.self_managed) {
         (None, _) => "anyone".into(),
         (Some(m), false) => m.to_string(),
         (Some(m), true) => format!("{m}+self"),
@@ -111,9 +111,9 @@ pub fn managed_label(mesh: &Mesh, site: &Site) -> String {
 
 /// Why `editor` may not `what` (change, remove) `site`; only meaningful if
 /// it may not.
-pub fn why_not(mesh: &Mesh, site: &Site, editor: &str, what: &str) -> String {
+pub fn why_not(network: &Network, site: &Site, editor: &str, what: &str) -> String {
     let name = &site.name;
-    if let Some(up) = client_of(mesh, editor)
+    if let Some(up) = client_of(network, editor)
         && site.name != editor
         && site.uplink.as_deref() != Some(editor)
     {
@@ -121,8 +121,8 @@ pub fn why_not(mesh: &Mesh, site: &Site, editor: &str, what: &str) -> String {
             "this site (\"{editor}\") is a client of \"{up}\": it may only change itself and its own clients, not {what} site \"{name}\""
         );
     }
-    if let Some(m) = restricted_by(mesh, editor)
-        && manager(mesh, site) != Some(editor)
+    if let Some(m) = restricted_by(network, editor)
+        && manager(network, site) != Some(editor)
     {
         return format!(
             "this site (\"{editor}\") may not {what} site \"{name}\": {}",
@@ -131,13 +131,13 @@ pub fn why_not(mesh: &Mesh, site: &Site, editor: &str, what: &str) -> String {
     }
     format!(
         "this site (\"{editor}\") may not {what} site \"{name}\": its VLANs, mappings and online state are managed by {}; make the change there",
-        managers(mesh, site)
+        managers(network, site)
     )
 }
 
 /// Why `editor` may not change the network's VLANs; empty if it may.
-pub fn why_not_network(mesh: &Mesh, editor: &str) -> String {
-    restricted_by(mesh, editor).map_or_else(String::new, |m| {
+pub fn why_not_network(network: &Network, editor: &str) -> String {
+    restricted_by(network, editor).map_or_else(String::new, |m| {
         format!(
             "this site (\"{editor}\") may not change the VLANs of the network: {}",
             restricted_reason(m)
@@ -153,7 +153,7 @@ fn restricted_reason(manager: &str) -> String {
 
 /// Checks that `editor` only changes what it may: the network's VLANs, and
 /// every site of `old` whose rules differ in `new` (or that is gone).
-pub fn check_edit(old: &Mesh, new: &Mesh, editor: &str) -> Result<(), String> {
+pub fn check_edit(old: &Network, new: &Network, editor: &str) -> Result<(), String> {
     if old.vlans != new.vlans && !may_change_network_vlans(old, editor) {
         return Err(why_not_network(old, editor));
     }
@@ -213,20 +213,20 @@ mod tests {
         }
     }
 
-    fn mesh() -> Mesh {
-        let mut mesh = Mesh::new(VlanSet::all());
-        mesh.sites = vec![
+    fn network() -> Network {
+        let mut network = Network::new(VlanSet::all());
+        network.sites = vec![
             site("a", 1, None, false),
             site("b", 2, None, false),
             site("c", 3, Some("a"), false),
             site("d", 4, Some("a"), true),
         ];
-        mesh
+        network
     }
 
     #[test]
     fn only_the_inviting_site_changes_an_invited_site() {
-        let old = mesh();
+        let old = network();
         let mut new = old.clone();
         new.sites[2].vlans = Some(VlanSet::from_range(10, 20));
         assert!(check_edit(&old, &new, "a").is_ok());
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn a_self_managed_site_changes_itself() {
-        let old = mesh();
+        let old = network();
         let mut new = old.clone();
         new.sites[3].online = false;
         assert!(check_edit(&old, &new, "d").is_ok());
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn mappings_removal_and_management_are_protected() {
-        let old = mesh();
+        let old = network();
         let mut new = old.clone();
         new.maps.push(VlanMap {
             site: "c".into(),
@@ -275,7 +275,7 @@ mod tests {
 
     #[test]
     fn open_sites_and_network_settings_are_open_to_unrestricted_sites() {
-        let old = mesh();
+        let old = network();
         let mut new = old.clone();
         new.sites[1].vlans = Some(VlanSet::from_range(30, 30));
         new.commit_timeout = std::time::Duration::from_secs(120);
@@ -300,7 +300,7 @@ mod tests {
 
     #[test]
     fn a_restricted_site_changes_no_vlan_rules() {
-        let old = mesh();
+        let old = network();
         assert_eq!(restricted_by(&old, "c"), Some("a"));
         assert_eq!(restricted_by(&old, "d"), None, "released");
         assert_eq!(restricted_by(&old, "a"), None);
@@ -329,7 +329,7 @@ mod tests {
 
     #[test]
     fn a_restricted_site_manages_the_sites_it_invited() {
-        let mut old = mesh();
+        let mut old = network();
         old.sites.push(site("e", 5, Some("c"), false));
         let mut new = old.clone();
         new.sites[4].online = false;
@@ -342,7 +342,7 @@ mod tests {
 
     #[test]
     fn labels_and_messages() {
-        let m = mesh();
+        let m = network();
         assert_eq!(managed_label(&m, &m.sites[0]), "anyone");
         assert_eq!(managed_label(&m, &m.sites[2]), "a");
         assert_eq!(managed_label(&m, &m.sites[3]), "a+self");
@@ -354,7 +354,7 @@ mod tests {
 
     #[test]
     fn a_client_changes_only_itself_and_its_own_clients() {
-        let mut old = mesh();
+        let mut old = network();
         // d is a client of a (released, so its VLANs are its own), e a client of d.
         old.sites[3].uplink = Some("a".into());
         old.sites.push(Site {
@@ -383,7 +383,7 @@ mod tests {
 
     #[test]
     fn a_restricted_site_sets_its_own_vlans() {
-        let old = mesh();
+        let old = network();
         assert_eq!(restricted_by(&old, "c"), Some("a"));
         let mut new = old.clone();
         new.sites[2].own_vlans = Some(VlanSet::from_range(60, 60));
@@ -398,7 +398,7 @@ mod tests {
 
     #[test]
     fn a_site_managed_by_itself_is_not_restricted() {
-        let mut old = mesh();
+        let mut old = network();
         old.sites[0].managed_by = Some("a".into());
         assert_eq!(restricted_by(&old, "a"), None);
         assert!(may_change_network_vlans(&old, "a"));

@@ -30,7 +30,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     if lines.is_empty() {
         // Conflicts elsewhere in the table are shown right away, not only
         // when their row is selected.
-        let paths: Vec<FieldPath> = (0..draft.mesh.maps.len()).map(FieldPath::map).collect();
+        let paths: Vec<FieldPath> = (0..draft.network.maps.len()).map(FieldPath::map).collect();
         lines = paths
             .iter()
             .flat_map(|p| draft.within(p))
@@ -49,8 +49,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_vlans(frame: &mut Frame, draft: &Draft, restricted_by: Option<&str>, area: Rect) {
-    let path = FieldPath::mesh("vlans");
-    let vlans = &draft.mesh.vlans;
+    let path = FieldPath::network("vlans");
+    let vlans = &draft.network.vlans;
     let mut lines = vec![Line::from(vec![
         Span::styled(
             format!(" {vlans}"),
@@ -79,12 +79,12 @@ fn draw_vlans(frame: &mut Frame, draft: &Draft, restricted_by: Option<&str>, are
     // The own VLANs of this site: always its own business.
     let me = draft.local.self_name.as_deref().unwrap_or_default();
     let own = draft
-        .mesh
+        .network
         .site(me)
         .and_then(|s| s.own_vlans.as_ref())
         .map_or_else(|| "none".to_string(), ToString::to_string);
     let up = draft
-        .mesh
+        .network
         .site(me)
         .and_then(|s| s.uplink.as_deref())
         .map_or_else(String::new, |u| format!(", never to {u}"));
@@ -119,7 +119,7 @@ fn effect(map: &VlanMap) -> String {
 fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
     let header = Row::new(vec!["#", "SITE", "LOCAL", "SHARED", "MEANING"]).style(theme::header());
     let rows: Vec<Row> = draft
-        .mesh
+        .network
         .maps
         .iter()
         .enumerate()
@@ -129,7 +129,7 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
                 Cell::from(format!("{}", i + 1)),
                 marked(
                     draft
-                        .mesh
+                        .network
                         .site(&map.site)
                         .map_or_else(|| map.site.clone(), format::site_with_kind),
                     at("site"),
@@ -149,16 +149,16 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         Constraint::Length(8),
         Constraint::Min(10),
     ];
-    let errors = (0..draft.mesh.maps.len())
+    let errors = (0..draft.network.maps.len())
         .filter(|&i| draft.worst_within(&FieldPath::map(i)) == Some(Severity::Error))
         .count();
     let title = if errors > 0 {
         format!(
             " VLAN mappings: {} ({errors} with conflicts) ",
-            draft.mesh.maps.len()
+            draft.network.maps.len()
         )
     } else {
-        format!(" VLAN mappings: {} ", draft.mesh.maps.len())
+        format!(" VLAN mappings: {} ", draft.network.maps.len())
     };
     let table = Table::new(rows, widths)
         .header(header)

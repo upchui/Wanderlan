@@ -20,7 +20,7 @@ use crate::hostinfo;
 use crate::kernel;
 use crate::tui::{self, TuiOptions};
 
-const EXAMPLE_MESH: &str = include_str!("../../../packaging/examples/mesh.toml");
+const EXAMPLE_NETWORK: &str = include_str!("../../../packaging/examples/network.toml");
 const EXAMPLE_LOCAL: &str = include_str!("../../../packaging/examples/local.toml");
 
 /// Command line of `wanderlan`. Without a subcommand the interactive
@@ -47,21 +47,21 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Check a mesh.toml (and optionally a local.toml) for errors.
+    /// Check a network.toml (and optionally a local.toml) for errors.
     Validate {
-        /// The mesh.toml to check.
+        /// The network.toml to check.
         file: PathBuf,
-        /// A local.toml to check together with the mesh.
+        /// A local.toml to check together with the network.
         #[arg(long)]
         local: Option<PathBuf>,
     },
     /// Apply a configuration; it is rolled back unless confirmed in time.
     ///
-    /// Without --mesh/--local the files in /etc/wanderlan are applied.
+    /// Without --network/--local the files in /etc/wanderlan are applied.
     Apply {
-        /// mesh.toml to apply.
+        /// network.toml to apply.
         #[arg(long)]
-        mesh: Option<PathBuf>,
+        network: Option<PathBuf>,
         /// local.toml to apply (default: the running one).
         #[arg(long)]
         local: Option<PathBuf>,
@@ -73,7 +73,7 @@ pub enum Command {
     Confirm,
     /// Revert the pending change now.
     Rollback,
-    /// Write an example mesh.toml and local.toml.
+    /// Write an example network.toml and local.toml.
     Init {
         /// Directory to write the files to; prints them if omitted.
         #[arg(long)]
@@ -82,7 +82,7 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Print the running mesh.toml (on a client: its part of the network).
+    /// Print the running network.toml (on a client: its part of the network).
     Export,
     /// Re-enable a tunnel port shut down by the loop guard.
     Unblock {
@@ -285,14 +285,14 @@ pub async fn run(args: Args) -> Result<ExitCode> {
         Some(Command::Init { dir, force }) => init(dir.as_deref(), force),
         Some(Command::Status { json }) => status(&socket, json).await,
         Some(Command::Apply {
-            mesh,
+            network,
             local,
             timeout,
-        }) => apply(&socket, mesh.as_deref(), local.as_deref(), timeout).await,
+        }) => apply(&socket, network.as_deref(), local.as_deref(), timeout).await,
         Some(Command::Confirm) => {
             let client = connect(&socket).await?;
             let c: Confirmed = client.call(Request::Confirm).await?;
-            println!("Confirmed; mesh revision {} is in effect.", c.revision);
+            println!("Confirmed; network revision {} is in effect.", c.revision);
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Rollback) => {
@@ -307,7 +307,7 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             if !cfg.configured {
                 bail!("this site is not configured yet");
             }
-            print!("{}", cfg.mesh);
+            print!("{}", cfg.network);
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Unblock { port }) => {
@@ -549,7 +549,7 @@ async fn join_network(
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             println!(
-                "Done: \"{}\" is part of the network (mesh revision {}). See `wanderlan status`.",
+                "Done: \"{}\" is part of the network (network revision {}). See `wanderlan status`.",
                 joined.site, st.revision
             );
             if !in_sync {
@@ -614,14 +614,14 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
     if !running.configured {
         bail!("this site is not part of a network");
     }
-    let mesh = config::parse_mesh(&running.mesh)
+    let network = config::parse_network(&running.network)
         .ok()
-        .and_then(|p| p.mesh)
+        .and_then(|p| p.network)
         .context("cannot read the running configuration")?;
     let mut local = config::parse_local(&running.local)
         .map_err(|_| anyhow!("cannot read the running local.toml"))?
         .local;
-    if mesh.site(site).is_none() || local.self_name.as_deref() == Some(site) {
+    if network.site(site).is_none() || local.self_name.as_deref() == Some(site) {
         bail!("there is no tunnel to \"{site}\"");
     }
     let before = local.tunnel_trunks.clone();
@@ -632,7 +632,7 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
         if let Some(msg) = config::ifname_error(interface) {
             bail!("{interface}: {msg}");
         }
-        if let Some(peer) = mesh.site(site)
+        if let Some(peer) = network.site(site)
             && hostinfo::route_interface(peer.address).as_deref() == Some(interface)
         {
             bail!(
@@ -652,7 +652,7 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
     let applied: Applied = client
         .call(Request::Apply(ApplyParams {
             config: ConfigInput {
-                mesh: running.mesh,
+                network: running.network,
                 local: config::render_local(&local),
             },
             base_revision: Some(running.revision),
@@ -692,11 +692,11 @@ async fn edit_site(
     if !running.configured {
         bail!("this site is not part of a network");
     }
-    let mut mesh = config::parse_mesh(&running.mesh)
+    let mut network = config::parse_network(&running.network)
         .ok()
-        .and_then(|p| p.mesh)
+        .and_then(|p| p.network)
         .context("cannot read the running configuration")?;
-    let Some(entry) = mesh.sites.iter_mut().find(|s| s.name == site) else {
+    let Some(entry) = network.sites.iter_mut().find(|s| s.name == site) else {
         bail!("there is no site \"{site}\"");
     };
     let me = status.site.unwrap_or_default();
@@ -710,7 +710,7 @@ async fn edit_site(
     let applied: Applied = client
         .call(Request::Apply(ApplyParams {
             config: ConfigInput {
-                mesh: config::render_mesh(&mesh),
+                network: config::render_network(&network),
                 local: running.local,
             },
             base_revision: Some(running.revision),
@@ -719,7 +719,7 @@ async fn edit_site(
         .await?;
     if confirm {
         let c: Confirmed = client.call(Request::Confirm).await?;
-        println!("{done} (mesh revision {}).", c.revision);
+        println!("{done} (network revision {}).", c.revision);
     } else {
         println!(
             "{done} now. Run `wanderlan confirm` within {} seconds to keep it, otherwise it is rolled back.",
@@ -772,12 +772,12 @@ async fn connect(socket: &Path) -> Result<Client> {
 }
 
 fn validate(file: &Path, local: Option<&Path>) -> Result<ExitCode> {
-    let mesh_text =
+    let network_text =
         std::fs::read_to_string(file).with_context(|| format!("cannot read {}", file.display()))?;
     let local_text = local
         .map(|p| std::fs::read_to_string(p).with_context(|| format!("cannot read {}", p.display())))
         .transpose()?;
-    let diags = config::check(&mesh_text, local_text.as_deref());
+    let diags = config::check(&network_text, local_text.as_deref());
     for d in &diags {
         let label = match (d.file, local) {
             (ConfigFile::Local, Some(p)) => p.display().to_string(),
@@ -800,11 +800,16 @@ fn validate(file: &Path, local: Option<&Path>) -> Result<ExitCode> {
 
 fn init(dir: Option<&Path>, force: bool) -> Result<ExitCode> {
     let Some(dir) = dir else {
-        println!("# ---- mesh.toml ----\n{EXAMPLE_MESH}\n# ---- local.toml ----\n{EXAMPLE_LOCAL}");
+        println!(
+            "# ---- network.toml ----\n{EXAMPLE_NETWORK}\n# ---- local.toml ----\n{EXAMPLE_LOCAL}"
+        );
         return Ok(ExitCode::SUCCESS);
     };
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    for (name, content) in [("mesh.toml", EXAMPLE_MESH), ("local.toml", EXAMPLE_LOCAL)] {
+    for (name, content) in [
+        ("network.toml", EXAMPLE_NETWORK),
+        ("local.toml", EXAMPLE_LOCAL),
+    ] {
         let path = dir.join(name);
         if path.exists() && !force {
             bail!(
@@ -821,23 +826,23 @@ fn init(dir: Option<&Path>, force: bool) -> Result<ExitCode> {
 
 async fn apply(
     socket: &Path,
-    mesh: Option<&Path>,
+    network: Option<&Path>,
     local: Option<&Path>,
     timeout: Option<Duration>,
 ) -> Result<ExitCode> {
     let client = connect(socket).await?;
     settle(&client).await?;
     let timeout_secs = timeout.map(|t| t.as_secs().max(1));
-    let request = if mesh.is_none() && local.is_none() {
+    let request = if network.is_none() && local.is_none() {
         Request::ApplyFiles(ApplyFilesParams { timeout_secs })
     } else {
         let running: ConfigTexts = client.call(Request::GetConfig).await?;
         let read = |p: &Path| {
             std::fs::read_to_string(p).with_context(|| format!("cannot read {}", p.display()))
         };
-        let mesh_text = match mesh {
+        let network_text = match network {
             Some(p) => read(p)?,
-            None => running.mesh.clone(),
+            None => running.network.clone(),
         };
         let local_text = match local {
             Some(p) => read(p)?,
@@ -845,7 +850,7 @@ async fn apply(
         };
         Request::Apply(ApplyParams {
             config: ConfigInput {
-                mesh: mesh_text,
+                network: network_text,
                 local: local_text,
             },
             base_revision: Some(running.revision),
@@ -907,7 +912,11 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
             "This site is not configured yet: run `wanderlan` to start a new network, or `wanderlan join <address> <code>` with an invitation."
         ),
     }
-    println!("Mesh revision {} ({})", st.revision, short(&st.fingerprint));
+    println!(
+        "Network revision {} ({})",
+        st.revision,
+        short(&st.fingerprint)
+    );
     if let Some(p) = &st.pending {
         println!(
             "PENDING CHANGE: rolled back in {} s unless confirmed (`wanderlan confirm`)",

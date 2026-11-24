@@ -1,6 +1,6 @@
-# wanderlan
+# Wanderlan
 
-wanderlan stretches VLANs between sites on layer 2, over a network that
+Wanderlan stretches VLANs between sites on layer 2, over a network that
 already connects them (usually a VPN). It works like plugging switches
 together: one site is the **server**, every further site is a **client**
 plugged into it with an invitation code, and for every site you decide
@@ -147,7 +147,8 @@ Every commit on `main` that passes all tests is published as
 newest build. The last 20 builds and every tagged release stay in the
 repository: `apt-cache madison wanderlan` lists them,
 `sudo apt install wanderlan=<version>` goes back. Update all sites to the
-same build.
+same build. Older builds kept the shared configuration under another file
+name; the first start of a new build moves it to `network.toml`.
 
 The package installs the daemon `wanderland` (systemd service, enabled and
 started), the terminal UI and command line `wanderlan`, empty configuration
@@ -248,8 +249,8 @@ container and no other GRE tunnel needs them). Join again with a new
 invitation; a client that joins through another site becomes that site's
 client. If the site leaves for good, delete it on its server (Sites, `d`).
 
-**Edit the files by hand.** Edit `/etc/wanderlan/mesh.toml` or `local.toml`,
-check with `wanderlan validate /etc/wanderlan/mesh.toml --local
+**Edit the files by hand.** Edit `/etc/wanderlan/network.toml` or `local.toml`,
+check with `wanderlan validate /etc/wanderlan/network.toml --local
 /etc/wanderlan/local.toml`, then `sudo wanderlan apply` and
 `sudo wanderlan confirm`. Edits that are not confirmed are restored and kept
 as `*.rejected`.
@@ -258,7 +259,7 @@ as `*.rejected`.
 
 Two files in `/etc/wanderlan/`, both maintained by the daemon:
 
-* `mesh.toml`: the network. A server holds the whole network; a client only
+* `network.toml`: the network. A server holds the whole network; a client only
   its part of it (itself, its server, its own clients). The daemons keep the
   files in sync.
 * `local.toml`: this host only, never synchronised.
@@ -266,7 +267,7 @@ Two files in `/etc/wanderlan/`, both maintained by the daemon:
 `local.toml`:
 
 ```toml
-self = "hq"         # which site of mesh.toml this host is
+self = "hq"         # which site of network.toml this host is
 trunk = "ens19"     # the interface carrying the VLANs
 
 # Optional: the tunnel to dc uses a trunk of its own (a segment of its own).
@@ -274,10 +275,10 @@ trunk = "ens19"     # the interface carrying the VLANs
 trunk = "ens20"
 ```
 
-`mesh.toml` on `hq` (a server):
+`network.toml` on `hq` (a server):
 
 ```toml
-[mesh]
+[network]
 # vlans = "all"               # VLANs of every site without its own list
 commit_timeout = "60s"        # changes are rolled back unless confirmed in time
 # mtu_probe_interval = "5m"   # how often the path MTU to each peer is measured
@@ -313,22 +314,22 @@ local = "native"
 shared = 30
 ```
 
-The `mesh.toml` of `lab` contains only `hq` (as its server), `lab` and lab's
+The `network.toml` of `lab` contains only `hq` (as its server), `lab` and lab's
 mapping.
 
 ### Settings
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `mesh.vlans` | all | VLANs of every site without its own list. Missing, empty or `"all"`: every VLAN and the untagged traffic. Otherwise e.g. `"native,10-50"`, `"10,20,30-40"` or `[10, "20-30"]`. |
-| `mesh.commit_timeout` | `60s` | Time to confirm a change (10 s to 1 h). |
-| `mesh.mtu_probe_interval` | `5m` | Interval of the path MTU measurement (at least 10 s). |
-| `mesh.mss` | unset | Fixed TCP MSS (536 to 1460) instead of the measured value. |
-| `mesh.control_port` | `51821` | UDP and TCP port of the daemons on the site addresses. |
-| `mesh.revision` | `0` | Revision counter of the sync; raised by the daemon. |
+| `network.vlans` | all | VLANs of every site without its own list. Missing, empty or `"all"`: every VLAN and the untagged traffic. Otherwise e.g. `"native,10-50"`, `"10,20,30-40"` or `[10, "20-30"]`. |
+| `network.commit_timeout` | `60s` | Time to confirm a change (10 s to 1 h). |
+| `network.mtu_probe_interval` | `5m` | Interval of the path MTU measurement (at least 10 s). |
+| `network.mss` | unset | Fixed TCP MSS (536 to 1460) instead of the measured value. |
+| `network.control_port` | `51821` | UDP and TCP port of the daemons on the site addresses. |
+| `network.revision` | `0` | Revision counter of the sync; raised by the daemon. |
 | `site.name` | | Unique; `a-z`, `0-9` and `-`, at most 12 characters (it is part of the interface name `gt-<name>`). |
 | `site.address` | | Unique IPv4 address of the site in the transport network. |
-| `site.vlans` | `mesh.vlans` | VLANs this site takes part in. |
+| `site.vlans` | `network.vlans` | VLANs this site takes part in. |
 | `site.own_vlans` | none | The site's own VLANs: on its trunk and towards its own clients, never towards its server. The site itself may always change them. |
 | `site.uplink` | none | The site this one is a client of; none: a server. `""` marks a server explicitly. |
 | `site.online` | `true` | `false`: the tunnels of the site stay down. Sites that join start with `false`. |
@@ -337,7 +338,7 @@ mapping.
 | `map.site` | | The site the mapping belongs to. |
 | `map.local` | | `"native"` (untagged) or a local VLAN ID (not 1). |
 | `map.shared` | | The VLAN in the network; one of the VLANs of the site, not 1. |
-| `self` (local) | | Which site of `mesh.toml` this host is. |
+| `self` (local) | | Which site of `network.toml` this host is. |
 | `trunk` (local) | | The interface carrying the VLANs. |
 | `tunnels.<site>.trunk` (local) | `trunk` | A trunk of its own for the tunnel to `<site>`. |
 
@@ -345,8 +346,8 @@ Every file is checked when it is loaded or applied; problems are reported
 with file and line:
 
 ```
-mesh.toml:24: error: site "office": vlans: VLAN ID 5000 is outside 1-4094
-mesh.toml:42: error: map #2: shared VLAN 60 is not one of the VLANs of site "office" (10,20)
+network.toml:24: error: site "office": vlans: VLAN ID 5000 is outside 1-4094
+network.toml:42: error: map #2: shared VLAN 60 is not one of the VLANs of site "office" (10,20)
 ```
 
 Names and addresses are unique, uplinks lead to an existing site and never
@@ -475,10 +476,10 @@ log lines and keeps trying.
 | `wanderlan role <site> server\|client <server>` | Make a site a server or a client |
 | `wanderlan trunk <site> <interface\|default>` | Trunk of the tunnel to a site |
 | `wanderlan own-vlans <site> <vlans\|none>` | Own VLANs of a site (trunk and its own clients only) |
-| `wanderlan apply [--mesh F] [--local F] [--timeout 60s]` | Apply files (default: those in `/etc/wanderlan`) |
+| `wanderlan apply [--network F] [--local F] [--timeout 60s]` | Apply files (default: those in `/etc/wanderlan`) |
 | `wanderlan confirm` / `wanderlan rollback` | Confirm or revert the pending change |
-| `wanderlan validate <mesh.toml> [--local <local.toml>]` | Check files without applying them |
-| `wanderlan init [--dir D]` / `wanderlan export` | Print or write the example configuration / print the running `mesh.toml` |
+| `wanderlan validate <network.toml> [--local <local.toml>]` | Check files without applying them |
+| `wanderlan init [--dir D]` / `wanderlan export` | Print or write the example configuration / print the running `network.toml` |
 | `wanderlan probe` / `wanderlan unblock <port>` | Measure the path MTU now / re-enable a port the loop guard shut down |
 | `wanderlan reset [--yes]` | Remove everything wanderlan set up on this site |
 
@@ -541,8 +542,9 @@ or `WANDERLAN_SOCKET`.
   transport address, and GRE runs unencrypted on top of that trusted network.
 * **Servers and clients, like plugging switches together.** Roles are not
   configured up front: a site that joins is a client of the site that invited
-  it and only has to reach it; servers form a mesh with split horizon. There
-  are no tunnels between clients; the VLANs decide who meets whom.
+  it and only has to reach it; servers are all connected with each other,
+  with split horizon. There are no tunnels between clients; the VLANs decide
+  who meets whom.
 * **Clients only know their part.** A client's configuration contains its
   server and its own clients only; servers merge the changes of their clients.
 * **Who may change a site**: its manager (the inviting site), the site itself

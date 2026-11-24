@@ -3,9 +3,9 @@
 
 begin "Two sites: tunnel, VLAN filtering and ping in VLAN 20"
 
-mesh_toml "10-50" site1 site2 >"$RUN_DIR/mesh-2.toml"
+network_toml "10-50" site1 site2 >"$RUN_DIR/network-2.toml"
 for s in site1 site2; do
-  configure "$s" "$RUN_DIR/mesh-2.toml"
+  configure "$s" "$RUN_DIR/network-2.toml"
   x "$s" "wl-daemon start"
 done
 
@@ -59,9 +59,9 @@ fi
 
 begin "All VLANs and untagged: like a trunk between two switches"
 
-mesh_toml "" site1 site2 >"$RUN_DIR/mesh-2-all.toml"
+network_toml "" site1 site2 >"$RUN_DIR/network-2-all.toml"
 for s in site1 site2; do
-  configure "$s" "$RUN_DIR/mesh-2-all.toml"
+  configure "$s" "$RUN_DIR/network-2-all.toml"
   x "$s" "wl-daemon reload"
 done
 wait_eq 20 "site1: trunk0 carries every VLAN, untagged as native VLAN" "1:pu,2-4094" \
@@ -82,9 +82,9 @@ client_native_del c-site1
 client_native_del c-site2
 
 # Back to VLANs 10-50 for the following cases.
-renew "$RUN_DIR/mesh-2.toml"
+renew "$RUN_DIR/network-2.toml"
 for s in site1 site2; do
-  configure "$s" "$RUN_DIR/mesh-2.toml"
+  configure "$s" "$RUN_DIR/network-2.toml"
   x "$s" "wl-daemon reload"
 done
 wait_eq 20 "site1: trunk0 carries VLANs 10-50 again" "10-50" vlan_summary site1 trunk0

@@ -1,7 +1,7 @@
 # wanderlan example site-local configuration.
 # Copy to /etc/wanderlan/local.toml and adjust. This file is never synchronised.
 
-self = "haus2"     # name of this site in mesh.toml
+self = "haus2"     # name of this site in network.toml
 trunk = "ens19"    # local interface carrying the VLANs (tagged trunk)
 
 # Optional: a tunnel with a trunk of its own. It becomes a segment of its own

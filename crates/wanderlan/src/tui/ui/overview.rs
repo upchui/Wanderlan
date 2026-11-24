@@ -95,7 +95,7 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
     lines.push(Line::from(vec![
         Span::styled(" state ", theme::dim()),
         Span::styled(state, style),
-        Span::styled("  mesh revision ", theme::dim()),
+        Span::styled("  network revision ", theme::dim()),
         Span::raw(format!(
             "{} ({})",
             status.revision,

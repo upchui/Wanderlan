@@ -3,32 +3,32 @@
 //! Servers (sites without uplink) know the whole network. A client knows
 //! only itself, the site it is plugged into (its uplink, which it sees as a
 //! server) and its own clients; never the clients of other servers. Its
-//! `mesh.toml` contains exactly that.
+//! `network.toml` contains exactly that.
 //!
 //! A client's changes reach the network through its uplink: the uplink
 //! fetches the client's view and merges what the client is responsible for
-//! (itself, its own clients and the network settings) into its own mesh.
+//! (itself, its own clients and the network settings) into its own network.
 
 use std::collections::BTreeSet;
 
-use crate::config::{Mesh, Site, VlanMap, fingerprint, validate};
+use crate::config::{Network, Site, VlanMap, fingerprint, validate};
 use crate::policy;
 
-/// The part of `mesh` the site `site` knows: everything for a server; for a
+/// The part of `network` the site `site` knows: everything for a server; for a
 /// client itself, its uplink (without the uplink's own uplink) and its own
 /// clients. An unknown site knows no sites at all.
-pub fn view_for(mesh: &Mesh, site: &str) -> Mesh {
-    let Some(me) = mesh.site(site) else {
-        return Mesh {
+pub fn view_for(network: &Network, site: &str) -> Network {
+    let Some(me) = network.site(site) else {
+        return Network {
             sites: Vec::new(),
             maps: Vec::new(),
-            ..mesh.clone()
+            ..network.clone()
         };
     };
     let Some(uplink) = me.uplink.as_deref() else {
-        return mesh.clone();
+        return network.clone();
     };
-    let sites: Vec<Site> = mesh
+    let sites: Vec<Site> = network
         .sites
         .iter()
         .filter(|s| s.name == site || s.name == uplink || s.uplink.as_deref() == Some(site))
@@ -41,31 +41,31 @@ pub fn view_for(mesh: &Mesh, site: &str) -> Mesh {
             s
         })
         .collect();
-    let maps = mesh
+    let maps = network
         .maps
         .iter()
         .filter(|m| sites.iter().any(|s| s.name == m.site))
         .cloned()
         .collect();
-    Mesh {
+    Network {
         sites,
         maps,
-        ..mesh.clone()
+        ..network.clone()
     }
 }
 
-fn maps_of<'a>(mesh: &'a Mesh, site: &str) -> Vec<&'a VlanMap> {
-    let mut maps: Vec<&VlanMap> = mesh.maps.iter().filter(|m| m.site == site).collect();
+fn maps_of<'a>(network: &'a Network, site: &str) -> Vec<&'a VlanMap> {
+    let mut maps: Vec<&VlanMap> = network.maps.iter().filter(|m| m.site == site).collect();
     maps.sort_by_key(|m| (m.local, m.shared));
     maps
 }
 
-/// Merges the view of the client `from` into `full` (the mesh of its
+/// Merges the view of the client `from` into `full` (the network of its
 /// uplink): its own entry, the entries of its own clients (new ones too,
 /// removed ones go), their mappings and the network settings. Anything else
 /// in the view must be as `from` received it. The result is checked against
 /// the rights of `from` and validated.
-pub fn merge(full: &Mesh, view: &Mesh, from: &str) -> Result<Mesh, String> {
+pub fn merge(full: &Network, view: &Network, from: &str) -> Result<Network, String> {
     if view.site(from).is_none() {
         return Err(format!(
             "the configuration of \"{from}\" does not contain \"{from}\" itself"
@@ -186,10 +186,10 @@ mod tests {
 
     /// alex and dc are servers; marcel and site2 are clients of alex, x is a
     /// client of marcel, y a client of dc.
-    fn full() -> Mesh {
-        let mut mesh = Mesh::new(VlanSet::from_range(10, 50));
-        mesh.revision = 7;
-        mesh.sites = vec![
+    fn full() -> Network {
+        let mut network = Network::new(VlanSet::from_range(10, 50));
+        network.revision = 7;
+        network.sites = vec![
             site("alex", 1, None),
             site("dc", 2, None),
             site("marcel", 3, Some("alex")),
@@ -197,7 +197,7 @@ mod tests {
             site("x", 5, Some("marcel")),
             site("y", 6, Some("dc")),
         ];
-        mesh.maps = vec![
+        network.maps = vec![
             VlanMap {
                 site: "site2".into(),
                 local: LocalVid::Native,
@@ -209,46 +209,46 @@ mod tests {
                 shared: 14,
             },
         ];
-        mesh
+        network
     }
 
-    fn names(mesh: &Mesh) -> Vec<&str> {
-        mesh.sites.iter().map(|s| s.name.as_str()).collect()
+    fn names(network: &Network) -> Vec<&str> {
+        network.sites.iter().map(|s| s.name.as_str()).collect()
     }
 
     #[test]
     fn a_client_knows_its_server_and_its_own_clients_only() {
-        let mesh = full();
+        let network = full();
         assert_eq!(
-            names(&view_for(&mesh, "alex")),
-            names(&mesh),
+            names(&view_for(&network, "alex")),
+            names(&network),
             "a server knows all"
         );
-        let site2 = view_for(&mesh, "site2");
+        let site2 = view_for(&network, "site2");
         assert_eq!(names(&site2), ["alex", "site2"]);
         assert_eq!(site2.maps.len(), 1, "only its own mapping");
         assert_eq!(site2.revision, 7);
-        let marcel = view_for(&mesh, "marcel");
+        let marcel = view_for(&network, "marcel");
         assert_eq!(names(&marcel), ["alex", "marcel", "x"]);
-        let x = view_for(&mesh, "x");
+        let x = view_for(&network, "x");
         assert_eq!(names(&x), ["marcel", "x"]);
         assert_eq!(
             x.site("marcel").unwrap().uplink,
             None,
             "its uplink is its server"
         );
-        assert!(view_for(&mesh, "nobody").sites.is_empty());
+        assert!(view_for(&network, "nobody").sites.is_empty());
         // Every view is a valid configuration of its own.
         for s in ["site2", "marcel", "x", "y"] {
-            let v = view_for(&mesh, s);
+            let v = view_for(&network, s);
             assert!(!validate(&v, None).iter().any(|d| d.is_error()), "{s}");
         }
     }
 
     #[test]
     fn the_uplink_merges_what_the_client_is_responsible_for() {
-        let mesh = full();
-        let mut view = view_for(&mesh, "marcel");
+        let network = full();
+        let mut view = view_for(&network, "marcel");
         view.revision = 8;
         // marcel changes its client x and invites z.
         view.sites
@@ -257,7 +257,7 @@ mod tests {
             .unwrap()
             .online = false;
         view.sites.push(site("z", 9, Some("marcel")));
-        let merged = merge(&mesh, &view, "marcel").unwrap();
+        let merged = merge(&network, &view, "marcel").unwrap();
         assert_eq!(merged.revision, 8);
         assert!(!merged.site("x").unwrap().online);
         assert!(merged.site("z").is_some());
@@ -265,95 +265,97 @@ mod tests {
             merged.site("y").is_some() && merged.site("site2").is_some(),
             "the rest stays"
         );
-        assert_eq!(merged.site("alex").unwrap(), mesh.site("alex").unwrap());
+        assert_eq!(merged.site("alex").unwrap(), network.site("alex").unwrap());
 
         // Removing its own client.
-        let mut view = view_for(&mesh, "marcel");
+        let mut view = view_for(&network, "marcel");
         view.revision = 8;
         view.sites.retain(|s| s.name != "x");
-        let merged = merge(&mesh, &view, "marcel").unwrap();
+        let merged = merge(&network, &view, "marcel").unwrap();
         assert!(merged.site("x").is_none());
 
         // An older view with changes still gets a newer revision.
-        let mut view = view_for(&mesh, "site2");
+        let mut view = view_for(&network, "site2");
         view.sites
             .iter_mut()
             .find(|s| s.name == "site2")
             .unwrap()
             .vlans = Some(VlanSet::from_range(13, 13));
-        let merged = merge(&mesh, &view, "site2").unwrap();
+        let merged = merge(&network, &view, "site2").unwrap();
         assert_eq!(merged.revision, 8);
         // Nothing changed: the revision is not raised.
-        let same = merge(&mesh, &view_for(&mesh, "site2"), "site2").unwrap();
-        assert_eq!(same, mesh);
+        let same = merge(&network, &view_for(&network, "site2"), "site2").unwrap();
+        assert_eq!(same, network);
     }
 
     #[test]
     fn a_client_cannot_change_its_server_or_take_other_names() {
-        let mesh = full();
-        let mut view = view_for(&mesh, "site2");
+        let network = full();
+        let mut view = view_for(&network, "site2");
         view.revision = 8;
         view.sites
             .iter_mut()
             .find(|s| s.name == "alex")
             .unwrap()
             .online = false;
-        let err = merge(&mesh, &view, "site2").unwrap_err();
+        let err = merge(&network, &view, "site2").unwrap_err();
         assert!(
             err.contains("may only change itself and its own clients"),
             "{err}"
         );
 
-        let mut view = view_for(&mesh, "site2");
+        let mut view = view_for(&network, "site2");
         view.sites.push(site("marcel", 20, Some("site2")));
-        let err = merge(&mesh, &view, "site2").unwrap_err();
+        let err = merge(&network, &view, "site2").unwrap_err();
         assert!(err.contains("already used"), "{err}");
 
-        let mut view = view_for(&mesh, "site2");
+        let mut view = view_for(&network, "site2");
         view.sites.retain(|s| s.name != "alex");
-        assert!(merge(&mesh, &view, "site2").is_err());
+        assert!(merge(&network, &view, "site2").is_err());
         assert!(
-            merge(&mesh, &view_for(&mesh, "alex"), "site2").is_err(),
+            merge(&network, &view_for(&network, "alex"), "site2").is_err(),
             "wrong sender"
         );
     }
 
     #[test]
     fn the_rights_of_the_client_apply() {
-        let mut mesh = full();
+        let mut network = full();
         // site2 is managed by alex and may not change itself.
-        mesh.sites
+        network
+            .sites
             .iter_mut()
             .find(|s| s.name == "site2")
             .unwrap()
             .self_managed = false;
-        let mut view = view_for(&mesh, "site2");
+        let mut view = view_for(&network, "site2");
         view.revision = 8;
         view.sites
             .iter_mut()
             .find(|s| s.name == "site2")
             .unwrap()
             .online = false;
-        let err = merge(&mesh, &view, "site2").unwrap_err();
+        let err = merge(&network, &view, "site2").unwrap_err();
         assert!(err.contains("may not change"), "{err}");
     }
 
     #[test]
     fn a_restricted_client_sets_its_own_vlans_through_its_server() {
-        let mut mesh = full();
-        mesh.sites
+        let mut network = full();
+        network
+            .sites
             .iter_mut()
             .find(|s| s.name == "site2")
             .unwrap()
             .self_managed = false;
-        let mut view = view_for(&mesh, "site2");
+        let mut view = view_for(&network, "site2");
         view.revision = 8;
         view.sites
             .iter_mut()
             .find(|s| s.name == "site2")
             .unwrap()
             .own_vlans = Some(VlanSet::from_range(50, 50));
-        let merged = merge(&mesh, &view, "site2").unwrap();
+        let merged = merge(&network, &view, "site2").unwrap();
         assert_eq!(
             merged.site("site2").unwrap().own_vlans,
             Some(VlanSet::from_range(50, 50))

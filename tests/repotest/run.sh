@@ -24,11 +24,11 @@ for s in heim buero c-heim c-buero; do
 done
 
 # heim starts a new network, with the files the setup wizard writes.
-printf '[mesh]\nvlans = "10-50"\n\n[[site]]\nname = "heim"\naddress = "10.8.0.1"\n' |
-  "${COMPOSE[@]}" exec -T heim sh -c 'cat > /etc/wanderlan/mesh.toml'
+printf '[network]\nvlans = "10-50"\n\n[[site]]\nname = "heim"\naddress = "10.8.0.1"\n' |
+  "${COMPOSE[@]}" exec -T heim sh -c 'cat > /etc/wanderlan/network.toml'
 printf 'self = "heim"\ntrunk = "trunk0"\n' |
   "${COMPOSE[@]}" exec -T heim sh -c 'cat > /etc/wanderlan/local.toml'
-x heim "wanderlan validate /etc/wanderlan/mesh.toml --local /etc/wanderlan/local.toml" || exit 1
+x heim "wanderlan validate /etc/wanderlan/network.toml --local /etc/wanderlan/local.toml" || exit 1
 x heim "wl-daemon start"
 for _ in $(seq 1 30); do
   x heim "wanderlan status --json | jq -e '.state == \"running\"'" >/dev/null 2>&1 && break

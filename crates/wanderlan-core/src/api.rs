@@ -77,8 +77,9 @@ pub enum Request {
 /// A configuration given as TOML texts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConfigInput {
-    /// Contents of `mesh.toml`.
-    pub mesh: String,
+    /// Contents of `network.toml`.
+    #[serde(alias = "mesh")]
+    pub network: String,
     /// Contents of `local.toml`.
     pub local: String,
 }
@@ -227,7 +228,7 @@ pub struct Joined {
     pub via: String,
     /// Number of sites in the network.
     pub sites: usize,
-    /// Mesh revision received.
+    /// Network revision received.
     pub revision: u64,
 }
 
@@ -319,7 +320,7 @@ pub struct Applied {
 /// Result of [`Request::Confirm`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Confirmed {
-    /// The mesh revision now in effect.
+    /// The network revision now in effect.
     pub revision: u64,
 }
 
@@ -328,13 +329,14 @@ pub struct Confirmed {
 pub struct ConfigTexts {
     /// True if the site has a configuration.
     pub configured: bool,
-    /// Running `mesh.toml` in canonical form (empty if none).
-    pub mesh: String,
+    /// Running `network.toml` in canonical form (empty if none).
+    #[serde(alias = "mesh")]
+    pub network: String,
     /// Running `local.toml` in canonical form.
     pub local: String,
-    /// Mesh revision.
+    /// Network revision.
     pub revision: u64,
-    /// Mesh fingerprint (hex SHA-256).
+    /// Network fingerprint (hex SHA-256).
     pub fingerprint: String,
 }
 
@@ -486,13 +488,13 @@ pub struct PeerStatus {
     /// Counters of the tunnel port.
     #[serde(default)]
     pub traffic: Traffic,
-    /// Mesh revision announced by the peer.
+    /// Network revision announced by the peer.
     pub revision: Option<u64>,
-    /// Whether the peer runs the same mesh configuration.
+    /// Whether the peer runs the same network configuration.
     pub in_sync: Option<bool>,
 }
 
-/// One site of the mesh (for the overview).
+/// One site of the network (for the overview).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SiteSummary {
     /// Name.
@@ -536,9 +538,9 @@ pub struct Status {
     pub trunk: Option<String>,
     /// Shared VLANs.
     pub vlans: Option<String>,
-    /// Mesh revision in effect.
+    /// Network revision in effect.
     pub revision: u64,
-    /// Mesh fingerprint.
+    /// Network fingerprint.
     pub fingerprint: String,
     /// A change waiting for confirmation.
     pub pending: Option<PendingChange>,
@@ -546,7 +548,7 @@ pub struct Status {
     pub last_error: Option<String>,
     /// Direct peers with live data.
     pub peers: Vec<PeerStatus>,
-    /// All sites of the mesh.
+    /// All sites of the network.
     pub sites: Vec<SiteSummary>,
     /// Ports shut down by the loop guard.
     pub blocked: Vec<String>,
@@ -676,12 +678,12 @@ mod tests {
             })
         );
         let req: RequestEnvelope = serde_json::from_str(
-            r#"{"id":3,"method":"apply","params":{"mesh":"m","local":"l","timeout_secs":10}}"#,
+            r#"{"id":3,"method":"apply","params":{"network":"m","local":"l","timeout_secs":10}}"#,
         )
         .unwrap();
         match req.request {
             Request::Apply(p) => {
-                assert_eq!(p.config.mesh, "m");
+                assert_eq!(p.config.network, "m");
                 assert_eq!(p.timeout_secs, Some(10));
                 assert_eq!(p.base_revision, None);
             }

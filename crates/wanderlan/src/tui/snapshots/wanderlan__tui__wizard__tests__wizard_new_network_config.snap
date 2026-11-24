@@ -1,13 +1,13 @@
 ---
 source: crates/wanderlan/src/tui/wizard.rs
 assertion_line: 551
-expression: render_mesh(&mesh)
+expression: render_network(&network)
 ---
-# wanderlan mesh configuration, shared by all sites.
+# wanderlan network configuration, shared by all sites.
 # This file is kept identical on all sites by the wanderlan daemon.
 # Change it with the `wanderlan` TUI or edit it and run `wanderlan apply`.
 
-[mesh]
+[network]
 revision = 0
 vlans = "all"
 control_port = 51821

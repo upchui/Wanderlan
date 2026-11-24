@@ -124,18 +124,18 @@ pub struct Runtime {
 /// Computes the desired state.
 pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
     let blocked = &runtime.blocked;
-    let mesh = &cfg.mesh;
+    let network = &cfg.network;
     let me = cfg.self_name();
     let local_address = cfg.self_site().map_or(Ipv4Addr::UNSPECIFIED, |s| s.address);
 
     let own = cfg
         .self_site()
-        .map(|s| mesh.effective_vlans(s))
+        .map(|s| network.effective_vlans(s))
         .unwrap_or_default();
     // The site's own VLANs: on its trunk and towards its own clients only.
     let own_extra = cfg
         .self_site()
-        .map(|s| mesh.own_vlans(s))
+        .map(|s| network.own_vlans(s))
         .unwrap_or_default();
     let downwards: crate::config::VlanSet = own.iter().chain(own_extra.iter()).collect();
     // The native VLAN leaves the trunk untagged (and untagged frames belong
@@ -155,7 +155,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
     let default_trunk = cfg.trunk();
 
     let self_online = cfg.self_site().is_none_or(|s| s.online);
-    let tunnels: Vec<TunnelSpec> = topology::tunnels_for(mesh, me)
+    let tunnels: Vec<TunnelSpec> = topology::tunnels_for(network, me)
         .into_iter()
         .map(|t| {
             let name = t.ifname();
@@ -167,13 +167,13 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
                 topology::TunnelKind::Server | topology::TunnelKind::Uplink => own.clone(),
             };
             let theirs: crate::config::VlanSet = match t.kind {
-                topology::TunnelKind::Uplink => mesh
+                topology::TunnelKind::Uplink => network
                     .effective_vlans(t.peer)
                     .iter()
-                    .chain(mesh.own_vlans(t.peer).iter())
+                    .chain(network.own_vlans(t.peer).iter())
                     .collect(),
                 topology::TunnelKind::Server | topology::TunnelKind::Client => {
-                    mesh.effective_vlans(t.peer)
+                    network.effective_vlans(t.peer)
                 }
             };
             // Down while blocked by the loop guard, or while this site or the
@@ -258,7 +258,7 @@ fn mss_rules(cfg: &Config, tunnels: &[TunnelSpec], runtime: &Runtime) -> BTreeSe
     let mut out = BTreeSet::new();
     for t in tunnels {
         let mss = cfg
-            .mesh
+            .network
             .mss
             .or_else(|| measured.get(t.name.as_str()).copied())
             .or(fallback);
@@ -291,7 +291,7 @@ fn trunk_mapping(cfg: &Config, shared: &PortVlans) -> (PortVlans, Vec<TcRule>) {
     let me = cfg.self_name();
     let mut native = None;
     let mut translations: Vec<(u16, u16)> = Vec::new();
-    for map in cfg.mesh.maps_of(me) {
+    for map in cfg.network.maps_of(me) {
         match map.local {
             LocalVid::Native => native = Some(map.shared),
             LocalVid::Vid(local) => translations.push((local, map.shared)),
@@ -346,11 +346,11 @@ mod tests {
     use super::*;
     use crate::config::{Loaded, load};
 
-    const MESH: &str = include_str!("../../../packaging/examples/mesh.toml");
+    const NETWORK: &str = include_str!("../../../packaging/examples/network.toml");
 
     fn config(self_name: &str) -> Config {
         let local = format!("self = \"{self_name}\"\ntrunk = \"ens19\"\n");
-        match load(MESH, &local).unwrap().loaded {
+        match load(NETWORK, &local).unwrap().loaded {
             Loaded::Configured(cfg) => cfg,
             Loaded::Unconfigured { .. } => panic!("configured"),
         }
@@ -405,13 +405,13 @@ mod tests {
 
     #[test]
     fn offline_sites_have_their_tunnels_down() {
-        let mesh = MESH.replace(
+        let network = NETWORK.replace(
             "name = \"buero\"\naddress = \"10.8.0.2\"\n",
             "name = \"buero\"\naddress = \"10.8.0.2\"\nonline = false\n",
         );
         let at = |site: &str| {
             let local = format!("self = \"{site}\"\ntrunk = \"ens19\"\n");
-            let Loaded::Configured(cfg) = load(&mesh, &local).unwrap().loaded else {
+            let Loaded::Configured(cfg) = load(&network, &local).unwrap().loaded else {
                 panic!("configured");
             };
             derive(&cfg, &Runtime::default())
@@ -436,9 +436,9 @@ mod tests {
     fn native_vlan_is_untagged_on_the_trunk_and_tagged_in_tunnels() {
         // All VLANs: VLAN 1 (native) is untagged on the trunk; haus3 maps its
         // untagged traffic to VLAN 20, so the native VLAN does not reach it.
-        let mesh = MESH.replace("vlans = \"10-50\"", "vlans = \"all\"");
+        let network = NETWORK.replace("vlans = \"10-50\"", "vlans = \"all\"");
         let local = "self = \"heim\"\ntrunk = \"ens19\"\n";
-        let Loaded::Configured(cfg) = load(&mesh, local).unwrap().loaded else {
+        let Loaded::Configured(cfg) = load(&network, local).unwrap().loaded else {
             panic!("configured");
         };
         let d = derive(&cfg, &Runtime::default());
@@ -458,7 +458,7 @@ mod tests {
         assert_eq!(tunnel("gt-haus3").len(), 4093);
 
         let local = "self = \"haus3\"\ntrunk = \"ens19\"\n";
-        let Loaded::Configured(cfg) = load(&mesh, local).unwrap().loaded else {
+        let Loaded::Configured(cfg) = load(&network, local).unwrap().loaded else {
             panic!("configured");
         };
         let d = derive(&cfg, &Runtime::default());
@@ -493,9 +493,9 @@ mod tests {
     fn chained_translations_keep_targets_on_the_trunk() {
         // 130 -> 30 and 30 -> 40 at the same site: local 30 is translated, but
         // shared 30 is still needed as target of local 130.
-        let mesh = MESH.replace("local = \"native\"\nshared = 20", "local = 30\nshared = 40");
+        let network = NETWORK.replace("local = \"native\"\nshared = 20", "local = 30\nshared = 40");
         let local = "self = \"haus3\"\ntrunk = \"ens19\"\n";
-        let Loaded::Configured(cfg) = load(&mesh, local).unwrap().loaded else {
+        let Loaded::Configured(cfg) = load(&network, local).unwrap().loaded else {
             panic!("configured");
         };
         let d = derive(&cfg, &Runtime::default());
@@ -516,9 +516,9 @@ mod tests {
 
     #[test]
     fn translated_local_inside_shared_range_is_removed_from_trunk() {
-        let mesh = MESH.replace("local = 130", "local = 15");
+        let network = NETWORK.replace("local = 130", "local = 15");
         let local = "self = \"haus3\"\ntrunk = \"ens19\"\n";
-        let Loaded::Configured(cfg) = load(&mesh, local).unwrap().loaded else {
+        let Loaded::Configured(cfg) = load(&network, local).unwrap().loaded else {
             panic!("configured");
         };
         let d = derive(&cfg, &Runtime::default());
@@ -566,9 +566,9 @@ mod tests {
 
     #[test]
     fn fixed_mss_overrides_measurements() {
-        let mesh = MESH.replace("# mss = 1300", "mss = 1300");
+        let network = NETWORK.replace("# mss = 1300", "mss = 1300");
         let local = "self = \"heim\"\ntrunk = \"ens19\"\n";
-        let Loaded::Configured(cfg) = load(&mesh, local).unwrap().loaded else {
+        let Loaded::Configured(cfg) = load(&network, local).unwrap().loaded else {
             panic!("configured");
         };
         let mut runtime = Runtime::default();
@@ -614,7 +614,7 @@ mod tests {
     #[test]
     fn a_tunnel_with_its_own_trunk_gets_its_own_bridge() {
         let local = "self = \"heim\"\ntrunk = \"ens19\"\n\n[tunnels.haus2]\ntrunk = \"ens20\"\n[tunnels.haus3]\ntrunk = \"ens19\"\n";
-        let cfg = match load(MESH, local).unwrap().loaded {
+        let cfg = match load(NETWORK, local).unwrap().loaded {
             Loaded::Configured(cfg) => cfg,
             Loaded::Unconfigured { .. } => panic!("configured"),
         };
@@ -635,11 +635,11 @@ mod tests {
 
     #[test]
     fn the_ports_of_clients_are_not_isolated() {
-        let mesh = MESH.replace(
+        let network = NETWORK.replace(
             "name = \"haus2\"\n",
             "name = \"haus2\"\nuplink = \"heim\"\n",
         );
-        let cfg = match load(&mesh, "self = \"heim\"\ntrunk = \"ens19\"\n")
+        let cfg = match load(&network, "self = \"heim\"\ntrunk = \"ens19\"\n")
             .unwrap()
             .loaded
         {
@@ -656,7 +656,7 @@ mod tests {
                 .all(|t| t.isolated)
         );
         // haus2 has only its tunnel to heim.
-        let cfg2 = match load(&mesh, "self = \"haus2\"\ntrunk = \"ens19\"\n")
+        let cfg2 = match load(&network, "self = \"haus2\"\ntrunk = \"ens19\"\n")
             .unwrap()
             .loaded
         {
@@ -677,7 +677,7 @@ mod tests {
     fn own_vlans_go_to_the_trunk_and_down_but_never_up() {
         // heim: server; buero: client of heim (VLANs 20, own 60);
         // haus2: client of buero.
-        let mesh = MESH
+        let network = NETWORK
             .replace(
                 "name = \"buero\"\naddress = \"10.8.0.2\"\n",
                 "name = \"buero\"\naddress = \"10.8.0.2\"\nvlans = \"20\"\nown_vlans = \"60\"\nuplink = \"heim\"\n",
@@ -689,7 +689,7 @@ mod tests {
             .replace("vlans = \"20,30\"", "vlans = \"20,60\"");
         let derive_for = |me: &str| {
             let local = format!("self = \"{me}\"\ntrunk = \"ens19\"\n");
-            match load(&mesh, &local).unwrap().loaded {
+            match load(&network, &local).unwrap().loaded {
                 Loaded::Configured(cfg) => derive(&cfg, &Runtime::default()),
                 Loaded::Unconfigured { .. } => panic!("configured"),
             }

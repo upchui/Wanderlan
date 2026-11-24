@@ -1,6 +1,6 @@
 //! Configuration sync and joining over TCP on `<address>:<control_port>`.
 //!
-//! * `MESH`: the server answers with the confirmed `mesh.toml` as the asking
+//! * `NETWORK`: the server answers with the confirmed `network.toml` as the asking
 //!   peer may see it (canonical form; a client gets only its view, see
 //!   `wanderlan_core::view`) and closes the connection. Only direct peers
 //!   (and peers removed within the last minutes) are served.
@@ -22,7 +22,7 @@ use wanderlan_core::join::{JoinReply, JoinRequest};
 
 use crate::daemon::Input;
 
-/// Largest accepted mesh.toml.
+/// Largest accepted network.toml.
 const MAX_SIZE: u64 = 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// Longest accepted request line.
@@ -35,7 +35,7 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Offer {
     /// Address to listen on.
     pub bind: Option<SocketAddrV4>,
-    /// What each allowed address gets: the confirmed mesh.toml as that
+    /// What each allowed address gets: the confirmed network.toml as that
     /// peer may see it.
     pub views: BTreeMap<Ipv4Addr, String>,
 }
@@ -65,7 +65,7 @@ async fn run(mut offer: watch::Receiver<Offer>, inputs: mpsc::Sender<Input>) {
                 continue;
             }
         };
-        info!("Serving the mesh configuration to peers on {bind} (TCP)");
+        info!("Serving the network configuration to peers on {bind} (TCP)");
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
@@ -110,7 +110,7 @@ async fn serve(
     .await
     .context("timeout")??;
     let line = line.trim();
-    if line == "MESH" {
+    if line == "NETWORK" {
         let Some(view) = offer.views.get(from.ip()) else {
             bail!("{from} is not a peer");
         };
@@ -188,13 +188,13 @@ pub async fn join(target: SocketAddrV4, request: &JoinRequest) -> Result<JoinRep
     serde_json::from_str(text.trim()).with_context(|| format!("{target} sent an invalid answer"))
 }
 
-/// Fetches the mesh configuration from a peer.
+/// Fetches the network configuration from a peer.
 pub async fn fetch(peer: SocketAddrV4) -> Result<String> {
     let mut stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(peer))
         .await
         .context("timeout while connecting")?
         .with_context(|| format!("cannot connect to {peer}"))?;
-    stream.write_all(b"MESH\n").await?;
+    stream.write_all(b"NETWORK\n").await?;
     let mut text = String::new();
     tokio::time::timeout(
         TIMEOUT,

@@ -1,6 +1,6 @@
 //! `wanderland`, the wanderlan daemon.
 //!
-//! It reads `/etc/wanderlan/{mesh,local}.toml`, derives the desired layer-2
+//! It reads `/etc/wanderlan/{network,local}.toml`, derives the desired layer-2
 //! setup of this site (bridge, GRETAP tunnels, VLANs) and keeps the system in
 //! that state. On SIGTERM/SIGINT it removes everything it created.
 
@@ -27,7 +27,7 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(name = "wanderland", version = wanderlan_core::VERSION, about)]
 pub struct Args {
-    /// Directory containing mesh.toml and local.toml.
+    /// Directory containing network.toml and local.toml.
     #[arg(long, default_value = "/etc/wanderlan")]
     pub config_dir: PathBuf,
     /// Directory for state (confirmed copies of the configuration).

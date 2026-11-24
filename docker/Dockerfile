@@ -152,7 +152,7 @@ RUN wanderlan --version && wanderland --version \
  && if [ -n "${MIN_VERSION}" ]; then dpkg --compare-versions "${installed}" ge "${MIN_VERSION}"; fi \
  && getent group wanderlan \
  && test -f /lib/systemd/system/wanderland.service -o -f /usr/lib/systemd/system/wanderland.service \
- && wanderlan init | grep -q '^\[mesh\]' 
+ && wanderlan init | grep -q '^\[network\]' 
 
 # The repository installation plus test tools, to run two hosts with the
 # example configuration (tests/repotest).

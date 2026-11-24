@@ -5,11 +5,11 @@ use wanderlan_core::api::{
     ConfigTexts, Event, Interface, Level, MacEntry, PeerStatus, PortState, SiteState, SiteSummary,
     Status,
 };
-use wanderlan_core::config::{Local, fingerprint, parse_mesh, render_local, render_mesh};
+use wanderlan_core::config::{Local, fingerprint, parse_network, render_local, render_network};
 
-/// `mesh.toml` of the fixture mesh (revision 7).
-pub const MESH: &str = r#"
-[mesh]
+/// `network.toml` of the fixture network (revision 7).
+pub const NETWORK: &str = r#"
+[network]
 revision = 7
 vlans = "10-50"
 mtu_probe_interval = "5m"
@@ -56,7 +56,7 @@ shared = 30
 
 /// The running configuration as the daemon sends it (canonical form).
 pub fn config_texts() -> ConfigTexts {
-    let mesh = parse_mesh(MESH).unwrap().mesh.unwrap();
+    let network = parse_network(NETWORK).unwrap().network.unwrap();
     let local = Local {
         self_name: Some("heim".into()),
         trunk: Some("ens19".into()),
@@ -64,10 +64,10 @@ pub fn config_texts() -> ConfigTexts {
     };
     ConfigTexts {
         configured: true,
-        mesh: render_mesh(&mesh),
+        network: render_network(&network),
         local: render_local(&local),
         revision: 7,
-        fingerprint: fingerprint(&mesh),
+        fingerprint: fingerprint(&network),
     }
 }
 
@@ -75,7 +75,7 @@ pub fn config_texts() -> ConfigTexts {
 pub fn unconfigured_texts() -> ConfigTexts {
     ConfigTexts {
         configured: false,
-        mesh: String::new(),
+        network: String::new(),
         local: "# wanderlan site-local configuration.\n".into(),
         revision: 0,
         fingerprint: String::new(),
@@ -289,7 +289,7 @@ pub fn events() -> Vec<Event> {
         message: message.into(),
     };
     vec![
-        ev(0, Level::Info, None, "daemon started, mesh revision 7"),
+        ev(0, Level::Info, None, "daemon started, network revision 7"),
         ev(2, Level::Info, Some("buero"), "tunnel gt-buero is up"),
         ev(
             3,
@@ -301,7 +301,7 @@ pub fn events() -> Vec<Event> {
             65,
             Level::Warn,
             Some("haus5"),
-            "haus5 runs mesh revision 6 with a different configuration; it will be updated by the sync",
+            "haus5 runs network revision 6 with a different configuration; it will be updated by the sync",
         ),
         ev(
             130,

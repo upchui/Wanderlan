@@ -1,6 +1,6 @@
 //! Configuration files on disk.
 //!
-//! `/etc/wanderlan/{mesh,local}.toml` always hold the confirmed
+//! `/etc/wanderlan/{network,local}.toml` always hold the confirmed
 //! configuration, except while a change made by editing the files is
 //! pending. A copy of the last confirmed files is kept in the state
 //! directory, together with a marker for such pending file changes, so that
@@ -8,14 +8,16 @@
 
 use std::path::{Path, PathBuf};
 
-/// The `mesh.toml` shipped by the package (written back on reset, so that
+/// The `network.toml` shipped by the package (written back on reset, so that
 /// dpkg sees the conffile unchanged).
-const TEMPLATE_MESH: &str = include_str!("../../../packaging/etc/mesh.toml");
+const TEMPLATE_NETWORK: &str = include_str!("../../../packaging/etc/network.toml");
 /// The `local.toml` shipped by the package.
 const TEMPLATE_LOCAL: &str = include_str!("../../../packaging/etc/local.toml");
+/// Name of `network.toml` (and of its `[network]` table) in older versions.
+const OLD_NAME: &str = "mesh";
 
 use anyhow::{Context as _, Result};
-use wanderlan_core::config::{Config, render_local, render_mesh};
+use wanderlan_core::config::{Config, render_local, render_network};
 
 /// File locations.
 #[derive(Debug, Clone)]
@@ -27,9 +29,9 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// `mesh.toml` in the configuration directory.
-    pub fn mesh(&self) -> PathBuf {
-        self.config_dir.join("mesh.toml")
+    /// `network.toml` in the configuration directory.
+    pub fn network(&self) -> PathBuf {
+        self.config_dir.join("network.toml")
     }
 
     /// `local.toml` in the configuration directory.
@@ -45,17 +47,46 @@ impl Paths {
         self.state_dir.join("pending-files")
     }
 
+    /// Moves the files of older versions (`mesh.toml` with a `[mesh]`
+    /// table) to `network.toml`, in the configuration directory and in the
+    /// confirmed copy. A `network.toml` with a configuration of its own
+    /// (not just the package template or comments) is kept. Returns a line
+    /// per moved file.
+    pub fn migrate(&self) -> Result<Vec<String>> {
+        let mut moved = Vec::new();
+        for dir in [self.config_dir.clone(), self.confirmed_dir()] {
+            for suffix in ["", ".rejected"] {
+                let old = dir.join(format!("{OLD_NAME}.toml{suffix}"));
+                if !old.exists() {
+                    continue;
+                }
+                let new = dir.join(format!("network.toml{suffix}"));
+                let text = read_optional(&old)?;
+                let current = read_optional(&new)?;
+                if !carries_configuration(&current) && carries_configuration(&text) {
+                    write_atomic(&new, &rename_table(&text))?;
+                    moved.push(format!("Moved {} to {}", old.display(), new.display()));
+                }
+                remove_optional(&old)?;
+            }
+        }
+        Ok(moved)
+    }
+
     /// Reads both files; missing files are empty.
     pub fn read(&self) -> Result<(String, String)> {
-        Ok((read_optional(&self.mesh())?, read_optional(&self.local())?))
+        Ok((
+            read_optional(&self.network())?,
+            read_optional(&self.local())?,
+        ))
     }
 
     /// Writes a confirmed configuration to the configuration directory and
     /// keeps a copy in the state directory.
     pub fn write_confirmed(&self, cfg: &Config) -> Result<()> {
-        let mesh = render_mesh(&cfg.mesh);
+        let network = render_network(&cfg.network);
         let local = render_local(&cfg.local);
-        write_atomic(&self.mesh(), &mesh)?;
+        write_atomic(&self.network(), &network)?;
         write_atomic(&self.local(), &local)?;
         self.save_copy()
     }
@@ -66,8 +97,8 @@ impl Paths {
         let dir = self.confirmed_dir();
         std::fs::create_dir_all(&dir)
             .with_context(|| format!("cannot create {}", dir.display()))?;
-        let (mesh, local) = self.read()?;
-        write_atomic(&dir.join("mesh.toml"), &mesh)?;
+        let (network, local) = self.read()?;
+        write_atomic(&dir.join("network.toml"), &network)?;
         write_atomic(&dir.join("local.toml"), &local)
     }
 
@@ -75,10 +106,10 @@ impl Paths {
     /// rejected files are kept as `*.rejected`.
     pub fn restore_confirmed(&self) -> Result<bool> {
         let dir = self.confirmed_dir();
-        if !dir.join("mesh.toml").exists() {
+        if !dir.join("network.toml").exists() {
             return Ok(false);
         }
-        for name in ["mesh.toml", "local.toml"] {
+        for name in ["network.toml", "local.toml"] {
             let current = self.config_dir.join(name);
             let saved = read_optional(&dir.join(name))?;
             let now = read_optional(&current)?;
@@ -126,9 +157,9 @@ impl Paths {
                 errors.push(format!("{e:#}"));
             }
         };
-        attempt(write_atomic(&self.mesh(), TEMPLATE_MESH));
+        attempt(write_atomic(&self.network(), TEMPLATE_NETWORK));
         attempt(write_atomic(&self.local(), TEMPLATE_LOCAL));
-        for name in ["mesh.toml.rejected", "local.toml.rejected"] {
+        for name in ["network.toml.rejected", "local.toml.rejected"] {
             attempt(remove_optional(&self.config_dir.join(name)));
         }
         match std::fs::read_dir(&self.state_dir) {
@@ -158,7 +189,10 @@ impl Paths {
     /// What a reset should have removed but is still there.
     pub fn leftovers(&self) -> Vec<String> {
         let mut left = Vec::new();
-        for (path, template) in [(self.mesh(), TEMPLATE_MESH), (self.local(), TEMPLATE_LOCAL)] {
+        for (path, template) in [
+            (self.network(), TEMPLATE_NETWORK),
+            (self.local(), TEMPLATE_LOCAL),
+        ] {
             if std::fs::read_to_string(&path).ok().as_deref() != Some(template) {
                 left.push(format!("{} is not the package template", path.display()));
             }
@@ -178,6 +212,36 @@ impl Paths {
         }
         left
     }
+}
+
+/// False for the unconfigured package template of older versions (it is
+/// replaced by the current one).
+fn carries_configuration(text: &str) -> bool {
+    match wanderlan_core::config::parse_network(text) {
+        Ok(parsed) => parsed.network.is_some(),
+        // Not valid, but written by someone: keep it for them to fix.
+        Err(_) => !text.trim().is_empty(),
+    }
+}
+
+/// `[mesh]` becomes `[network]`; everything else stays as it is.
+fn rename_table(text: &str) -> String {
+    let old = format!("[{OLD_NAME}]");
+    let mut out: String = text
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with(&old) {
+                line.replacen(&old, "[network]", 1)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 fn remove_optional(path: &Path) -> Result<()> {
@@ -214,6 +278,93 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<()> {
 mod tests {
     use super::*;
 
+    fn temp_paths(name: &str) -> (PathBuf, Paths) {
+        let base = std::env::temp_dir().join(format!("wl-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let paths = Paths {
+            config_dir: base.join("etc"),
+            state_dir: base.join("state"),
+        };
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        (base, paths)
+    }
+
+    const OLD: &str = "# comment\n[mesh]\nrevision = 3\nvlans = \"10-50\"\n\n[[site]]\nname = \"a\"\naddress = \"10.0.0.1\"\n";
+
+    #[test]
+    fn the_files_of_older_versions_are_moved() {
+        let (base, paths) = temp_paths("migrate");
+        // The package installed the new template next to the old file.
+        std::fs::write(paths.network(), TEMPLATE_NETWORK).unwrap();
+        std::fs::write(paths.config_dir.join("mesh.toml"), OLD).unwrap();
+        std::fs::write(paths.config_dir.join("mesh.toml.rejected"), OLD).unwrap();
+        std::fs::create_dir_all(paths.confirmed_dir()).unwrap();
+        std::fs::write(paths.confirmed_dir().join("mesh.toml"), OLD).unwrap();
+        let moved = paths.migrate().unwrap();
+        assert_eq!(moved.len(), 3, "{moved:?}");
+        let new = std::fs::read_to_string(paths.network()).unwrap();
+        assert_eq!(new, OLD.replace("[mesh]", "[network]"));
+        assert!(
+            wanderlan_core::config::parse_network(&new)
+                .unwrap()
+                .network
+                .is_some()
+        );
+        for dir in [&paths.config_dir, &paths.confirmed_dir()] {
+            assert!(!dir.join("mesh.toml").exists());
+        }
+        assert!(paths.confirmed_dir().join("network.toml").exists());
+        assert!(paths.config_dir.join("network.toml.rejected").exists());
+        // A second start changes nothing.
+        assert!(paths.migrate().unwrap().is_empty());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_network_toml_with_comments_only_is_replaced() {
+        let (base, paths) = temp_paths("migrate-comments");
+        std::fs::write(paths.network(), "# not configured\n").unwrap();
+        std::fs::write(paths.config_dir.join("mesh.toml"), OLD).unwrap();
+        assert_eq!(paths.migrate().unwrap().len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(paths.network()).unwrap(),
+            OLD.replace("[mesh]", "[network]")
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_network_toml_with_a_configuration_is_kept() {
+        let (base, paths) = temp_paths("migrate-keep");
+        std::fs::write(paths.network(), "[network]\nvlans = \"20\"\n").unwrap();
+        std::fs::write(paths.config_dir.join("mesh.toml"), OLD).unwrap();
+        assert!(paths.migrate().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(paths.network()).unwrap(),
+            "[network]\nvlans = \"20\"\n"
+        );
+        assert!(!paths.config_dir.join("mesh.toml").exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn an_unconfigured_old_template_is_not_taken_over() {
+        let (base, paths) = temp_paths("migrate-template");
+        std::fs::write(paths.network(), TEMPLATE_NETWORK).unwrap();
+        std::fs::write(
+            paths.config_dir.join("mesh.toml"),
+            "# This site is not configured yet.\n",
+        )
+        .unwrap();
+        assert!(paths.migrate().unwrap().is_empty());
+        assert_eq!(
+            std::fs::read_to_string(paths.network()).unwrap(),
+            TEMPLATE_NETWORK
+        );
+        assert!(!paths.config_dir.join("mesh.toml").exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn restore_keeps_rejected_files() {
         let base = std::env::temp_dir().join(format!("wl-files-{}", std::process::id()));
@@ -222,16 +373,16 @@ mod tests {
             state_dir: base.join("state"),
         };
         std::fs::create_dir_all(&paths.config_dir).unwrap();
-        std::fs::write(paths.mesh(), "good").unwrap();
+        std::fs::write(paths.network(), "good").unwrap();
         std::fs::write(paths.local(), "local").unwrap();
         paths.save_copy().unwrap();
-        std::fs::write(paths.mesh(), "bad").unwrap();
+        std::fs::write(paths.network(), "bad").unwrap();
         paths.set_marker().unwrap();
         assert!(paths.marker_exists());
         assert!(paths.restore_confirmed().unwrap());
-        assert_eq!(std::fs::read_to_string(paths.mesh()).unwrap(), "good");
+        assert_eq!(std::fs::read_to_string(paths.network()).unwrap(), "good");
         assert_eq!(
-            std::fs::read_to_string(paths.config_dir.join("mesh.toml.rejected")).unwrap(),
+            std::fs::read_to_string(paths.config_dir.join("network.toml.rejected")).unwrap(),
             "bad"
         );
         assert!(!paths.marker_exists());
@@ -246,22 +397,22 @@ mod tests {
             state_dir: base.join("state"),
         };
         std::fs::create_dir_all(&paths.config_dir).unwrap();
-        std::fs::write(paths.mesh(), "configured").unwrap();
+        std::fs::write(paths.network(), "configured").unwrap();
         std::fs::write(paths.local(), "self = \"a\"").unwrap();
-        std::fs::write(paths.config_dir.join("mesh.toml.rejected"), "x").unwrap();
+        std::fs::write(paths.config_dir.join("network.toml.rejected"), "x").unwrap();
         paths.save_copy().unwrap();
         paths.set_marker().unwrap();
         std::fs::write(paths.invites(), "[]").unwrap();
         paths.reset().unwrap();
         assert_eq!(
-            std::fs::read_to_string(paths.mesh()).unwrap(),
-            TEMPLATE_MESH
+            std::fs::read_to_string(paths.network()).unwrap(),
+            TEMPLATE_NETWORK
         );
         assert_eq!(
             std::fs::read_to_string(paths.local()).unwrap(),
             TEMPLATE_LOCAL
         );
-        assert!(!paths.config_dir.join("mesh.toml.rejected").exists());
+        assert!(!paths.config_dir.join("network.toml.rejected").exists());
         assert!(paths.state_dir.exists(), "the state directory itself stays");
         assert_eq!(std::fs::read_dir(&paths.state_dir).unwrap().count(), 0);
         assert_eq!(paths.leftovers(), Vec::<String>::new());
@@ -280,7 +431,7 @@ mod tests {
             state_dir: base.join("lib").join("wanderlan"),
         };
         std::fs::create_dir_all(&paths.config_dir).unwrap();
-        std::fs::write(paths.mesh(), "configured").unwrap();
+        std::fs::write(paths.network(), "configured").unwrap();
         paths.save_copy().unwrap();
         std::fs::write(paths.invites(), "[]").unwrap();
         let parent = base.join("lib");

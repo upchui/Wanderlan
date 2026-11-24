@@ -1,7 +1,7 @@
 //! Rules of the automatic configuration sync.
 //!
 //! Every daemon announces the revision and fingerprint of its confirmed
-//! `mesh.toml` in its control probes. A site fetches the mesh from a direct
+//! `network.toml` in its control probes. A site fetches the network from a direct
 //! peer that announces a newer one: a higher revision (also with the same
 //! content, e.g. a site taken offline and online again, so that the revision
 //! numbers agree everywhere), or the same revision with a different content
@@ -11,9 +11,9 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::{Config, Local, Mesh, fingerprint, validate};
+use crate::config::{Config, Local, Network, fingerprint, validate};
 
-/// Revision and fingerprint of a mesh.
+/// Revision and fingerprint of a network.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version {
     /// Revision counter.
@@ -23,11 +23,11 @@ pub struct Version {
 }
 
 impl Version {
-    /// The version of a mesh.
-    pub fn of(mesh: &Mesh) -> Self {
+    /// The version of a network.
+    pub fn of(network: &Network) -> Self {
         Self {
-            revision: mesh.revision,
-            fingerprint: fingerprint(mesh),
+            revision: network.revision,
+            fingerprint: fingerprint(network),
         }
     }
 
@@ -51,10 +51,10 @@ pub fn choose<'a>(
         .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
 }
 
-/// Why a received mesh cannot be used here.
+/// Why a received network cannot be used here.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Rejection {
-    /// The text is not a valid mesh.
+    /// The text is not a valid network.
     #[error("the received configuration is invalid: {0}")]
     Invalid(String),
     /// This site is not part of it.
@@ -62,9 +62,9 @@ pub enum Rejection {
     SelfMissing(String),
 }
 
-/// Checks a received mesh against the local configuration and returns the
+/// Checks a received network against the local configuration and returns the
 /// complete configuration to apply.
-pub fn accept(received: Mesh, local: &Local) -> Result<Config, Rejection> {
+pub fn accept(received: Network, local: &Local) -> Result<Config, Rejection> {
     let me = local.self_name.clone().unwrap_or_default();
     if received.site(&me).is_none() {
         return Err(Rejection::SelfMissing(me));
@@ -74,7 +74,7 @@ pub fn accept(received: Mesh, local: &Local) -> Result<Config, Rejection> {
         return Err(Rejection::Invalid(err.message.clone()));
     }
     Ok(Config {
-        mesh: received,
+        network: received,
         local: local.clone(),
     })
 }
@@ -82,7 +82,7 @@ pub fn accept(received: Mesh, local: &Local) -> Result<Config, Rejection> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::parse_mesh;
+    use crate::config::parse_network;
 
     fn v(revision: u64, fp: &str) -> Version {
         Version {
@@ -126,23 +126,23 @@ mod tests {
 
     #[test]
     fn accept_requires_self() {
-        let mesh = parse_mesh(include_str!("../../../packaging/examples/mesh.toml"))
+        let network = parse_network(include_str!("../../../packaging/examples/network.toml"))
             .unwrap()
-            .mesh
+            .network
             .unwrap();
         let local = Local {
             self_name: Some("haus2".into()),
             trunk: Some("ens19".into()),
             ..Default::default()
         };
-        assert!(accept(mesh.clone(), &local).is_ok());
+        assert!(accept(network.clone(), &local).is_ok());
         let stranger = Local {
             self_name: Some("haus9".into()),
             trunk: Some("ens19".into()),
             ..Default::default()
         };
         assert_eq!(
-            accept(mesh, &stranger).unwrap_err(),
+            accept(network, &stranger).unwrap_err(),
             Rejection::SelfMissing("haus9".into())
         );
     }

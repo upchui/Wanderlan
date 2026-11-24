@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use super::model::{Local, LocalVid, Mesh};
+use super::model::{Local, LocalVid, Network};
 
-const MESH_HEADER: &str = "\
-# wanderlan mesh configuration, shared by all sites.
+const NETWORK_HEADER: &str = "\
+# wanderlan network configuration, shared by all sites.
 # This file is kept identical on all sites by the wanderlan daemon.
 # Change it with the `wanderlan` TUI or edit it and run `wanderlan apply`.
 ";
@@ -29,29 +29,29 @@ fn duration(d: Duration) -> String {
     quote(&humantime::format_duration(d).to_string())
 }
 
-/// Renders `mesh.toml` in canonical form.
-pub fn render_mesh(mesh: &Mesh) -> String {
-    render_mesh_inner(mesh, true)
+/// Renders `network.toml` in canonical form.
+pub fn render_network(network: &Network) -> String {
+    render_network_inner(network, true)
 }
 
-fn render_mesh_inner(mesh: &Mesh, with_revision: bool) -> String {
-    let mut out = String::from(MESH_HEADER);
-    out.push_str("\n[mesh]\n");
+fn render_network_inner(network: &Network, with_revision: bool) -> String {
+    let mut out = String::from(NETWORK_HEADER);
+    out.push_str("\n[network]\n");
     if with_revision {
-        let _ = writeln!(out, "revision = {}", mesh.revision);
+        let _ = writeln!(out, "revision = {}", network.revision);
     }
-    let _ = writeln!(out, "vlans = {}", quote(&mesh.vlans.to_string()));
-    let _ = writeln!(out, "control_port = {}", mesh.control_port);
+    let _ = writeln!(out, "vlans = {}", quote(&network.vlans.to_string()));
+    let _ = writeln!(out, "control_port = {}", network.control_port);
     let _ = writeln!(
         out,
         "mtu_probe_interval = {}",
-        duration(mesh.mtu_probe_interval)
+        duration(network.mtu_probe_interval)
     );
-    let _ = writeln!(out, "commit_timeout = {}", duration(mesh.commit_timeout));
-    if let Some(mss) = mesh.mss {
+    let _ = writeln!(out, "commit_timeout = {}", duration(network.commit_timeout));
+    if let Some(mss) = network.mss {
         let _ = writeln!(out, "mss = {mss}");
     }
-    for site in &mesh.sites {
+    for site in &network.sites {
         out.push_str("\n[[site]]\n");
         let _ = writeln!(out, "name = {}", quote(&site.name));
         let _ = writeln!(out, "address = {}", quote(&site.address.to_string()));
@@ -80,7 +80,7 @@ fn render_mesh_inner(mesh: &Mesh, with_revision: bool) -> String {
             None => {}
         }
     }
-    for map in &mesh.maps {
+    for map in &network.maps {
         out.push_str("\n[[map]]\n");
         let _ = writeln!(out, "site = {}", quote(&map.site));
         match map.local {
@@ -123,12 +123,12 @@ pub fn render_local(local: &Local) -> String {
     out
 }
 
-/// SHA-256 over the canonical mesh form without the revision, hex encoded.
+/// SHA-256 over the canonical network form without the revision, hex encoded.
 ///
-/// Two meshes with the same content have the same fingerprint regardless of
+/// Two networks with the same content have the same fingerprint regardless of
 /// their revision counter and of formatting or comments in the source file.
-pub fn fingerprint(mesh: &Mesh) -> String {
-    let digest = Sha256::digest(render_mesh_inner(mesh, false).as_bytes());
+pub fn fingerprint(network: &Network) -> String {
+    let digest = Sha256::digest(render_network_inner(network, false).as_bytes());
     let mut hex = String::with_capacity(64);
     for byte in digest {
         let _ = write!(hex, "{byte:02x}");

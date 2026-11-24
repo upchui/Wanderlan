@@ -43,9 +43,9 @@ depends = "nftables"
 assets = [
     ["target/release/wanderland", "usr/bin/", "755"],
     ["target/release/wanderlan", "usr/bin/", "755"],
-    ["../../packaging/etc/mesh.toml", "etc/wanderlan/mesh.toml", "644"],
+    ["../../packaging/etc/network.toml", "etc/wanderlan/network.toml", "644"],
     ["../../packaging/etc/local.toml", "etc/wanderlan/local.toml", "644"],
-    ["../../packaging/examples/mesh.toml", "usr/share/doc/wanderlan/examples/mesh.toml", "644"],
+    ["../../packaging/examples/network.toml", "usr/share/doc/wanderlan/examples/network.toml", "644"],
     ["../../packaging/examples/local.toml", "usr/share/doc/wanderlan/examples/local.toml", "644"],
     ["../../packaging/modules-load.conf", "usr/lib/modules-load.d/wanderlan.conf", "644"],
     ["../../README.md", "usr/share/doc/wanderlan/README.md", "644"],

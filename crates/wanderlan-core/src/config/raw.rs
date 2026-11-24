@@ -14,14 +14,16 @@ use serde_spanned::Spanned;
 use super::diag::{ConfigFile, Diagnostic, FieldPath, SpanMap};
 use super::model::{
     DEFAULT_COMMIT_TIMEOUT, DEFAULT_CONTROL_PORT, DEFAULT_MTU_PROBE_INTERVAL, Local, LocalVid,
-    Mesh, Site, VlanMap,
+    Network, Site, VlanMap,
 };
 use super::vlan::{VID_MAX, VID_MIN, VlanSet};
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawMeshFile {
-    mesh: Option<Spanned<RawMeshSection>>,
+struct RawNetworkFile {
+    /// `[network]`; files and sites of older versions call it `[mesh]`.
+    #[serde(alias = "mesh")]
+    network: Option<Spanned<RawNetworkSection>>,
     #[serde(default)]
     site: Vec<Spanned<RawSite>>,
     #[serde(default)]
@@ -30,7 +32,7 @@ struct RawMeshFile {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawMeshSection {
+struct RawNetworkSection {
     revision: Option<Spanned<i64>>,
     control_port: Option<Spanned<i64>>,
     vlans: Option<Spanned<RawVlans>>,
@@ -101,12 +103,12 @@ struct RawLocalTunnel {
     trunk: Option<Spanned<String>>,
 }
 
-/// Result of parsing `mesh.toml`.
+/// Result of parsing `network.toml`.
 #[derive(Debug, Clone)]
-pub struct ParsedMesh {
-    /// The mesh, or `None` if the file contains no configuration at all
+pub struct ParsedNetwork {
+    /// The network, or `None` if the file contains no configuration at all
     /// (e.g. the commented template shipped with the package).
-    pub mesh: Option<Mesh>,
+    pub network: Option<Network>,
     /// Source positions for line numbers in later diagnostics.
     pub spans: SpanMap,
     /// Warnings found while reading (e.g. keys that are no longer used).
@@ -202,31 +204,31 @@ fn toml_error(file: ConfigFile, spans: &SpanMap, err: &toml::de::Error) -> Diagn
     diag
 }
 
-/// Parses `mesh.toml`. Returns all syntax and type errors at once.
-pub fn parse_mesh(text: &str) -> Result<ParsedMesh, Vec<Diagnostic>> {
-    let mut lw = Lowering::new(ConfigFile::Mesh, text);
-    let raw: RawMeshFile = match toml::from_str(text) {
+/// Parses `network.toml`. Returns all syntax and type errors at once.
+pub fn parse_network(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
+    let mut lw = Lowering::new(ConfigFile::Network, text);
+    let raw: RawNetworkFile = match toml::from_str(text) {
         Ok(raw) => raw,
-        Err(e) => return Err(vec![toml_error(ConfigFile::Mesh, &lw.spans, &e)]),
+        Err(e) => return Err(vec![toml_error(ConfigFile::Network, &lw.spans, &e)]),
     };
 
-    if raw.mesh.is_none() && raw.site.is_empty() && raw.map.is_empty() {
-        return Ok(ParsedMesh {
-            mesh: None,
+    if raw.network.is_none() && raw.site.is_empty() && raw.map.is_empty() {
+        return Ok(ParsedNetwork {
+            network: None,
             spans: lw.spans,
             warnings: Vec::new(),
         });
     }
 
-    let mesh_path = FieldPath::mesh("");
-    let section = lw.take(&mesh_path, raw.mesh);
-    let mut mesh = Mesh::new(VlanSet::new());
+    let network_path = FieldPath::network("");
+    let section = lw.take(&network_path, raw.network);
+    let mut network = Network::new(VlanSet::new());
     match section {
         None => lw.error(
             FieldPath::root(),
-            "the [mesh] table is missing (it needs at least `vlans = \"10-50\"`)",
+            "the [network] table is missing (it needs at least `vlans = \"10-50\"`)",
         ),
-        Some(section) => lower_section(&mut lw, section, &mut mesh),
+        Some(section) => lower_section(&mut lw, section, &mut network),
     }
 
     let mut uplink_missing = Vec::new();
@@ -237,19 +239,19 @@ pub fn parse_mesh(text: &str) -> Result<ParsedMesh, Vec<Diagnostic>> {
             .and_then(|s| lower_site(&mut lw, i, s))
         {
             if !given {
-                uplink_missing.push(mesh.sites.len());
+                uplink_missing.push(network.sites.len());
             }
-            mesh.sites.push(site);
+            network.sites.push(site);
         }
     }
     // Configurations from before uplinks: a site that joined with an
     // invitation (it has a manager) hangs off that site.
     for i in uplink_missing {
-        let manager = mesh.sites.get(i).and_then(|s| s.managed_by.clone());
+        let manager = network.sites.get(i).and_then(|s| s.managed_by.clone());
         if let Some(m) = manager
-            && mesh.site(&m).is_some()
-            && mesh.sites.get(i).is_some_and(|s| s.name != m)
-            && let Some(site) = mesh.sites.get_mut(i)
+            && network.site(&m).is_some()
+            && network.sites.get(i).is_some_and(|s| s.name != m)
+            && let Some(site) = network.sites.get_mut(i)
         {
             site.uplink = Some(m);
         }
@@ -260,29 +262,29 @@ pub fn parse_mesh(text: &str) -> Result<ParsedMesh, Vec<Diagnostic>> {
             .take(&path, Some(raw_map))
             .and_then(|m| lower_map(&mut lw, i, m))
         {
-            mesh.maps.push(map);
+            network.maps.push(map);
         }
     }
 
     if lw.diags.iter().any(Diagnostic::is_error) {
         Err(lw.diags)
     } else {
-        Ok(ParsedMesh {
-            mesh: Some(mesh),
+        Ok(ParsedNetwork {
+            network: Some(network),
             spans: lw.spans,
             warnings: lw.diags,
         })
     }
 }
 
-fn lower_section(lw: &mut Lowering, s: RawMeshSection, mesh: &mut Mesh) {
-    let path = FieldPath::mesh("revision");
+fn lower_section(lw: &mut Lowering, s: RawNetworkSection, network: &mut Network) {
+    let path = FieldPath::network("revision");
     if let Some(v) = lw.take(&path, s.revision) {
-        mesh.revision = lw.int_in_range(&path, v, 0, i64::MAX).unwrap_or(0);
+        network.revision = lw.int_in_range(&path, v, 0, i64::MAX).unwrap_or(0);
     }
 
-    let path = FieldPath::mesh("control_port");
-    mesh.control_port = match lw.take(&path, s.control_port) {
+    let path = FieldPath::network("control_port");
+    network.control_port = match lw.take(&path, s.control_port) {
         Some(v) => lw
             .int_in_range(&path, v, 1, 65535)
             .and_then(|v| u16::try_from(v).ok())
@@ -292,36 +294,36 @@ fn lower_section(lw: &mut Lowering, s: RawMeshSection, mesh: &mut Mesh) {
 
     // Without (or with an empty) `vlans` every VLAN and the untagged
     // traffic pass, like on a trunk between two switches.
-    let path = FieldPath::mesh("vlans");
-    mesh.vlans = match lw.take(&path, s.vlans) {
+    let path = FieldPath::network("vlans");
+    network.vlans = match lw.take(&path, s.vlans) {
         None => VlanSet::all(),
         Some(RawVlans::Text(t)) if t.trim().is_empty() => VlanSet::all(),
         Some(vlans) => match parse_vlans(vlans) {
             Ok(set) => set,
             Err(e) => {
-                lw.error(path, format!("mesh.vlans: {e}"));
+                lw.error(path, format!("network.vlans: {e}"));
                 VlanSet::all()
             }
         },
     };
 
-    let path = FieldPath::mesh("mtu_probe_interval");
-    mesh.mtu_probe_interval = match lw.take(&path, s.mtu_probe_interval) {
+    let path = FieldPath::network("mtu_probe_interval");
+    network.mtu_probe_interval = match lw.take(&path, s.mtu_probe_interval) {
         Some(text) => lw
             .duration(&path, &text)
             .unwrap_or(DEFAULT_MTU_PROBE_INTERVAL),
         None => DEFAULT_MTU_PROBE_INTERVAL,
     };
 
-    let path = FieldPath::mesh("commit_timeout");
-    mesh.commit_timeout = match lw.take(&path, s.commit_timeout) {
+    let path = FieldPath::network("commit_timeout");
+    network.commit_timeout = match lw.take(&path, s.commit_timeout) {
         Some(text) => lw.duration(&path, &text).unwrap_or(DEFAULT_COMMIT_TIMEOUT),
         None => DEFAULT_COMMIT_TIMEOUT,
     };
 
-    let path = FieldPath::mesh("mss");
+    let path = FieldPath::network("mss");
     if let Some(v) = lw.take(&path, s.mss) {
-        mesh.mss = lw
+        network.mss = lw
             .int_in_range(&path, v, 1, 65535)
             .and_then(|v| u16::try_from(v).ok());
     }

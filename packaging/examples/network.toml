@@ -1,4 +1,4 @@
-# wanderlan example mesh configuration.
+# wanderlan example network configuration.
 #
 # Usually nobody writes this file by hand: set up the first site with
 # `wanderlan` ("Start a new network"), then add every further site with an
@@ -14,7 +14,7 @@
 # GRETAP tunnel leads there (sites that join with an invitation become
 # clients of the inviting site).
 
-[mesh]
+[network]
 vlans = "10-50"               # VLANs of every site that does not list its own
 mtu_probe_interval = "5m"     # how often the path MTU to each peer is measured
 # mss = 1300                  # optional: fixed TCP MSS instead of measuring

@@ -2,11 +2,11 @@
 # Five sites: every site has a tunnel to every other site (one virtual
 # switch); split horizon keeps it loop-free; VLANs per site.
 
-begin "Five sites: full mesh, split horizon"
+begin "Five sites: servers connected with each other, split horizon"
 
-mesh_toml "10-50" site1 site2 site3 site4 site5 >"$RUN_DIR/mesh-5.toml"
+network_toml "10-50" site1 site2 site3 site4 site5 >"$RUN_DIR/network-5.toml"
 for s in site1 site2 site3 site4 site5; do
-  configure "$s" "$RUN_DIR/mesh-5.toml"
+  configure "$s" "$RUN_DIR/network-5.toml"
   if x "$s" "wl-daemon status"; then x "$s" "wl-daemon reload"; else x "$s" "wl-daemon start"; fi
 done
 
@@ -50,9 +50,9 @@ begin "VLANs per site: a site only takes part in its VLANs"
 
 # site5 only takes part in VLAN 20: its tunnels carry VLAN 20 only, VLAN 30
 # does not reach it, the other sites keep VLAN 30 among each other.
-mesh_toml "10-50" site1 site2 site3 site4 site5=20 >"$RUN_DIR/mesh-5-vlans.toml"
+network_toml "10-50" site1 site2 site3 site4 site5=20 >"$RUN_DIR/network-5-vlans.toml"
 for s in site1 site2 site3 site4 site5; do
-  configure "$s" "$RUN_DIR/mesh-5-vlans.toml"
+  configure "$s" "$RUN_DIR/network-5-vlans.toml"
   x "$s" "wl-daemon reload"
 done
 wait_for 30 "site5's trunk carries VLAN 20 only" eval '[ "$(vlan_summary site5 trunk0)" = 20 ]'
@@ -71,18 +71,18 @@ for s in site3 site4 site5; do
 done
 
 # A mapping onto a VLAN the site does not take part in is rejected.
-MESH_EXTRA='[[map]]
+NETWORK_EXTRA='[[map]]
 site = "site5"
 local = "native"
-shared = 30' mesh_toml "10-50" site1 site2 site5=20 >"$RUN_DIR/mesh-bad.toml"
-put site1 /tmp/mesh-bad.toml <"$RUN_DIR/mesh-bad.toml"
+shared = 30' network_toml "10-50" site1 site2 site5=20 >"$RUN_DIR/network-bad.toml"
+put site1 /tmp/network-bad.toml <"$RUN_DIR/network-bad.toml"
 check "wanderlan validate rejects a mapping onto a VLAN the site does not have" \
-  x site1 "! wanderlan validate /tmp/mesh-bad.toml && wanderlan validate /tmp/mesh-bad.toml 2>&1 | grep -q 'not one of the VLANs of site \"site5\"'"
+  x site1 "! wanderlan validate /tmp/network-bad.toml && wanderlan validate /tmp/network-bad.toml 2>&1 | grep -q 'not one of the VLANs of site \"site5\"'"
 
 # Back to all VLANs everywhere for the following cases.
-renew "$RUN_DIR/mesh-5.toml"
+renew "$RUN_DIR/network-5.toml"
 for s in site1 site2 site3 site4 site5; do
-  configure "$s" "$RUN_DIR/mesh-5.toml"
+  configure "$s" "$RUN_DIR/network-5.toml"
   x "$s" "wl-daemon reload"
 done
 wait_for 30 "site5's trunk carries VLANs 10-50 again" eval '[ "$(vlan_summary site5 trunk0)" = "10-50" ]'

@@ -281,7 +281,7 @@ fn not_configured(frame: &mut Frame, area: Rect) {
         Line::styled("This site is not configured yet.", theme::warn()),
         Line::raw(""),
         Line::raw("Press 6 to run the setup wizard. It creates a minimal configuration"),
-        Line::raw("(this site and one peer); the rest of the mesh then arrives by sync."),
+        Line::raw("(this site and one peer); the rest of the network then arrives by sync."),
     ];
     frame.render_widget(Paragraph::new(text).block(titled(" Draft ")), area);
 }

@@ -12,7 +12,7 @@ use std::str::FromStr as _;
 use crossterm::event::{KeyCode, KeyEvent};
 use wanderlan_core::api::{Interface, JoinParams};
 use wanderlan_core::config::{
-    DEFAULT_CONTROL_PORT, Local, Mesh, Site, VlanSet, has_errors, ifname_error, site_name_error,
+    DEFAULT_CONTROL_PORT, Local, Network, Site, VlanSet, has_errors, ifname_error, site_name_error,
     validate,
 };
 use wanderlan_core::join;
@@ -432,12 +432,12 @@ impl Wizard {
     }
 
     /// Builds the configuration of a new network: this site alone.
-    pub fn build(&self, interfaces: &[Interface]) -> Result<(Mesh, Local), String> {
+    pub fn build(&self, interfaces: &[Interface]) -> Result<(Network, Local), String> {
         let name = self.name.value().trim().to_string();
         let vlans = self.parse_vlans()?;
         self.check_trunk(interfaces)?;
-        let mut mesh = Mesh::new(vlans);
-        mesh.sites.push(Site {
+        let mut network = Network::new(vlans);
+        network.sites.push(Site {
             name: name.clone(),
             address: parse_address(self.address.value())?,
             vlans: None,
@@ -452,7 +452,7 @@ impl Wizard {
             trunk: Some(self.trunk(interfaces)),
             ..Default::default()
         };
-        let diags = validate(&mesh, Some(&local));
+        let diags = validate(&network, Some(&local));
         if has_errors(&diags) {
             let first = diags
                 .iter()
@@ -461,7 +461,7 @@ impl Wizard {
                 .unwrap_or_default();
             return Err(first);
         }
-        Ok((mesh, local))
+        Ok((network, local))
     }
 
     /// The VLANs of the new network; empty means all VLANs and untagged.
@@ -505,7 +505,7 @@ fn parse_address(text: &str) -> Result<Ipv4Addr, String> {
 #[cfg(test)]
 mod tests {
     use crossterm::event::KeyModifiers;
-    use wanderlan_core::config::{render_local, render_mesh};
+    use wanderlan_core::config::{render_local, render_network};
 
     use super::*;
     use crate::tui::fixtures;
@@ -553,8 +553,8 @@ mod tests {
     fn a_new_network_has_this_site_only() {
         let mut w = new_network();
         assert_eq!(press(&mut w, KeyCode::Enter), Some(Action::Review));
-        let (mesh, local) = w.build(&fixtures::interfaces()).unwrap();
-        insta::assert_snapshot!("wizard_new_network_mesh", render_mesh(&mesh));
+        let (network, local) = w.build(&fixtures::interfaces()).unwrap();
+        insta::assert_snapshot!("wizard_new_network_config", render_network(&network));
         assert_eq!(
             render_local(&local),
             "# wanderlan site-local configuration (never synchronised).\n\nself = \"heim\"\ntrunk = \"ens19\"\n"

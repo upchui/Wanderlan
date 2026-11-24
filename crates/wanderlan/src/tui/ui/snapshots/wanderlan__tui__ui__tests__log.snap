@@ -1,16 +1,15 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 107
 expression: render(&app)
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
 " Level all  Peer all  following  6 of 6 events                                  "
 "┌ Events (times in UTC) ───────────────────────────────────────────────────────┐"
 "│-- 2026-11-24 --                                                              │"
-"│10:00:00 info  -            daemon started, mesh revision 7                   │"
+"│10:00:00 info  -            daemon started, network revision 7                │"
 "│10:00:02 info  buero        tunnel gt-buero is up                             │"
 "│10:00:03 info  buero        path MTU to buero is 1420, MSS 1338               │"
-"│10:01:05 warn  haus5        haus5 runs mesh revision 6 with a different       │"
+"│10:01:05 warn  haus5        haus5 runs network revision 6 with a different    │"
 "│                            configuration; it will be updated by the sync     │"
 "│10:02:10 error haus2        loop detected on gt-haus2: own frames came back;  │"
 "│                            the port is blocked                               │"

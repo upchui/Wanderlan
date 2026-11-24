@@ -7,6 +7,17 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 0.2 do not sync with each other.
 
+### network.toml
+
+- wanderlan is no mesh, so nothing is called that any more: the shared
+  configuration is `/etc/wanderlan/network.toml` with a `[network]` table,
+  `wanderlan apply --network`, "network revision" everywhere.
+- Upgrading moves an existing `mesh.toml` (also the confirmed copy and
+  `*.rejected`) to `network.toml` at the first start and renames its `[mesh]`
+  table; files and sites with the old table name are still read. Sites with
+  an older version cannot read `[network]`: update all sites, until then
+  changes do not reach the old ones (their tunnels keep running).
+
 ### Like a switch: no hubs and spokes
 
 - Every site has a tunnel to every other site; all tunnel ports are isolated
@@ -14,7 +25,7 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
   other in the transport network.
 - VLANs per site (`[[site]] vlans = "20,30"`), like the allowed VLANs of a
   switch port; a tunnel carries the VLANs both of its sites take part in.
-  `mesh.vlans` is the default. Mappings (native → VLAN, VLAN → VLAN) as
+  `network.vlans` is the default. Mappings (native → VLAN, VLAN → VLAN) as
   before, checked against the VLANs of their site.
 - `role` and `hub` in existing configurations are ignored with a warning.
 - The loop guard also detects MAC addresses moving between the trunk and a
@@ -76,7 +87,7 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
   reports what is left. As root and outside containers the reset also
   unloads the kernel module `ip_gre` if no other GRE tunnel uses it, so the
   kernel's devices `gre0`, `gretap0` and `erspan0` disappear.
-- Starting a new network after a reset was refused ("peer … has a newer mesh
+- Starting a new network after a reset was refused ("peer … has a newer network
   configuration") because announcements of the old network were kept; only
   reachable peers of the new configuration count now.
 - Only one daemon runs: a second `wanderland` (e.g. typed instead of
@@ -140,7 +151,7 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
 - A client that joins again through another site becomes a client of that
   site.
 - Clients never see the clients of other servers: a client's configuration
-  (TUI, status, `mesh.toml`) contains only itself, its server and its own
+  (TUI, status, `network.toml`) contains only itself, its server and its own
   clients; servers keep the whole network. Each peer gets its view in the
   sync; a client's changes are merged by its server (only its own entry,
   its own clients and the network settings, checked against its rights).
@@ -259,7 +270,7 @@ First release. Everything below this line went into it.
 - Interactive terminal UI (`wanderlan` without arguments, ratatui +
   crossterm, keyboard first, `--mouse` optional, works in 80×24 and over
   SSH): overview with live peer status, sites with forms and in-field
-  validation, mesh and local settings, VLAN range and mapping table with
+  validation, network and local settings, VLAN range and mapping table with
   immediate conflict marking, MAC table (filter, sort), live log (filter by
   level and peer), setup wizard on first start.
 - Changes are collected in a draft; `a` shows the diff against the running
@@ -280,11 +291,11 @@ First release. Everything below this line went into it.
 - Commit with rollback: every change must be confirmed within
   `commit_timeout`, otherwise the previous state is restored; edited files
   that are not confirmed are restored and kept as `*.rejected`, also across
-  a restart. Confirming a local change raises the mesh revision.
+  a restart. Confirming a local change raises the network revision.
 - Loop guard: MAC addresses flapping between GRETAP ports shut down the
   offending port (spoke ports first) until `wanderlan unblock`.
-- Automatic sync of `mesh.toml`: probes announce revision and fingerprint,
-  sites fetch a newer mesh from a direct peer over TCP, apply it with the
+- Automatic sync of `network.toml`: probes announce revision and fingerprint,
+  sites fetch a newer network from a direct peer over TCP, apply it with the
   commit timer and confirm it automatically once a peer is reachable;
   rejected versions are not fetched again, removed peers may fetch for 5
   minutes, changes based on an outdated revision are refused.
@@ -294,7 +305,7 @@ First release. Everything below this line went into it.
 - Integration tests: rollback after the deadline, rollback of edited files,
   invalid configurations with line numbers, an external layer-2 loop cut by
   the loop guard, sync of a change to all sites, refusal of outdated
-  changes, a new site fetching the mesh from its hub.
+  changes, a new site fetching the network from its hub.
 
 ### Milestone 5 – MTU and MSS
 
@@ -337,7 +348,7 @@ First release. Everything below this line went into it.
   router (standing in for the existing transport network/VPN).
 - Tests: VLAN 20 between spokes at the same hub and at different hubs, split
   horizon (`isolated` on hub-to-hub ports, own broadcasts never return, also
-  with three fully meshed hubs), topology check via `wanderlan validate`,
+  with three hubs, all connected with each other), topology check via `wanderlan validate`,
   hub container restart, daemon crash with adoption of existing interfaces.
 - After a topology change the daemon flushes the learned MAC addresses of
   the bridge, immediately and again after 10 s and 30 s, so that entries
@@ -368,7 +379,7 @@ First release. Everything below this line went into it.
   and the TUI/CLI `wanderlan`; clippy denies `unwrap`/`expect` outside tests.
 - Docker build with the stages `base` and `check` (fmt, clippy, tests);
   `scripts/check.sh` runs it locally, `ci.yml` on every push and pull request.
-- Loading and validation of `mesh.toml` and `local.toml` with line numbers:
+- Loading and validation of `network.toml` and `local.toml` with line numbers:
   unique names and addresses, hub/spoke references, topology check, VLAN
   ranges and mappings, durations, MSS, unknown keys.
 - `wanderlan validate <file> [--local <file>]` and `wanderlan init`.

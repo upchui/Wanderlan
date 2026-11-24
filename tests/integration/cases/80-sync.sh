@@ -4,52 +4,52 @@
 begin "Sync: a confirmed change at one site reaches all sites"
 
 base=$(jqs site2 .revision)
-sed 's/^vlans = .*/vlans = "10-60"/' "$RUN_DIR/mesh-map.toml" | put site2 /tmp/mesh-60.toml
-x site2 "wanderlan apply --mesh /tmp/mesh-60.toml" >/dev/null
+sed 's/^vlans = .*/vlans = "10-60"/' "$RUN_DIR/network-map.toml" | put site2 /tmp/network-60.toml
+x site2 "wanderlan apply --network /tmp/network-60.toml" >/dev/null
 out=$(x site2 "wanderlan confirm")
 want=$((base + 1))
-if grep -q "mesh revision $want is in effect" <<<"$out"; then
+if grep -q "network revision $want is in effect" <<<"$out"; then
   pass "confirming bumps the revision to $want"
 else
   fail "unexpected confirm output: $out"
 fi
 fp=$(jqs site2 .fingerprint)
 for s in site1 site3 site4 site5; do
-  wait_eq 90 "$s has mesh revision $want" "$want" jqs "$s" .revision
+  wait_eq 90 "$s has network revision $want" "$want" jqs "$s" .revision
   check "$s has the same configuration (fingerprint)" test "$(jqs "$s" .fingerprint)" = "$fp"
   wait_eq 30 "$s confirmed the synced change automatically" "null" jqs "$s" .pending
 done
 check "site3 applied the synced VLAN range (10-60 on trunk0)" test "$(vlan_summary site3 trunk0)" = "10-60"
-check "site3 wrote the synced configuration to its mesh.toml" \
-  x site3 "grep -q '^revision = $want' /etc/wanderlan/mesh.toml && grep -q '^vlans = \"10-60\"' /etc/wanderlan/mesh.toml"
+check "site3 wrote the synced configuration to its network.toml" \
+  x site3 "grep -q '^revision = $want' /etc/wanderlan/network.toml && grep -q '^vlans = \"10-60\"' /etc/wanderlan/network.toml"
 check "site5 kept its own local.toml" x site5 "grep -q '^self = \"site5\"' /etc/wanderlan/local.toml"
 wait_for 30 "site1 reports all peers in sync" \
   x site1 "wanderlan status --json | jq -e '[.peers[].in_sync] | all'"
 
 begin "Sync: changes based on an outdated revision are refused"
 
-mesh_old=$(x site3 "wanderlan export" | sed 's/^vlans = .*/vlans = "10-55"/')
-printf '%s\n' "$mesh_old" | put site3 /tmp/mesh-old.toml
-api_reply=$(x site3 "jq -Rsc '{id: 1, method: \"apply\", params: {mesh: ., local: \"self = \\\"site3\\\"\\ntrunk = \\\"trunk0\\\"\\n\", base_revision: 1}}' /tmp/mesh-old.toml | timeout 3 nc -U -q 1 /run/wanderlan/wanderlan.sock")
+network_old=$(x site3 "wanderlan export" | sed 's/^vlans = .*/vlans = "10-55"/')
+printf '%s\n' "$network_old" | put site3 /tmp/network-old.toml
+api_reply=$(x site3 "jq -Rsc '{id: 1, method: \"apply\", params: {network: ., local: \"self = \\\"site3\\\"\\ntrunk = \\\"trunk0\\\"\\n\", base_revision: 1}}' /tmp/network-old.toml | timeout 3 nc -U -q 1 /run/wanderlan/wanderlan.sock")
 if grep -q 'the configuration changed meanwhile' <<<"$api_reply"; then
   pass "an apply based on revision 1 is refused"
 else
   fail "unexpected API reply: $api_reply"
 fi
 
-begin "Sync: a site with an outdated mesh fetches the whole mesh from a peer"
+begin "Sync: a site with an outdated network fetches the whole network from a peer"
 
 x site5 "wl-daemon stop"
-printf '[mesh]\nrevision = 0\nvlans = "10-50"\n\n[[site]]\nname = "site5"\naddress = "10.100.13.10"\n\n[[site]]\nname = "site2"\naddress = "10.100.2.10"\n' \
-  | put site5 /etc/wanderlan/mesh.toml
+printf '[network]\nrevision = 0\nvlans = "10-50"\n\n[[site]]\nname = "site5"\naddress = "10.100.13.10"\n\n[[site]]\nname = "site2"\naddress = "10.100.2.10"\n' \
+  | put site5 /etc/wanderlan/network.toml
 x site5 "wl-daemon start"
-wait_eq 90 "site5 fetched the mesh from site2 (revision $want, 5 sites)" "$want 5" \
+wait_eq 90 "site5 fetched the network from site2 (revision $want, 5 sites)" "$want 5" \
   jqs site5 '"\(.revision) \(.sites | length)"'
-check "site5 has its mappings again (tc rules from the synced mesh)" \
+check "site5 has its mappings again (tc rules from the synced network)" \
   x site5 "tc filter show dev trunk0 ingress | grep -q 'vlan_id 130'"
 expect_ping c-site5 10.30.0.1 "local VLAN 130 at site5 reaches VLAN 30 at site1 again"
 
 # Back to VLANs 10-50 for the remaining cases.
-sed 's/^vlans = .*/vlans = "10-50"/' "$RUN_DIR/mesh-map.toml" | put site1 /tmp/mesh-50.toml
-x site1 "wanderlan apply --mesh /tmp/mesh-50.toml >/dev/null && wanderlan confirm >/dev/null"
+sed 's/^vlans = .*/vlans = "10-50"/' "$RUN_DIR/network-map.toml" | put site1 /tmp/network-50.toml
+x site1 "wanderlan apply --network /tmp/network-50.toml >/dev/null && wanderlan confirm >/dev/null"
 wait_eq 90 "site5 is back at VLANs 10-50" "10-19,20:pu,21-50" vlan_summary site5 trunk0

@@ -52,9 +52,9 @@ healthy() {
 
 state() { x "$1" "wanderlan status --json | jq -r .state"; }
 new_network() { # new_network <host> <site name> <address>: what the setup wizard does
-  x "$1" "printf '[mesh]\n\n[[site]]\nname = \"$2\"\naddress = \"$3\"\n' > /tmp/mesh.toml"
+  x "$1" "printf '[network]\n\n[[site]]\nname = \"$2\"\naddress = \"$3\"\n' > /tmp/network.toml"
   x "$1" "printf 'self = \"$2\"\ntrunk = \"trunk0\"\n' > /tmp/local.toml"
-  x "$1" "wanderlan apply --mesh /tmp/mesh.toml --local /tmp/local.toml >/dev/null && wanderlan confirm >/dev/null"
+  x "$1" "wanderlan apply --network /tmp/network.toml --local /tmp/local.toml >/dev/null && wanderlan confirm >/dev/null"
 }
 invite_code() { x "$1" "wanderlan invite" | awk '$1 == "wanderlan" && $2 == "join" {print $4; exit}'; }
 join() { # join <host> <code>
@@ -131,7 +131,7 @@ check "no nftables table is left" x alpha "! nft list table bridge wanderlan 2>/
 check "the state directory exists and is empty" \
   x alpha "[ -d /var/lib/wanderlan ] && [ -z \"\$(ls -A /var/lib/wanderlan)\" ]"
 check "the configuration files are the package templates" \
-  x alpha "grep -q 'not configured yet' /etc/wanderlan/mesh.toml && ! grep -q '^self' /etc/wanderlan/local.toml"
+  x alpha "grep -q 'not configured yet' /etc/wanderlan/network.toml && ! grep -q '^self' /etc/wanderlan/local.toml"
 out=$(x alpha "wanderlan reset --yes" 2>&1)
 expect_output "a second reset succeeds too" 'Reset done' "$out"
 healthy

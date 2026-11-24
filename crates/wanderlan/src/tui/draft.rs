@@ -7,8 +7,8 @@
 
 use wanderlan_core::api::ConfigTexts;
 use wanderlan_core::config::{
-    Diagnostic, FieldPath, Local, Mesh, Severity, Site, parse_local, parse_mesh, render_local,
-    render_mesh, validate,
+    Diagnostic, FieldPath, Local, Network, Severity, Site, parse_local, parse_network,
+    render_local, render_network, validate,
 };
 
 use super::diff::{self, DiffLine};
@@ -18,12 +18,12 @@ use super::diff::{self, DiffLine};
 pub struct Running {
     /// True if the site has a configuration.
     pub configured: bool,
-    /// Mesh revision.
+    /// Network revision.
     pub revision: u64,
-    /// Mesh fingerprint.
+    /// Network fingerprint.
     pub fingerprint: String,
-    /// The mesh, if there is one.
-    pub mesh: Option<Mesh>,
+    /// The network, if there is one.
+    pub network: Option<Network>,
     /// The local settings.
     pub local: Local,
 }
@@ -37,12 +37,12 @@ impl Running {
                 .map_or_else(|| "unknown error".to_string(), ToString::to_string);
             format!("cannot read the running {file}: {detail}")
         };
-        let mesh = if texts.mesh.trim().is_empty() {
+        let network = if texts.network.trim().is_empty() {
             None
         } else {
-            parse_mesh(&texts.mesh)
-                .map_err(|d| first("mesh.toml", d))?
-                .mesh
+            parse_network(&texts.network)
+                .map_err(|d| first("network.toml", d))?
+                .network
         };
         let local = parse_local(&texts.local)
             .map_err(|d| first("local.toml", d))?
@@ -51,14 +51,17 @@ impl Running {
             configured: texts.configured,
             revision: texts.revision,
             fingerprint: texts.fingerprint.clone(),
-            mesh,
+            network,
             local,
         })
     }
 
-    /// Canonical `mesh.toml` (empty if there is no mesh).
-    pub fn mesh_text(&self) -> String {
-        self.mesh.as_ref().map(render_mesh).unwrap_or_default()
+    /// Canonical `network.toml` (empty if there is no network).
+    pub fn network_text(&self) -> String {
+        self.network
+            .as_ref()
+            .map(render_network)
+            .unwrap_or_default()
     }
 
     /// Canonical `local.toml`.
@@ -72,20 +75,20 @@ impl Running {
 pub struct Draft {
     /// Revision of the running configuration the draft was copied from.
     pub base_revision: u64,
-    /// The edited mesh.
-    pub mesh: Mesh,
+    /// The edited network.
+    pub network: Network,
     /// The edited local settings.
     pub local: Local,
-    /// Result of validating `mesh` and `local`.
+    /// Result of validating `network` and `local`.
     pub diagnostics: Vec<Diagnostic>,
 }
 
 impl Draft {
     /// Creates a draft and validates it.
-    pub fn new(base_revision: u64, mesh: Mesh, local: Local) -> Self {
+    pub fn new(base_revision: u64, network: Network, local: Local) -> Self {
         let mut draft = Self {
             base_revision,
-            mesh,
+            network,
             local,
             diagnostics: Vec::new(),
         };
@@ -93,31 +96,31 @@ impl Draft {
         draft
     }
 
-    /// A draft of the running configuration, if it has a mesh.
+    /// A draft of the running configuration, if it has a network.
     pub fn from_running(running: &Running) -> Option<Self> {
         running
-            .mesh
+            .network
             .clone()
-            .map(|mesh| Self::new(running.revision, mesh, running.local.clone()))
+            .map(|network| Self::new(running.revision, network, running.local.clone()))
     }
 
     /// Validates the draft again after a change.
     pub fn revalidate(&mut self) {
-        self.diagnostics = validate(&self.mesh, Some(&self.local));
+        self.diagnostics = validate(&self.network, Some(&self.local));
     }
 
     /// True if the draft differs from the running configuration (the
     /// revision counter is ignored).
     pub fn differs_from(&self, running: &Running) -> bool {
-        match &running.mesh {
+        match &running.network {
             None => true,
-            Some(mesh) => !same_mesh(&self.mesh, mesh) || self.local != running.local,
+            Some(network) => !same_network(&self.network, network) || self.local != running.local,
         }
     }
 
-    /// Canonical `mesh.toml` of the draft.
-    pub fn mesh_text(&self) -> String {
-        render_mesh(&self.mesh)
+    /// Canonical `network.toml` of the draft.
+    pub fn network_text(&self) -> String {
+        render_network(&self.network)
     }
 
     /// Canonical `local.toml` of the draft.
@@ -154,33 +157,33 @@ impl Draft {
 
     /// Removes a site together with its VLAN mappings.
     pub fn remove_site(&mut self, index: usize) -> Option<Site> {
-        if index >= self.mesh.sites.len() {
+        if index >= self.network.sites.len() {
             return None;
         }
-        let site = self.mesh.sites.remove(index);
-        self.mesh.maps.retain(|m| m.site != site.name);
+        let site = self.network.sites.remove(index);
+        self.network.maps.retain(|m| m.site != site.name);
         self.revalidate();
         Some(site)
     }
 
     /// Removes a VLAN mapping.
     pub fn remove_map(&mut self, index: usize) -> bool {
-        if index >= self.mesh.maps.len() {
+        if index >= self.network.maps.len() {
             return false;
         }
-        self.mesh.maps.remove(index);
+        self.network.maps.remove(index);
         self.revalidate();
         true
     }
 
     /// Updates all references to a renamed site (mappings, `self`).
     pub fn rename_references(&mut self, old: &str, new: &str) {
-        for map in &mut self.mesh.maps {
+        for map in &mut self.network.maps {
             if map.site == old {
                 map.site = new.to_string();
             }
         }
-        for site in &mut self.mesh.sites {
+        for site in &mut self.network.sites {
             if site.managed_by.as_deref() == Some(old) {
                 site.managed_by = Some(new.to_string());
             }
@@ -198,12 +201,12 @@ impl Draft {
 
     /// Diff of the draft against the running configuration.
     pub fn diff(&self, running: Option<&Running>) -> Vec<DiffLine> {
-        let (old_mesh, old_local) = running
-            .map(|r| (r.mesh_text(), r.local_text()))
+        let (old_network, old_local) = running
+            .map(|r| (r.network_text(), r.local_text()))
             .unwrap_or_default();
         diff::config_diff(
-            (&old_mesh, &old_local),
-            (&self.mesh_text(), &self.local_text()),
+            (&old_network, &old_local),
+            (&self.network_text(), &self.local_text()),
             "running",
             "draft",
         )
@@ -227,8 +230,8 @@ fn worst<'a>(diags: impl Iterator<Item = &'a Diagnostic>) -> Option<Severity> {
     found
 }
 
-/// Compares two meshes ignoring the revision counter.
-pub fn same_mesh(a: &Mesh, b: &Mesh) -> bool {
+/// Compares two networks ignoring the revision counter.
+pub fn same_network(a: &Network, b: &Network) -> bool {
     a.control_port == b.control_port
         && a.vlans == b.vlans
         && a.mtu_probe_interval == b.mtu_probe_interval
@@ -247,7 +250,7 @@ mod tests {
     fn running_parses_texts() {
         let running = Running::parse(&fixtures::config_texts()).unwrap();
         assert_eq!(running.revision, 7);
-        assert_eq!(running.mesh.as_ref().unwrap().sites.len(), 6);
+        assert_eq!(running.network.as_ref().unwrap().sites.len(), 6);
         assert_eq!(running.local.self_name.as_deref(), Some("heim"));
     }
 
@@ -258,7 +261,7 @@ mod tests {
         assert!(!draft.differs_from(&running));
         assert_eq!(draft.errors(), 0);
         // A revision bump alone is not a change.
-        draft.mesh.revision += 1;
+        draft.network.revision += 1;
         assert!(!draft.differs_from(&running));
         // Removing heim leaves "self" pointing at a site that is gone.
         let removed = draft.remove_site(0).unwrap();
@@ -268,7 +271,7 @@ mod tests {
         let self_path = FieldPath::local("self");
         assert_eq!(draft.worst_at(&self_path), Some(Severity::Error));
         // An empty VLAN list of a site is marked on the site.
-        draft.mesh.sites[1].vlans = Some(wanderlan_core::config::VlanSet::new());
+        draft.network.sites[1].vlans = Some(wanderlan_core::config::VlanSet::new());
         draft.revalidate();
         assert_eq!(
             draft.worst_within(&FieldPath::site(1)),
@@ -280,15 +283,15 @@ mod tests {
     fn removing_a_site_removes_its_maps() {
         let running = Running::parse(&fixtures::config_texts()).unwrap();
         let mut draft = Draft::from_running(&running).unwrap();
-        let before = draft.mesh.maps.len();
+        let before = draft.network.maps.len();
         let index = draft
-            .mesh
+            .network
             .sites
             .iter()
             .position(|s| s.name == "haus3")
             .unwrap();
         draft.remove_site(index);
-        assert_eq!(draft.mesh.maps.len(), before - 2);
+        assert_eq!(draft.network.maps.len(), before - 2);
     }
 
     #[test]
@@ -300,27 +303,27 @@ mod tests {
             .tunnel_trunks
             .insert("haus3".into(), "ens20".into());
         let haus3 = draft
-            .mesh
+            .network
             .sites
             .iter()
             .position(|s| s.name == "haus3")
             .unwrap();
-        draft.mesh.sites[haus3].name = "haus33".into();
+        draft.network.sites[haus3].name = "haus33".into();
         draft.rename_references("haus3", "haus33");
-        draft.mesh.sites[0].name = "home".into();
+        draft.network.sites[0].name = "home".into();
         draft.rename_references("heim", "home");
         // buero manages haus6.
-        draft.mesh.sites[1].name = "office".into();
+        draft.network.sites[1].name = "office".into();
         draft.rename_references("buero", "office");
         draft.revalidate();
         assert_eq!(draft.errors(), 0, "{:?}", draft.diagnostics);
         assert_eq!(draft.local.self_name.as_deref(), Some("home"));
-        assert!(draft.mesh.maps.iter().all(|m| m.site == "haus33"));
+        assert!(draft.network.maps.iter().all(|m| m.site == "haus33"));
         assert_eq!(
             draft.local.tunnel_trunks.get("haus33").map(String::as_str),
             Some("ens20")
         );
-        let haus6 = draft.mesh.site("haus6").unwrap();
+        let haus6 = draft.network.site("haus6").unwrap();
         assert_eq!(haus6.managed_by.as_deref(), Some("office"));
     }
 

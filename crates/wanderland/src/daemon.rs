@@ -23,7 +23,8 @@ use wanderlan_core::api::{
     PortTraffic, Request, ResetReport, SiteState, SiteSummary, Status, Validation,
 };
 use wanderlan_core::config::{
-    self, Config, ConfigFile, Diagnostic, Loaded, Mesh, render_local, render_mesh, unified_diff,
+    self, Config, ConfigFile, Diagnostic, Loaded, Network, render_local, render_network,
+    unified_diff,
 };
 use wanderlan_core::desired::{self, OWNER_ALIAS, Runtime};
 use wanderlan_core::join::{self, JoinReply, JoinRequest};
@@ -72,12 +73,12 @@ const REFUSED_MARKER: &str = "# wanderlan: not taken over: ";
 /// What a fetched configuration is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FetchMode {
-    /// From a server or the uplink: it replaces the own mesh.
+    /// From a server or the uplink: it replaces the own network.
     Replace,
-    /// From a client: its changes are merged into the own mesh.
+    /// From a client: its changes are merged into the own network.
     Merge,
     /// From the uplink after a change of this site was not taken over:
-    /// replaces the own mesh only if the uplink refused the change.
+    /// replaces the own network only if the uplink refused the change.
     Resync,
 }
 
@@ -131,7 +132,7 @@ pub enum Input {
         peer: String,
         /// What to do with it.
         mode: FetchMode,
-        /// The mesh text or an error.
+        /// The network text or an error.
         result: Result<String, String>,
     },
     /// The loop guard detected a loop.
@@ -415,8 +416,8 @@ fn to_value<T: serde::Serialize>(v: &T) -> Result<serde_json::Value, ApiError> {
 }
 
 /// Loads both texts; returns the configuration or the diagnostics.
-fn load_texts(mesh: &str, local: &str) -> Result<(Loaded, Vec<Diagnostic>), Vec<Diagnostic>> {
-    config::load(mesh, local).map(|o| (o.loaded, o.warnings))
+fn load_texts(network: &str, local: &str) -> Result<(Loaded, Vec<Diagnostic>), Vec<Diagnostic>> {
+    config::load(network, local).map(|o| (o.loaded, o.warnings))
 }
 
 fn invalid(diagnostics: Vec<Diagnostic>) -> ApiError {
@@ -431,6 +432,10 @@ impl Controller {
     /// Loads the configuration at startup. A file change that was pending
     /// when the daemon stopped is rolled back first.
     fn startup(&mut self) {
+        match self.paths.migrate() {
+            Ok(moved) => moved.into_iter().for_each(|m| self.events.info(m)),
+            Err(e) => self.events.error(format!("{e:#}")),
+        }
         if self.paths.marker_exists() {
             match self.paths.restore_confirmed() {
                 Ok(true) => self.events.warn(
@@ -454,7 +459,7 @@ impl Controller {
     /// measurements, so that a restart does not remove and re-add them.
     async fn seed_measurements(&mut self) {
         let Some(cfg) = &self.config else { return };
-        if cfg.mesh.mss.is_some() {
+        if cfg.network.mss.is_some() {
             return;
         }
         let Ok(Some(rules)) = self.sys.mss_rules().await else {
@@ -475,7 +480,7 @@ impl Controller {
 
     /// Loads and validates the files; logs problems.
     fn load_files(&self) -> Option<Config> {
-        let (mesh, local) = match self.paths.read() {
+        let (network, local) = match self.paths.read() {
             Ok(t) => t,
             Err(e) => {
                 self.events.error(format!("{e:#}"));
@@ -483,10 +488,10 @@ impl Controller {
             }
         };
         let label = |file: ConfigFile| match file {
-            ConfigFile::Mesh => self.paths.mesh().display().to_string(),
+            ConfigFile::Network => self.paths.network().display().to_string(),
             ConfigFile::Local => self.paths.local().display().to_string(),
         };
-        match load_texts(&mesh, &local) {
+        match load_texts(&network, &local) {
             Ok((loaded, warnings)) => {
                 for w in &warnings {
                     warn!("{}", w.display_with(&label(w.file)));
@@ -499,12 +504,12 @@ impl Controller {
                     }
                     Loaded::Configured(cfg) => {
                         self.events.info(format!(
-                            "Loaded configuration: site \"{}\", {} sites, VLANs {}, trunk {}, mesh revision {}",
+                            "Loaded configuration: site \"{}\", {} sites, VLANs {}, trunk {}, network revision {}",
                             cfg.self_name(),
-                            cfg.mesh.sites.len(),
-                            cfg.mesh.vlans,
+                            cfg.network.sites.len(),
+                            cfg.network.vlans,
                             cfg.trunk(),
-                            cfg.mesh.revision
+                            cfg.network.revision
                         ));
                         Some(cfg)
                     }
@@ -567,7 +572,7 @@ impl Controller {
     /// Direct peers of the configuration in effect.
     fn direct_peers(&self) -> BTreeMap<String, Ipv4Addr> {
         self.config.as_ref().map_or_else(BTreeMap::new, |cfg| {
-            topology::tunnels_for(&cfg.mesh, cfg.self_name())
+            topology::tunnels_for(&cfg.network, cfg.self_name())
                 .into_iter()
                 .map(|t| (t.peer.name.clone(), t.peer.address))
                 .collect()
@@ -584,9 +589,9 @@ impl Controller {
             .collect();
         let bind = self.config.as_ref().and_then(|cfg| {
             cfg.self_site()
-                .map(|s| SocketAddrV4::new(s.address, cfg.mesh.control_port))
+                .map(|s| SocketAddrV4::new(s.address, cfg.network.control_port))
         });
-        let version = |m: &Mesh| Announce {
+        let version = |m: &Network| Announce {
             revision: m.revision,
             fingerprint: fingerprint_bytes(&config::fingerprint(m)),
         };
@@ -598,14 +603,14 @@ impl Controller {
         let announce = match &self.confirmed {
             None => Announce::default(),
             Some(c) => {
-                let own = render_mesh(&c.mesh);
+                let own = render_network(&c.network);
                 for (name, addr) in peers.iter().chain(responders.iter()) {
                     let client = c
-                        .mesh
+                        .network
                         .site(name)
                         .is_none_or(|s| s.uplink.as_deref() == Some(c.self_name()));
                     if client {
-                        let v = view::view_for(&c.mesh, name);
+                        let v = view::view_for(&c.network, name);
                         announce_to.insert(name.clone(), version(&v));
                         expected.insert(name.clone(), Version::of(&v));
                         // A refused change: the client learns why.
@@ -613,23 +618,25 @@ impl Controller {
                             Some(reason) => format!(
                                 "{REFUSED_MARKER}{}\n{}",
                                 reason.replace('\n', " "),
-                                render_mesh(&v)
+                                render_network(&v)
                             ),
-                            None => render_mesh(&v),
+                            None => render_network(&v),
                         };
                         views.insert(*addr, text);
                     } else {
                         views.insert(*addr, own.clone());
                     }
                 }
-                version(&c.mesh)
+                version(&c.network)
             }
         };
         self.expected = expected;
-        let mtu_interval = self
-            .config
-            .as_ref()
-            .and_then(|c| c.mesh.mss.is_none().then_some(c.mesh.mtu_probe_interval));
+        let mtu_interval = self.config.as_ref().and_then(|c| {
+            c.network
+                .mss
+                .is_none()
+                .then_some(c.network.mtu_probe_interval)
+        });
         self.probe_config.send_replace(ProbeConfig {
             bind,
             peers,
@@ -679,7 +686,7 @@ impl Controller {
             }
             Input::Probe(ProbeEvent::Announce { peer, announce }) => {
                 debug!(
-                    "Peer \"{peer}\" announces mesh revision {}",
+                    "Peer \"{peer}\" announces network revision {}",
                     announce.revision
                 );
                 self.maybe_sync();
@@ -716,7 +723,7 @@ impl Controller {
                         Level::Info,
                         Some(&source),
                         format!(
-                            "Configuration from \"{source}\" confirmed automatically (peer \"{via}\" is reachable); mesh revision {}",
+                            "Configuration from \"{source}\" confirmed automatically (peer \"{via}\" is reachable); network revision {}",
                             c.revision
                         ),
                     ),
@@ -740,7 +747,7 @@ impl Controller {
                         Level::Info,
                         Some(&site),
                         format!(
-                            "Site \"{site}\" joined the network; mesh revision {}",
+                            "Site \"{site}\" joined the network; network revision {}",
                             c.revision
                         ),
                     ),
@@ -751,9 +758,9 @@ impl Controller {
         self.maybe_sync();
     }
 
-    /// Fetches a newer mesh from a peer, if one announces it: from a server
-    /// or the uplink (replacing the own mesh), otherwise the changes of a
-    /// client (merged into the own mesh).
+    /// Fetches a newer network from a peer, if one announces it: from a server
+    /// or the uplink (replacing the own network), otherwise the changes of a
+    /// client (merged into the own network).
     fn maybe_sync(&mut self) {
         if self.pending.is_some() || self.fetching {
             return;
@@ -762,9 +769,9 @@ impl Controller {
             return;
         };
         let me = confirmed.self_name().to_string();
-        let ours = Version::of(&confirmed.mesh);
-        let port = confirmed.mesh.control_port;
-        let tunnels: Vec<(String, TunnelKind)> = topology::tunnels_for(&confirmed.mesh, &me)
+        let ours = Version::of(&confirmed.network);
+        let port = confirmed.network.control_port;
+        let tunnels: Vec<(String, TunnelKind)> = topology::tunnels_for(&confirmed.network, &me)
             .into_iter()
             .map(|t| (t.peer.name.clone(), t.kind))
             .collect();
@@ -875,7 +882,7 @@ impl Controller {
                 Level::Info,
                 Some(&peer),
                 format!(
-                    "Peer \"{peer}\" has mesh revision {} (here: {}); fetching it",
+                    "Peer \"{peer}\" has network revision {} (here: {}); fetching it",
                     v.revision, ours.revision
                 ),
             ),
@@ -900,7 +907,7 @@ impl Controller {
         let Some(mut cfg) = self.confirmed.clone() else {
             return;
         };
-        cfg.mesh.revision = revision;
+        cfg.network.revision = revision;
         if let Err(e) = self.paths.write_confirmed(&cfg) {
             warn!("cannot write the configuration files: {e:#}");
             return;
@@ -928,8 +935,8 @@ impl Controller {
         let Some(local) = self.confirmed.as_ref().map(|c| c.local.clone()) else {
             return;
         };
-        let parsed = match config::parse_mesh(&text) {
-            Ok(p) => p.mesh,
+        let parsed = match config::parse_network(&text) {
+            Ok(p) => p.network,
             Err(diags) => {
                 let msg = diags.first().map_or_else(String::new, ToString::to_string);
                 self.events.emit(
@@ -942,14 +949,14 @@ impl Controller {
                 return;
             }
         };
-        let Some(mesh) = parsed else { return };
-        let fingerprint = config::fingerprint(&mesh);
-        let mesh = match mode {
+        let Some(network) = parsed else { return };
+        let fingerprint = config::fingerprint(&network);
+        let network = match mode {
             FetchMode::Merge => {
-                let Some(own) = self.confirmed.as_ref().map(|c| c.mesh.clone()) else {
+                let Some(own) = self.confirmed.as_ref().map(|c| c.network.clone()) else {
                     return;
                 };
-                match view::merge(&own, &mesh, &peer) {
+                match view::merge(&own, &network, &peer) {
                     Ok(merged) => {
                         self.refused.remove(&peer);
                         merged
@@ -984,11 +991,11 @@ impl Controller {
                     "Your change was not taken over by \"{peer}\": {reason}"
                 ));
                 self.diverged_since = None;
-                mesh
+                network
             }
-            FetchMode::Replace => mesh,
+            FetchMode::Replace => network,
         };
-        match sync::accept(mesh, &local) {
+        match sync::accept(network, &local) {
             Err(e) => {
                 self.reject(fingerprint);
                 self.events.emit(
@@ -1039,8 +1046,8 @@ impl Controller {
                 to_value(&applied)
             }
             Request::ApplyFiles(params) => {
-                let (mesh, local) = self.paths.read().map_err(api_err)?;
-                let cfg = self.candidate(&ConfigInput { mesh, local })?;
+                let (network, local) = self.paths.read().map_err(api_err)?;
+                let cfg = self.candidate(&ConfigInput { network, local })?;
                 let timeout = params.timeout_secs.map(Duration::from_secs);
                 let applied = self
                     .apply(cfg, ChangeSource::Local, timeout, None, true)
@@ -1077,7 +1084,7 @@ impl Controller {
                         "this site is not part of a network yet; set it up first (wanderlan)",
                     ));
                 };
-                join::check_rules(&confirmed.mesh, confirmed.self_name(), &rules)
+                join::check_rules(&confirmed.network, confirmed.self_name(), &rules)
                     .map_err(|e| ApiError::new(format!("the rules cannot be used: {e}")))?;
                 let invite = self.invites.create(now_secs(), rules).map_err(api_err)?;
                 let invitation = self.invitation(&invite);
@@ -1118,7 +1125,7 @@ impl Controller {
         let command = self
             .confirmed
             .as_ref()
-            .and_then(|c| c.self_site().map(|s| (s.address, c.mesh.control_port)))
+            .and_then(|c| c.self_site().map(|s| (s.address, c.network.control_port)))
             .map(|(address, port)| {
                 if port == config::DEFAULT_CONTROL_PORT {
                     format!("wanderlan join {address} {}", invite.code)
@@ -1140,7 +1147,7 @@ impl Controller {
 
     /// A site asks to join with an invitation of this site: check the code,
     /// add the site (its address is the source of the connection) and answer
-    /// with the new mesh. The change is confirmed as soon as the new site
+    /// with the new network. The change is confirmed as soon as the new site
     /// answers probes, or rolled back after `commit_timeout`.
     async fn admit(&mut self, from: Ipv4Addr, request: JoinRequest) -> JoinReply {
         let error = |message: String| JoinReply::Error { message };
@@ -1179,7 +1186,7 @@ impl Controller {
             return JoinReply::Busy;
         }
         let admission = match join::add_site(
-            &confirmed.mesh,
+            &confirmed.network,
             confirmed.self_name(),
             &request.name,
             request.name_is_default,
@@ -1206,15 +1213,15 @@ impl Controller {
                     admission.name, invite.code
                 ),
             );
-            let mesh = render_mesh(&view::view_for(&confirmed.mesh, &admission.name));
+            let network = render_network(&view::view_for(&confirmed.network, &admission.name));
             return JoinReply::Ok {
                 site: admission.name,
                 via,
-                mesh,
+                network,
             };
         }
         // The new site gets its view of the network only.
-        let mesh = render_mesh(&view::view_for(&admission.mesh, &admission.name));
+        let network = render_network(&view::view_for(&admission.network, &admission.name));
         let site = admission.name;
         if !admission.added {
             self.events.emit(
@@ -1224,7 +1231,7 @@ impl Controller {
             );
         }
         let cfg = Config {
-            mesh: admission.mesh,
+            network: admission.network,
             local: confirmed.local.clone(),
         };
         let source = ChangeSource::Join { site: site.clone() };
@@ -1239,7 +1246,7 @@ impl Controller {
                         invite.code
                     ),
                 );
-                JoinReply::Ok { site, via, mesh }
+                JoinReply::Ok { site, via, network }
             }
             Err(e) => error(format!("cannot add the site here: {}", e.message)),
         }
@@ -1318,7 +1325,7 @@ impl Controller {
             ApiError::new(format!("cannot join: {e}"))
         })?;
         let (site, via, text) = match answer {
-            JoinReply::Ok { site, via, mesh } => (site, via, mesh),
+            JoinReply::Ok { site, via, network } => (site, via, network),
             JoinReply::Busy => {
                 return Err(ApiError::new(
                     "the inviting site is busy with another change; try again in a minute",
@@ -1334,8 +1341,8 @@ impl Controller {
         if self.config.is_some() || self.pending.is_some() {
             return Err(ApiError::new("this site was configured meanwhile"));
         }
-        let mesh = match config::parse_mesh(&text) {
-            Ok(parsed) => parsed.mesh,
+        let network = match config::parse_network(&text) {
+            Ok(parsed) => parsed.network,
             Err(diags) => {
                 let msg = diags.first().map_or_else(String::new, ToString::to_string);
                 return Err(ApiError::new(format!(
@@ -1349,13 +1356,13 @@ impl Controller {
             trunk: Some(params.trunk.clone()),
             ..Default::default()
         };
-        let cfg = sync::accept(mesh, &local).map_err(|e| {
+        let cfg = sync::accept(network, &local).map_err(|e| {
             ApiError::new(format!(
                 "the configuration from \"{via}\" cannot be used: {e}"
             ))
         })?;
-        let revision = cfg.mesh.revision;
-        let sites = cfg.mesh.sites.len();
+        let revision = cfg.network.revision;
+        let sites = cfg.network.sites.len();
         let source = ChangeSource::Sync { peer: via.clone() };
         self.apply(cfg, source, None, None, false).await?;
         self.events.info(format!(
@@ -1445,14 +1452,14 @@ impl Controller {
         match &self.config {
             Some(cfg) => ConfigTexts {
                 configured: true,
-                mesh: render_mesh(&cfg.mesh),
+                network: render_network(&cfg.network),
                 local: render_local(&cfg.local),
-                revision: cfg.mesh.revision,
-                fingerprint: config::fingerprint(&cfg.mesh),
+                revision: cfg.network.revision,
+                fingerprint: config::fingerprint(&cfg.network),
             },
             None => ConfigTexts {
                 configured: false,
-                mesh: String::new(),
+                network: String::new(),
                 local: self.paths.read().map(|(_, l)| l).unwrap_or_default(),
                 revision: 0,
                 fingerprint: String::new(),
@@ -1461,15 +1468,15 @@ impl Controller {
     }
 
     fn diff_against_running(&self, cfg: &Config) -> String {
-        let (old_mesh, old_local) = self.config.as_ref().map_or_else(
+        let (old_network, old_local) = self.config.as_ref().map_or_else(
             || (String::new(), String::new()),
-            |c| (render_mesh(&c.mesh), render_local(&c.local)),
+            |c| (render_network(&c.network), render_local(&c.local)),
         );
         let mut diff = unified_diff(
-            "running/mesh.toml",
-            &old_mesh,
-            "new/mesh.toml",
-            &render_mesh(&cfg.mesh),
+            "running/network.toml",
+            &old_network,
+            "new/network.toml",
+            &render_network(&cfg.network),
         );
         diff.push_str(&unified_diff(
             "running/local.toml",
@@ -1481,7 +1488,7 @@ impl Controller {
     }
 
     fn validate(&self, input: &ConfigInput) -> Validation {
-        match load_texts(&input.mesh, &input.local) {
+        match load_texts(&input.network, &input.local) {
             Ok((Loaded::Configured(cfg), warnings)) => Validation {
                 valid: true,
                 diagnostics: warnings,
@@ -1501,7 +1508,7 @@ impl Controller {
     }
 
     fn candidate(&self, input: &ConfigInput) -> Result<Config, ApiError> {
-        match load_texts(&input.mesh, &input.local) {
+        match load_texts(&input.network, &input.local) {
             Ok((Loaded::Configured(cfg), _)) => Ok(cfg),
             Ok((Loaded::Unconfigured { .. }, _)) => Err(ApiError::new(
                 "local.toml does not set `self`; the configuration is incomplete",
@@ -1530,16 +1537,18 @@ impl Controller {
         if source == ChangeSource::Local
             && let Some(confirmed) = &self.confirmed
         {
-            policy::check_edit(&confirmed.mesh, &cfg.mesh, confirmed.self_name())
+            policy::check_edit(&confirmed.network, &cfg.network, confirmed.self_name())
                 .map_err(ApiError::new)?;
         }
-        let warnings: Vec<Diagnostic> = config::validate(&cfg.mesh, Some(&cfg.local))
+        let warnings: Vec<Diagnostic> = config::validate(&cfg.network, Some(&cfg.local))
             .into_iter()
             .filter(|d| !d.is_error())
             .collect();
         let diff = self.diff_against_running(&cfg);
-        let timeout = timeout.unwrap_or(cfg.mesh.commit_timeout).max(MIN_TIMEOUT);
-        let fingerprint = config::fingerprint(&cfg.mesh);
+        let timeout = timeout
+            .unwrap_or(cfg.network.commit_timeout)
+            .max(MIN_TIMEOUT);
+        let fingerprint = config::fingerprint(&cfg.network);
         let previous = self.config.clone();
         self.set_config(Some(cfg));
         let changes = match self.reconcile_once().await {
@@ -1594,35 +1603,35 @@ impl Controller {
     /// Refuses a local change that is based on an outdated revision.
     fn check_base(&self, base: u64, cfg: &Config) -> Result<(), ApiError> {
         if let Some(c) = &self.confirmed
-            && c.mesh.revision > base
+            && c.network.revision > base
         {
             return Err(ApiError::new(format!(
                 "the configuration changed meanwhile (now revision {}, your change is based on {base}); reload it and try again",
-                c.mesh.revision
+                c.network.revision
             )));
         }
         // What a peer would have if it were up to date: a client of this
         // site its view, any other peer the whole of what this site knows.
         let me = cfg.self_name();
-        let expected = |mesh: &Mesh, peer: &str| {
-            let client = mesh
+        let expected = |network: &Network, peer: &str| {
+            let client = network
                 .site(peer)
                 .is_some_and(|s| s.uplink.as_deref() == Some(me));
             if client {
-                config::fingerprint(&view::view_for(mesh, peer))
+                config::fingerprint(&view::view_for(network, peer))
             } else {
-                config::fingerprint(mesh)
+                config::fingerprint(network)
             }
         };
         // Only peers that stay peers (same name and address) and answer now
         // count; a site of another or an old network must not block a change.
         let current = self.direct_peers();
-        let relevant: BTreeSet<String> = topology::tunnels_for(&cfg.mesh, me)
+        let relevant: BTreeSet<String> = topology::tunnels_for(&cfg.network, me)
             .into_iter()
             .filter(|t| current.get(&t.peer.name) == Some(&t.peer.address))
             .map(|t| t.peer.name.clone())
             .collect();
-        let base_mesh = self.confirmed.as_ref().map(|c| &c.mesh);
+        let base_network = self.confirmed.as_ref().map(|c| &c.network);
         let newer = self.probes.read().ok().and_then(|t| {
             t.iter()
                 .filter(|(name, p)| p.reachable && relevant.contains(*name))
@@ -1632,13 +1641,13 @@ impl Controller {
                     // A peer with the content this change is based on (only
                     // a higher revision number) does not make it outdated.
                     a.revision > base
-                        && theirs != expected(&cfg.mesh, name)
-                        && base_mesh.is_none_or(|m| theirs != expected(m, name))
+                        && theirs != expected(&cfg.network, name)
+                        && base_network.is_none_or(|m| theirs != expected(m, name))
                 })
         });
         if let Some((peer, a)) = newer {
             return Err(ApiError::new(format!(
-                "peer \"{peer}\" has a newer mesh configuration (revision {}); wait for the sync, reload and try again",
+                "peer \"{peer}\" has a newer network configuration (revision {}); wait for the sync, reload and try again",
                 a.revision
             )));
         }
@@ -1654,13 +1663,13 @@ impl Controller {
             return Err(ApiError::new("there is no configuration"));
         };
         if pending.source == ChangeSource::Local {
-            let previous_version = self.confirmed.as_ref().map(|c| Version::of(&c.mesh));
+            let previous_version = self.confirmed.as_ref().map(|c| Version::of(&c.network));
             let changed = previous_version
                 .as_ref()
-                .is_none_or(|v| v.fingerprint != config::fingerprint(&cfg.mesh));
+                .is_none_or(|v| v.fingerprint != config::fingerprint(&cfg.network));
             if changed {
                 let base = previous_version.map_or(0, |v| v.revision);
-                cfg.mesh.revision = base.max(cfg.mesh.revision) + 1;
+                cfg.network.revision = base.max(cfg.network.revision) + 1;
             }
             self.rejected.clear();
             // A change of its own: the last refusal is history.
@@ -1685,12 +1694,12 @@ impl Controller {
         self.runtime.blocked.clear();
         if user {
             self.events.info(format!(
-                "Change confirmed; mesh revision {} is in effect",
-                cfg.mesh.revision
+                "Change confirmed; network revision {} is in effect",
+                cfg.network.revision
             ));
         }
         Ok(Confirmed {
-            revision: cfg.mesh.revision,
+            revision: cfg.network.revision,
         })
     }
 
@@ -1711,7 +1720,7 @@ impl Controller {
                 let before = pending
                     .previous
                     .as_ref()
-                    .and_then(|c| c.mesh.site(site))
+                    .and_then(|c| c.network.site(site))
                     .map(|s| s.uplink.clone());
                 let text = match before {
                     Some(Some(up)) => format!(
@@ -1774,9 +1783,9 @@ impl Controller {
         let events = self.events.clone();
         let changes =
             reconcile::reconcile(&self.sys, &desired, |c| events.info(c.to_string())).await?;
-        let key = topology::forwarding_key(&cfg.mesh);
-        let mesh_changed = self.applied_key.as_ref().is_some_and(|k| *k != key);
-        if mesh_changed || reconcile::ports_changed(&changes) {
+        let key = topology::forwarding_key(&cfg.network);
+        let network_changed = self.applied_key.as_ref().is_some_and(|k| *k != key);
+        if network_changed || reconcile::ports_changed(&changes) {
             let bridges: Vec<&str> = desired.bridges().collect();
             info!(
                 "Flushing learned MAC addresses of {} because the topology changed",
@@ -1797,7 +1806,7 @@ impl Controller {
                 "Site \"{}\" is up to date ({} tunnels, VLANs {})",
                 cfg.self_name(),
                 desired.tunnels.len(),
-                cfg.mesh.vlans
+                cfg.network.vlans
             );
         }
         self.update_port_map().await;
@@ -1915,7 +1924,7 @@ impl Controller {
         let confirmed_fp = self
             .confirmed
             .as_ref()
-            .map(|c| config::fingerprint(&c.mesh))
+            .map(|c| config::fingerprint(&c.network))
             .unwrap_or_default();
         let pending = self.pending.as_ref().map(|p| PendingChange {
             remaining_secs: p
@@ -1949,7 +1958,7 @@ impl Controller {
         };
         let desired = desired::derive(cfg, &self.runtime);
         let me = cfg.self_site();
-        let tunnels = topology::tunnels_for(&cfg.mesh, cfg.self_name());
+        let tunnels = topology::tunnels_for(&cfg.network, cfg.self_name());
         let direct: BTreeSet<&str> = tunnels.iter().map(|t| t.peer.name.as_str()).collect();
         let peers = tunnels
             .iter()
@@ -2029,7 +2038,7 @@ impl Controller {
             })
             .collect();
         let sites = cfg
-            .mesh
+            .network
             .sites
             .iter()
             .map(|s| SiteSummary {
@@ -2037,8 +2046,8 @@ impl Controller {
                 address: s.address.to_string(),
                 vlans: {
                     // Own VLANs (towards its own clients only) with a "+".
-                    let own = cfg.mesh.own_vlans(s);
-                    let vlans = cfg.mesh.effective_vlans(s);
+                    let own = cfg.network.own_vlans(s);
+                    let vlans = cfg.network.effective_vlans(s);
                     if own.is_empty() {
                         vlans.to_string()
                     } else {
@@ -2049,7 +2058,7 @@ impl Controller {
                 is_self: s.name == cfg.self_name(),
                 direct: direct.contains(s.name.as_str()),
                 uplink: s.uplink.clone(),
-                via: topology::via(&cfg.mesh, cfg.self_name(), &s.name).map(str::to_string),
+                via: topology::via(&cfg.network, cfg.self_name(), &s.name).map(str::to_string),
             })
             .collect();
         let trunks: Vec<PortTraffic> = desired
@@ -2077,9 +2086,9 @@ impl Controller {
             address: me.map(|s| s.address.to_string()),
             online: me.is_none_or(|s| s.online),
             trunk: Some(cfg.trunk().to_string()),
-            vlans: me.map(|s| cfg.mesh.effective_vlans(s).to_string()),
-            revision: cfg.mesh.revision,
-            fingerprint: config::fingerprint(&cfg.mesh),
+            vlans: me.map(|s| cfg.network.effective_vlans(s).to_string()),
+            revision: cfg.network.revision,
+            fingerprint: config::fingerprint(&cfg.network),
             pending,
             last_error: self.last_error.clone(),
             peers,
@@ -2099,13 +2108,13 @@ mod tests {
 
     #[test]
     fn a_refused_view_carries_its_reason_in_the_first_line() {
-        let view = format!("{REFUSED_MARKER}site \"x\" is already used\n[mesh]\nrevision = 4\n");
+        let view = format!("{REFUSED_MARKER}site \"x\" is already used\n[network]\nrevision = 4\n");
         assert_eq!(refusal(&view), Some("site \"x\" is already used"));
-        assert_eq!(refusal("[mesh]\nrevision = 4\n"), None);
+        assert_eq!(refusal("[network]\nrevision = 4\n"), None);
         // Only the first line counts: a comment further down is no refusal.
-        assert_eq!(refusal(&format!("[mesh]\n{REFUSED_MARKER}no\n")), None);
+        assert_eq!(refusal(&format!("[network]\n{REFUSED_MARKER}no\n")), None);
         // It is a TOML comment: the view still parses.
-        assert!(wanderlan_core::config::parse_mesh(&view).is_ok());
+        assert!(wanderlan_core::config::parse_network(&view).is_ok());
     }
 
     #[test]
