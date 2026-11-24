@@ -12,6 +12,7 @@ use std::fmt;
 
 use crate::config::VlanSet;
 use crate::desired::{Desired, GRETAP_MTU, OWNER_ALIAS};
+use crate::sys::nft::MssRule;
 use crate::sys::tc::{IfTc, TcRule};
 use crate::sys::{
     BridgeOptions, GretapParams, LinkKind, LinkState, LinkUpdate, PortVlans, SysError, System,
@@ -31,6 +32,8 @@ pub struct Actual {
     pub vlans: BTreeMap<u32, PortVlans>,
     /// tc state of the links with a clsact qdisc, by index.
     pub tc: BTreeMap<u32, IfTc>,
+    /// MSS rules, `None` if the nftables table does not exist.
+    pub mss: Option<BTreeSet<MssRule>>,
 }
 
 impl Actual {
@@ -44,7 +47,13 @@ impl Actual {
             .collect();
         let vlans = net.port_vlans().await?;
         let tc = net.tc_state().await?;
-        Ok(Self { links, vlans, tc })
+        let mss = net.mss_rules().await?;
+        Ok(Self {
+            links,
+            vlans,
+            tc,
+            mss,
+        })
     }
 
     fn by_index(&self, index: u32) -> Option<&LinkState> {
@@ -109,6 +118,10 @@ pub enum Change {
     AddTcRule { dev: String, rule: TcRule },
     /// Remove a VLAN translation rule.
     DelTcRule { dev: String, rule: TcRule },
+    /// Replace the MSS clamping rules (nftables table `bridge wanderlan`).
+    SetMss { rules: BTreeSet<MssRule> },
+    /// Delete the nftables table.
+    DeleteNftTable,
 }
 
 fn vid_list(vids: impl IntoIterator<Item = u16>) -> String {
@@ -184,6 +197,19 @@ impl fmt::Display for Change {
             Self::DelClsact { dev } => write!(f, "Removing the clsact qdisc from {dev}"),
             Self::AddTcRule { dev, rule } => write!(f, "On {dev}: {rule}"),
             Self::DelTcRule { dev, rule } => write!(f, "On {dev}: no longer {rule}"),
+            Self::SetMss { rules } => {
+                let mut per_port: BTreeMap<&str, u16> = BTreeMap::new();
+                for r in rules.iter().filter(|r| !r.ipv6) {
+                    per_port.insert(r.port.as_str(), r.mss);
+                }
+                let parts: Vec<String> = per_port.iter().map(|(p, m)| format!("{p} {m}")).collect();
+                write!(
+                    f,
+                    "Setting TCP MSS clamping in nftables table bridge wanderlan ({})",
+                    parts.join(", ")
+                )
+            }
+            Self::DeleteNftTable => write!(f, "Deleting nftables table bridge wanderlan"),
         }
     }
 }
@@ -371,6 +397,14 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
     }
 
     let tc_changes = tc_changes(desired, actual, trunk);
+    let nft_changes = match (&actual.mss, desired.mss.is_empty()) {
+        (None, true) => Vec::new(),
+        (Some(_), true) => vec![Change::DeleteNftTable],
+        (Some(have), false) if *have == desired.mss => Vec::new(),
+        _ => vec![Change::SetMss {
+            rules: desired.mss.clone(),
+        }],
+    };
 
     let mut out = deletes;
     out.extend(bridge_changes);
@@ -379,6 +413,7 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
     out.extend(vlan_dels);
     out.extend(vlan_adds);
     out.extend(tc_changes);
+    out.extend(nft_changes);
     out.extend(ups);
     Ok(out)
 }
@@ -528,6 +563,9 @@ fn port_changes(
 /// ours. Deleting the bridge also detaches the trunk.
 pub fn plan_teardown(actual: &Actual) -> Vec<Change> {
     let mut tc = Vec::new();
+    if actual.mss.is_some() {
+        tc.push(Change::DeleteNftTable);
+    }
     for (index, state) in &actual.tc {
         let Some(link) = actual.by_index(*index) else {
             continue;
@@ -643,6 +681,8 @@ pub async fn apply<N: System>(net: &N, actual: &Actual, change: &Change) -> Resu
         Change::DelClsact { dev } => net.del_clsact(index_of(dev)?).await?,
         Change::AddTcRule { dev, rule } => net.add_tc_rule(index_of(dev)?, rule).await?,
         Change::DelTcRule { dev, rule } => net.del_tc_rule(index_of(dev)?, rule).await?,
+        Change::SetMss { rules } => net.set_mss_rules(rules).await?,
+        Change::DeleteNftTable => net.delete_table().await?,
     }
     Ok(())
 }

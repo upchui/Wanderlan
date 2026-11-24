@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod desired;
+pub mod mtu;
 pub mod reconcile;
 pub mod sys;
 pub mod topology;

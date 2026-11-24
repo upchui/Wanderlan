@@ -1,64 +1,97 @@
-//! Main loop of the daemon.
+//! The controller: owns the configuration and the runtime state and keeps the
+//! system in the desired state.
 
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddrV4;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
-
-use tokio::time::Instant;
 
 use anyhow::{Context as _, Result};
 use tokio::signal::unix::{SignalKind, signal};
-use tracing::{error, info, warn};
+use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
+use tracing::{debug, error, info, warn};
 use wanderlan_core::config::{self, Config, ConfigFile, Loaded};
-use wanderlan_core::desired;
+use wanderlan_core::desired::{self, Runtime};
+use wanderlan_core::mtu::wire::Announce;
 use wanderlan_core::reconcile;
-use wanderlan_core::sys::netlink::Netlink;
+use wanderlan_core::sys::linux::LinuxSystem;
 use wanderlan_core::topology::{self, ForwardingKey};
 
 use crate::Args;
+use crate::probe::{self, ProbeConfig, ProbeEvent, ProbeTable};
+
+/// Delays of the extra flushes after a topology change. Sites apply a new
+/// configuration a few seconds apart; until all have switched, a bridge can
+/// learn addresses behind ports that are wrong in the new topology.
+const FOLLOW_UP_FLUSHES: [Duration; 2] = [Duration::from_secs(10), Duration::from_secs(30)];
+
+/// State of the daemon.
+struct Controller {
+    sys: LinuxSystem,
+    config_dir: PathBuf,
+    config: Option<Config>,
+    runtime: Runtime,
+    applied_key: Option<ForwardingKey>,
+    last_error: Option<String>,
+    flushes: BTreeSet<Instant>,
+    probe_config: watch::Sender<ProbeConfig>,
+    #[allow(dead_code)]
+    probes: ProbeTable,
+}
 
 /// Runs the daemon until SIGTERM or SIGINT.
 pub async fn run(args: Args) -> Result<()> {
     info!("wanderland {} starting", wanderlan_core::VERSION);
-    let net = Netlink::connect().context("cannot open a netlink connection")?;
+    let sys = LinuxSystem::connect().context("cannot open a netlink connection")?;
     let mut sigterm = signal(SignalKind::terminate()).context("cannot handle SIGTERM")?;
     let mut sigint = signal(SignalKind::interrupt()).context("cannot handle SIGINT")?;
     let mut sighup = signal(SignalKind::hangup()).context("cannot handle SIGHUP")?;
 
-    let mut current = load_config(&args.config_dir);
+    let (probe_tx, probe_rx) = watch::channel(ProbeConfig::default());
+    let (event_tx, mut event_rx) = mpsc::channel(64);
+    let probes: ProbeTable = Arc::new(RwLock::new(BTreeMap::new()));
+    let probe_task = probe::spawn(probe_rx, probes.clone(), event_tx);
+
+    let mut ctl = Controller {
+        sys,
+        config_dir: args.config_dir.clone(),
+        config: None,
+        runtime: Runtime::default(),
+        applied_key: None,
+        last_error: None,
+        flushes: BTreeSet::new(),
+        probe_config: probe_tx,
+        probes,
+    };
+    ctl.set_config(load_config(&ctl.config_dir));
+
     let mut ticker = tokio::time::interval(Duration::from_secs(args.reconcile_interval.max(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut last_error: Option<String> = None;
-    let mut applied_key = None;
-    // Follow-up flushes of the learned MAC addresses after a topology change.
-    let mut flushes: BTreeSet<Instant> = BTreeSet::new();
 
     loop {
-        let next_flush = flushes.first().copied();
+        let next_flush = ctl.flushes.first().copied();
         tokio::select! {
-            _ = ticker.tick() => {
-                if let Some(cfg) = &current {
-                    let (error, changed) = apply(&net, cfg, last_error, &mut applied_key).await;
-                    last_error = error;
-                    if changed {
-                        let now = Instant::now();
-                        flushes.extend(FOLLOW_UP_FLUSHES.iter().map(|d| now + *d));
-                    }
+            _ = ticker.tick() => ctl.reconcile().await,
+            Some(event) = event_rx.recv() => {
+                if ctl.handle_probe_event(event) {
+                    ctl.reconcile().await;
                 }
             }
             () = sleep_until_opt(next_flush) => {
                 if let Some(at) = next_flush {
-                    flushes.remove(&at);
+                    ctl.flushes.remove(&at);
                 }
-                if let Err(e) = reconcile::flush_learned(&net, wanderlan_core::BRIDGE_NAME).await {
+                if let Err(e) = reconcile::flush_learned(&ctl.sys, wanderlan_core::BRIDGE_NAME).await {
                     warn!("{e}");
                 }
             }
             _ = sighup.recv() => {
                 info!("Reloading the configuration (SIGHUP)");
-                if let Some(cfg) = load_config(&args.config_dir) {
-                    current = Some(cfg);
-                    last_error = None;
+                if let Some(cfg) = load_config(&ctl.config_dir) {
+                    ctl.set_config(Some(cfg));
+                    ctl.last_error = None;
                     ticker.reset_immediately();
                 }
             }
@@ -67,18 +100,14 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    info!("Stopping; removing the interfaces created by wanderlan");
-    let removed = reconcile::teardown(&net, |c| info!("{c}"))
+    probe_task.abort();
+    info!("Stopping; removing everything wanderlan created");
+    let removed = reconcile::teardown(&ctl.sys, |c| info!("{c}"))
         .await
         .context("cleanup failed")?;
     info!("Stopped ({} changes undone)", removed.len());
     Ok(())
 }
-
-/// Delays of the extra flushes after a topology change. Sites apply a new
-/// configuration a few seconds apart; until all have switched, a bridge can
-/// learn addresses behind ports that are wrong in the new topology.
-const FOLLOW_UP_FLUSHES: [Duration; 2] = [Duration::from_secs(10), Duration::from_secs(30)];
 
 /// Sleeps until the instant, or forever if there is none.
 async fn sleep_until_opt(at: Option<Instant>) {
@@ -88,49 +117,114 @@ async fn sleep_until_opt(at: Option<Instant>) {
     }
 }
 
-/// Reconciles once. Logs errors only when they change, so a missing trunk
-/// does not flood the log every 30 seconds. Returns the error (if any) and
-/// whether the forwarding topology changed.
-async fn apply(
-    net: &Netlink,
-    cfg: &Config,
-    last_error: Option<String>,
-    applied_key: &mut Option<ForwardingKey>,
-) -> (Option<String>, bool) {
-    let desired = desired::derive(cfg, &BTreeSet::new());
-    match reconcile::reconcile(net, &desired, |c| info!("{c}")).await {
-        Ok(changes) => {
-            let key = topology::forwarding_key(&cfg.mesh);
-            let mesh_changed = applied_key.as_ref().is_some_and(|k| *k != key);
-            let topology_changed = mesh_changed || reconcile::ports_changed(&changes);
-            if topology_changed {
-                info!(
-                    "Flushing learned MAC addresses of {} because the topology changed",
-                    desired.bridge
-                );
-                if let Err(e) = reconcile::flush_learned(net, &desired.bridge).await {
-                    warn!("{e}");
+impl Controller {
+    /// Switches to a new configuration and updates the probe service.
+    fn set_config(&mut self, cfg: Option<Config>) {
+        let probe = match &cfg {
+            Some(cfg) => {
+                let me = cfg.self_site();
+                let peers = topology::tunnels_for(&cfg.mesh, cfg.self_name())
+                    .into_iter()
+                    .map(|t| (t.peer.name.clone(), t.peer.address))
+                    .collect();
+                ProbeConfig {
+                    bind: me.map(|s| SocketAddrV4::new(s.address, cfg.mesh.control_port)),
+                    peers,
+                    mtu_interval: cfg
+                        .mesh
+                        .mss
+                        .is_none()
+                        .then_some(cfg.mesh.mtu_probe_interval),
+                    announce: Announce {
+                        revision: cfg.mesh.revision,
+                        fingerprint: fingerprint_bytes(&cfg.mesh),
+                    },
                 }
             }
-            *applied_key = Some(key);
-            if last_error.is_some() || !changes.is_empty() {
-                info!(
-                    "Site \"{}\" is up to date ({} tunnels, VLANs {})",
-                    cfg.self_name(),
-                    desired.tunnels.len(),
-                    cfg.mesh.vlans
+            None => ProbeConfig::default(),
+        };
+        // Forget measurements of sites that are no longer peers.
+        self.runtime
+            .pmtu
+            .retain(|peer, _| probe.peers.contains_key(peer));
+        self.probe_config.send_replace(probe);
+        self.config = cfg;
+    }
+
+    /// Handles a probe event; returns true if the desired state changed.
+    fn handle_probe_event(&mut self, event: ProbeEvent) -> bool {
+        match event {
+            ProbeEvent::Pmtu { peer, pmtu } => {
+                let old = match pmtu {
+                    Some(p) => self.runtime.pmtu.insert(peer, p),
+                    None => self.runtime.pmtu.remove(&peer),
+                };
+                old != pmtu
+            }
+            ProbeEvent::Announce { peer, announce } => {
+                debug!(
+                    "Peer \"{peer}\" announces mesh revision {}",
+                    announce.revision
                 );
+                false
             }
-            (None, topology_changed)
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if last_error.as_deref() != Some(msg.as_str()) {
-                error!("Cannot apply the configuration: {msg}");
-            }
-            (Some(msg), false)
         }
     }
+
+    /// Reconciles once. Logs errors only when they change, so a missing trunk
+    /// does not flood the log.
+    async fn reconcile(&mut self) {
+        let Some(cfg) = &self.config else { return };
+        let desired = desired::derive(cfg, &self.runtime);
+        match reconcile::reconcile(&self.sys, &desired, |c| info!("{c}")).await {
+            Ok(changes) => {
+                let key = topology::forwarding_key(&cfg.mesh);
+                let mesh_changed = self.applied_key.as_ref().is_some_and(|k| *k != key);
+                if mesh_changed || reconcile::ports_changed(&changes) {
+                    info!(
+                        "Flushing learned MAC addresses of {} because the topology changed",
+                        desired.bridge
+                    );
+                    if let Err(e) = reconcile::flush_learned(&self.sys, &desired.bridge).await {
+                        warn!("{e}");
+                    }
+                    let now = Instant::now();
+                    self.flushes
+                        .extend(FOLLOW_UP_FLUSHES.iter().map(|d| now + *d));
+                }
+                self.applied_key = Some(key);
+                if self.last_error.is_some() || !changes.is_empty() {
+                    info!(
+                        "Site \"{}\" is up to date ({} tunnels, VLANs {})",
+                        cfg.self_name(),
+                        desired.tunnels.len(),
+                        cfg.mesh.vlans
+                    );
+                }
+                self.last_error = None;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if self.last_error.as_deref() != Some(msg.as_str()) {
+                    error!("Cannot apply the configuration: {msg}");
+                }
+                self.last_error = Some(msg);
+            }
+        }
+    }
+}
+
+/// The mesh fingerprint as raw bytes.
+fn fingerprint_bytes(mesh: &config::Mesh) -> [u8; 32] {
+    let hex = config::fingerprint(mesh);
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = hex
+            .get(2 * i..2 * i + 2)
+            .and_then(|h| u8::from_str_radix(h, 16).ok())
+            .unwrap_or(0);
+    }
+    out
 }
 
 /// Loads and validates the configuration files. Returns `None` if the site

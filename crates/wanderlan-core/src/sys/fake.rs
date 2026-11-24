@@ -7,6 +7,9 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
+use std::collections::BTreeSet;
+
+use super::nft::{MssRule, NftOps};
 use super::tc::{IfTc, TcOps, TcRule};
 use super::{
     BridgeOptions, GretapParams, LinkKind, LinkState, LinkUpdate, NetOps, PortVlans, SysError,
@@ -22,6 +25,8 @@ pub struct FakeState {
     pub vlans: BTreeMap<u32, PortVlans>,
     /// tc state by index.
     pub tc: BTreeMap<u32, IfTc>,
+    /// MSS rules; `None` if the nftables table does not exist.
+    pub mss: Option<BTreeSet<MssRule>>,
     /// Log of all mutating calls, e.g. `create_bridge br0`.
     pub calls: Vec<String>,
     next_index: u32,
@@ -420,6 +425,28 @@ impl TcOps for FakeNet {
             .retain(|r| !(r.direction == rule.direction && r.prio() == rule.prio()));
         if entry.ours.len() == before {
             return Err(err("del tc rule", "No such file or directory"));
+        }
+        Ok(())
+    }
+}
+
+impl NftOps for FakeNet {
+    async fn mss_rules(&self) -> SysResult<Option<BTreeSet<MssRule>>> {
+        Ok(self.lock().mss.clone())
+    }
+
+    async fn set_mss_rules(&self, rules: &BTreeSet<MssRule>) -> SysResult<()> {
+        let mut s = self.lock();
+        s.calls.push(format!("set_mss_rules {}", rules.len()));
+        s.mss = Some(rules.clone());
+        Ok(())
+    }
+
+    async fn delete_table(&self) -> SysResult<()> {
+        let mut s = self.lock();
+        s.calls.push("delete_table".into());
+        if s.mss.take().is_none() {
+            return Err(err("delete table", "No such file or directory"));
         }
         Ok(())
     }

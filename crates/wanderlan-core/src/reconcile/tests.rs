@@ -3,7 +3,7 @@ use std::net::Ipv4Addr;
 
 use super::*;
 use crate::config::{Config, Loaded, load};
-use crate::desired::{BRIDGE_OPTIONS, derive};
+use crate::desired::{BRIDGE_OPTIONS, Runtime, derive};
 use crate::sys::fake::FakeNet;
 use crate::sys::tc::{IfTc, TcRule};
 use crate::sys::{LinkKind, LinkState, NetOps, VlanFlags};
@@ -19,7 +19,7 @@ fn config_from(mesh: &str, self_name: &str) -> Config {
 }
 
 fn desired(self_name: &str) -> Desired {
-    derive(&config_from(MESH, self_name), &BTreeSet::new())
+    derive(&config_from(MESH, self_name), &Runtime::default())
 }
 
 async fn run(net: &FakeNet, d: &Desired) -> Vec<Change> {
@@ -106,7 +106,7 @@ async fn removed_peer_is_deleted_and_changed_address_recreated() {
     let mesh = MESH
         .replace("hub = \"heim\"", "hub = \"buero\"")
         .replace("10.8.0.2\"", "10.8.0.22\"");
-    let d = derive(&config_from(&mesh, "heim"), &BTreeSet::new());
+    let d = derive(&config_from(&mesh, "heim"), &Runtime::default());
     let changes = run(&net, &d).await;
     let text: Vec<String> = changes.iter().map(ToString::to_string).collect();
     assert!(
@@ -131,7 +131,7 @@ async fn vlan_range_change_only_touches_vlans() {
     let net = fresh();
     run(&net, &desired("heim")).await;
     let mesh = MESH.replace("vlans = \"10-50\"", "vlans = \"10-40,60\"");
-    let d = derive(&config_from(&mesh, "heim"), &BTreeSet::new());
+    let d = derive(&config_from(&mesh, "heim"), &Runtime::default());
     let changes = run(&net, &d).await;
     assert!(
         changes
@@ -240,8 +240,11 @@ async fn teardown_removes_everything_we_created() {
 async fn blocked_tunnel_is_brought_down_and_back_up() {
     let net = fresh();
     run(&net, &desired("heim")).await;
-    let blocked = BTreeSet::from(["gt-haus2".to_string()]);
-    let d = derive(&config_from(MESH, "heim"), &blocked);
+    let runtime = Runtime {
+        blocked: BTreeSet::from(["gt-haus2".to_string()]),
+        ..Runtime::default()
+    };
+    let d = derive(&config_from(MESH, "heim"), &runtime);
     let changes = run(&net, &d).await;
     assert_eq!(changes.len(), 1);
     assert_eq!(
@@ -327,7 +330,7 @@ async fn port_changes_are_detected_for_fdb_flush() {
     let changes = run(&net, &desired("heim")).await;
     assert!(ports_changed(&changes));
     let mesh = MESH.replace("vlans = \"10-50\"", "vlans = \"10-40\"");
-    let d = derive(&config_from(&mesh, "heim"), &BTreeSet::new());
+    let d = derive(&config_from(&mesh, "heim"), &Runtime::default());
     let changes = run(&net, &d).await;
     assert!(!ports_changed(&changes), "VLAN changes do not move MACs");
     flush_learned(&net, "br0").await.unwrap();
@@ -370,7 +373,7 @@ async fn removing_the_mapping_removes_rules_and_qdisc() {
     let net = fresh();
     run(&net, &desired("haus3")).await;
     let mesh = MESH.replace("local = 130\nshared = 30\n", "local = 131\nshared = 31\n");
-    let d = derive(&config_from(&mesh, "haus3"), &BTreeSet::new());
+    let d = derive(&config_from(&mesh, "haus3"), &Runtime::default());
     let changes = run(&net, &d).await;
     let text: Vec<String> = changes.iter().map(ToString::to_string).collect();
     assert!(
@@ -383,7 +386,7 @@ async fn removing_the_mapping_removes_rules_and_qdisc() {
     assert_eq!(cookies, vec!["wl:e31>131", "wl:i131>31", "wl:i31x"]);
 
     let mesh = MESH.replace("[[map]]\nsite = \"haus3\"\nlocal = 130\nshared = 30\n", "");
-    let d = derive(&config_from(&mesh, "haus3"), &BTreeSet::new());
+    let d = derive(&config_from(&mesh, "haus3"), &Runtime::default());
     run(&net, &d).await;
     assert_eq!(net.tc("ens19"), IfTc::default());
 }
@@ -410,4 +413,25 @@ async fn teardown_removes_translation_rules() {
     teardown(&net, |_| {}).await.unwrap();
     assert_eq!(net.tc("ens19"), IfTc::default());
     assert!(net.link("br0").is_none());
+}
+
+#[tokio::test]
+async fn mss_rules_follow_measurements() {
+    let net = fresh();
+    run(&net, &desired("heim")).await;
+    assert_eq!(net.state().mss, None, "no measurement, no table");
+    let mut runtime = Runtime::default();
+    runtime.pmtu.insert("buero".into(), 1400);
+    let d = derive(&config_from(MESH, "heim"), &runtime);
+    let changes = run(&net, &d).await;
+    assert_eq!(changes.len(), 1);
+    assert!(
+        changes[0]
+            .to_string()
+            .starts_with("Setting TCP MSS clamping")
+    );
+    assert_eq!(net.state().mss.unwrap().len(), 8);
+    assert!(run(&net, &d).await.is_empty());
+    teardown(&net, |_| {}).await.unwrap();
+    assert_eq!(net.state().mss, None);
 }

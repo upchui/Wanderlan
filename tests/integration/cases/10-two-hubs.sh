@@ -42,7 +42,10 @@ expect_no_ping c-hub1 10.99.0.2 "untagged traffic is not bridged"
 client_native_del c-hub1
 client_native_del c-hub2
 
-# Idempotence: reloading the same configuration changes nothing.
+# Idempotence: reloading the same configuration changes nothing. Wait for
+# the first path MTU measurement first, it installs the MSS rules.
+wait_for 60 "hub1 clamps the MSS on gt-hub2 after measuring the path MTU" \
+  x hub1 "nft list table bridge wanderlan 2>/dev/null | grep -q 'oifname \"gt-hub2\" .*maxseg size set 1418'"
 mark=$(daemon_log_lines hub1)
 x hub1 "wl-daemon reload"
 sleep 8

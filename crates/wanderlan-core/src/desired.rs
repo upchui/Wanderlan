@@ -1,10 +1,12 @@
 //! Desired system state derived from the configuration.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 
 use crate::BRIDGE_NAME;
 use crate::config::{Config, LocalVid};
+use crate::mtu;
+use crate::sys::nft::{MssRule, PortDir};
 use crate::sys::tc::{Direction, TcAction, TcRule};
 use crate::sys::{BridgeOptions, GretapParams, PortVlans, VlanFlags};
 use crate::topology::{self, TunnelKind};
@@ -66,11 +68,23 @@ pub struct Desired {
     pub tunnels: Vec<TunnelSpec>,
     /// Local address of the site (GRE source).
     pub local_address: Ipv4Addr,
+    /// TCP MSS clamping rules (nftables).
+    pub mss: BTreeSet<MssRule>,
 }
 
-/// Computes the desired state. `blocked` lists tunnel interfaces the loop
-/// guard has shut down.
-pub fn derive(cfg: &Config, blocked: &BTreeSet<String>) -> Desired {
+/// Runtime information that, besides the configuration, shapes the desired
+/// state.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Runtime {
+    /// Tunnel interfaces shut down by the loop guard.
+    pub blocked: BTreeSet<String>,
+    /// Measured path MTU per peer site.
+    pub pmtu: BTreeMap<String, u16>,
+}
+
+/// Computes the desired state.
+pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
+    let blocked = &runtime.blocked;
     let mesh = &cfg.mesh;
     let me = cfg.self_name();
     let local_address = cfg.self_site().map_or(Ipv4Addr::UNSPECIFIED, |s| s.address);
@@ -78,7 +92,7 @@ pub fn derive(cfg: &Config, blocked: &BTreeSet<String>) -> Desired {
     let shared: PortVlans = mesh.vlans.iter().map(|v| (v, VlanFlags::TAGGED)).collect();
     let (trunk_vlans, tc) = trunk_mapping(cfg, &shared);
 
-    let tunnels = topology::tunnels_for(mesh, me)
+    let tunnels: Vec<TunnelSpec> = topology::tunnels_for(mesh, me)
         .into_iter()
         .map(|t| {
             let name = t.ifname();
@@ -107,9 +121,48 @@ pub fn derive(cfg: &Config, blocked: &BTreeSet<String>) -> Desired {
             vlans: trunk_vlans,
             tc,
         },
+        mss: mss_rules(cfg, &tunnels, runtime),
         tunnels,
         local_address,
     }
+}
+
+/// MSS clamping per tunnel port: a fixed value from the configuration, or
+/// the value derived from the measured path MTU of the peer. Ports without a
+/// measurement use the smallest measured value; without any measurement
+/// there are no rules yet. Rules apply to SYNs entering and leaving through
+/// the port, so both ends of a connection see the smaller value.
+fn mss_rules(cfg: &Config, tunnels: &[TunnelSpec], runtime: &Runtime) -> BTreeSet<MssRule> {
+    let measured: BTreeMap<&str, u16> = tunnels
+        .iter()
+        .filter_map(|t| {
+            runtime
+                .pmtu
+                .get(&t.peer)
+                .map(|p| (t.name.as_str(), mtu::mss_for_pmtu(*p)))
+        })
+        .collect();
+    let fallback = measured.values().copied().min();
+    let mut out = BTreeSet::new();
+    for t in tunnels {
+        let mss = cfg
+            .mesh
+            .mss
+            .or_else(|| measured.get(t.name.as_str()).copied())
+            .or(fallback);
+        let Some(mss) = mss else { continue };
+        for dir in [PortDir::In, PortDir::Out] {
+            for ipv6 in [false, true] {
+                out.insert(MssRule {
+                    port: t.name.clone(),
+                    dir,
+                    ipv6,
+                    mss: if ipv6 { mtu::mss_ipv6(mss) } else { mss },
+                });
+            }
+        }
+    }
+    out
 }
 
 /// VLAN membership and translation rules of the trunk.
@@ -185,7 +238,7 @@ mod tests {
 
     #[test]
     fn hub_has_isolated_hub_ports_and_open_spoke_ports() {
-        let d = derive(&config("heim"), &BTreeSet::new());
+        let d = derive(&config("heim"), &Runtime::default());
         assert_eq!(d.bridge, "br0");
         assert_eq!(d.local_address, Ipv4Addr::new(10, 8, 0, 1));
         let summary: Vec<_> = d
@@ -212,7 +265,7 @@ mod tests {
 
     #[test]
     fn native_mapping_and_translation_shape_the_trunk() {
-        let d = derive(&config("haus3"), &BTreeSet::new());
+        let d = derive(&config("haus3"), &Runtime::default());
         assert_eq!(d.trunk.vlans.get(&20), Some(&VlanFlags::NATIVE));
         assert_eq!(d.trunk.vlans.get(&30), Some(&VlanFlags::TAGGED));
         assert!(!d.trunk.vlans.contains_key(&130));
@@ -223,11 +276,11 @@ mod tests {
 
     #[test]
     fn translation_rules_for_haus3() {
-        let d = derive(&config("haus3"), &BTreeSet::new());
+        let d = derive(&config("haus3"), &Runtime::default());
         let rules: Vec<String> = d.trunk.tc.iter().map(TcRule::cookie).collect();
         assert_eq!(rules, vec!["wl:i30x", "wl:i130>30", "wl:e30>130"]);
         assert!(
-            derive(&config("heim"), &BTreeSet::new())
+            derive(&config("heim"), &Runtime::default())
                 .trunk
                 .tc
                 .is_empty()
@@ -243,7 +296,7 @@ mod tests {
         let Loaded::Configured(cfg) = load(&mesh, local).unwrap().loaded else {
             panic!("configured");
         };
-        let d = derive(&cfg, &BTreeSet::new());
+        let d = derive(&cfg, &Runtime::default());
         assert_eq!(d.trunk.vlans.get(&30), Some(&VlanFlags::TAGGED));
         assert_eq!(d.trunk.vlans.get(&40), Some(&VlanFlags::TAGGED));
         let rules: Vec<String> = d.trunk.tc.iter().map(TcRule::cookie).collect();
@@ -266,15 +319,70 @@ mod tests {
         let Loaded::Configured(cfg) = load(&mesh, local).unwrap().loaded else {
             panic!("configured");
         };
-        let d = derive(&cfg, &BTreeSet::new());
+        let d = derive(&cfg, &Runtime::default());
         assert!(!d.trunk.vlans.contains_key(&15));
         assert_eq!(d.trunk.vlans.get(&30), Some(&VlanFlags::TAGGED));
     }
 
     #[test]
+    fn mss_from_measurements_with_minimum_fallback() {
+        let mut runtime = Runtime::default();
+        assert!(derive(&config("heim"), &runtime).mss.is_empty());
+        runtime.pmtu.insert("buero".into(), 1400);
+        let d = derive(&config("heim"), &runtime);
+        let rules: Vec<String> = d.mss.iter().map(MssRule::comment).collect();
+        assert_eq!(
+            rules,
+            vec![
+                "wl mss iif gt-buero ip 1318",
+                "wl mss iif gt-buero ip6 1298",
+                "wl mss oif gt-buero ip 1318",
+                "wl mss oif gt-buero ip6 1298",
+                "wl mss iif gt-haus2 ip 1318",
+                "wl mss iif gt-haus2 ip6 1298",
+                "wl mss oif gt-haus2 ip 1318",
+                "wl mss oif gt-haus2 ip6 1298",
+            ]
+        );
+        runtime.pmtu.insert("haus2".into(), 1500);
+        let d = derive(&config("heim"), &runtime);
+        assert!(
+            d.mss
+                .iter()
+                .any(|r| r.comment() == "wl mss oif gt-haus2 ip 1418")
+        );
+        assert!(
+            d.mss
+                .iter()
+                .any(|r| r.comment() == "wl mss oif gt-buero ip 1318")
+        );
+    }
+
+    #[test]
+    fn fixed_mss_overrides_measurements() {
+        let mesh = MESH.replace("# mss = 1300", "mss = 1300");
+        let local = "self = \"heim\"\ntrunk = \"ens19\"\n";
+        let Loaded::Configured(cfg) = load(&mesh, local).unwrap().loaded else {
+            panic!("configured");
+        };
+        let mut runtime = Runtime::default();
+        runtime.pmtu.insert("buero".into(), 1400);
+        let d = derive(&cfg, &runtime);
+        assert_eq!(d.mss.len(), 8);
+        assert!(
+            d.mss
+                .iter()
+                .all(|r| r.mss == if r.ipv6 { 1280 } else { 1300 })
+        );
+    }
+
+    #[test]
     fn blocked_tunnels_are_disabled() {
-        let blocked = BTreeSet::from(["gt-haus2".to_string()]);
-        let d = derive(&config("heim"), &blocked);
+        let runtime = Runtime {
+            blocked: BTreeSet::from(["gt-haus2".to_string()]),
+            ..Runtime::default()
+        };
+        let d = derive(&config("heim"), &runtime);
         let enabled: Vec<_> = d
             .tunnels
             .iter()

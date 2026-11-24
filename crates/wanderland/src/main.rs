@@ -6,6 +6,8 @@
 
 mod daemon;
 mod logging;
+mod probe;
+mod sockopt;
 
 use std::path::PathBuf;
 use std::process::ExitCode;

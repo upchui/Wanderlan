@@ -6,8 +6,10 @@
 //! tested without root privileges.
 
 pub mod fake;
+pub mod linux;
 pub mod netlink;
 mod netlink_tc;
+pub mod nft;
 pub mod tc;
 
 use std::collections::BTreeMap;
@@ -225,9 +227,9 @@ pub trait NetOps: Send + Sync {
 }
 
 /// Everything the reconciler needs from the system.
-pub trait System: NetOps + tc::TcOps {}
+pub trait System: NetOps + tc::TcOps + nft::NftOps {}
 
-impl<T: NetOps + tc::TcOps> System for T {}
+impl<T: NetOps + tc::TcOps + nft::NftOps> System for T {}
 
 /// Groups VLAN entries into ranges of consecutive IDs with equal flags.
 /// Entries with the PVID flag are never part of a range (the kernel rejects

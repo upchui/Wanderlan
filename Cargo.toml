@@ -17,6 +17,8 @@ clap = { version = "4.6.9", features = ["derive"] }
 futures-util = "0.3.34"
 humantime = "2.4.0"
 ipnet = { version = "2.12.2", features = ["serde"] }
+libc = "0.2.191"
+nftables = { version = "0.6.3", features = ["tokio"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 serde_spanned = "1.1.3"

@@ -4,6 +4,24 @@ All notable changes to wanderlan are documented in this file.
 
 ## [Unreleased]
 
+### Milestone 5 – MTU and MSS
+
+- Control probes between the daemons (UDP on `<address>:control_port`, only
+  from direct peers): reachability and RTT every 5 s, path MTU by binary
+  search with the DF bit set (`IP_PMTUDISC_PROBE`) at start, every
+  `mtu_probe_interval` and whenever a peer becomes reachable again.
+- MSS = path MTU − 82, clamped with nftables in table `bridge wanderlan`
+  for SYNs entering and leaving each tunnel port (IPv6: −20); ports without
+  a measurement use the smallest measured value; `mss` in the configuration
+  replaces the measurement. The table is replaced atomically and recognised
+  by rule comments.
+- Works around swapped `<`/`>` operators in the `nftables` crate 0.6.3.
+- GRETAP fragmentation stays on as safety net.
+- Integration tests: spoke3 with a 1400-byte underlay measures 1400 and
+  clamps to 1318, a 100 MB TCP transfer arrives intact with MSS 1318 in the
+  SYN, 1500-byte inner packets with DF and 4000-byte UDP datagrams arrive
+  (fragment counters prove the GRE fragmentation).
+
 ### Milestone 4 – VLAN mappings
 
 - Native mapping: untagged traffic on the trunk is mapped to a shared VLAN
