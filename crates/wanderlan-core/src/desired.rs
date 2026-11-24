@@ -159,23 +159,10 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
         .into_iter()
         .map(|t| {
             let name = t.ifname();
-            // What the tunnel carries: the VLANs both ends take part in; on
-            // the way down (site and its client) the own VLANs of the upper
-            // site too, never those of the lower one.
-            let ours: crate::config::VlanSet = match t.kind {
-                topology::TunnelKind::Client => downwards.clone(),
-                topology::TunnelKind::Server | topology::TunnelKind::Uplink => own.clone(),
-            };
-            let theirs: crate::config::VlanSet = match t.kind {
-                topology::TunnelKind::Uplink => network
-                    .effective_vlans(t.peer)
-                    .iter()
-                    .chain(network.own_vlans(t.peer).iter())
-                    .collect(),
-                topology::TunnelKind::Server | topology::TunnelKind::Client => {
-                    network.effective_vlans(t.peer)
-                }
-            };
+            // What the tunnel carries: the VLANs both ends take part in (on
+            // the way down also the own VLANs of the upper site), at most its
+            // own limit.
+            let carried = topology::tunnel_vlans(network, me, &t.peer.name).unwrap_or_default();
             // Down while blocked by the loop guard, or while this site or the
             // peer is offline (set up but not taken online yet).
             let down_reason = if blocked.contains(&name) {
@@ -200,11 +187,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
                     pmtudisc: false,
                 },
                 isolated: t.isolated(),
-                vlans: ours
-                    .iter()
-                    .filter(|v| theirs.contains(*v))
-                    .map(|v| (v, VlanFlags::TAGGED))
-                    .collect(),
+                vlans: carried.iter().map(|v| (v, VlanFlags::TAGGED)).collect(),
             }
         })
         .collect();

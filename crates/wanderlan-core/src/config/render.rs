@@ -91,6 +91,17 @@ fn render_network_inner(network: &Network, with_revision: bool) -> String {
         }
         let _ = writeln!(out, "shared = {}", map.shared);
     }
+    for tunnel in &network.tunnels {
+        out.push_str("\n[[tunnel]]\n");
+        let [a, b] = &tunnel.sites;
+        let _ = writeln!(out, "between = [{}, {}]", quote(a), quote(b));
+        let vlans = if tunnel.vlans.is_empty() {
+            "none".to_string()
+        } else {
+            tunnel.vlans.to_string()
+        };
+        let _ = writeln!(out, "vlans = {}", quote(&vlans));
+    }
     out
 }
 

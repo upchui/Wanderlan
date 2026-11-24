@@ -30,6 +30,7 @@ pub fn validate(network: &Network, local: Option<&Local>) -> Vec<Diagnostic> {
     v.sites(network);
     v.uplinks(network);
     v.maps(network);
+    v.tunnels(network);
     if let Some(local) = local.filter(|l| l.is_configured()) {
         v.local(network, local);
     }
@@ -256,6 +257,41 @@ impl Validator {
                     Some(next) => current = next,
                     None => break,
                 }
+            }
+        }
+    }
+
+    fn tunnels(&mut self, network: &Network) {
+        let mut seen: BTreeMap<&[String; 2], usize> = BTreeMap::new();
+        for (i, tunnel) in network.tunnels.iter().enumerate() {
+            let n = i + 1;
+            let path = FieldPath::tunnel_field(i, "between");
+            let [a, b] = &tunnel.sites;
+            if let Some(missing) = tunnel.sites.iter().find(|s| network.site(s).is_none()) {
+                self.error(
+                    path,
+                    format!("tunnel #{n}: site \"{missing}\" does not exist"),
+                );
+                continue;
+            }
+            if let Some(first) = seen.get(&tunnel.sites) {
+                self.error(
+                    path,
+                    format!(
+                        "tunnel #{n}: the tunnel between \"{a}\" and \"{b}\" already has its VLANs in tunnel #{}",
+                        first + 1
+                    ),
+                );
+                continue;
+            }
+            seen.insert(&tunnel.sites, i);
+            if crate::topology::tunnel_vlans(network, a, b).is_none() {
+                self.warning(
+                    path,
+                    format!(
+                        "tunnel #{n}: \"{a}\" and \"{b}\" have no tunnel with each other; this entry has no effect"
+                    ),
+                );
             }
         }
     }

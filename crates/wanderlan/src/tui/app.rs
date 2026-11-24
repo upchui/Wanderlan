@@ -429,6 +429,10 @@ pub struct App {
     pub sites_selected: usize,
     /// Selected mapping in the VLAN view.
     pub maps_selected: usize,
+    /// The VLAN view shows the tunnels instead of the mappings (`t`).
+    pub vlans_tunnels: bool,
+    /// Selected tunnel in the VLAN view.
+    pub tunnels_selected: usize,
     /// The setup wizard.
     pub wizard: Wizard,
     /// The invitation created last (shown in the overview while open).
@@ -474,6 +478,8 @@ impl App {
             overview_selected: 0,
             sites_selected: 0,
             maps_selected: 0,
+            vlans_tunnels: false,
+            tunnels_selected: 0,
             wizard: Wizard::new(),
             invitation: None,
             invitations: Vec::new(),
@@ -1030,6 +1036,25 @@ impl App {
         false
     }
 
+    /// True if this site may change the VLANs of the tunnel between `a` and
+    /// `b`; otherwise says why not.
+    fn may_change_tunnel(&mut self, a: &str, b: &str) -> bool {
+        let Some(running) = self.running.as_ref() else {
+            return true;
+        };
+        let (Some(network), Some(me)) =
+            (running.network.as_ref(), running.local.self_name.as_deref())
+        else {
+            return true;
+        };
+        if policy::may_change_tunnel(network, a, b, me) {
+            return true;
+        }
+        let text = policy::why_not_tunnel(network, a, b, me);
+        self.say(MessageKind::Error, text);
+        false
+    }
+
     /// True if this site may change the VLANs of the network; otherwise
     /// says why not.
     fn may_change_network_vlans(&mut self) -> bool {
@@ -1165,6 +1190,9 @@ impl App {
             self.maps_selected = self
                 .maps_selected
                 .min(d.network.maps.len().saturating_sub(1));
+            self.tunnels_selected = self
+                .tunnels_selected
+                .min(d.tunnel_rows().len().saturating_sub(1));
         }
     }
 
@@ -1865,6 +1893,15 @@ impl App {
     }
 
     fn on_vlans_key(&mut self, key: &KeyEvent) {
+        if key.code == KeyCode::Char('t') {
+            self.vlans_tunnels = !self.vlans_tunnels;
+            self.clamp_selection();
+            return;
+        }
+        if self.vlans_tunnels && !matches!(key.code, KeyCode::Char('v' | 'o')) {
+            self.on_tunnels_key(key);
+            return;
+        }
         let selected_map_site = self
             .draft
             .as_ref()
@@ -1921,6 +1958,60 @@ impl App {
                     text: format!("Remove VLAN mapping #{} from the draft?", selected + 1),
                     action: AskAction::DeleteMap(selected),
                 }));
+            }
+            _ => {}
+        }
+    }
+
+    /// Keys of the tunnel table in the VLAN view.
+    fn on_tunnels_key(&mut self, key: &KeyEvent) {
+        let Some(draft) = &self.draft else {
+            self.not_configured();
+            return;
+        };
+        let rows = draft.tunnel_rows();
+        let count = rows.len();
+        let selected = self.tunnels_selected.min(count.saturating_sub(1));
+        let Some(row) = rows.into_iter().nth(selected) else {
+            return;
+        };
+        let [a, b] = row.sites.clone();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.tunnels_selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.tunnels_selected = (selected + 1).min(count.saturating_sub(1));
+            }
+            KeyCode::Enter | KeyCode::Char('e') => {
+                if row.servers.is_none() {
+                    self.say(
+                        MessageKind::Info,
+                        format!("{a} and {b} have no tunnel with each other; d removes the entry."),
+                    );
+                } else if self.may_change_tunnel(&a, &b)
+                    && let Some(draft) = &self.draft
+                {
+                    self.modal = Some(Modal::Form(Form::tunnel_vlans(draft, &a, &b)));
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if row.limit.is_none() {
+                    self.say(
+                        MessageKind::Info,
+                        format!("The tunnel {a} – {b} has no limit of its own."),
+                    );
+                } else if self.may_change_tunnel(&a, &b)
+                    && let Some(draft) = &mut self.draft
+                {
+                    draft.network.set_tunnel_limit(&a, &b, None);
+                    draft.revalidate();
+                    self.clamp_selection();
+                    self.say(
+                        MessageKind::Info,
+                        format!(
+                            "The tunnel {a} – {b} carries all VLANs both sites have again (in the draft)."
+                        ),
+                    );
+                }
             }
             _ => {}
         }

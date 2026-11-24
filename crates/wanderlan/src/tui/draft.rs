@@ -7,9 +7,10 @@
 
 use wanderlan_core::api::ConfigTexts;
 use wanderlan_core::config::{
-    Diagnostic, FieldPath, Local, Network, Severity, Site, parse_local, parse_network,
-    render_local, render_network, validate,
+    Diagnostic, FieldPath, Local, Network, Severity, Site, VlanSet, parse_local, parse_network,
+    render_local, render_network, site_pair, validate,
 };
+use wanderlan_core::topology;
 
 use super::diff::{self, DiffLine};
 
@@ -162,6 +163,7 @@ impl Draft {
         }
         let site = self.network.sites.remove(index);
         self.network.maps.retain(|m| m.site != site.name);
+        self.network.tunnels.retain(|t| !t.touches(&site.name));
         self.revalidate();
         Some(site)
     }
@@ -191,12 +193,47 @@ impl Draft {
                 site.uplink = Some(new.to_string());
             }
         }
+        for tunnel in &mut self.network.tunnels {
+            if tunnel.touches(old) {
+                let [a, b] = &tunnel.sites;
+                let rename = |n: &String| if n == old { new.to_string() } else { n.clone() };
+                tunnel.sites = site_pair(&rename(a), &rename(b));
+            }
+        }
         if self.local.self_name.as_deref() == Some(old) {
             self.local.self_name = Some(new.to_string());
         }
         if let Some(trunk) = self.local.tunnel_trunks.remove(old) {
             self.local.tunnel_trunks.insert(new.to_string(), trunk);
         }
+    }
+
+    /// The rows of the tunnel table: every tunnel of the network, then the
+    /// limits of site pairs without a tunnel (so they can be removed).
+    pub fn tunnel_rows(&self) -> Vec<TunnelRow> {
+        let network = &self.network;
+        let mut rows: Vec<TunnelRow> = topology::edges(network)
+            .into_iter()
+            .map(|(a, b, servers)| TunnelRow {
+                carries: topology::tunnel_vlans(network, &a, &b),
+                limit: network.tunnel_limit(&a, &b).cloned(),
+                entry: network.tunnels.iter().position(|t| t.is(&a, &b)),
+                servers: Some(servers),
+                sites: [a, b],
+            })
+            .collect();
+        for (i, tunnel) in network.tunnels.iter().enumerate() {
+            if !rows.iter().any(|r| r.sites == tunnel.sites) {
+                rows.push(TunnelRow {
+                    sites: tunnel.sites.clone(),
+                    servers: None,
+                    carries: None,
+                    limit: Some(tunnel.vlans.clone()),
+                    entry: Some(i),
+                });
+            }
+        }
+        rows
     }
 
     /// Diff of the draft against the running configuration.
@@ -211,6 +248,21 @@ impl Draft {
             "draft",
         )
     }
+}
+
+/// One row of the tunnel table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelRow {
+    /// The two sites, the smaller name first.
+    pub sites: [String; 2],
+    /// Between two servers; `None` if there is no tunnel (only a limit).
+    pub servers: Option<bool>,
+    /// What the tunnel carries; `None` if there is no tunnel.
+    pub carries: Option<VlanSet>,
+    /// Its own limit, if it has one.
+    pub limit: Option<VlanSet>,
+    /// Index of the limit in `network.tunnels`.
+    pub entry: Option<usize>,
 }
 
 /// True if `path` is `parent` or lies below it.
@@ -239,6 +291,7 @@ pub fn same_network(a: &Network, b: &Network) -> bool {
         && a.commit_timeout == b.commit_timeout
         && a.sites == b.sites
         && a.maps == b.maps
+        && a.tunnels == b.tunnels
 }
 
 #[cfg(test)]
@@ -338,5 +391,32 @@ mod tests {
             &FieldPath::site_field(10, "hub"),
             &FieldPath::site(1)
         ));
+    }
+
+    #[test]
+    fn tunnel_limits_follow_removed_and_renamed_sites() {
+        let running = Running::parse(&fixtures::config_texts()).unwrap();
+        let mut draft = Draft::from_running(&running).unwrap();
+        draft
+            .network
+            .set_tunnel_limit("heim", "buero", Some(VlanSet::from_range(20, 20)));
+        draft
+            .network
+            .set_tunnel_limit("haus2", "haus3", Some(VlanSet::new()));
+        draft.rename_references("buero", "zentrale");
+        assert!(draft.network.tunnel_limit("heim", "zentrale").is_some());
+        assert_eq!(
+            draft.network.tunnels[0].sites,
+            ["heim".to_string(), "zentrale".to_string()],
+            "the smaller name first"
+        );
+        let haus2 = draft
+            .network
+            .sites
+            .iter()
+            .position(|s| s.name == "haus2")
+            .unwrap();
+        draft.remove_site(haus2);
+        assert_eq!(draft.network.tunnels.len(), 1);
     }
 }

@@ -8,7 +8,7 @@ use ratatui::backend::TestBackend;
 use wanderlan_core::api::{
     ChangeSource, Invitation, PendingChange, Request, SiteRules, Translation,
 };
-use wanderlan_core::config::VlanSet;
+use wanderlan_core::config::{VlanSet, parse_network, render_network};
 
 use super::draw;
 use crate::client::ClientError;
@@ -286,5 +286,50 @@ fn sites_as_tree() {
         "after the clients of heim comes buero"
     );
     key(&mut app, KeyCode::Up);
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
+fn vlans_tunnels() {
+    let mut app = connected();
+    if let Some(d) = &mut app.draft {
+        d.network
+            .set_tunnel_limit("heim", "buero", Some(VlanSet::from_range(20, 30)));
+        d.revalidate();
+    }
+    key(&mut app, KeyCode::Char('3'));
+    key(&mut app, KeyCode::Char('t'));
+    insta::assert_snapshot!(render(&app));
+    // d lifts the limit of the selected tunnel (buero – heim is the fourth).
+    for _ in 0..3 {
+        key(&mut app, KeyCode::Down);
+    }
+    key(&mut app, KeyCode::Char('d'));
+    assert!(
+        app.draft
+            .as_ref()
+            .is_some_and(|d| d.network.tunnels.is_empty()),
+        "the limit is gone"
+    );
+}
+
+#[test]
+fn tunnel_vlans_form() {
+    let mut app = connected();
+    key(&mut app, KeyCode::Char('3'));
+    key(&mut app, KeyCode::Char('t'));
+    key(&mut app, KeyCode::Enter);
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
+fn peer_details_limited() {
+    let mut app = connected();
+    let mut texts = fixtures::config_texts();
+    let mut network = parse_network(&texts.network).unwrap().network.unwrap();
+    network.set_tunnel_limit("heim", "buero", Some(VlanSet::from_range(20, 30)));
+    texts.network = render_network(&network);
+    reply(&mut app, Request::GetConfig, Reply::Config(texts));
+    key(&mut app, KeyCode::Enter);
     insta::assert_snapshot!(render(&app));
 }

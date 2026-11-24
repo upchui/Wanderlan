@@ -19,7 +19,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::{Network, Site};
+use crate::config::{Network, Site, VlanSet};
 
 /// Prefix of the GRETAP interfaces created by wanderlan.
 pub const GRETAP_PREFIX: &str = "gt-";
@@ -93,6 +93,36 @@ pub fn tunnels_for<'a>(network: &'a Network, local: &str) -> Vec<Tunnel<'a>> {
         .collect();
     out.sort_by(|a, b| a.peer.name.cmp(&b.peer.name));
     out
+}
+
+/// The VLANs the tunnel between `a` and `b` carries, or `None` if there is
+/// no tunnel between them. Between servers: the VLANs both take part in.
+/// Between a site and its client: also the own VLANs of the upper site,
+/// never those of the client. Never more than the tunnel's own limit
+/// (`[[tunnel]]`).
+pub fn tunnel_vlans(network: &Network, a: &str, b: &str) -> Option<VlanSet> {
+    let me = network.site(a)?;
+    let tunnel = tunnels_for(network, a)
+        .into_iter()
+        .find(|t| t.peer.name == b)?;
+    let peer = tunnel.peer;
+    let with_own = |s: &Site| -> VlanSet {
+        network
+            .effective_vlans(s)
+            .iter()
+            .chain(network.own_vlans(s).iter())
+            .collect()
+    };
+    let (ours, theirs) = match tunnel.kind {
+        TunnelKind::Client => (with_own(me), network.effective_vlans(peer)),
+        TunnelKind::Uplink => (network.effective_vlans(me), with_own(peer)),
+        TunnelKind::Server => (network.effective_vlans(me), network.effective_vlans(peer)),
+    };
+    let vlans = ours.intersection(&theirs);
+    Some(match network.tunnel_limit(a, b) {
+        Some(limit) => vlans.intersection(limit),
+        None => vlans,
+    })
 }
 
 /// All tunnels of the network as unordered site pairs (smaller name first),
@@ -391,5 +421,47 @@ mod tests {
         let mut c = example();
         c.sites[2].uplink = Some("heim".into());
         assert_ne!(forwarding_key(&a), forwarding_key(&c));
+    }
+
+    #[test]
+    fn a_tunnel_carries_at_most_its_limit() {
+        let mut network = with_clients();
+        // dc takes part in 30-60.
+        network.sites[1].vlans = Some(VlanSet::from_range(30, 60));
+        assert_eq!(
+            tunnel_vlans(&network, "alex", "dc"),
+            Some(VlanSet::from_range(30, 50)),
+            "servers: what both have"
+        );
+        // Down to a client also the own VLANs of the upper site.
+        network.sites[0].own_vlans = Some(VlanSet::from_range(60, 60));
+        network.sites[2].vlans = Some(VlanSet::from_range(10, 60));
+        assert!(
+            tunnel_vlans(&network, "alex", "marcel")
+                .unwrap()
+                .contains(60)
+        );
+        assert_eq!(
+            tunnel_vlans(&network, "marcel", "alex"),
+            tunnel_vlans(&network, "alex", "marcel"),
+            "the same from both ends"
+        );
+        // The limit narrows it, entered in either order.
+        network.set_tunnel_limit("dc", "alex", Some(VlanSet::from_range(40, 45)));
+        assert_eq!(
+            tunnel_vlans(&network, "alex", "dc"),
+            Some(VlanSet::from_range(40, 45))
+        );
+        network.set_tunnel_limit("alex", "dc", Some(VlanSet::new()));
+        assert_eq!(tunnel_vlans(&network, "dc", "alex"), Some(VlanSet::new()));
+        assert_eq!(network.tunnels.len(), 1);
+        assert_eq!(
+            network.tunnels[0].sites,
+            ["alex".to_string(), "dc".to_string()]
+        );
+        // Two clients of one site have no tunnel.
+        assert_eq!(tunnel_vlans(&network, "marcel", "site2"), None);
+        network.set_tunnel_limit("alex", "dc", None);
+        assert!(network.tunnels.is_empty());
     }
 }

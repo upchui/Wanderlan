@@ -604,3 +604,73 @@ fn own_vlans_are_checked() {
     let text = render_network(&parsed);
     assert!(text.contains("own_vlans = \"13,50\""), "{text}");
 }
+
+#[test]
+fn tunnel_limits_are_read_written_and_checked() {
+    let network = format!(
+        "{EXAMPLE_NETWORK}\n[[tunnel]]\nbetween = [\"heim\", \"buero\"]\nvlans = \"20-30\"\n\n[[tunnel]]\nbetween = [\"haus2\", \"heim\"]\nvlans = \"none\"\n"
+    );
+    let outcome = load(&network, LOCAL).expect("valid");
+    let Loaded::Configured(cfg) = outcome.loaded else {
+        panic!("configured");
+    };
+    let limit = cfg.network.tunnel_limit("buero", "heim").expect("limit");
+    assert_eq!(limit.to_string(), "20-30");
+    assert!(
+        cfg.network
+            .tunnel_limit("heim", "haus2")
+            .expect("none")
+            .is_empty()
+    );
+    let text = render_network(&cfg.network);
+    assert!(
+        text.contains("[[tunnel]]\nbetween = [\"buero\", \"heim\"]\nvlans = \"20-30\"\n"),
+        "{text}"
+    );
+    assert!(text.contains("vlans = \"none\""), "{text}");
+    let again = parse_network(&text).unwrap().network.unwrap();
+    assert_eq!(again.tunnels, cfg.network.tunnels);
+    assert_ne!(
+        fingerprint(&again),
+        fingerprint(&Network {
+            tunnels: Vec::new(),
+            ..again.clone()
+        })
+    );
+}
+
+#[test]
+fn wrong_tunnel_limits_are_errors() {
+    for (entry, contains) in [
+        (
+            "between = [\"heim\"]\nvlans = \"20\"",
+            "exactly two site names",
+        ),
+        (
+            "between = [\"heim\", \"heim\"]\nvlans = \"20\"",
+            "not \"heim\" with itself",
+        ),
+        (
+            "between = [\"heim\", \"nowhere\"]\nvlans = \"20\"",
+            "site \"nowhere\" does not exist",
+        ),
+        ("between = [\"heim\", \"buero\"]", "vlans (e.g."),
+        (
+            "between = [\"heim\", \"buero\"]\nvlans = \"5000\"",
+            "tunnel #1: vlans:",
+        ),
+    ] {
+        let network = format!("{EXAMPLE_NETWORK}\n[[tunnel]]\n{entry}\n");
+        let err = single_error(&network, LOCAL);
+        assert!(err.message.contains(contains), "{err}");
+        assert!(err.line.is_some(), "{err}");
+    }
+    let twice = format!(
+        "{EXAMPLE_NETWORK}\n[[tunnel]]\nbetween = [\"heim\", \"buero\"]\nvlans = \"20\"\n\n[[tunnel]]\nbetween = [\"buero\", \"heim\"]\nvlans = \"30\"\n"
+    );
+    let err = single_error(&twice, LOCAL);
+    assert!(
+        err.message.contains("already has its VLANs in tunnel #1"),
+        "{err}"
+    );
+}

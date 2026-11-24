@@ -174,6 +174,23 @@ pub enum Command {
         #[arg(long)]
         confirm: bool,
     },
+    /// Limit the VLANs of the tunnel between two sites (on top of the VLANs
+    /// both take part in), or lift the limit ("all"). "none": the tunnel
+    /// carries no VLAN.
+    ///
+    /// Example: `wanderlan tunnel-vlans server2 server3 30-40`.
+    #[command(name = "tunnel-vlans")]
+    TunnelVlans {
+        /// One end of the tunnel.
+        site: String,
+        /// The other end.
+        other: String,
+        /// VLANs, e.g. 30-40; "all" (no limit) or "none".
+        vlans: String,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Bridge the tunnel to a site with a trunk of its own (a segment of its
     /// own on this site), or with the default trunk again ("default").
     Trunk {
@@ -390,6 +407,12 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             })
             .await
         }
+        Some(Command::TunnelVlans {
+            site,
+            other,
+            vlans,
+            confirm,
+        }) => set_tunnel_vlans(&socket, &site, &other, &vlans, confirm).await,
         Some(Command::Manage {
             site,
             by,
@@ -667,6 +690,85 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
     if confirm {
         let _: Confirmed = client.call(Request::Confirm).await?;
         println!("{done}.");
+    } else {
+        println!(
+            "{done} now. Run `wanderlan confirm` within {} seconds to keep it, otherwise it is rolled back.",
+            applied.confirm_within_secs
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `wanderlan tunnel-vlans`: sets or lifts the VLAN limit of one tunnel.
+async fn set_tunnel_vlans(
+    socket: &Path,
+    a: &str,
+    b: &str,
+    vlans: &str,
+    confirm: bool,
+) -> Result<ExitCode> {
+    let limit = match vlans.trim() {
+        "" | "all" => None,
+        "none" => Some(config::VlanSet::new()),
+        text => Some(
+            text.parse::<config::VlanSet>()
+                .map_err(|e| anyhow!("{text}: {e}"))?,
+        )
+        .filter(|v| !v.is_all()),
+    };
+    let client = connect(socket).await?;
+    settle(&client).await?;
+    let running: ConfigTexts = client.call(Request::GetConfig).await?;
+    if !running.configured {
+        bail!("this site is not part of a network");
+    }
+    let mut network = config::parse_network(&running.network)
+        .ok()
+        .and_then(|p| p.network)
+        .context("cannot read the running configuration")?;
+    if let Some(unknown) = [a, b].into_iter().find(|n| network.site(n).is_none()) {
+        bail!("there is no site \"{unknown}\" in the network of this site");
+    }
+    if wanderlan_core::topology::tunnel_vlans(&network, a, b).is_none() {
+        bail!("\"{a}\" and \"{b}\" have no tunnel with each other");
+    }
+    let show = |v: &config::VlanSet| {
+        if v.is_empty() {
+            "none".to_string()
+        } else {
+            v.to_string()
+        }
+    };
+    if network.tunnel_limit(a, b) == limit.as_ref() {
+        println!("The tunnel between {a} and {b} already has this limit.");
+        return Ok(ExitCode::SUCCESS);
+    }
+    network.set_tunnel_limit(a, b, limit.clone());
+    let carries = wanderlan_core::topology::tunnel_vlans(&network, a, b).unwrap_or_default();
+    let applied: Applied = client
+        .call(Request::Apply(ApplyParams {
+            config: ConfigInput {
+                network: config::render_network(&network),
+                local: running.local,
+            },
+            base_revision: Some(running.revision),
+            timeout_secs: None,
+        }))
+        .await?;
+    let done = match &limit {
+        Some(l) => format!(
+            "The tunnel between {a} and {b} carries VLANs {} (limited to {})",
+            show(&carries),
+            show(l)
+        ),
+        None => format!(
+            "The tunnel between {a} and {b} carries VLANs {} (no limit of its own)",
+            show(&carries)
+        ),
+    };
+    if confirm {
+        let c: Confirmed = client.call(Request::Confirm).await?;
+        println!("{done} (network revision {}).", c.revision);
     } else {
         println!(
             "{done} now. Run `wanderlan confirm` within {} seconds to keep it, otherwise it is rolled back.",

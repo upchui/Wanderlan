@@ -11,7 +11,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::{Network, Site, VlanMap, fingerprint, validate};
+use crate::config::{Network, Site, TunnelVlans, VlanMap, fingerprint, validate};
 use crate::policy;
 
 /// The part of `network` the site `site` knows: everything for a server; for a
@@ -22,6 +22,7 @@ pub fn view_for(network: &Network, site: &str) -> Network {
         return Network {
             sites: Vec::new(),
             maps: Vec::new(),
+            tunnels: Vec::new(),
             ..network.clone()
         };
     };
@@ -47,9 +48,20 @@ pub fn view_for(network: &Network, site: &str) -> Network {
         .filter(|m| sites.iter().any(|s| s.name == m.site))
         .cloned()
         .collect();
+    let tunnels = network
+        .tunnels
+        .iter()
+        .filter(|t| {
+            t.sites
+                .iter()
+                .all(|name| sites.iter().any(|s| &s.name == name))
+        })
+        .cloned()
+        .collect();
     Network {
         sites,
         maps,
+        tunnels,
         ..network.clone()
     }
 }
@@ -147,6 +159,32 @@ pub fn merge(full: &Network, view: &Network, from: &str) -> Result<Network, Stri
     for map in own_maps {
         if !merged.maps.contains(map) {
             merged.maps.push(map.clone());
+        }
+    }
+
+    // The VLANs of its own tunnels as in the view; the others as received.
+    let touches_own = |t: &TunnelVlans| t.sites.iter().any(|s| names.contains(s.as_str()));
+    let foreign = |n: &Network| -> Vec<TunnelVlans> {
+        let mut list: Vec<TunnelVlans> = n
+            .tunnels
+            .iter()
+            .filter(|t| !touches_own(t))
+            .cloned()
+            .collect();
+        list.sort_by(|x, y| x.sites.cmp(&y.sites));
+        list
+    };
+    if foreign(view) != foreign(&expected) {
+        return Err(format!(
+            "\"{from}\" may only change the VLANs of its own tunnels"
+        ));
+    }
+    merged
+        .tunnels
+        .retain(|t| !touches_own(t) || view.tunnels.contains(t));
+    for tunnel in view.tunnels.iter().filter(|t| touches_own(t)) {
+        if !merged.tunnels.contains(tunnel) {
+            merged.tunnels.push(tunnel.clone());
         }
     }
 
@@ -360,5 +398,40 @@ mod tests {
             merged.site("site2").unwrap().own_vlans,
             Some(VlanSet::from_range(50, 50))
         );
+    }
+
+    #[test]
+    fn a_client_sees_and_changes_only_its_own_tunnels() {
+        let mut network = full();
+        network.set_tunnel_limit("alex", "dc", Some(VlanSet::from_range(10, 20)));
+        network.set_tunnel_limit("alex", "marcel", Some(VlanSet::from_range(10, 30)));
+        network.set_tunnel_limit("dc", "y", Some(VlanSet::from_range(10, 40)));
+        let view = view_for(&network, "marcel");
+        assert_eq!(
+            view.tunnels.len(),
+            1,
+            "only its tunnel to alex: {:?}",
+            view.tunnels
+        );
+        let mut changed = view.clone();
+        changed.set_tunnel_limit("marcel", "alex", Some(VlanSet::from_range(14, 14)));
+        let merged = merge(&network, &changed, "marcel").expect("its own tunnel");
+        assert_eq!(
+            merged.tunnel_limit("alex", "marcel"),
+            Some(&VlanSet::from_range(14, 14))
+        );
+        assert_eq!(
+            merged.tunnel_limit("alex", "dc"),
+            Some(&VlanSet::from_range(10, 20)),
+            "the tunnels it does not see stay"
+        );
+        assert_eq!(
+            merged.tunnel_limit("dc", "y"),
+            Some(&VlanSet::from_range(10, 40))
+        );
+        let mut foreign = view.clone();
+        foreign.set_tunnel_limit("alex", "nobody", Some(VlanSet::new()));
+        let err = merge(&network, &foreign, "marcel").unwrap_err();
+        assert!(err.contains("its own tunnels"), "{err}");
     }
 }

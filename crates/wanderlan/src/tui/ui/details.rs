@@ -105,6 +105,12 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, area: Rect) {
         (None, Some(r), None) => format!("revision {r}"),
         (None, None, _) => "-".into(),
     };
+    let limited = app.running.as_ref().is_some_and(|r| {
+        r.network
+            .as_ref()
+            .zip(r.local.self_name.as_deref())
+            .is_some_and(|(network, me)| network.tunnel_limit(me, &peer.name).is_some())
+    });
     let mut lines = vec![
         Line::from(vec![
             label("Tunnel"),
@@ -132,6 +138,14 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, area: Rect) {
         Line::from(vec![
             label("VLANs"),
             Span::raw(peer.vlans.clone()),
+            Span::styled(
+                if limited {
+                    " (limited on this tunnel)"
+                } else {
+                    ""
+                },
+                theme::dim(),
+            ),
             Span::styled("   trunk ", theme::dim()),
             Span::raw(if peer.trunk.is_empty() {
                 "-".to_string()

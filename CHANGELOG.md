@@ -200,6 +200,18 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
   complete configuration reference, how it works, and the project
   decisions. The TUI help and the open questions follow suit.
 
+### VLANs per tunnel
+
+- A tunnel can carry less than the VLANs both of its sites take part in:
+  `[[tunnel]] between = ["dc", "lab"] vlans = "30-40"` (or `"none"`). So
+  `dc – hq` can carry 10-20 and `dc – lab` 30-40. With a trunk of its own
+  for a tunnel, the same VLAN IDs on another interface reach another site.
+- VLANs (`3`), `t`: every tunnel with what it carries and its limit
+  (`Enter` limits, `d` lifts); `wanderlan tunnel-vlans <site> <site>
+  <vlans|all|none>`; the peer details mark a limited tunnel.
+- Whoever may change one of the two sites may limit their tunnel; a client
+  sees and changes only its own tunnels.
+
 ### Faster, and sync problems in plain sight
 
 - A server that cannot take over a change of its client says so: `refused`

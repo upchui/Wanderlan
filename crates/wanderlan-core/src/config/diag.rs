@@ -79,6 +79,16 @@ impl FieldPath {
         Self(format!("map[{index}].{field}"))
     }
 
+    /// A `[[tunnel]]` table.
+    pub fn tunnel(index: usize) -> Self {
+        Self(format!("tunnel[{index}]"))
+    }
+
+    /// A key in a `[[tunnel]]` table.
+    pub fn tunnel_field(index: usize, field: &str) -> Self {
+        Self(format!("tunnel[{index}].{field}"))
+    }
+
     /// A top-level key of `local.toml`.
     pub fn local(field: &str) -> Self {
         Self(field.to_string())

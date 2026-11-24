@@ -1,0 +1,28 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+"┌ VLANs of the network (v) ────────────────────────────────────────────────────┐"
+"│ 10-50  (41 VLANs)                                                            │"
+"│ Default of every site (native = untagged); limit a site in Sites (2).        │"
+"│ Own VLANs of heim (o): none  trunk and own clients only                      │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"┌ Tunnels: 11 (1 limited; t: mappings) ────────────────────────────────────────┐"
+"│TUNNEL                      KIND     CARRIES                    LIMIT         │"
+"│buero – haus2               servers  20,30                      -             │"
+"│buero – haus3               servers  10-50                      -             │"
+"│buero – haus5               servers  10-50                      -             │"
+"│buero – heim                servers  20-30                      20-30         │"
+"│haus2 – haus3               servers  20,30                      -             │"
+"│haus2 – haus5               servers  20,30                      -             │"
+"│haus2 – heim                servers  20,30                      -             │"
+"│haus3 – haus5               servers  10-50                      -             │"
+"│haus3 – heim                servers  10-50                      -             │"
+"│haus5 – heim                servers  10-50                      -             │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" A tunnel carries the VLANs of both sites; Enter limits it, d lifts the limit.  "
+"                                                                                "
+"                                                                                "
+"                                                       draft: modified  heim r7 "
+" v  VLANs   e  limit   d  no limit   t  mappings   a  apply   x  discard        "

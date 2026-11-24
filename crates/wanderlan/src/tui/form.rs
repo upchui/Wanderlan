@@ -43,6 +43,8 @@ pub enum FormKind {
     /// The own VLANs of one site (index in the network): on its trunk and
     /// towards its own clients only.
     OwnVlans(usize),
+    /// The VLANs of the tunnel between two sites (indices in the network).
+    TunnelVlans(usize, usize),
 }
 
 /// The editable value of a field.
@@ -416,6 +418,41 @@ impl Form {
         )
     }
 
+    /// Form for the VLANs of the tunnel between the sites `a` and `b`.
+    pub fn tunnel_vlans(draft: &Draft, a: &str, b: &str) -> Self {
+        let index = |name: &str| {
+            draft
+                .network
+                .sites
+                .iter()
+                .position(|s| s.name == name)
+                .unwrap_or(usize::MAX)
+        };
+        let value = draft
+            .network
+            .tunnel_limit(a, b)
+            .map(|v| {
+                if v.is_empty() {
+                    "none".to_string()
+                } else {
+                    v.to_string()
+                }
+            })
+            .unwrap_or_default();
+        let fields = vec![Field::text(
+            "vlans",
+            "VLANs",
+            "empty: all VLANs both sites have; e.g. 30-40 or none",
+            value,
+        )];
+        Self::new(
+            FormKind::TunnelVlans(index(a), index(b)),
+            format!("VLANs of the tunnel {a} – {b}"),
+            fields,
+            draft,
+        )
+    }
+
     pub fn vlans(draft: &Draft) -> Self {
         let fields = vec![vlans_field(&draft.network.vlans)];
         Self::new(FormKind::Vlans, "VLANs of the network", fields, draft)
@@ -634,6 +671,18 @@ impl Form {
             FormKind::OwnVlans(i) => Some(i),
             FormKind::Invite => Some(draft.network.sites.len()),
             FormKind::Map(i) => Some(i.unwrap_or(draft.network.maps.len())),
+            FormKind::TunnelVlans(a, b) => {
+                let name = |i: usize| draft.network.sites.get(i).map_or("", |s| s.name.as_str());
+                let (a, b) = (name(a), name(b));
+                Some(
+                    draft
+                        .network
+                        .tunnels
+                        .iter()
+                        .position(|t| t.is(a, b))
+                        .unwrap_or(draft.network.tunnels.len()),
+                )
+            }
             FormKind::Network | FormKind::Vlans | FormKind::Local | FormKind::TunnelTrunk(_) => {
                 None
             }
@@ -647,6 +696,7 @@ impl Form {
                 Some(FieldPath::site(i))
             }
             FormKind::Map(_) => Some(FieldPath::map(i)),
+            FormKind::TunnelVlans(..) => Some(FieldPath::tunnel(i)),
             FormKind::Network | FormKind::Vlans | FormKind::Local | FormKind::TunnelTrunk(_) => {
                 None
             }
@@ -661,6 +711,7 @@ impl Form {
                 FieldPath::site_field(i, key)
             }
             FormKind::Map(_) => FieldPath::map_field(i, key),
+            FormKind::TunnelVlans(..) => FieldPath::tunnel_field(i, key),
             FormKind::Network | FormKind::Vlans => FieldPath::network(key),
             FormKind::Local => FieldPath::local(key),
             FormKind::TunnelTrunk(site) => {
@@ -734,6 +785,24 @@ impl Form {
             FormKind::OwnVlans(site) => {
                 let own = self.parse_own_vlans()?;
                 candidate.network.sites.get_mut(site)?.own_vlans = own;
+            }
+            FormKind::TunnelVlans(a, b) => {
+                let a = candidate.network.sites.get(a)?.name.clone();
+                let b = candidate.network.sites.get(b)?.name.clone();
+                let text = self.value("vlans");
+                let limit = match text.trim() {
+                    "" | "all" => None,
+                    "none" => Some(VlanSet::new()),
+                    t => match t.parse::<VlanSet>() {
+                        Ok(v) if v.is_all() => None,
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            self.set_error("vlans", e.to_string());
+                            return None;
+                        }
+                    },
+                };
+                candidate.network.set_tunnel_limit(&a, &b, limit);
             }
             FormKind::TunnelTrunk(site) => {
                 let name = candidate.network.sites.get(site)?.name.clone();

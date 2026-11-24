@@ -77,6 +77,7 @@ pub const SECTIONS: &[Section] = &[
             ("n", "new mapping (native or local VLAN -> shared VLAN)"),
             ("e, Enter", "edit the mapping"),
             ("d, Del", "delete the mapping"),
+            ("t", "tunnels: what each carries (Enter: limit it)"),
         ],
         text: "",
     },
@@ -227,11 +228,18 @@ pub fn bar(app: &App) -> Vec<Binding> {
                 ("d", "delete"),
             ],
             View::Settings => vec![("Up/Down", "choose"), ("Enter", "change")],
+            View::Vlans if app.vlans_tunnels => vec![
+                ("v", "VLANs"),
+                ("e", "limit"),
+                ("d", "no limit"),
+                ("t", "mappings"),
+            ],
             View::Vlans => vec![
                 ("v", "VLANs"),
-                ("n", "new map"),
+                ("n", "new"),
                 ("e", "edit"),
-                ("d", "delete"),
+                ("d", "del"),
+                ("t", "tunnels"),
             ],
             View::Macs if app.macs.editing => {
                 return vec![("Enter", "keep filter"), ("Esc", "clear filter")];

@@ -69,6 +69,11 @@ A tunnel carries the VLANs that **both** of its ends take part in. So two
 clients exchange traffic only in a VLAN that they and their server all have;
 a VLAN the server does not take part in does not pass it.
 
+A single tunnel can be limited further (`[[tunnel]]`): e.g. `dc – hq` carries
+only 10-20 and `dc – lab` only 30-40, although all three take part in more.
+Together with a trunk of its own for a tunnel, the same VLAN IDs on another
+interface of a site are a network of their own and still reach another site.
+
 Besides the VLANs its server gives it, a site can have **own VLANs**: they
 are on its trunk and go to its own clients, but never up to its server. So a
 client can build its own VLANs below it without touching what its server
@@ -227,6 +232,11 @@ site, local VLAN `native` (or a local VLAN ID, e.g. `130`), shared VLAN
 `wanderlan manage <site> --self-managed yes`,
 `wanderlan role <site> client <server>`, `wanderlan role <site> server`.
 
+**Limit what one tunnel carries.** VLANs (`3`), `t` lists every tunnel with
+what it carries; `Enter` limits it (e.g. `30-40`, or `none`), `d` lifts the
+limit. CLI: `wanderlan tunnel-vlans dc lab 30-40` (`all` lifts it). Whoever may
+change one of the two sites may limit their tunnel.
+
 **Give a tunnel its own trunk.** Normally all tunnels share the trunk. A
 tunnel can be bridged with another local interface instead, as a segment of
 its own at this site (bridge `wl-<interface>`, same VLANs and mappings): only
@@ -338,6 +348,8 @@ mapping.
 | `map.site` | | The site the mapping belongs to. |
 | `map.local` | | `"native"` (untagged) or a local VLAN ID (not 1). |
 | `map.shared` | | The VLAN in the network; one of the VLANs of the site, not 1. |
+| `tunnel.between` | | The two sites of a tunnel, e.g. `["dc", "lab"]`. |
+| `tunnel.vlans` | | The most this tunnel carries (on top of the VLANs of both sites), e.g. `"30-40"`; `"none"`: no VLAN at all. |
 | `self` (local) | | Which site of `network.toml` this host is. |
 | `trunk` (local) | | The interface carrying the VLANs. |
 | `tunnels.<site>.trunk` (local) | `trunk` | A trunk of its own for the tunnel to `<site>`. |
@@ -450,7 +462,7 @@ and in 80×24 (`--mouse` enables the mouse). `?` shows all keys.
 |-----|------|
 | `1` | Overview: this site with its role, the tunnel neighbours live (reply, round trip, path MTU, MSS, port state, MAC addresses, throughput, config in sync or `refused`), traffic of the tunnels and of every trunk, and all known sites with role and link (`via hq` for sites without a tunnel from here), each server with its clients indented below. `Enter` on a neighbour: traffic graph, round-trip history, min/avg/max round trip, jitter, probe loss, latency, counters. |
 | `2` | Sites: name, address, VLANs, role, manager, tunnel; clients indented below their server. Invite (`i`), open invitations (`I`), online/offline (`o`), new (`n`), edit (`Enter`: VLANs, "Changes", "Connected to"), delete (`d`). |
-| `3` | VLANs: the VLANs of the network (`v`), the own VLANs of this site (`o`) and the mappings (`n`, `Enter`, `d`) with their site and its role; conflicts are marked right away. |
+| `3` | VLANs: the VLANs of the network (`v`), the own VLANs of this site (`o`) and the mappings (`n`, `Enter`, `d`) with their site and its role; conflicts are marked right away. `t` switches to the tunnels: what each carries, its limit (`Enter`, `d`). |
 | `4` | MAC addresses: filter (`/`), sort (`s`, `o`). |
 | `5` | Log: live events, filter by level (`l`) and site (`p`). |
 | `6` | Setup: new network or join; on a configured site invite (`i`) and reset (`R`). |
@@ -476,6 +488,7 @@ log lines and keeps trying.
 | `wanderlan role <site> server\|client <server>` | Make a site a server or a client |
 | `wanderlan trunk <site> <interface\|default>` | Trunk of the tunnel to a site |
 | `wanderlan own-vlans <site> <vlans\|none>` | Own VLANs of a site (trunk and its own clients only) |
+| `wanderlan tunnel-vlans <site> <site> <vlans\|all\|none>` | The most the tunnel between two sites carries |
 | `wanderlan apply [--network F] [--local F] [--timeout 60s]` | Apply files (default: those in `/etc/wanderlan`) |
 | `wanderlan confirm` / `wanderlan rollback` | Confirm or revert the pending change |
 | `wanderlan validate <network.toml> [--local <local.toml>]` | Check files without applying them |
@@ -484,7 +497,7 @@ log lines and keeps trying.
 | `wanderlan reset [--yes]` | Remove everything wanderlan set up on this site |
 
 Commands that change the configuration (`online`, `offline`, `manage`,
-`role`, `trunk`, `own-vlans`) take `--confirm` to confirm right away; without it, run
+`role`, `trunk`, `own-vlans`, `tunnel-vlans`) take `--confirm` to confirm right away; without it, run
 `wanderlan confirm` within the commit timeout. They wait for a change that is
 still being synchronised. The daemon's socket can be chosen with `--socket`
 or `WANDERLAN_SOCKET`.

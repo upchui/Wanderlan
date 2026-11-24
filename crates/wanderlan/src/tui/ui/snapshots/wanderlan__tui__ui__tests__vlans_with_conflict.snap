@@ -25,4 +25,4 @@ expression: render(&app)
 "                                                                                "
 "                                                                                "
 "                                                     draft: 1 error(s)  heim r7 "
-" v  VLANs   n  new map   e  edit   d  delete   a  apply   x  discard   ?  help  "
+" v  VLANs   n  new   e  edit   d  del   t  tunnels   a  apply   x  discard      "

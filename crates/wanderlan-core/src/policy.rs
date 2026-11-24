@@ -20,6 +20,8 @@
 //! edited files). It is an agreement between the daemons, not a
 //! cryptographic protection.
 
+use std::collections::BTreeSet;
+
 use crate::config::{Network, Site, VlanMap};
 
 /// The parts of a site that only its managers may change.
@@ -79,6 +81,44 @@ pub fn may_change(network: &Network, site: &Site, editor: &str) -> bool {
         Some(m) => editor == m || (editor == site.name && site.self_managed),
         None => restricted_by(network, editor).is_none(),
     }
+}
+
+/// True if `editor` may change the VLANs of the tunnel between `a` and `b`:
+/// whoever may change one of the two sites. A site that is not there yet is
+/// judged when it is added.
+pub fn may_change_tunnel(network: &Network, a: &str, b: &str, editor: &str) -> bool {
+    [a, b].iter().any(|name| {
+        network
+            .site(name)
+            .is_none_or(|site| may_change(network, site, editor))
+    })
+}
+
+/// Why `editor` may not change the VLANs of the tunnel between `a` and `b`;
+/// only meaningful if it may not.
+pub fn why_not_tunnel(network: &Network, a: &str, b: &str, editor: &str) -> String {
+    let what = format!("the VLANs of the tunnel between \"{a}\" and \"{b}\"");
+    if let Some(m) = restricted_by(network, editor) {
+        return format!(
+            "this site (\"{editor}\") may not change {what}: {}",
+            restricted_reason(m)
+        );
+    }
+    if let Some(up) = client_of(network, editor) {
+        return format!(
+            "this site (\"{editor}\") is a client of \"{up}\": it may only change its own tunnels, not {what}"
+        );
+    }
+    let by = |name: &str| {
+        network
+            .site(name)
+            .map_or_else(String::new, |s| managers(network, s))
+    };
+    format!(
+        "this site (\"{editor}\") may not change {what}: \"{a}\" is managed by {}, \"{b}\" by {}",
+        by(a),
+        by(b)
+    )
 }
 
 /// The site `editor` is a client of, if it is a client.
@@ -176,6 +216,19 @@ pub fn check_edit(old: &Network, new: &Network, editor: &str) -> Result<(), Stri
             && !may_change(old, site, editor)
         {
             return Err(why_not(old, site, editor, "change the own VLANs of"));
+        }
+    }
+    // The VLANs of a tunnel: whoever may change one of its two sites.
+    let pairs: BTreeSet<&[String; 2]> = old
+        .tunnels
+        .iter()
+        .chain(new.tunnels.iter())
+        .map(|t| &t.sites)
+        .collect();
+    for [a, b] in pairs {
+        if old.tunnel_limit(a, b) != new.tunnel_limit(a, b) && !may_change_tunnel(old, a, b, editor)
+        {
+            return Err(why_not_tunnel(old, a, b, editor));
         }
     }
     // A client only adds clients of its own.
@@ -414,5 +467,23 @@ mod tests {
         let mut other = old.clone();
         other.sites[0].online = false;
         assert!(check_edit(&old, &other, "b").is_err());
+    }
+
+    #[test]
+    fn a_tunnel_is_changed_by_whoever_may_change_one_of_its_sites() {
+        let old = network();
+        let mut new = old.clone();
+        new.set_tunnel_limit("b", "c", Some(VlanSet::from_range(10, 20)));
+        assert!(check_edit(&old, &new, "b").is_ok(), "b may change b");
+        assert!(check_edit(&old, &new, "a").is_ok(), "a manages c");
+        let err = check_edit(&old, &new, "c").unwrap_err();
+        assert!(
+            err.contains("may not change the VLANs of the tunnel between \"b\" and \"c\""),
+            "{err}"
+        );
+        assert!(err.contains("managed by \"a\""), "{err}");
+        let mut own = old.clone();
+        own.set_tunnel_limit("a", "d", Some(VlanSet::new()));
+        assert!(check_edit(&old, &own, "d").is_ok(), "d may change itself");
     }
 }

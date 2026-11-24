@@ -1,11 +1,12 @@
-//! View 3: the VLANs of the network and the mapping table. Conflicts are marked from
-//! the draft's diagnostics, which are recomputed on every edit.
+//! View 3: the VLANs of the network and the mapping table, or (`t`) the
+//! tunnels with the VLANs each carries. Conflicts are marked from the draft's
+//! diagnostics, which are recomputed on every edit.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState, Wrap};
-use wanderlan_core::config::{FieldPath, LocalVid, Severity, VlanMap};
+use wanderlan_core::config::{FieldPath, LocalVid, Severity, VlanMap, VlanSet};
 
 use super::{diagnostic_line, not_configured, severity_style, titled};
 use crate::tui::app::App;
@@ -24,6 +25,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     ])
     .areas(area);
     draw_vlans(frame, draft, app.restricted_by().as_deref(), vlans);
+    if app.vlans_tunnels {
+        draw_tunnels(frame, app, draft, table, detail);
+        return;
+    }
     draw_maps(frame, app, draft, table);
     let selected = FieldPath::map(app.maps_selected);
     let mut lines: Vec<Line> = draft.within(&selected).map(diagnostic_line).collect();
@@ -114,6 +119,89 @@ fn effect(map: &VlanMap) -> String {
         LocalVid::Native => format!("untagged at {} = shared VLAN {}", map.site, map.shared),
         LocalVid::Vid(v) => format!("VLAN {v} at {} = shared VLAN {}", map.site, map.shared),
     }
+}
+
+fn vlans_text(vlans: &VlanSet) -> String {
+    if vlans.is_empty() {
+        "none".into()
+    } else {
+        vlans.to_string()
+    }
+}
+
+fn draw_tunnels(frame: &mut Frame, app: &App, draft: &Draft, area: Rect, detail: Rect) {
+    let rows = draft.tunnel_rows();
+    let selected = app.tunnels_selected.min(rows.len().saturating_sub(1));
+    let header = Row::new(vec!["TUNNEL", "KIND", "CARRIES", "LIMIT"]).style(theme::header());
+    let table_rows: Vec<Row> = rows
+        .iter()
+        .map(|r| {
+            let [a, b] = &r.sites;
+            let kind = match r.servers {
+                Some(true) => "servers",
+                Some(false) => "client",
+                None => "-",
+            };
+            let carries = r
+                .carries
+                .as_ref()
+                .map_or_else(|| "no tunnel".to_string(), vlans_text);
+            let limit = r.limit.as_ref().map_or_else(|| "-".to_string(), vlans_text);
+            let style = severity_style(
+                r.entry
+                    .and_then(|i| draft.worst_within(&FieldPath::tunnel(i))),
+            );
+            Row::new(vec![
+                Cell::from(format!("{a} – {b}")),
+                Cell::from(kind),
+                Cell::from(carries),
+                Cell::from(limit),
+            ])
+            .style(style)
+        })
+        .collect();
+    let limited = rows.iter().filter(|r| r.limit.is_some()).count();
+    let title = format!(" Tunnels: {} ({limited} limited; t: mappings) ", rows.len());
+    if table_rows.is_empty() {
+        frame.render_widget(
+            Paragraph::new(" No tunnels: this site is alone in the network.")
+                .style(theme::dim())
+                .block(titled(title)),
+            area,
+        );
+    } else {
+        let widths = [
+            Constraint::Length(27),
+            Constraint::Length(8),
+            Constraint::Min(10),
+            Constraint::Length(14),
+        ];
+        let table = Table::new(table_rows, widths)
+            .header(header)
+            .block(titled(title))
+            .row_highlight_style(theme::selected());
+        let mut state = TableState::default();
+        state.select(Some(selected));
+        frame.render_stateful_widget(table, area, &mut state);
+    }
+    let mut lines: Vec<Line> = rows
+        .get(selected)
+        .and_then(|r| r.entry)
+        .map(|i| {
+            draft
+                .within(&FieldPath::tunnel(i))
+                .map(diagnostic_line)
+                .collect()
+        })
+        .unwrap_or_default();
+    if lines.is_empty() {
+        lines.push(Line::styled(
+            " A tunnel carries the VLANs of both sites; Enter limits it, d lifts the limit.",
+            theme::dim(),
+        ));
+    }
+    lines.truncate(3);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), detail);
 }
 
 fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {

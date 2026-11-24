@@ -14,7 +14,7 @@ use serde_spanned::Spanned;
 use super::diag::{ConfigFile, Diagnostic, FieldPath, SpanMap};
 use super::model::{
     DEFAULT_COMMIT_TIMEOUT, DEFAULT_CONTROL_PORT, DEFAULT_MTU_PROBE_INTERVAL, Local, LocalVid,
-    Network, Site, VlanMap,
+    Network, Site, TunnelVlans, VlanMap, site_pair,
 };
 use super::vlan::{VID_MAX, VID_MIN, VlanSet};
 
@@ -28,6 +28,8 @@ struct RawNetworkFile {
     site: Vec<Spanned<RawSite>>,
     #[serde(default)]
     map: Vec<Spanned<RawMap>>,
+    #[serde(default)]
+    tunnel: Vec<Spanned<RawTunnel>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +80,14 @@ struct RawMap {
     site: Option<Spanned<String>>,
     local: Option<Spanned<RawLocalVid>>,
     shared: Option<Spanned<i64>>,
+}
+
+/// `[[tunnel]]`: the VLANs one tunnel carries at most.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawTunnel {
+    between: Option<Spanned<Vec<String>>>,
+    vlans: Option<Spanned<RawVlans>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,7 +222,7 @@ pub fn parse_network(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
         Err(e) => return Err(vec![toml_error(ConfigFile::Network, &lw.spans, &e)]),
     };
 
-    if raw.network.is_none() && raw.site.is_empty() && raw.map.is_empty() {
+    if raw.network.is_none() && raw.site.is_empty() && raw.map.is_empty() && raw.tunnel.is_empty() {
         return Ok(ParsedNetwork {
             network: None,
             spans: lw.spans,
@@ -263,6 +273,15 @@ pub fn parse_network(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
             .and_then(|m| lower_map(&mut lw, i, m))
         {
             network.maps.push(map);
+        }
+    }
+    for (i, raw_tunnel) in raw.tunnel.into_iter().enumerate() {
+        let path = FieldPath::tunnel(i);
+        if let Some(tunnel) = lw
+            .take(&path, Some(raw_tunnel))
+            .and_then(|t| lower_tunnel(&mut lw, i, t))
+        {
+            network.tunnels.push(tunnel);
         }
     }
 
@@ -477,6 +496,60 @@ fn lower_map(lw: &mut Lowering, i: usize, m: RawMap) -> Option<VlanMap> {
         site: site?,
         local: local?,
         shared: shared?,
+    })
+}
+
+fn lower_tunnel(lw: &mut Lowering, i: usize, t: RawTunnel) -> Option<TunnelVlans> {
+    let label = format!("tunnel #{}", i + 1);
+    let between_path = FieldPath::tunnel_field(i, "between");
+    let between = lw.take(&between_path, t.between);
+    let vlans_path = FieldPath::tunnel_field(i, "vlans");
+    let vlans = lw.take(&vlans_path, t.vlans);
+    let sites = lw
+        .required(
+            between_path.clone(),
+            between,
+            &format!("{label}: between (the two sites, e.g. [\"hq\", \"lab\"])"),
+        )
+        .and_then(|names| match names.as_slice() {
+            [a, b] if a != b => Some(site_pair(a, b)),
+            [a, _] => {
+                lw.error(
+                    between_path.clone(),
+                    format!("{label}: a tunnel connects two sites, not \"{a}\" with itself"),
+                );
+                None
+            }
+            _ => {
+                lw.error(
+                    between_path.clone(),
+                    format!(
+                        "{label}: between needs exactly two site names, e.g. [\"hq\", \"lab\"]"
+                    ),
+                );
+                None
+            }
+        });
+    let vlans = lw
+        .required(
+            vlans_path.clone(),
+            vlans,
+            &format!("{label}: vlans (e.g. \"10-20\" or \"none\")"),
+        )
+        .and_then(|v| match v {
+            RawVlans::Text(t) if t.trim() == "none" => Some(VlanSet::new()),
+            RawVlans::Text(t) if t.trim().is_empty() => Some(VlanSet::all()),
+            v => match parse_vlans(v) {
+                Ok(set) => Some(set),
+                Err(e) => {
+                    lw.error(vlans_path, format!("{label}: vlans: {e}"));
+                    None
+                }
+            },
+        });
+    Some(TunnelVlans {
+        sites: sites?,
+        vlans: vlans?,
     })
 }
 

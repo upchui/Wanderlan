@@ -44,6 +44,8 @@ pub struct Network {
     pub sites: Vec<Site>,
     /// Per-site VLAN mappings.
     pub maps: Vec<VlanMap>,
+    /// VLAN limits of single tunnels (`[[tunnel]]`).
+    pub tunnels: Vec<TunnelVlans>,
 }
 
 impl Network {
@@ -58,6 +60,24 @@ impl Network {
             commit_timeout: DEFAULT_COMMIT_TIMEOUT,
             sites: Vec::new(),
             maps: Vec::new(),
+            tunnels: Vec::new(),
+        }
+    }
+
+    /// The VLAN limit of the tunnel between `a` and `b`, if it has one.
+    pub fn tunnel_limit(&self, a: &str, b: &str) -> Option<&VlanSet> {
+        self.tunnels.iter().find(|t| t.is(a, b)).map(|t| &t.vlans)
+    }
+
+    /// Sets (`Some`) or removes (`None`) the VLAN limit of the tunnel
+    /// between `a` and `b`; an existing entry keeps its place.
+    pub fn set_tunnel_limit(&mut self, a: &str, b: &str, vlans: Option<VlanSet>) {
+        match vlans {
+            None => self.tunnels.retain(|t| !t.is(a, b)),
+            Some(vlans) => match self.tunnels.iter_mut().find(|t| t.is(a, b)) {
+                Some(entry) => entry.vlans = vlans,
+                None => self.tunnels.push(TunnelVlans::new(a, b, vlans)),
+            },
         }
     }
 
@@ -160,6 +180,45 @@ pub struct VlanMap {
     pub local: LocalVid,
     /// VLAN ID in the shared network.
     pub shared: u16,
+}
+
+/// The VLANs one tunnel carries at most (`[[tunnel]]`): a limit on top of
+/// the VLANs of its two sites.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct TunnelVlans {
+    /// The two sites, the smaller name first.
+    pub sites: [String; 2],
+    /// The VLANs; empty: none at all.
+    pub vlans: VlanSet,
+}
+
+impl TunnelVlans {
+    /// The limit of the tunnel between `a` and `b`.
+    pub fn new(a: &str, b: &str, vlans: VlanSet) -> Self {
+        Self {
+            sites: site_pair(a, b),
+            vlans,
+        }
+    }
+
+    /// True for the tunnel between `a` and `b` (in any order).
+    pub fn is(&self, a: &str, b: &str) -> bool {
+        self.sites == site_pair(a, b)
+    }
+
+    /// True if `site` is one of its ends.
+    pub fn touches(&self, site: &str) -> bool {
+        self.sites.iter().any(|s| s == site)
+    }
+}
+
+/// Two site names, the smaller one first.
+pub fn site_pair(a: &str, b: &str) -> [String; 2] {
+    if a <= b {
+        [a.to_string(), b.to_string()]
+    } else {
+        [b.to_string(), a.to_string()]
+    }
 }
 
 /// The site-local configuration (`local.toml`).
