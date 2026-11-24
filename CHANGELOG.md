@@ -4,6 +4,22 @@ All notable changes to wanderlan are documented in this file.
 
 ## [Unreleased]
 
+### Milestone 4 – VLAN mappings
+
+- Native mapping: untagged traffic on the trunk is mapped to a shared VLAN
+  (`pvid untagged` on the trunk).
+- VLAN translation with tc `clsact`, `flower` and `action vlan modify` via
+  netlink (local → shared on ingress, shared → local on egress). Frames that
+  arrive tagged with a translation target are dropped (`gact drop`) so the
+  local VLAN and the translated VLAN never merge; chained translations keep
+  their targets on the trunk.
+- wanderlan recognises its tc rules by an action cookie (`wl:i130>30`) and
+  never touches foreign filters; the clsact qdisc is removed only if no
+  other filters use it.
+- Integration tests: untagged client reaches VLAN 20 at other sites, local
+  VLAN 130 reaches VLAN 30, tagged VLAN 30 at the translating site does not
+  leak, conflicting mappings are rejected, reload is idempotent.
+
 ### Milestone 3 – Hubs and spokes
 
 - Five-site integration topology: two hubs, two spokes at the first hub, one

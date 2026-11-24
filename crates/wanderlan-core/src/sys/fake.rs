@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::sync::{Mutex, MutexGuard};
 
+use super::tc::{IfTc, TcOps, TcRule};
 use super::{
     BridgeOptions, GretapParams, LinkKind, LinkState, LinkUpdate, NetOps, PortVlans, SysError,
     SysResult, VlanFlags,
@@ -19,6 +20,8 @@ pub struct FakeState {
     pub links: BTreeMap<u32, LinkState>,
     /// VLAN entries by index.
     pub vlans: BTreeMap<u32, PortVlans>,
+    /// tc state by index.
+    pub tc: BTreeMap<u32, IfTc>,
     /// Log of all mutating calls, e.g. `create_bridge br0`.
     pub calls: Vec<String>,
     next_index: u32,
@@ -89,6 +92,26 @@ impl FakeNet {
     /// Looks up a link by name.
     pub fn link(&self, name: &str) -> Option<LinkState> {
         self.lock().links.values().find(|l| l.name == name).cloned()
+    }
+
+    /// tc state of a link by name.
+    pub fn tc(&self, name: &str) -> IfTc {
+        let s = self.lock();
+        s.links
+            .values()
+            .find(|l| l.name == name)
+            .and_then(|l| s.tc.get(&l.index).cloned())
+            .unwrap_or_default()
+    }
+
+    /// Adds a foreign filter (not created by wanderlan) to a link.
+    pub fn add_foreign_filter(&self, name: &str) {
+        let mut s = self.lock();
+        if let Some(index) = s.links.values().find(|l| l.name == name).map(|l| l.index) {
+            let entry = s.tc.entry(index).or_default();
+            entry.clsact = true;
+            entry.foreign += 1;
+        }
     }
 
     /// VLAN entries of a link by name.
@@ -211,6 +234,7 @@ impl NetOps for FakeNet {
         };
         s.calls.push(format!("delete_link {}", link.name));
         s.vlans.remove(&index);
+        s.tc.remove(&index);
         let ports: Vec<u32> = s
             .links
             .values()
@@ -330,6 +354,72 @@ impl NetOps for FakeNet {
             for vid in vids {
                 entries.remove(vid);
             }
+        }
+        Ok(())
+    }
+}
+
+impl TcOps for FakeNet {
+    async fn tc_state(&self) -> SysResult<BTreeMap<u32, IfTc>> {
+        Ok(self
+            .lock()
+            .tc
+            .iter()
+            .filter(|(_, t)| t.clsact)
+            .map(|(k, v)| (*k, v.clone()))
+            .collect())
+    }
+
+    async fn add_clsact(&self, index: u32) -> SysResult<()> {
+        let mut s = self.lock();
+        s.calls.push(format!("add_clsact #{index}"));
+        let entry = s.tc.entry(index).or_default();
+        if entry.clsact {
+            return Err(err("add clsact", "File exists"));
+        }
+        entry.clsact = true;
+        Ok(())
+    }
+
+    async fn del_clsact(&self, index: u32) -> SysResult<()> {
+        let mut s = self.lock();
+        s.calls.push(format!("del_clsact #{index}"));
+        match s.tc.remove(&index) {
+            Some(t) if t.clsact => Ok(()),
+            _ => Err(err("del clsact", "No such file or directory")),
+        }
+    }
+
+    async fn add_tc_rule(&self, index: u32, rule: &TcRule) -> SysResult<()> {
+        let mut s = self.lock();
+        s.calls
+            .push(format!("add_tc_rule #{index} {}", rule.cookie()));
+        let entry = s.tc.entry(index).or_default();
+        if !entry.clsact {
+            return Err(err("add tc rule", "no clsact qdisc"));
+        }
+        if entry
+            .ours
+            .iter()
+            .any(|r| r.direction == rule.direction && r.prio() == rule.prio())
+        {
+            return Err(err("add tc rule", "File exists"));
+        }
+        entry.ours.push(*rule);
+        Ok(())
+    }
+
+    async fn del_tc_rule(&self, index: u32, rule: &TcRule) -> SysResult<()> {
+        let mut s = self.lock();
+        s.calls
+            .push(format!("del_tc_rule #{index} {}", rule.cookie()));
+        let entry = s.tc.entry(index).or_default();
+        let before = entry.ours.len();
+        entry
+            .ours
+            .retain(|r| !(r.direction == rule.direction && r.prio() == rule.prio()));
+        if entry.ours.len() == before {
+            return Err(err("del tc rule", "No such file or directory"));
         }
         Ok(())
     }

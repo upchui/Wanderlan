@@ -5,7 +5,8 @@ use super::*;
 use crate::config::{Config, Loaded, load};
 use crate::desired::{BRIDGE_OPTIONS, derive};
 use crate::sys::fake::FakeNet;
-use crate::sys::{LinkKind, LinkState, VlanFlags};
+use crate::sys::tc::{IfTc, TcRule};
+use crate::sys::{LinkKind, LinkState, NetOps, VlanFlags};
 
 const MESH: &str = include_str!("../../../../packaging/examples/mesh.toml");
 
@@ -347,4 +348,66 @@ fn forwarding_key_reflects_roles_and_tunnels() {
     );
     b.sites[3].hub = Some("heim".into());
     assert_ne!(forwarding_key(&a), forwarding_key(&b));
+}
+
+#[tokio::test]
+async fn translation_rules_are_installed_once() {
+    let net = fresh();
+    let d = desired("haus3");
+    run(&net, &d).await;
+    let tc = net.tc("ens19");
+    assert!(tc.clsact);
+    let mut cookies: Vec<String> = tc.ours.iter().map(TcRule::cookie).collect();
+    cookies.sort();
+    assert_eq!(cookies, vec!["wl:e30>130", "wl:i130>30", "wl:i30x"]);
+    net.take_calls();
+    assert!(run(&net, &d).await.is_empty());
+    assert!(net.take_calls().is_empty());
+}
+
+#[tokio::test]
+async fn removing_the_mapping_removes_rules_and_qdisc() {
+    let net = fresh();
+    run(&net, &desired("haus3")).await;
+    let mesh = MESH.replace("local = 130\nshared = 30\n", "local = 131\nshared = 31\n");
+    let d = derive(&config_from(&mesh, "haus3"), &BTreeSet::new());
+    let changes = run(&net, &d).await;
+    let text: Vec<String> = changes.iter().map(ToString::to_string).collect();
+    assert!(
+        text.iter()
+            .any(|t| t == "On ens19: translate local VLAN 131 to shared VLAN 31 (incoming)"),
+        "{text:?}"
+    );
+    let mut cookies: Vec<String> = net.tc("ens19").ours.iter().map(TcRule::cookie).collect();
+    cookies.sort();
+    assert_eq!(cookies, vec!["wl:e31>131", "wl:i131>31", "wl:i31x"]);
+
+    let mesh = MESH.replace("[[map]]\nsite = \"haus3\"\nlocal = 130\nshared = 30\n", "");
+    let d = derive(&config_from(&mesh, "haus3"), &BTreeSet::new());
+    run(&net, &d).await;
+    assert_eq!(net.tc("ens19"), IfTc::default());
+}
+
+#[tokio::test]
+async fn foreign_filters_are_kept() {
+    let net = fresh();
+    net.add_foreign_filter("ens19");
+    run(&net, &desired("haus3")).await;
+    let tc = net.tc("ens19");
+    assert_eq!(tc.foreign, 1);
+    assert_eq!(tc.ours.len(), 3);
+    teardown(&net, |_| {}).await.unwrap();
+    let tc = net.tc("ens19");
+    assert!(tc.clsact, "the clsact qdisc is still used by someone else");
+    assert!(tc.ours.is_empty());
+    assert_eq!(tc.foreign, 1);
+}
+
+#[tokio::test]
+async fn teardown_removes_translation_rules() {
+    let net = fresh();
+    run(&net, &desired("haus3")).await;
+    teardown(&net, |_| {}).await.unwrap();
+    assert_eq!(net.tc("ens19"), IfTc::default());
+    assert!(net.link("br0").is_none());
 }

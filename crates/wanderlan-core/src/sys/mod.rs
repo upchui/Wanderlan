@@ -7,6 +7,8 @@
 
 pub mod fake;
 pub mod netlink;
+mod netlink_tc;
+pub mod tc;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -221,6 +223,11 @@ pub trait NetOps: Send + Sync {
         vids: &[u16],
     ) -> impl Future<Output = SysResult<()>> + Send;
 }
+
+/// Everything the reconciler needs from the system.
+pub trait System: NetOps + tc::TcOps {}
+
+impl<T: NetOps + tc::TcOps> System for T {}
 
 /// Groups VLAN entries into ranges of consecutive IDs with equal flags.
 /// Entries with the PVID flag are never part of a range (the kernel rejects

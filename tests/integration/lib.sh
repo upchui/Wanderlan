@@ -145,7 +145,7 @@ daemon_log_lines() { x "$1" "wc -l < /var/log/wanderland.log 2>/dev/null || echo
 daemon_log_since() { x "$1" "tail -n +$(($2 + 1)) /var/log/wanderland.log 2>/dev/null"; }
 
 # Lines of the daemon log that describe system changes.
-CHANGE_RE='Creating|Adding VLANs|Removing VLANs|Deleting|Attaching|Bringing|Isolating|Removing isolation|Setting'
+CHANGE_RE='Creating|Adding VLANs|Removing VLANs|Deleting|Attaching|Bringing|Isolating|Removing isolation|Setting|clsact|On [a-z0-9.]+: '
 
 dump_logs() {
   local svc

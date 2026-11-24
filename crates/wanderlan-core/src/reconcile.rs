@@ -12,8 +12,9 @@ use std::fmt;
 
 use crate::config::VlanSet;
 use crate::desired::{Desired, GRETAP_MTU, OWNER_ALIAS};
+use crate::sys::tc::{IfTc, TcRule};
 use crate::sys::{
-    BridgeOptions, GretapParams, LinkKind, LinkState, LinkUpdate, NetOps, PortVlans, SysError,
+    BridgeOptions, GretapParams, LinkKind, LinkState, LinkUpdate, PortVlans, SysError, System,
     VlanFlags,
 };
 use crate::topology::GRETAP_PREFIX;
@@ -28,11 +29,13 @@ pub struct Actual {
     pub links: BTreeMap<String, LinkState>,
     /// VLAN entries by link index.
     pub vlans: BTreeMap<u32, PortVlans>,
+    /// tc state of the links with a clsact qdisc, by index.
+    pub tc: BTreeMap<u32, IfTc>,
 }
 
 impl Actual {
     /// Reads the current state from the system.
-    pub async fn observe<N: NetOps>(net: &N) -> Result<Self, SysError> {
+    pub async fn observe<N: System>(net: &N) -> Result<Self, SysError> {
         let links = net
             .links()
             .await?
@@ -40,7 +43,8 @@ impl Actual {
             .map(|l| (l.name.clone(), l))
             .collect();
         let vlans = net.port_vlans().await?;
-        Ok(Self { links, vlans })
+        let tc = net.tc_state().await?;
+        Ok(Self { links, vlans, tc })
     }
 
     fn by_index(&self, index: u32) -> Option<&LinkState> {
@@ -97,6 +101,14 @@ pub enum Change {
     },
     /// Remove VLAN entries from a port.
     DelVlans { port: String, vids: Vec<u16> },
+    /// Add a clsact qdisc for VLAN translation.
+    AddClsact { dev: String },
+    /// Remove the clsact qdisc.
+    DelClsact { dev: String },
+    /// Add a VLAN translation rule.
+    AddTcRule { dev: String, rule: TcRule },
+    /// Remove a VLAN translation rule.
+    DelTcRule { dev: String, rule: TcRule },
 }
 
 fn vid_list(vids: impl IntoIterator<Item = u16>) -> String {
@@ -166,6 +178,12 @@ impl fmt::Display for Change {
                 "Removing VLANs {} from port {port}",
                 vid_list(vids.iter().copied())
             ),
+            Self::AddClsact { dev } => {
+                write!(f, "Adding a clsact qdisc to {dev} for VLAN translation")
+            }
+            Self::DelClsact { dev } => write!(f, "Removing the clsact qdisc from {dev}"),
+            Self::AddTcRule { dev, rule } => write!(f, "On {dev}: {rule}"),
+            Self::DelTcRule { dev, rule } => write!(f, "On {dev}: no longer {rule}"),
         }
     }
 }
@@ -352,14 +370,79 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
         }
     }
 
+    let tc_changes = tc_changes(desired, actual, trunk);
+
     let mut out = deletes;
     out.extend(bridge_changes);
     out.extend(creates);
     out.extend(settings);
     out.extend(vlan_dels);
     out.extend(vlan_adds);
+    out.extend(tc_changes);
     out.extend(ups);
     Ok(out)
+}
+
+/// VLAN translation rules: the trunk gets exactly the desired rules; rules
+/// of ours on other interfaces (e.g. a former trunk) are removed.
+fn tc_changes(desired: &Desired, actual: &Actual, trunk: &LinkState) -> Vec<Change> {
+    let mut dels = Vec::new();
+    let mut adds = Vec::new();
+    let mut qdisc_adds = Vec::new();
+    let mut qdisc_dels = Vec::new();
+
+    let wanted: BTreeSet<TcRule> = desired.trunk.tc.iter().copied().collect();
+    let current = actual.tc.get(&trunk.index).cloned().unwrap_or_default();
+    let have: BTreeSet<TcRule> = current.ours.iter().copied().collect();
+    for rule in have.difference(&wanted) {
+        dels.push(Change::DelTcRule {
+            dev: trunk.name.clone(),
+            rule: *rule,
+        });
+    }
+    let missing: Vec<&TcRule> = wanted.difference(&have).collect();
+    if !missing.is_empty() && !current.clsact {
+        qdisc_adds.push(Change::AddClsact {
+            dev: trunk.name.clone(),
+        });
+    }
+    for rule in missing {
+        adds.push(Change::AddTcRule {
+            dev: trunk.name.clone(),
+            rule: *rule,
+        });
+    }
+    if wanted.is_empty() && !have.is_empty() && current.foreign == 0 {
+        qdisc_dels.push(Change::DelClsact {
+            dev: trunk.name.clone(),
+        });
+    }
+
+    for (index, state) in &actual.tc {
+        if *index == trunk.index || state.ours.is_empty() {
+            continue;
+        }
+        let Some(link) = actual.by_index(*index) else {
+            continue;
+        };
+        for rule in &state.ours {
+            dels.push(Change::DelTcRule {
+                dev: link.name.clone(),
+                rule: *rule,
+            });
+        }
+        if state.foreign == 0 {
+            qdisc_dels.push(Change::DelClsact {
+                dev: link.name.clone(),
+            });
+        }
+    }
+
+    let mut out = dels;
+    out.extend(qdisc_dels);
+    out.extend(qdisc_adds);
+    out.extend(adds);
+    out
 }
 
 struct PortWanted<'a> {
@@ -444,7 +527,27 @@ fn port_changes(
 /// Changes that remove everything wanderlan created: all links marked as
 /// ours. Deleting the bridge also detaches the trunk.
 pub fn plan_teardown(actual: &Actual) -> Vec<Change> {
-    let mut out: Vec<Change> = actual
+    let mut tc = Vec::new();
+    for (index, state) in &actual.tc {
+        let Some(link) = actual.by_index(*index) else {
+            continue;
+        };
+        if state.ours.is_empty() || is_owned(link) {
+            continue;
+        }
+        for rule in &state.ours {
+            tc.push(Change::DelTcRule {
+                dev: link.name.clone(),
+                rule: *rule,
+            });
+        }
+        if state.foreign == 0 {
+            tc.push(Change::DelClsact {
+                dev: link.name.clone(),
+            });
+        }
+    }
+    let mut links: Vec<Change> = actual
         .links
         .values()
         .filter(|l| is_owned(l))
@@ -454,11 +557,12 @@ pub fn plan_teardown(actual: &Actual) -> Vec<Change> {
         })
         .collect();
     // Delete tunnels before the bridge so the trunk is detached last.
-    out.sort_by_key(|c| match c {
+    links.sort_by_key(|c| match c {
         Change::DeleteLink { name, .. } if name.starts_with(GRETAP_PREFIX) => 0,
         _ => 1,
     });
-    out
+    tc.extend(links);
+    tc
 }
 
 /// Error from [`reconcile`] or [`teardown`].
@@ -476,7 +580,7 @@ pub enum ReconcileError {
 }
 
 /// Applies one change.
-pub async fn apply<N: NetOps>(net: &N, actual: &Actual, change: &Change) -> Result<(), SysError> {
+pub async fn apply<N: System>(net: &N, actual: &Actual, change: &Change) -> Result<(), SysError> {
     let index_of =
         |name: &str| -> Result<u32, SysError> {
             actual.links.get(name).map(|l| l.index).ok_or_else(|| {
@@ -535,6 +639,10 @@ pub async fn apply<N: NetOps>(net: &N, actual: &Actual, change: &Change) -> Resu
             let is_bridge = matches!(link.kind, LinkKind::Bridge(_));
             net.del_vlans(link.index, is_bridge, vids).await?;
         }
+        Change::AddClsact { dev } => net.add_clsact(index_of(dev)?).await?,
+        Change::DelClsact { dev } => net.del_clsact(index_of(dev)?).await?,
+        Change::AddTcRule { dev, rule } => net.add_tc_rule(index_of(dev)?, rule).await?,
+        Change::DelTcRule { dev, rule } => net.del_tc_rule(index_of(dev)?, rule).await?,
     }
     Ok(())
 }
@@ -550,7 +658,7 @@ fn changes_links(change: &Change) -> bool {
 
 /// Brings the system into the desired state. Calls `log` for every change
 /// before it is applied and returns all applied changes.
-pub async fn reconcile<N: NetOps>(
+pub async fn reconcile<N: System>(
     net: &N,
     desired: &Desired,
     mut log: impl FnMut(&Change),
@@ -587,7 +695,7 @@ pub async fn reconcile<N: NetOps>(
 
 /// Sets the owner alias on a freshly created link. If that fails the link is
 /// removed again so that no unmarked interface is left behind.
-async fn mark_owned<N: NetOps>(net: &N, name: &str) -> Result<(), SysError> {
+async fn mark_owned<N: System>(net: &N, name: &str) -> Result<(), SysError> {
     let link = net
         .links()
         .await?
@@ -625,7 +733,7 @@ pub fn ports_changed(changes: &[Change]) -> bool {
 /// entries can point to a port through which the address is no longer
 /// reachable (split horizon would drop the frames there); flushing makes the
 /// bridge flood once and learn the new paths.
-pub async fn flush_learned<N: NetOps>(net: &N, bridge: &str) -> Result<(), SysError> {
+pub async fn flush_learned<N: System>(net: &N, bridge: &str) -> Result<(), SysError> {
     let links = net.links().await?;
     if let Some(link) = links.iter().find(|l| l.name == bridge && is_owned(l)) {
         net.flush_fdb(link.index, bridge).await?;
@@ -634,7 +742,7 @@ pub async fn flush_learned<N: NetOps>(net: &N, bridge: &str) -> Result<(), SysEr
 }
 
 /// Removes everything wanderlan created.
-pub async fn teardown<N: NetOps>(
+pub async fn teardown<N: System>(
     net: &N,
     mut log: impl FnMut(&Change),
 ) -> Result<Vec<Change>, ReconcileError> {

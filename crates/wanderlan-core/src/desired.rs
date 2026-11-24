@@ -5,6 +5,7 @@ use std::net::Ipv4Addr;
 
 use crate::BRIDGE_NAME;
 use crate::config::{Config, LocalVid};
+use crate::sys::tc::{Direction, TcAction, TcRule};
 use crate::sys::{BridgeOptions, GretapParams, PortVlans, VlanFlags};
 use crate::topology::{self, TunnelKind};
 
@@ -29,6 +30,8 @@ pub struct TrunkSpec {
     pub name: String,
     /// VLAN membership.
     pub vlans: PortVlans,
+    /// VLAN translation rules (tc), sorted.
+    pub tc: Vec<TcRule>,
 }
 
 /// One GRETAP tunnel port.
@@ -73,21 +76,7 @@ pub fn derive(cfg: &Config, blocked: &BTreeSet<String>) -> Desired {
     let local_address = cfg.self_site().map_or(Ipv4Addr::UNSPECIFIED, |s| s.address);
 
     let shared: PortVlans = mesh.vlans.iter().map(|v| (v, VlanFlags::TAGGED)).collect();
-
-    // The trunk carries all shared VLANs, adjusted by the local mappings:
-    // a native mapping makes the shared VLAN the untagged VLAN of the trunk;
-    // a translated local VLAN is no longer available as shared VLAN here.
-    let mut trunk_vlans = shared.clone();
-    for map in mesh.maps_of(me) {
-        match map.local {
-            LocalVid::Native => {
-                trunk_vlans.insert(map.shared, VlanFlags::NATIVE);
-            }
-            LocalVid::Vid(local) => {
-                trunk_vlans.remove(&local);
-            }
-        }
-    }
+    let (trunk_vlans, tc) = trunk_mapping(cfg, &shared);
 
     let tunnels = topology::tunnels_for(mesh, me)
         .into_iter()
@@ -116,10 +105,67 @@ pub fn derive(cfg: &Config, blocked: &BTreeSet<String>) -> Desired {
         trunk: TrunkSpec {
             name: cfg.trunk().to_string(),
             vlans: trunk_vlans,
+            tc,
         },
         tunnels,
         local_address,
     }
+}
+
+/// VLAN membership and translation rules of the trunk.
+///
+/// * A native mapping makes the shared VLAN the untagged VLAN of the trunk.
+/// * A translation local L -> shared S rewrites L to S on ingress and S to L
+///   on egress. The trunk is a member of S (frames arrive already rewritten).
+/// * A translated local VLAN L is not available as shared VLAN L on this
+///   trunk, unless L is itself the target of another translation.
+/// * Frames arriving tagged with a translation target S are dropped, unless S
+///   is itself a translated local VLAN; otherwise local VLAN S and the
+///   translated VLAN would merge into one.
+fn trunk_mapping(cfg: &Config, shared: &PortVlans) -> (PortVlans, Vec<TcRule>) {
+    let me = cfg.self_name();
+    let mut native = None;
+    let mut translations: Vec<(u16, u16)> = Vec::new();
+    for map in cfg.mesh.maps_of(me) {
+        match map.local {
+            LocalVid::Native => native = Some(map.shared),
+            LocalVid::Vid(local) => translations.push((local, map.shared)),
+        }
+    }
+    let locals: BTreeSet<u16> = translations.iter().map(|(l, _)| *l).collect();
+    let targets: BTreeSet<u16> = translations.iter().map(|(_, s)| *s).collect();
+
+    let mut vlans: PortVlans = shared
+        .iter()
+        .filter(|(vid, _)| !locals.contains(vid) || targets.contains(vid))
+        .map(|(vid, flags)| (*vid, *flags))
+        .collect();
+    if let Some(vid) = native {
+        vlans.insert(vid, VlanFlags::NATIVE);
+    }
+
+    let mut rules = Vec::new();
+    for (local, target) in &translations {
+        rules.push(TcRule {
+            direction: Direction::Ingress,
+            vid: *local,
+            action: TcAction::Translate(*target),
+        });
+        rules.push(TcRule {
+            direction: Direction::Egress,
+            vid: *target,
+            action: TcAction::Translate(*local),
+        });
+    }
+    for target in targets.iter().filter(|t| !locals.contains(t)) {
+        rules.push(TcRule {
+            direction: Direction::Ingress,
+            vid: *target,
+            action: TcAction::Drop,
+        });
+    }
+    rules.sort();
+    (vlans, rules)
 }
 
 #[cfg(test)]
@@ -173,6 +219,56 @@ mod tests {
         assert_eq!(d.tunnels.len(), 1);
         assert_eq!(d.tunnels[0].name, "gt-buero");
         assert!(!d.tunnels[0].isolated);
+    }
+
+    #[test]
+    fn translation_rules_for_haus3() {
+        let d = derive(&config("haus3"), &BTreeSet::new());
+        let rules: Vec<String> = d.trunk.tc.iter().map(TcRule::cookie).collect();
+        assert_eq!(rules, vec!["wl:i30x", "wl:i130>30", "wl:e30>130"]);
+        assert!(
+            derive(&config("heim"), &BTreeSet::new())
+                .trunk
+                .tc
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn chained_translations_keep_targets_on_the_trunk() {
+        // 130 -> 30 and 30 -> 40 at the same site: local 30 is translated, but
+        // shared 30 is still needed as target of local 130.
+        let mesh = MESH.replace("local = \"native\"\nshared = 20", "local = 30\nshared = 40");
+        let local = "self = \"haus3\"\ntrunk = \"ens19\"\n";
+        let Loaded::Configured(cfg) = load(&mesh, local).unwrap().loaded else {
+            panic!("configured");
+        };
+        let d = derive(&cfg, &BTreeSet::new());
+        assert_eq!(d.trunk.vlans.get(&30), Some(&VlanFlags::TAGGED));
+        assert_eq!(d.trunk.vlans.get(&40), Some(&VlanFlags::TAGGED));
+        let rules: Vec<String> = d.trunk.tc.iter().map(TcRule::cookie).collect();
+        assert_eq!(
+            rules,
+            vec![
+                "wl:i30>40",
+                "wl:i40x",
+                "wl:i130>30",
+                "wl:e30>130",
+                "wl:e40>30"
+            ]
+        );
+    }
+
+    #[test]
+    fn translated_local_inside_shared_range_is_removed_from_trunk() {
+        let mesh = MESH.replace("local = 130", "local = 15");
+        let local = "self = \"haus3\"\ntrunk = \"ens19\"\n";
+        let Loaded::Configured(cfg) = load(&mesh, local).unwrap().loaded else {
+            panic!("configured");
+        };
+        let d = derive(&cfg, &BTreeSet::new());
+        assert!(!d.trunk.vlans.contains_key(&15));
+        assert_eq!(d.trunk.vlans.get(&30), Some(&VlanFlags::TAGGED));
     }
 
     #[test]
