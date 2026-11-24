@@ -149,10 +149,15 @@ pub fn ask(frame: &mut Frame, ask: &Ask, area: Rect) {
         .map(|l| Line::raw(format!(" {l}")))
         .collect();
     text.push(Line::raw(""));
+    let (yes, no) = if ask.action.enter_means_yes() {
+        (" y/Enter ", " n/Esc ")
+    } else {
+        (" y ", " n/Enter ")
+    };
     text.push(Line::from(vec![
-        Span::styled(" y ", theme::key()),
+        Span::styled(yes, theme::key()),
         Span::raw(" yes   "),
-        Span::styled(" n ", theme::key()),
+        Span::styled(no, theme::key()),
         Span::raw(" no"),
     ]));
     frame.render_widget(

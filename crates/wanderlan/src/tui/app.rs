@@ -171,7 +171,7 @@ pub enum Busy {
 }
 
 /// What a confirmation question does when answered with yes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AskAction {
     /// Quit the TUI.
     Quit,
@@ -185,10 +185,32 @@ pub enum AskAction {
     Unblock(String),
     /// Remove everything wanderlan set up on this site.
     Reset,
+    /// Roll the pending change back now.
+    Rollback,
+    /// Delete an open invitation (then back to the list).
+    DeleteInvite {
+        /// The code.
+        code: String,
+        /// Selected row of the list.
+        selected: usize,
+    },
+    /// Close a form and lose its input (no: back to the form).
+    DiscardInput(Box<Form>),
+}
+
+impl AskAction {
+    /// True if Enter means yes. Where a wrong yes loses something that
+    /// cannot be had back easily, Enter means no and only `y` is yes.
+    pub fn enter_means_yes(&self) -> bool {
+        matches!(
+            self,
+            Self::DeleteSite(_) | Self::DeleteMap(_) | Self::Unblock(_)
+        )
+    }
 }
 
 /// A yes/no question.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Ask {
     /// Title of the popup.
     pub title: String,
@@ -1264,6 +1286,32 @@ impl App {
             fx.push(Effect::Quit);
             return;
         }
+        // The banner offers c and r: they work in every window that does
+        // not take text (forms: Esc first).
+        if matches!(
+            self.modal,
+            Some(
+                Modal::Help { .. }
+                    | Modal::Messages { .. }
+                    | Modal::Peer { .. }
+                    | Modal::Invites { .. }
+            )
+        ) && key.modifiers.is_empty()
+            && self.pending().is_some()
+        {
+            match key.code {
+                KeyCode::Char('c') => {
+                    self.modal = None;
+                    self.confirm(fx);
+                    return;
+                }
+                KeyCode::Char('r') => {
+                    self.modal = self.ask_rollback();
+                    return;
+                }
+                _ => {}
+            }
+        }
         if let Some(modal) = self.modal.take() {
             self.modal = self.on_modal_key(modal, key, fx);
             return;
@@ -1344,7 +1392,11 @@ impl App {
             KeyCode::Char('a') => self.open_review(),
             KeyCode::Char('x') => self.ask_discard(),
             KeyCode::Char('c') => self.confirm(fx),
-            KeyCode::Char('r') => self.rollback(fx),
+            KeyCode::Char('r') => {
+                if let Some(ask) = self.ask_rollback() {
+                    self.modal = Some(ask);
+                }
+            }
             _ => return false,
         }
         true
@@ -1459,6 +1511,21 @@ impl App {
         }
     }
 
+    /// The question before rolling the pending change back, or a message
+    /// that there is none.
+    fn ask_rollback(&mut self) -> Option<Modal> {
+        if self.pending().is_none() {
+            self.say(MessageKind::Info, "No change is waiting for confirmation.");
+            return None;
+        }
+        Some(Modal::Ask(Ask {
+            title: "Roll back".into(),
+            text: "Roll the pending change back now? The configuration before it applies again."
+                .into(),
+            action: AskAction::Rollback,
+        }))
+    }
+
     fn rollback(&mut self, fx: &mut Vec<Effect>) {
         if self.pending().is_none() {
             self.say(MessageKind::Info, "No change is waiting for confirmation.");
@@ -1497,16 +1564,34 @@ impl App {
                     scroll: scroll.min(max),
                 })
             }
-            Modal::Ask(ask) => match key.code {
-                KeyCode::Char('y' | 'Y') | KeyCode::Enter => {
-                    self.on_answer(ask.action, fx);
-                    None
+            Modal::Ask(ask) => {
+                let yes = match key.code {
+                    KeyCode::Char('y' | 'Y') => true,
+                    KeyCode::Enter => ask.action.enter_means_yes(),
+                    KeyCode::Char('n' | 'N') | KeyCode::Esc => false,
+                    _ => return Some(Modal::Ask(ask)),
+                };
+                match (yes, ask.action) {
+                    // No: back where the question came from.
+                    (false, AskAction::DiscardInput(form)) => Some(Modal::Form(*form)),
+                    (false, AskAction::DeleteInvite { selected, .. }) => {
+                        Some(Modal::Invites { selected })
+                    }
+                    (false, _) => None,
+                    (true, AskAction::DeleteInvite { code, selected }) => {
+                        fx.push(Effect::Request(Request::DeleteInvite(InviteParams {
+                            code,
+                        })));
+                        Some(Modal::Invites { selected })
+                    }
+                    (true, action) => {
+                        self.on_answer(action, fx);
+                        None
+                    }
                 }
-                KeyCode::Char('n' | 'N') | KeyCode::Esc => None,
-                _ => Some(Modal::Ask(ask)),
-            },
+            }
             Modal::Form(form) => self.on_form_key(form, key, fx),
-            Modal::Invites { selected } => self.on_invites_key(selected, key, fx),
+            Modal::Invites { selected } => self.on_invites_key(selected, key),
             Modal::Messages { scroll } => match key.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'M') => None,
                 KeyCode::Up | KeyCode::Char('k') => Some(Modal::Messages {
@@ -1525,12 +1610,7 @@ impl App {
         }
     }
 
-    fn on_invites_key(
-        &mut self,
-        selected: usize,
-        key: &KeyEvent,
-        fx: &mut Vec<Effect>,
-    ) -> Option<Modal> {
+    fn on_invites_key(&mut self, selected: usize, key: &KeyEvent) -> Option<Modal> {
         let count = self.invitations.len();
         if let Some(n) = nav(key.code, selected, count, self.scrolls.invites.page()) {
             return Some(Modal::Invites { selected: n });
@@ -1543,9 +1623,17 @@ impl App {
             }
             KeyCode::Char('d') | KeyCode::Delete => {
                 if let Some(inv) = self.invitations.get(selected) {
-                    fx.push(Effect::Request(Request::DeleteInvite(InviteParams {
-                        code: inv.code.clone(),
-                    })));
+                    return Some(Modal::Ask(Ask {
+                        title: "Delete invitation".into(),
+                        text: format!(
+                            "Delete the invitation {}? Its code no longer works.",
+                            inv.code
+                        ),
+                        action: AskAction::DeleteInvite {
+                            code: inv.code.clone(),
+                            selected,
+                        },
+                    }));
                 }
                 selected
             }
@@ -1566,6 +1654,13 @@ impl App {
         match form.handle_key(key) {
             FormEvent::Nothing => {}
             FormEvent::Changed => form.revalidate(draft),
+            FormEvent::Cancel if form.is_touched() => {
+                return Some(Modal::Ask(Ask {
+                    title: "Discard input".into(),
+                    text: "Close the form and lose what you entered? n goes back to it.".into(),
+                    action: AskAction::DiscardInput(Box::new(form)),
+                }));
+            }
             FormEvent::Cancel => return None,
             FormEvent::Submit if form.kind == FormKind::Invite => {
                 if form.submit(draft).is_some() {
@@ -1640,10 +1735,7 @@ impl App {
                     self.confirm(fx);
                     return None;
                 }
-                KeyCode::Char('r') => {
-                    self.rollback(fx);
-                    return None;
-                }
+                KeyCode::Char('r') => return self.ask_rollback(),
                 _ => {}
             },
             ReviewState::Ready | ReviewState::Failed(_) => match key.code {
@@ -1704,6 +1796,13 @@ impl App {
                 fx.push(Effect::Request(Request::Unblock(UnblockParams { port })));
             }
             AskAction::Reset => fx.push(Effect::Request(Request::Reset)),
+            AskAction::Rollback => self.rollback(fx),
+            AskAction::DeleteInvite { code, .. } => {
+                fx.push(Effect::Request(Request::DeleteInvite(InviteParams {
+                    code,
+                })));
+            }
+            AskAction::DiscardInput(_) => {}
         }
     }
 
@@ -2149,14 +2248,19 @@ impl App {
 }
 
 /// Text of the countdown banner, if a change waits for confirmation.
-pub fn banner_text(pending: &PendingChange) -> String {
+pub fn banner_text(pending: &PendingChange, in_form: bool) -> String {
     let what = match &pending.source {
         ChangeSource::Local => "UNCONFIRMED CHANGE".to_string(),
         ChangeSource::Sync { peer } => format!("CHANGE FROM {peer}"),
         ChangeSource::Join { site } => format!("SITE {site} JOINING"),
     };
+    let keys = if in_form {
+        "Esc, then c confirm / r roll back"
+    } else {
+        "c confirm  |  r roll back now"
+    };
     format!(
-        " {what}: rollback in {} s  |  c confirm  |  r roll back now ",
+        " {what}: rollback in {} s  |  {keys} ",
         pending.remaining_secs
     )
 }

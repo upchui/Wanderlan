@@ -725,6 +725,11 @@ impl Form {
         }
     }
 
+    /// True once something was typed or chosen in the form.
+    pub fn is_touched(&self) -> bool {
+        self.fields.iter().any(|f| f.touched)
+    }
+
     /// Builds the candidate draft; records parse errors on the fields.
     fn build(&mut self, draft: &Draft) -> Option<Draft> {
         let mut candidate = draft.clone();

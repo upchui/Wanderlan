@@ -282,12 +282,13 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         })
         .collect();
     let empty = rows.is_empty();
+    // The meaning must fit "VLAN 1234 at <site> = shared VLAN 1234".
     let widths = [
         Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Length(21),
-        Constraint::Length(8),
-        Constraint::Length(8),
+        Constraint::Length(7),
+        Constraint::Length(7),
         Constraint::Min(10),
     ];
     let errors = (0..draft.network.maps.len())

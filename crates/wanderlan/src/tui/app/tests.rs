@@ -256,7 +256,10 @@ fn pending_change_can_be_confirmed_or_rolled_back() {
 
     let mut app = connected();
     with_pending(&mut app, ChangeSource::Local);
+    // r asks first; y rolls back.
     let fx = app.update(ch('r'));
+    assert!(requests(&fx).is_empty());
+    let fx = app.update(ch('y'));
     assert_eq!(requests(&fx), vec![&Request::Rollback]);
 }
 
@@ -274,7 +277,7 @@ fn banner_names_the_source_and_the_remaining_time() {
         remaining_secs: 9,
         source: ChangeSource::Local,
     };
-    let text = banner_text(&local);
+    let text = banner_text(&local, false);
     assert!(text.contains("UNCONFIRMED CHANGE: rollback in 9 s"));
     assert!(text.contains("c confirm"));
     let synced = PendingChange {
@@ -283,7 +286,8 @@ fn banner_names_the_source_and_the_remaining_time() {
             peer: "buero".into(),
         },
     };
-    assert!(banner_text(&synced).contains("CHANGE FROM buero"));
+    assert!(banner_text(&synced, false).contains("CHANGE FROM buero"));
+    assert!(banner_text(&synced, true).contains("Esc, then c"));
 }
 
 #[test]
@@ -639,4 +643,104 @@ fn page_keys_and_the_overview_cursor() {
     );
     press(&mut app, KeyCode::Home);
     assert_eq!(app.sites_selected, 0);
+}
+
+#[test]
+fn confirm_and_roll_back_work_in_windows() {
+    let mut app = connected();
+    with_pending(&mut app, ChangeSource::Local);
+    app.update(ch('?'));
+    assert!(matches!(app.modal, Some(Modal::Help { .. })));
+    let fx = app.update(ch('c'));
+    assert!(
+        requests(&fx).contains(&&Request::Confirm),
+        "c confirms from the help"
+    );
+    assert!(app.modal.is_none());
+    // r asks first, also from a window.
+    app.busy = None;
+    app.update(ch('?'));
+    app.update(ch('r'));
+    assert!(matches!(
+        &app.modal,
+        Some(Modal::Ask(a)) if a.action == AskAction::Rollback
+    ));
+    let fx = app.update(key(KeyCode::Enter));
+    assert!(requests(&fx).is_empty(), "Enter is no for a roll back");
+    app.update(ch('r'));
+    let fx = app.update(ch('y'));
+    assert!(requests(&fx).contains(&&Request::Rollback));
+}
+
+#[test]
+fn enter_is_no_where_a_wrong_yes_hurts() {
+    let mut app = connected();
+    app.update(ch('6'));
+    app.update(ch('R'));
+    assert!(matches!(
+        &app.modal,
+        Some(Modal::Ask(a)) if a.action == AskAction::Reset
+    ));
+    let fx = app.update(key(KeyCode::Enter));
+    assert!(requests(&fx).is_empty(), "Enter does not reset");
+    assert!(app.modal.is_none());
+}
+
+#[test]
+fn a_form_with_input_asks_before_it_closes() {
+    let mut app = connected();
+    app.update(ch('2'));
+    app.update(ch('n'));
+    // Esc on an untouched form closes it.
+    app.update(key(KeyCode::Esc));
+    assert!(app.modal.is_none());
+    app.update(ch('n'));
+    app.update(ch('x'));
+    app.update(key(KeyCode::Esc));
+    assert!(matches!(&app.modal, Some(Modal::Ask(_))));
+    app.update(ch('n'));
+    match &app.modal {
+        Some(Modal::Form(form)) => {
+            assert_eq!(form.fields[0].value(), "x", "the input is still there")
+        }
+        other => panic!("back to the form, got {other:?}"),
+    }
+    app.update(key(KeyCode::Esc));
+    app.update(ch('y'));
+    assert!(app.modal.is_none());
+}
+
+#[test]
+fn deleting_an_invitation_asks() {
+    let mut app = connected();
+    app.update(ch('2'));
+    app.update(ch('I'));
+    app.update(reply(
+        Request::Invites,
+        Reply::Invites(vec![wanderlan_core::api::Invitation {
+            code: "K7F3Q-9QX2M".into(),
+            command: "wanderlan join 10.8.0.1 K7F3Q-9QX2M".into(),
+            created_secs: 0,
+            in_use: false,
+            rules: wanderlan_core::api::SiteRules::default(),
+        }]),
+    ));
+    app.update(ch('d'));
+    assert!(matches!(&app.modal, Some(Modal::Ask(_))));
+    app.update(ch('n'));
+    assert!(
+        matches!(&app.modal, Some(Modal::Invites { .. })),
+        "no: back to the list"
+    );
+    app.update(ch('d'));
+    let fx = app.update(ch('y'));
+    assert!(
+        requests(&fx)
+            .iter()
+            .any(|r| matches!(r, Request::DeleteInvite(_)))
+    );
+    assert!(
+        matches!(&app.modal, Some(Modal::Invites { .. })),
+        "yes: back to the list"
+    );
 }

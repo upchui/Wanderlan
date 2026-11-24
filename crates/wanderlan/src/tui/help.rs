@@ -27,7 +27,7 @@ pub const SECTIONS: &[Section] = &[
             ("a", "review the draft (diff) and apply it"),
             ("x", "discard the draft"),
             ("c", "confirm a pending change"),
-            ("r", "roll a pending change back now"),
+            ("r", "roll a pending change back now (asks first)"),
             ("?", "this help"),
             ("M", "the last messages of the status line"),
             ("q", "quit (asks if the draft has unapplied changes)"),
@@ -134,7 +134,8 @@ pub const SECTIONS: &[Section] = &[
     Section {
         title: "Windows",
         keys: &[
-            ("Esc", "close the window"),
+            ("Esc", "close the window (a form with input asks first)"),
+            ("c, r", "confirm / roll back also in windows without text"),
             ("n, d", "open invitations: new, delete"),
             ("Enter, q", "also close the peer details"),
         ],
@@ -209,7 +210,10 @@ pub fn bar(app: &App) -> Vec<Binding> {
     if let Some(modal) = &app.modal {
         return match modal {
             Modal::Help { .. } => vec![("Up/Down", "scroll"), ("Esc", "close")],
-            Modal::Ask(_) => vec![("y/Enter", "yes"), ("n/Esc", "no")],
+            Modal::Ask(ask) if ask.action.enter_means_yes() => {
+                vec![("y/Enter", "yes"), ("n/Esc", "no")]
+            }
+            Modal::Ask(_) => vec![("y", "yes"), ("n/Enter/Esc", "no")],
             Modal::Messages { .. } => vec![("Up/Down", "scroll"), ("Esc", "close")],
             Modal::Invites { .. } => vec![
                 ("Up/Down", "choose"),

@@ -54,7 +54,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
     if let Some(p) = pending {
         let urgent = p.remaining_secs <= URGENT_SECS;
         frame.render_widget(
-            Paragraph::new(banner_text(p)).style(theme::banner(urgent)),
+            Paragraph::new(banner_text(p, matches!(app.modal, Some(Modal::Form(_)))))
+                .style(theme::banner(urgent)),
             banner,
         );
     }
