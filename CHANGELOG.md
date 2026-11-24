@@ -4,6 +4,15 @@ All notable changes to wanderlan are documented in this file.
 
 ## [Unreleased]
 
+### Fixes
+
+- Loop guard: the FDB watch socket has a 4 MiB buffer and NETLINK_NO_ENOBUFS,
+  so a broadcast storm cannot overflow it, and the watch is set up again if
+  it ever ends.
+- Integration test of the loop guard: the loop is started with ARP
+  broadcasts; before, known unicast never entered the second path and the
+  test only passed by chance.
+
 ### Milestone 7 – TUI and CLI
 
 - Interactive terminal UI (`wanderlan` without arguments, ratatui +

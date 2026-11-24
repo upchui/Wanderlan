@@ -2,11 +2,11 @@
 //! moving between tunnel ports.
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{info, warn};
 use wanderlan_core::loopguard::{self, LoopGuard};
 use wanderlan_core::sys::linux::LinuxSystem;
 use wanderlan_core::sys::observe::{FdbEvent, ObserveOps as _};
@@ -31,67 +31,97 @@ pub struct LoopReport {
     pub message: String,
 }
 
-/// Starts watching the FDB.
+/// Delay before the FDB watch is set up again after it ended or failed.
+const RESTART_DELAY: Duration = Duration::from_secs(1);
+
+/// Starts watching the FDB. If the watch cannot be set up or ends, it is set
+/// up again after a short delay, so the loop guard never stays silent.
 pub fn spawn(
     sys: &LinuxSystem,
     ports: watch::Receiver<PortMap>,
     inputs: mpsc::Sender<Input>,
-) -> Option<JoinHandle<()>> {
-    let mut events = match sys.watch_fdb() {
-        Ok(rx) => rx,
-        Err(e) => {
-            warn!("Loop guard disabled: {e}");
-            return None;
+) -> JoinHandle<()> {
+    let sys = sys.clone();
+    tokio::spawn(async move {
+        let mut guard = LoopGuard::default();
+        let mut failing = false;
+        loop {
+            match sys.watch_fdb() {
+                Ok(mut events) => {
+                    if failing {
+                        info!("Loop guard is watching the bridge again");
+                        failing = false;
+                    }
+                    while let Some(event) = events.recv().await {
+                        if !handle(&mut guard, event, &ports, &inputs).await {
+                            return;
+                        }
+                    }
+                    warn!("The FDB watch of the loop guard ended; restarting it");
+                }
+                Err(e) => {
+                    if !failing {
+                        warn!("Loop guard cannot watch the bridge ({e}); retrying");
+                        failing = true;
+                    }
+                }
+            }
+            guard.reset();
+            tokio::time::sleep(RESTART_DELAY).await;
+        }
+    })
+}
+
+/// Processes one FDB event. Returns false once the controller is gone.
+async fn handle(
+    guard: &mut LoopGuard,
+    event: FdbEvent,
+    ports: &watch::Receiver<PortMap>,
+    inputs: &mpsc::Sender<Input>,
+) -> bool {
+    let entry = match event {
+        FdbEvent::Learned(entry) => entry,
+        FdbEvent::Removed { mac, vlan } => {
+            guard.forget(mac, vlan);
+            return true;
         }
     };
-    Some(tokio::spawn(async move {
-        let mut guard = LoopGuard::default();
-        while let Some(event) = events.recv().await {
-            let FdbEvent::Learned(entry) = event else {
-                if let FdbEvent::Removed { mac, vlan } = event {
-                    guard.forget(mac, vlan);
-                }
-                continue;
-            };
-            let map = ports.borrow().clone();
-            if entry.permanent || entry.bridge != map.bridge || map.bridge.is_none() {
-                continue;
-            }
-            let detected = guard.learned(Instant::now(), entry.mac, entry.vlan, entry.port, |p| {
-                map.tunnels.contains_key(&p)
-            });
-            let Some(detected) = detected else { continue };
-            let isolated = |p: u32| map.tunnels.get(&p).is_some_and(|(_, iso)| *iso);
-            let Some(port) = loopguard::choose_port(&detected, isolated)
-                .and_then(|p| map.tunnels.get(&p).map(|(n, _)| n.clone()))
-            else {
-                continue;
-            };
-            let mut involved: Vec<String> = detected
-                .moves
-                .iter()
-                .flat_map(|m| [m.from, m.to])
-                .filter_map(|p| map.tunnels.get(&p).map(|(n, _)| n.clone()))
-                .collect();
-            involved.sort();
-            involved.dedup();
-            let vlan = detected
-                .vlan
-                .map_or_else(String::new, |v| format!(" in VLAN {v}"));
-            let message = format!(
-                "Loop detected: MAC {}{vlan} moved {} times between {} within {} s; shutting down {port}",
-                loopguard::format_mac(&detected.mac),
-                detected.moves.len(),
-                involved.join(" and "),
-                loopguard::WINDOW.as_secs()
-            );
-            if inputs
-                .send(Input::Loop(LoopReport { port, message }))
-                .await
-                .is_err()
-            {
-                break;
-            }
-        }
-    }))
+    let map = ports.borrow().clone();
+    if entry.permanent || entry.bridge != map.bridge || map.bridge.is_none() {
+        return true;
+    }
+    let detected = guard.learned(Instant::now(), entry.mac, entry.vlan, entry.port, |p| {
+        map.tunnels.contains_key(&p)
+    });
+    let Some(detected) = detected else {
+        return true;
+    };
+    let isolated = |p: u32| map.tunnels.get(&p).is_some_and(|(_, iso)| *iso);
+    let Some(port) = loopguard::choose_port(&detected, isolated)
+        .and_then(|p| map.tunnels.get(&p).map(|(n, _)| n.clone()))
+    else {
+        return true;
+    };
+    let mut involved: Vec<String> = detected
+        .moves
+        .iter()
+        .flat_map(|m| [m.from, m.to])
+        .filter_map(|p| map.tunnels.get(&p).map(|(n, _)| n.clone()))
+        .collect();
+    involved.sort();
+    involved.dedup();
+    let vlan = detected
+        .vlan
+        .map_or_else(String::new, |v| format!(" in VLAN {v}"));
+    let message = format!(
+        "Loop detected: MAC {}{vlan} moved {} times between {} within {} s; shutting down {port}",
+        loopguard::format_mac(&detected.mac),
+        detected.moves.len(),
+        involved.join(" and "),
+        loopguard::WINDOW.as_secs()
+    );
+    inputs
+        .send(Input::Loop(LoopReport { port, message }))
+        .await
+        .is_ok()
 }

@@ -140,7 +140,7 @@ pub async fn run(args: Args) -> Result<()> {
         api_server::spawn(args.socket.clone(), events.clone(), inputs_tx.clone())
             .context("cannot start the API")?,
     ];
-    tasks.extend(fdb_guard::spawn(&sys, ports_rx, inputs_tx.clone()));
+    tasks.push(fdb_guard::spawn(&sys, ports_rx, inputs_tx.clone()));
 
     let paths = Paths {
         config_dir: args.config_dir.clone(),

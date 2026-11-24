@@ -6,8 +6,10 @@ begin "Loop guard: an external loop between two spokes is cut"
 
 expect_ping c-spoke1 10.20.0.12 "VLAN 20: spoke1 reaches spoke2 before the loop"
 x looper "ip link set loopa master brl; ip link set loopb master brl; ip link set loopa up; ip link set loopb up"
-# Some traffic so that addresses move.
-x c-spoke1 "ping -c 5 -i 0.2 -W 1 10.20.0.12 >/dev/null 2>&1" || true
+# A loop only starts with a broadcast (or unknown unicast): known unicast
+# follows the learned path and never enters the second one. Clear the ARP
+# cache and ask for an unused address, so ARP broadcasts start circling.
+x c-spoke1 "ip neigh flush dev trunk0.20; ping -c 3 -i 0.5 -W 1 10.20.0.250 >/dev/null 2>&1" || true
 wait_for 30 "hub1 detects the loop and blocks a spoke port" \
   x hub1 "wanderlan status --json | jq -e '.blocked | length == 1'"
 blocked=$(jqs hub1 '.blocked[0]')

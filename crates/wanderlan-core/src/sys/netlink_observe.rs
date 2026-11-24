@@ -6,6 +6,7 @@ use rtnetlink::packet_route::neighbour::{
     NeighbourAddress, NeighbourAttribute, NeighbourFlags, NeighbourMessage, NeighbourState,
 };
 use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
+use rtnetlink::sys::AsyncSocket as _;
 use rtnetlink::{MulticastGroup, new_multicast_connection};
 use tokio::sync::mpsc;
 
@@ -16,6 +17,8 @@ use super::{SysError, SysResult};
 
 /// Kernel ticks per second of `NDA_CACHEINFO` (USER_HZ).
 const USER_HZ: u64 = 100;
+/// Receive buffer of the FDB watch socket.
+const FDB_RX_BUFFER: usize = 4 * 1024 * 1024;
 
 /// Parses a bridge FDB message; `None` for other neighbour messages.
 fn parse(msg: &NeighbourMessage) -> Option<FdbEntry> {
@@ -89,8 +92,19 @@ impl ObserveOps for Netlink {
     }
 
     fn watch_fdb(&self) -> SysResult<mpsc::UnboundedReceiver<FdbEvent>> {
-        let (connection, handle, mut messages) = new_multicast_connection(&[MulticastGroup::Neigh])
-            .map_err(|e| SysError::new("watch bridge FDB", e))?;
+        let (mut connection, handle, mut messages) =
+            new_multicast_connection(&[MulticastGroup::Neigh])
+                .map_err(|e| SysError::new("watch bridge FDB", e))?;
+        // A broadcast storm produces FDB updates faster than they can be read.
+        // A large buffer keeps most of them; without ENOBUFS the kernel drops
+        // the rest silently instead of reporting an error.
+        let socket = connection.socket_mut().socket_mut();
+        if let Err(e) = socket.set_rx_buf_sz(FDB_RX_BUFFER) {
+            tracing::warn!("cannot enlarge the FDB watch buffer: {e}");
+        }
+        if let Err(e) = socket.set_no_enobufs(true) {
+            tracing::warn!("cannot set NETLINK_NO_ENOBUFS on the FDB watch socket: {e}");
+        }
         let (tx, rx) = mpsc::unbounded_channel();
         // The connection runs in the same task as the forwarding, so both end
         // together once the receiver is dropped.
