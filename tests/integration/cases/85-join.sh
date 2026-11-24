@@ -128,6 +128,47 @@ wait_for 30 "the tunnel to site5 is down at site3" \
   x site3 "ip -j link show gt-site5 | jq -e '.[0].flags | index(\"UP\") | not'"
 check "and online again" x site2 "wanderlan online site5 --confirm"
 expect_ping c-site5 10.20.0.1 "VLAN 20: traffic flows again"
+
+begin "Permissions: a joined site changes no VLANs unless it is released"
+
+rev=$(jqs site2 .revision)
+wait_eq 60 "site5 has revision $rev" "$rev" jqs site5 .revision
+x site5 "sed 's/^vlans = .*/vlans = \"10-40\"/' /etc/wanderlan/mesh.toml > /tmp/net-vlans.toml"
+out=$(x site5 "wanderlan apply --mesh /tmp/net-vlans.toml" 2>&1)
+if grep -q 'may not change the VLANs of the network' <<<"$out" && grep -q 'managed by "site2"' <<<"$out"; then
+  pass "site5 may not change the network's VLANs"
+else
+  fail "unexpected output when site5 changes the network's VLANs: $out"
+fi
+x site5 "sed '/^name = \"site1\"\$/a vlans = \"20\"' /etc/wanderlan/mesh.toml > /tmp/site1-vlans.toml"
+out=$(x site5 "wanderlan apply --mesh /tmp/site1-vlans.toml" 2>&1)
+if grep -q 'may not change site "site1"' <<<"$out"; then
+  pass "site5 may not change the VLANs of site1"
+else
+  fail "unexpected output when site5 changes site1: $out"
+fi
+out=$(x site5 "wanderlan offline site5 --confirm" 2>&1)
+if grep -q 'may not change site "site5"' <<<"$out"; then
+  pass "site5 may not take itself offline"
+else
+  fail "unexpected output when site5 changes itself: $out"
+fi
+out=$(x site2 "wanderlan manage site5 --self-managed yes --confirm" 2>&1)
+if grep -q '"site2" and "site5" itself may change it' <<<"$out"; then
+  pass "site2 lets site5 manage itself"
+else
+  fail "unexpected output of wanderlan manage: $out"
+fi
+rev=$(jqs site2 .revision)
+wait_eq 60 "site5 has revision $rev" "$rev" jqs site5 .revision
+check "now site5 takes itself offline" x site5 "wanderlan offline site5 --confirm"
+wait_for 30 "the tunnel to site5 is down at site1" \
+  x site1 "ip -j link show gt-site5 | jq -e '.[0].flags | index(\"UP\") | not'"
+check "and online again" x site5 "wanderlan online site5 --confirm"
+expect_ping c-site5 10.20.0.1 "VLAN 20: traffic flows again"
+rev=$(jqs site5 .revision)
+wait_eq 60 "site2 has revision $rev" "$rev" jqs site2 .revision
+check "site2 withdraws the release" x site2 "wanderlan manage site5 --self-managed no --confirm"
 reply=$(raw_join router 10.100.2.10 "$code1" ghost)
 if grep -q 'unknown or already used invitation code' <<<"$reply"; then
   pass "a used code is refused"

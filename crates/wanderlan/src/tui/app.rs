@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, VecDeque};
 use wanderlan_core::api::{
     ApiError, Applied, ApplyParams, ChangeSource, ConfigInput, ConfigTexts, Confirmed, Event,
     Interface, Invitation, InviteParams, Joined, MacEntry, PeerStatus, PendingChange, PortState,
-    Request, ResetReport, SiteRules, SiteState, Status, UnblockParams,
+    Request, ResetReport, SiteState, Status, UnblockParams,
 };
 use wanderlan_core::config::{Diagnostic, has_errors, render_local, render_mesh};
 use wanderlan_core::policy;
@@ -416,6 +416,9 @@ pub struct App {
     /// Remove the kernel's GRE fallback devices once the interface list
     /// after a reset arrived.
     cleanup_after_reset: bool,
+    /// Open the invitation form once the configuration of a new network
+    /// arrived.
+    invite_after_setup: bool,
     /// The event log.
     pub log: LogState,
     /// The MAC table.
@@ -465,6 +468,7 @@ impl App {
             interfaces_error: None,
             diagnosis: None,
             cleanup_after_reset: false,
+            invite_after_setup: false,
             log: LogState::default(),
             macs: MacState::default(),
             overview_selected: 0,
@@ -859,8 +863,13 @@ impl App {
         if !keep {
             self.draft = Draft::from_running(&running);
         }
+        let configured = running.mesh.is_some();
         self.running = Some(running);
         self.clamp_selection();
+        if configured && std::mem::take(&mut self.invite_after_setup) {
+            self.modal = None;
+            self.invite();
+        }
     }
 
     fn on_interfaces(&mut self, list: Vec<Interface>, fx: &mut Vec<Effect>) {
@@ -929,14 +938,17 @@ impl App {
     }
 
     /// The new network is confirmed: invite the next site right away.
+    /// The new network is confirmed: the invitation form for the next site
+    /// opens as soon as the running configuration arrived (it needs it).
     fn setup_done(&mut self, fx: &mut Vec<Effect>) {
         self.wizard = Wizard::new();
-        self.view = View::Overview;
+        self.view = View::Sites;
+        self.invite_after_setup = true;
         self.say(
             MessageKind::Success,
-            "Setup complete. Creating an invitation for the next site ...",
+            "Setup complete. Invite the next site: its rules, and who may change them (Esc: later, i).",
         );
-        fx.push(Effect::Request(Request::Invite(SiteRules::default())));
+        self.request_config(fx);
     }
 
     fn on_invitation(&mut self, invitation: Invitation, fx: &mut Vec<Effect>) {
@@ -983,6 +995,14 @@ impl App {
             .retain(|name, _| status.peers.iter().any(|p| &p.name == name));
     }
 
+    /// The site that manages this one, if this site is restricted: then it
+    /// may not change VLAN rules (see [`policy`]).
+    pub fn restricted_by(&self) -> Option<String> {
+        let running = self.running.as_ref()?;
+        let me = running.local.self_name.as_deref()?;
+        policy::restricted_by(running.mesh.as_ref()?, me).map(str::to_string)
+    }
+
     /// True if this site may change the rules of `site` (VLANs, mappings,
     /// online); otherwise says who may.
     fn may_change(&mut self, site: &str) -> bool {
@@ -1000,10 +1020,25 @@ impl App {
         if policy::may_change(running, entry, &me) {
             return true;
         }
-        let text = format!(
-            "{site} is managed by {}; change its VLANs, mappings and online state there.",
-            policy::managers(entry)
-        );
+        let text = policy::why_not(running, entry, &me, "change");
+        self.say(MessageKind::Error, text);
+        false
+    }
+
+    /// True if this site may change the VLANs of the network; otherwise
+    /// says why not.
+    fn may_change_network_vlans(&mut self) -> bool {
+        let Some(running) = self.running.as_ref() else {
+            return true;
+        };
+        let (Some(mesh), Some(me)) = (running.mesh.as_ref(), running.local.self_name.as_deref())
+        else {
+            return true;
+        };
+        if policy::may_change_network_vlans(mesh, me) {
+            return true;
+        }
+        let text = policy::why_not_network(mesh, me);
         self.say(MessageKind::Error, text);
         false
     }
@@ -1649,6 +1684,9 @@ impl App {
                 if row.local {
                     self.request_interfaces(fx);
                 }
+                if row.key == "vlans" && !self.may_change_network_vlans() {
+                    return;
+                }
                 let Some(draft) = &self.draft else { return };
                 let mut form = if row.local {
                     Form::local(draft, &self.interfaces)
@@ -1796,7 +1834,13 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.maps_selected = (selected + 1).min(count.saturating_sub(1));
             }
-            KeyCode::Char('v') => self.modal = Some(Modal::Form(Form::vlans(draft))),
+            KeyCode::Char('v') => {
+                if self.may_change_network_vlans()
+                    && let Some(draft) = &self.draft
+                {
+                    self.modal = Some(Modal::Form(Form::vlans(draft)));
+                }
+            }
             KeyCode::Char('n') => self.modal = Some(Modal::Form(Form::map(draft, None, None))),
             KeyCode::Enter | KeyCode::Char('e') if selected < count => {
                 self.modal = Some(Modal::Form(Form::map(draft, Some(selected), None)));

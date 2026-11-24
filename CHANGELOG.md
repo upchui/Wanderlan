@@ -85,9 +85,9 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
   without `--foreground`, `wanderland` only explains what it is. A deleted
   API socket is created again within seconds.
 - `wanderlan join` returns once the inviting site has confirmed the new
-  site too, so `wanderlan online <site>` works right after it; `online`,
-  `offline` (and `manage`) wait for a pending join or synchronised change
-  instead of failing.
+  site too, so `wanderlan online <site>` works right after it; `apply`,
+  `online`, `offline` and `manage` wait for a pending join or synchronised
+  change instead of failing.
 - The daemon exits for a restart by systemd if one of its services stops;
   panics are logged. The unit restarts it always (also after a kill) and
   never gives up.
@@ -97,6 +97,26 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
   fallback devices (`gre0`, …).
 - Tests: `scripts/systemd-test.sh` runs the package's hardened unit under
   systemd through the steps users take (also in CI).
+
+### Who may change what
+
+- A site that joined with an invitation and was not released is restricted:
+  it cannot change any VLANs, mappings or online state, neither its own nor
+  those of other sites, nor the VLANs of the network (before it could change
+  the network's VLANs and those of the first site); only those of sites it
+  invited itself. Released (`self_managed`), it has the same rights as the
+  site that invited it. Timeouts, MTU check, MSS, port and invitations stay
+  open to every site.
+- Visible and adjustable: the Sites view has a column MANAGED BY and the site
+  form a field "Changes" (only the manager / the manager and the site /
+  any site); Settings shows who manages this site and which sites it
+  manages; a restricted site shows it in the overview and the VLAN view, and
+  the edit keys explain why they refuse. CLI: `wanderlan manage <site>
+  [--by S | --anyone] [--self-managed yes|no]`.
+- After "Start a new network" the setup opens the invitation form (rules and
+  who may change them) instead of creating an invitation without rules.
+- Sites added by hand are managed by the site that added them (field
+  "Changes").
 
 ### More to see
 

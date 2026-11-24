@@ -124,6 +124,26 @@ pub enum Command {
         #[arg(long)]
         confirm: bool,
     },
+    /// Set who may change a site's VLANs, mappings and online state.
+    ///
+    /// Example: `wanderlan manage buero --self-managed yes` lets "buero"
+    /// change its own VLANs too.
+    Manage {
+        /// The site.
+        site: String,
+        /// The managing site (default: the current one, or this site).
+        #[arg(long, conflicts_with = "anyone")]
+        by: Option<String>,
+        /// No manager: every site that is not managed by another may change it.
+        #[arg(long)]
+        anyone: bool,
+        /// Whether the site may change its own VLANs too (yes/no).
+        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+        self_managed: Option<bool>,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Join an existing network with an invitation.
     ///
     /// Run on a new site: `wanderlan join <address> <code>` as printed by
@@ -268,6 +288,42 @@ pub async fn run(args: Args) -> Result<ExitCode> {
         Some(Command::Online { site, confirm }) => set_online(&socket, &site, true, confirm).await,
         Some(Command::Offline { site, confirm }) => {
             set_online(&socket, &site, false, confirm).await
+        }
+        Some(Command::Manage {
+            site,
+            by,
+            anyone,
+            self_managed,
+            confirm,
+        }) => {
+            edit_site(&socket, &site, confirm, |entry, me| {
+                let before = (entry.managed_by.clone(), entry.self_managed);
+                if anyone {
+                    entry.managed_by = None;
+                    entry.self_managed = false;
+                } else {
+                    let manager = by
+                        .or_else(|| entry.managed_by.clone())
+                        .unwrap_or_else(|| me.to_string());
+                    entry.managed_by = Some(manager);
+                    if let Some(v) = self_managed {
+                        entry.self_managed = v;
+                    }
+                }
+                let who = match (&entry.managed_by, entry.self_managed) {
+                    (None, _) => "every site may change it".to_string(),
+                    (Some(m), false) => format!("only \"{m}\" may change it"),
+                    (Some(m), true) => {
+                        format!("\"{m}\" and \"{}\" itself may change it", entry.name)
+                    }
+                };
+                if before == (entry.managed_by.clone(), entry.self_managed) {
+                    Err(format!("Nothing to change: {who}."))
+                } else {
+                    Ok(format!("{}: {who}", entry.name))
+                }
+            })
+            .await
         }
         Some(Command::Join {
             target,
@@ -438,8 +494,29 @@ async fn settle(client: &Client) -> Result<()> {
 }
 
 async fn set_online(socket: &Path, site: &str, online: bool, confirm: bool) -> Result<ExitCode> {
+    let word = if online { "online" } else { "offline" };
+    edit_site(socket, site, confirm, |entry, _| {
+        if entry.online == online {
+            return Err(format!("{site} is already {word}."));
+        }
+        entry.online = online;
+        Ok(format!("{site} is {word}"))
+    })
+    .await
+}
+
+/// Changes one site of the running configuration and applies the change.
+/// `edit` gets the site and the name of this site; it returns what changed,
+/// or why nothing needs to change.
+async fn edit_site(
+    socket: &Path,
+    site: &str,
+    confirm: bool,
+    edit: impl FnOnce(&mut config::Site, &str) -> Result<String, String>,
+) -> Result<ExitCode> {
     let client = connect(socket).await?;
     settle(&client).await?;
+    let status: Status = client.call(Request::Status).await?;
     let running: ConfigTexts = client.call(Request::GetConfig).await?;
     if !running.configured {
         bail!("this site is not part of a network");
@@ -448,15 +525,17 @@ async fn set_online(socket: &Path, site: &str, online: bool, confirm: bool) -> R
         .ok()
         .and_then(|p| p.mesh)
         .context("cannot read the running configuration")?;
-    let word = if online { "online" } else { "offline" };
     let Some(entry) = mesh.sites.iter_mut().find(|s| s.name == site) else {
         bail!("there is no site \"{site}\"");
     };
-    if entry.online == online {
-        println!("{site} is already {word}.");
-        return Ok(ExitCode::SUCCESS);
-    }
-    entry.online = online;
+    let me = status.site.unwrap_or_default();
+    let done = match edit(entry, &me) {
+        Ok(done) => done,
+        Err(nothing) => {
+            println!("{nothing}");
+            return Ok(ExitCode::SUCCESS);
+        }
+    };
     let applied: Applied = client
         .call(Request::Apply(ApplyParams {
             config: ConfigInput {
@@ -469,10 +548,10 @@ async fn set_online(socket: &Path, site: &str, online: bool, confirm: bool) -> R
         .await?;
     if confirm {
         let c: Confirmed = client.call(Request::Confirm).await?;
-        println!("{site} is {word} (mesh revision {}).", c.revision);
+        println!("{done} (mesh revision {}).", c.revision);
     } else {
         println!(
-            "{site} is {word} now. Run `wanderlan confirm` within {} seconds to keep it, otherwise it is rolled back.",
+            "{done} now. Run `wanderlan confirm` within {} seconds to keep it, otherwise it is rolled back.",
             applied.confirm_within_secs
         );
     }
@@ -576,6 +655,7 @@ async fn apply(
     timeout: Option<Duration>,
 ) -> Result<ExitCode> {
     let client = connect(socket).await?;
+    settle(&client).await?;
     let timeout_secs = timeout.map(|t| t.as_secs().max(1));
     let request = if mesh.is_none() && local.is_none() {
         Request::ApplyFiles(ApplyFilesParams { timeout_secs })

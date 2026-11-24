@@ -23,7 +23,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         Constraint::Length(3),
     ])
     .areas(area);
-    draw_vlans(frame, draft, vlans);
+    draw_vlans(frame, draft, app.restricted_by().as_deref(), vlans);
     draw_maps(frame, app, draft, table);
     let selected = FieldPath::map(app.maps_selected);
     let mut lines: Vec<Line> = draft.within(&selected).map(diagnostic_line).collect();
@@ -48,7 +48,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), detail);
 }
 
-fn draw_vlans(frame: &mut Frame, draft: &Draft, area: Rect) {
+fn draw_vlans(frame: &mut Frame, draft: &Draft, restricted_by: Option<&str>, area: Rect) {
     let path = FieldPath::mesh("vlans");
     let vlans = &draft.mesh.vlans;
     let mut lines = vec![Line::from(vec![
@@ -65,17 +65,23 @@ fn draw_vlans(frame: &mut Frame, draft: &Draft, area: Rect) {
             theme::dim(),
         ),
     ])];
-    match draft.at(&path).next() {
-        Some(d) => lines.push(diagnostic_line(d)),
-        None => lines.push(Line::styled(
+    match (draft.at(&path).next(), restricted_by) {
+        (Some(d), _) => lines.push(diagnostic_line(d)),
+        (None, Some(manager)) => lines.push(Line::styled(
+            format!(" Managed by {manager}: VLANs and mappings change only there."),
+            theme::warn(),
+        )),
+        (None, None) => lines.push(Line::styled(
             " Default of every site (native = untagged); limit a site in Sites (2).",
             theme::dim(),
         )),
     }
-    frame.render_widget(
-        Paragraph::new(lines).block(titled(" VLANs of the network (v) ")),
-        area,
-    );
+    let title = if restricted_by.is_some() {
+        " VLANs of the network (read only) "
+    } else {
+        " VLANs of the network (v) "
+    };
+    frame.render_widget(Paragraph::new(lines).block(titled(title)), area);
 }
 
 /// A cell that is marked when a diagnostic points at it.

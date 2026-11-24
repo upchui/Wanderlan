@@ -413,6 +413,74 @@ fn a_site_managed_elsewhere_cannot_be_changed_here() {
     assert!(app.modal.is_none());
 }
 
+/// The fixture app on a site that is managed by "buero" (restricted).
+fn restricted() -> App {
+    let mut app = connected();
+    let mut texts = fixtures::config_texts();
+    let heim = "name = \"heim\"\naddress = \"10.8.0.1\"\n";
+    assert!(texts.mesh.contains(heim), "{}", texts.mesh);
+    texts.mesh = texts
+        .mesh
+        .replace(heim, &format!("{heim}managed_by = \"buero\"\n"));
+    app.update(reply(Request::GetConfig, Reply::Config(texts)));
+    app
+}
+
+#[test]
+fn a_restricted_site_changes_no_vlans() {
+    let mut app = restricted();
+    assert_eq!(app.restricted_by().as_deref(), Some("buero"));
+    let refused = |app: &App| {
+        app.modal.is_none()
+            && app
+                .message
+                .as_ref()
+                .is_some_and(|m| m.text.contains("managed by \"buero\""))
+    };
+    // The network's VLANs, in the VLAN view and in the settings.
+    app.update(ch('3'));
+    app.update(ch('v'));
+    assert!(refused(&app));
+    app.message = None;
+    app.update(ch('7'));
+    app.settings_selected = 0;
+    app.update(key(KeyCode::Enter));
+    assert!(refused(&app));
+    // An open site (here buero, which has no manager).
+    app.message = None;
+    app.update(ch('2'));
+    app.sites_selected = 1;
+    app.update(ch('e'));
+    assert!(refused(&app));
+    // Technical settings stay open.
+    app.update(ch('7'));
+    app.settings_selected = 1;
+    app.update(key(KeyCode::Enter));
+    assert!(matches!(app.modal, Some(Modal::Form(_))));
+}
+
+#[test]
+fn after_the_setup_the_invitation_form_opens() {
+    let mut app = connected();
+    app.wizard.step = Step::Applied;
+    let fx = app.update(reply(
+        Request::Confirm,
+        Reply::Confirmed(Confirmed { revision: 1 }),
+    ));
+    assert!(requests(&fx).contains(&&Request::GetConfig));
+    assert!(
+        !requests(&fx)
+            .iter()
+            .any(|r| matches!(r, Request::Invite(_))),
+        "no invitation without its rules"
+    );
+    app.update(reply(
+        Request::GetConfig,
+        Reply::Config(fixtures::config_texts()),
+    ));
+    assert!(matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::Invite));
+}
+
 #[test]
 fn enter_on_a_peer_opens_its_details_and_history_grows() {
     let mut app = connected();

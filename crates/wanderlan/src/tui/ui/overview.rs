@@ -73,6 +73,12 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
             theme::warn(),
         )),
     }
+    if let Some(manager) = app.restricted_by() {
+        lines.push(Line::styled(
+            format!(" Managed by {manager}: VLANs, mappings and online state change only there."),
+            theme::warn(),
+        ));
+    }
     let (state, style) = match status.state {
         SiteState::Running => ("running", theme::ok()),
         SiteState::Error => ("error", theme::bad()),

@@ -55,7 +55,7 @@ pub const SECTIONS: &[Section] = &[
             ("n", "new site by hand"),
             (
                 "e, Enter",
-                "edit the site (renaming updates all references)",
+                "edit the site; \"Changes\": who may change its VLANs",
             ),
             ("d, Del", "delete the site and its VLAN mappings"),
             (

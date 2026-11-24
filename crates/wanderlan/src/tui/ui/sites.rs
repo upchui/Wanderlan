@@ -6,6 +6,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use wanderlan_core::config::{FieldPath, Severity};
+use wanderlan_core::policy;
 
 use super::{diagnostic_line, health_style, not_configured, port_state, severity_style, titled};
 use crate::tui::app::App;
@@ -35,7 +36,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
     let running = app.running.as_ref().and_then(|r| r.mesh.as_ref());
     let own = draft.local.self_name.as_deref();
-    let header = Row::new(vec!["", "NAME", "ADDRESS", "VLANS", "TUNNEL"]).style(theme::header());
+    let header = Row::new(vec!["", "NAME", "ADDRESS", "VLANS", "MANAGED BY", "TUNNEL"])
+        .style(theme::header());
     let rows: Vec<Row> = draft
         .mesh
         .sites
@@ -66,6 +68,7 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
                     Some(v) => Cell::from(v.to_string()),
                     None => Cell::from(Span::styled(draft.mesh.vlans.to_string(), theme::dim())),
                 },
+                Cell::from(policy::managed_label(&draft.mesh, site)),
                 Cell::from(tunnel).style(tunnel_style),
             ])
             .style(style)
@@ -85,7 +88,8 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         Constraint::Length(1),
         Constraint::Length(12),
         Constraint::Length(15),
-        Constraint::Length(20),
+        Constraint::Length(14),
+        Constraint::Length(13),
         Constraint::Min(8),
     ];
     let table = Table::new(rows, widths)
@@ -115,21 +119,19 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
         line.push_span(Span::styled(more, theme::dim()));
         lines.push(line);
     }
-    if let Some(site) = draft.mesh.sites.get(app.sites_selected)
-        && let Some(by) = &site.managed_by
-    {
-        let itself = if site.self_managed {
-            format!(" and {} itself", site.name)
-        } else {
-            String::new()
-        };
-        lines.push(Line::styled(
-            format!(
-                " {} is managed by {by}{itself}: only there its VLANs and online state change.",
+    if let Some(site) = draft.mesh.sites.get(app.sites_selected) {
+        let text = match policy::manager(&draft.mesh, site) {
+            Some(_) => format!(
+                " {}: VLANs, mappings and online state are changed by {} (Enter: Changes).",
+                site.name,
+                policy::managers(&draft.mesh, site)
+            ),
+            None => format!(
+                " {}: every site that is not managed by another may change it (Enter: Changes).",
                 site.name
             ),
-            theme::dim(),
-        ));
+        };
+        lines.push(Line::styled(text, theme::dim()));
     }
     if lines.is_empty() {
         let marks = "+ new, * changed (not applied yet). a: review and apply the draft.";

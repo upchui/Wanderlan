@@ -145,11 +145,25 @@ translations (`--map 130:30`). A code works once and stays valid until it is
 used or deleted (`wanderlan invite list`, `wanderlan invite delete <code>`;
 TUI: Sites, `I`).
 
-The site that created the invitation **manages** the new site: only it may
-change the new site's VLANs, mappings and online state, or remove it. With
-`--self-managed` the new site may change its own rules too. Sites without a
-manager (the first site, sites added by hand) may be changed from every
-site.
+The site that created the invitation **manages** the new site. Who may
+change what:
+
+| Change | Who |
+|--------|-----|
+| VLANs, mappings, online state of a managed site, removing it | its manager; the site itself too if it was released (`--self-managed`, TUI: "Changes") |
+| The same for a site without a manager (the first site) and the VLANs of the network | every site that is not *restricted* |
+| Timeouts, MTU check, MSS, control port, invitations | every site |
+
+A site is *restricted* if it joined with an invitation and was not
+released: it cannot change any VLANs, neither its own nor those of other
+sites or of the network, only those of sites it invited itself. Released,
+it has the same rights as the site that invited it. Change who manages a
+site in the TUI (Sites, `Enter`, field "Changes") or with `wanderlan manage
+<site> [--by S | --anyone] [--self-managed yes|no]`; Settings (7) shows who
+manages this site and which sites it manages. After "Start a new network"
+the setup opens the invitation form, so the rules (and whether the new site
+may change them) are chosen right away. This is an agreement between the
+daemons, not a cryptographic protection.
 
 To start over on a site: `sudo wanderlan reset` removes the bridge, the
 tunnels, all rules, the configuration and the invitations; the site is
@@ -352,6 +366,7 @@ discards the draft, `?` shows all keys, `q` quits.
 | `wanderlan invite list` / `wanderlan invite delete <code>` | Open invitations of this site |
 | `wanderlan join <address>[:port] <code> [--name N] [--trunk IF]` | Join a network (on an unconfigured site) |
 | `wanderlan online <site> [--confirm]` / `wanderlan offline <site> [--confirm]` | Take a site online (its tunnels come up) or offline |
+| `wanderlan manage <site> [--by S \| --anyone] [--self-managed yes\|no] [--confirm]` | Who may change a site's VLANs, mappings and online state |
 | `wanderlan reset [--yes]` | Remove everything wanderlan set up on this site; unconfigured again |
 
 The socket can be changed with `--socket` or `WANDERLAN_SOCKET`.

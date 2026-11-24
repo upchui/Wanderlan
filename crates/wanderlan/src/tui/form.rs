@@ -17,6 +17,8 @@ use wanderlan_core::config::{
     ifname_error, site_name_error,
 };
 
+use wanderlan_core::policy;
+
 use super::draft::{Draft, is_within};
 use super::format;
 use super::input::{Outcome, TextInput};
@@ -189,6 +191,20 @@ impl Form {
             Some(s) => format!("Edit site {}", s.name),
             None => "New site".to_string(),
         };
+        let me = draft.local.self_name.clone().unwrap_or_default();
+        let (choices, current) = match existing {
+            Some(s) => {
+                let manager = policy::manager(&draft.mesh, s).map(str::to_string);
+                let choices = changes_choices(manager.as_deref().unwrap_or(&me), &s.name);
+                let current = match (manager, s.self_managed) {
+                    (None, _) => ANY_SITE.to_string(),
+                    (Some(m), false) => format!("only {m}"),
+                    (Some(m), true) => format!("{m} and {}", s.name),
+                };
+                (choices, current)
+            }
+            None => (changes_choices(&me, "the new site"), format!("only {me}")),
+        };
         let fields = vec![
             Field::text(
                 "name",
@@ -210,6 +226,13 @@ impl Form {
                     draft.mesh.vlans
                 ),
                 vlans,
+            ),
+            Field::choice(
+                "changes",
+                "Changes",
+                "who may change its VLANs, mappings and online state",
+                choices,
+                &current,
             ),
         ];
         Self::new(FormKind::Site(index), title, fields, draft)
@@ -558,18 +581,23 @@ impl Form {
         match self.kind {
             FormKind::Site(index) => {
                 let site = self.parse_site()?;
+                let (managed_by, self_managed) = parse_changes(&self.value("changes"));
                 match index.and_then(|i| candidate.mesh.sites.get_mut(i)) {
                     Some(slot) => {
                         let mut site = site;
                         site.online = slot.online;
-                        site.managed_by.clone_from(&slot.managed_by);
-                        site.self_managed = slot.self_managed;
+                        site.managed_by = managed_by;
+                        site.self_managed = self_managed;
                         let old = std::mem::replace(slot, site.clone());
                         if old.name != site.name {
                             candidate.rename_references(&old.name, &site.name);
                         }
                     }
-                    None => candidate.mesh.sites.push(site),
+                    None => candidate.mesh.sites.push(Site {
+                        managed_by,
+                        self_managed,
+                        ..site
+                    }),
                 }
             }
             FormKind::Map(index) => {
@@ -585,6 +613,7 @@ impl Form {
                 let interval = self.parse_duration("mtu_probe_interval");
                 let timeout = self.parse_duration("commit_timeout");
                 let mss = self.parse_mss();
+                let vlans = vlans.and_then(|v| self.guard_network_vlans(draft, v));
                 let mesh = &mut candidate.mesh;
                 mesh.vlans = vlans?;
                 mesh.control_port = port?;
@@ -592,7 +621,10 @@ impl Form {
                 mesh.commit_timeout = timeout?;
                 mesh.mss = mss?;
             }
-            FormKind::Vlans => candidate.mesh.vlans = self.parse_vlans()?,
+            FormKind::Vlans => {
+                let vlans = self.parse_vlans()?;
+                candidate.mesh.vlans = self.guard_network_vlans(draft, vlans)?;
+            }
             FormKind::Invite => self.build_invite(&mut candidate)?,
             FormKind::Local => {
                 let own = self.value("self");
@@ -774,6 +806,17 @@ impl Form {
     }
 
     /// The VLANs of the network; empty means all VLANs and untagged.
+    /// The network's VLANs may only change on a site that is not restricted
+    /// (see [`policy`]).
+    fn guard_network_vlans(&mut self, draft: &Draft, vlans: VlanSet) -> Option<VlanSet> {
+        let me = draft.local.self_name.as_deref().unwrap_or_default();
+        if vlans != draft.mesh.vlans && !policy::may_change_network_vlans(&draft.mesh, me) {
+            self.set_error("vlans", policy::why_not_network(&draft.mesh, me));
+            return None;
+        }
+        Some(vlans)
+    }
+
     fn parse_vlans(&mut self) -> Option<VlanSet> {
         let text = self.value("vlans");
         if text.trim().is_empty() {
@@ -870,6 +913,34 @@ pub fn trunk_candidates(interfaces: &[Interface]) -> Vec<&Interface> {
     list
 }
 
+/// The "Changes" choice that lets every site change a site.
+const ANY_SITE: &str = "any site";
+
+/// Choices of the "Changes" field of a site: only its manager, the manager
+/// and the site itself, or every site.
+fn changes_choices(manager: &str, site: &str) -> Vec<String> {
+    let mut choices = vec![format!("only {manager}")];
+    if manager != site {
+        choices.push(format!("{manager} and {site}"));
+    }
+    choices.push(ANY_SITE.to_string());
+    choices
+}
+
+/// `managed_by` and `self_managed` from a "Changes" choice.
+fn parse_changes(value: &str) -> (Option<String>, bool) {
+    if value == ANY_SITE {
+        return (None, false);
+    }
+    if let Some(manager) = value.strip_prefix("only ") {
+        return (Some(manager.to_string()), false);
+    }
+    match value.split_once(" and ") {
+        Some((manager, _)) => (Some(manager.to_string()), true),
+        None => (None, false),
+    }
+}
+
 /// Help text of the trunk field: the usable interfaces.
 pub fn trunk_hint(interfaces: &[Interface]) -> String {
     let names: Vec<&str> = trunk_candidates(interfaces)
@@ -918,8 +989,9 @@ mod tests {
         let form = Form::site(&d, None);
         assert_eq!(
             form.fields.iter().map(|f| f.key).collect::<Vec<_>>(),
-            ["name", "address", "vlans"]
+            ["name", "address", "vlans", "changes"]
         );
+        assert_eq!(form.value("changes"), "only heim", "managed by this site");
         // Empty required fields are errors, but hidden until touched.
         let name = form.field("name").unwrap();
         assert!(name.error.is_some());
@@ -929,6 +1001,36 @@ mod tests {
             "empty: all VLANs"
         );
         assert!(!form.is_valid());
+    }
+
+    #[test]
+    fn the_changes_field_sets_who_manages_a_site() {
+        let d = draft();
+        let haus6 = d.mesh.sites.iter().position(|s| s.name == "haus6").unwrap();
+        let form = Form::site(&d, Some(haus6));
+        assert_eq!(form.value("changes"), "only buero");
+        assert_eq!(
+            changes_choices("buero", "haus6"),
+            ["only buero", "buero and haus6", "any site"]
+        );
+        let heim = Form::site(&d, Some(0));
+        assert_eq!(heim.value("changes"), "any site", "no manager yet");
+        assert_eq!(changes_choices("heim", "heim"), ["only heim", "any site"]);
+        assert_eq!(parse_changes("only buero"), (Some("buero".into()), false));
+        assert_eq!(
+            parse_changes("buero and haus6"),
+            (Some("buero".into()), true)
+        );
+        assert_eq!(parse_changes("any site"), (None, false));
+        // A new site: managed by this site unless chosen otherwise.
+        let mut form = Form::site(&d, None);
+        type_text(&mut form, &d, "neu");
+        press(&mut form, &d, KeyCode::Tab);
+        type_text(&mut form, &d, "10.8.0.99");
+        let candidate = form.submit(&d).unwrap();
+        let neu = candidate.mesh.site("neu").unwrap();
+        assert_eq!(neu.managed_by.as_deref(), Some("heim"));
+        assert!(!neu.self_managed);
     }
 
     #[test]

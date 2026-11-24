@@ -1,21 +1,20 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 80
 expression: render(&app)
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
 "┌ Sites (draft): 6 ────────────────────────────────────────────────────────────┐"
-"│  NAME         ADDRESS         VLANS                TUNNEL                    │"
-"│  heim         10.8.0.1        10-50                this site                 │"
-"│  buero        10.8.0.2        10-50                up                        │"
-"│  haus2        10.8.0.11       20,30                BLOCKED                   │"
-"│  haus3        10.8.0.12       10-50                up                        │"
-"│  haus5        10.8.0.15       10-50                up                        │"
-"│  haus6        10.8.0.16       10-50                offline                   │"
+"│  NAME         ADDRESS         VLANS          MANAGED BY    TUNNEL            │"
+"│  heim         10.8.0.1        10-50          anyone        this site         │"
+"│  buero        10.8.0.2        10-50          anyone        up                │"
+"│  haus2        10.8.0.11       20,30          anyone        BLOCKED           │"
+"│  haus3        10.8.0.12       10-50          anyone        up                │"
+"│  haus5        10.8.0.15       10-50          anyone        up                │"
+"│  haus6        10.8.0.16       10-50          buero         offline           │"
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" + new, * changed (not applied yet). a: review and apply the draft.             "
+" heim: every site that is not managed by another may change it (Enter: Changes)."
 "                                                                                "
 "                                                                                "
 "┌ Network settings (m) ────────────────┐┌ This host (l) ───────────────────────┐"
