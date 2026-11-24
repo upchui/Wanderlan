@@ -3,13 +3,16 @@ Description=wanderlan layer-2 mesh daemon
 Documentation=https://github.com/upchui/Wanderlan
 After=network-online.target
 Wants=network-online.target
+# Never give up restarting: without the daemon the sites are not connected.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=/usr/bin/wanderland
 ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
-RestartSec=5s
+# Also after a crash or a kill; `systemctl stop` stops it for good.
+Restart=always
+RestartSec=2s
 TimeoutStopSec=30s
 
 # Runs as root but with CAP_NET_ADMIN as its only capability.

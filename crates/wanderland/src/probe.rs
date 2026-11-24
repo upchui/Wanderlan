@@ -186,6 +186,11 @@ async fn run(
         for (_, (_, task)) in prober {
             task.abort();
         }
+        // Without a listening address (reset, unconfigured) or with a new
+        // one, nothing measured or announced before is valid any more.
+        if let Ok(mut t) = table.write() {
+            t.clear();
+        }
     }
 }
 

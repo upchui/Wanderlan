@@ -115,19 +115,68 @@ impl Paths {
     }
 
     /// Back to the state after installation: the configuration files become
-    /// the package templates again; the state directory (confirmed copies,
-    /// marker, invitations) and rejected files are removed.
+    /// the package templates again; the contents of the state directory
+    /// (confirmed copies, marker, invitations) and rejected files are
+    /// removed. The state directory itself stays: under systemd it is the
+    /// unit's `StateDirectory` and its parent (`/var/lib`) is read-only.
     pub fn reset(&self) -> Result<()> {
-        write_atomic(&self.mesh(), TEMPLATE_MESH)?;
-        write_atomic(&self.local(), TEMPLATE_LOCAL)?;
+        let mut errors: Vec<String> = Vec::new();
+        let mut attempt = |result: Result<()>| {
+            if let Err(e) = result {
+                errors.push(format!("{e:#}"));
+            }
+        };
+        attempt(write_atomic(&self.mesh(), TEMPLATE_MESH));
+        attempt(write_atomic(&self.local(), TEMPLATE_LOCAL));
         for name in ["mesh.toml.rejected", "local.toml.rejected"] {
-            remove_optional(&self.config_dir.join(name))?;
+            attempt(remove_optional(&self.config_dir.join(name)));
         }
-        match std::fs::remove_dir_all(&self.state_dir) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e).with_context(|| format!("cannot remove {}", self.state_dir.display())),
+        match std::fs::read_dir(&self.state_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let removed = if path.is_dir() && !path.is_symlink() {
+                        std::fs::remove_dir_all(&path)
+                    } else {
+                        std::fs::remove_file(&path)
+                    };
+                    attempt(removed.with_context(|| format!("cannot remove {}", path.display())));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                attempt(Err(e).with_context(|| format!("cannot read {}", self.state_dir.display())))
+            }
         }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("{}", errors.join("; "))
+        }
+    }
+
+    /// What a reset should have removed but is still there.
+    pub fn leftovers(&self) -> Vec<String> {
+        let mut left = Vec::new();
+        for (path, template) in [(self.mesh(), TEMPLATE_MESH), (self.local(), TEMPLATE_LOCAL)] {
+            if std::fs::read_to_string(&path).ok().as_deref() != Some(template) {
+                left.push(format!("{} is not the package template", path.display()));
+            }
+        }
+        if let Ok(entries) = std::fs::read_dir(&self.state_dir) {
+            let names: Vec<String> = entries
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            if !names.is_empty() {
+                left.push(format!(
+                    "{} still contains {}",
+                    self.state_dir.display(),
+                    names.join(", ")
+                ));
+            }
+        }
+        left
     }
 }
 
@@ -213,8 +262,34 @@ mod tests {
             TEMPLATE_LOCAL
         );
         assert!(!paths.config_dir.join("mesh.toml.rejected").exists());
-        assert!(!paths.state_dir.exists());
+        assert!(paths.state_dir.exists(), "the state directory itself stays");
+        assert_eq!(std::fs::read_dir(&paths.state_dir).unwrap().count(), 0);
+        assert_eq!(paths.leftovers(), Vec::<String>::new());
         paths.reset().unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn reset_works_when_the_parent_of_the_state_directory_is_read_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Like systemd's StateDirectory under ProtectSystem=strict: the state
+        // directory is writable, /var/lib above it is not.
+        let base = std::env::temp_dir().join(format!("wl-reset-ro-{}", std::process::id()));
+        let paths = Paths {
+            config_dir: base.join("etc"),
+            state_dir: base.join("lib").join("wanderlan"),
+        };
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        std::fs::write(paths.mesh(), "configured").unwrap();
+        paths.save_copy().unwrap();
+        std::fs::write(paths.invites(), "[]").unwrap();
+        let parent = base.join("lib");
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let result = paths.reset();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        result.unwrap();
+        assert!(paths.state_dir.exists());
+        assert_eq!(std::fs::read_dir(&paths.state_dir).unwrap().count(), 0);
         std::fs::remove_dir_all(base).unwrap();
     }
 }

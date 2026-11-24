@@ -1,0 +1,60 @@
+# Two hosts that run wanderland under systemd with the hardened unit of the
+# package, connected by a transport network, each with a client on its trunk
+# (see run.sh).
+name: wanderlan-systemd
+
+x-host: &host
+  image: ${SYSTEMDNODE_IMAGE:-wanderlan-systemdnode}
+  privileged: true
+  cgroup: private
+  tmpfs: [/run, /run/lock, /tmp]
+  sysctls:
+    net.ipv6.conf.all.disable_ipv6: "1"
+    net.ipv6.conf.default.disable_ipv6: "1"
+
+x-client: &client
+  image: ${SYSTEMDNODE_IMAGE:-wanderlan-systemdnode}
+  init: true
+  cap_add: [NET_ADMIN]
+  entrypoint: [/usr/local/bin/node-entrypoint]
+  sysctls:
+    net.ipv6.conf.all.disable_ipv6: "1"
+    net.ipv6.conf.default.disable_ipv6: "1"
+
+services:
+  alpha:
+    <<: *host
+    hostname: alpha
+    networks:
+      transport: { ipv4_address: 10.8.0.1 }
+      tr-alpha: { ipv4_address: 10.201.1.10 }
+  beta:
+    <<: *host
+    hostname: beta
+    networks:
+      transport: { ipv4_address: 10.8.0.2 }
+      tr-beta: { ipv4_address: 10.201.2.10 }
+  c-alpha:
+    <<: *client
+    environment: { ROLE: client, TRUNK_NET: "10.201.1." }
+    networks:
+      tr-alpha: { ipv4_address: 10.201.1.20 }
+  c-beta:
+    <<: *client
+    environment: { ROLE: client, TRUNK_NET: "10.201.2." }
+    networks:
+      tr-beta: { ipv4_address: 10.201.2.20 }
+
+networks:
+  transport:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.8.0.0/24, gateway: 10.8.0.254 }]
+  tr-alpha:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.201.1.0/24 }]
+  tr-beta:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.201.2.0/24 }]

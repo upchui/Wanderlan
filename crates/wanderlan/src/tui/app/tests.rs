@@ -64,7 +64,7 @@ fn connects_and_retries_when_the_daemon_is_down() {
     let fx = app.update(Msg::ConnectFailed(ClientError::NotRunning {
         path: PathBuf::from("/run/wanderlan/wanderlan.sock"),
     }));
-    assert!(fx.is_empty());
+    assert_eq!(fx, vec![Effect::Diagnose], "asks systemd why");
     match &app.conn {
         Conn::Down { error, .. } => assert!(error.contains("daemon is not running")),
         other => panic!("unexpected {other:?}"),
@@ -75,6 +75,51 @@ fn connects_and_retries_when_the_daemon_is_down() {
     }
     assert_eq!(reconnect, vec![Effect::Connect]);
     assert_eq!(app.conn, Conn::Connecting);
+    let fx = app.update(Msg::ConnectFailed(ClientError::NotRunning {
+        path: PathBuf::from("/run/wanderlan/wanderlan.sock"),
+    }));
+    assert!(fx.is_empty(), "not on every attempt");
+    app.update(Msg::Diagnosis(crate::service::Diagnosis {
+        state: Some("failed".into()),
+        journal: vec!["boom".into()],
+    }));
+    assert!(app.diagnosis.is_some());
+    app.update(Msg::Connected);
+    assert_eq!(app.diagnosis, None, "forgotten once connected");
+}
+
+#[test]
+fn after_a_reset_the_kernel_devices_are_cleaned_up_and_everything_reloaded() {
+    let mut app = App::new("/s", false);
+    app.start();
+    app.update(Msg::Connected);
+    let fx = app.update(Msg::Response {
+        request: Request::Reset,
+        result: Ok(Reply::Reset(ResetReport::default())),
+    });
+    let reqs = requests(&fx);
+    assert!(reqs.contains(&&Request::Interfaces));
+    assert!(reqs.contains(&&Request::Status));
+    let fx = app.update(Msg::Response {
+        request: Request::Interfaces,
+        result: Ok(Reply::Interfaces(vec![])),
+    });
+    assert_eq!(fx, vec![Effect::KernelCleanup(vec![])]);
+    let fx = app.update(Msg::KernelCleaned(Some("Unloaded".into())));
+    assert!(
+        requests(&fx).contains(&&Request::Interfaces),
+        "the list is reloaded"
+    );
+    app.update(Msg::Response {
+        request: Request::Interfaces,
+        result: Ok(Reply::Interfaces(vec![])),
+    });
+    // A failed reset also reloads the real state.
+    let fx = app.update(Msg::Response {
+        request: Request::Reset,
+        result: Err(ClientError::Api(ApiError::new("boom"))),
+    });
+    assert!(requests(&fx).contains(&&Request::Interfaces));
 }
 
 #[test]

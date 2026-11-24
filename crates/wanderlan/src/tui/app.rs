@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, VecDeque};
 use wanderlan_core::api::{
     ApiError, Applied, ApplyParams, ChangeSource, ConfigInput, ConfigTexts, Confirmed, Event,
     Interface, Invitation, InviteParams, Joined, MacEntry, PeerStatus, PendingChange, PortState,
-    Request, SiteRules, SiteState, Status, UnblockParams,
+    Request, ResetReport, SiteRules, SiteState, Status, UnblockParams,
 };
 use wanderlan_core::config::{Diagnostic, has_errors, render_local, render_mesh};
 use wanderlan_core::policy;
@@ -29,6 +29,7 @@ use super::macs::MacState;
 use super::wizard::{self, Mode, Step, Wizard};
 use crate::client::ClientError;
 use crate::hostinfo;
+use crate::service::Diagnosis;
 
 /// Ticks (seconds) between connection attempts while the daemon is down.
 pub const RETRY_TICKS: u32 = 2;
@@ -323,6 +324,8 @@ pub enum Reply {
     Invites(Vec<Invitation>),
     /// Answer to `join`.
     Joined(Joined),
+    /// Answer to `reset`.
+    Reset(ResetReport),
     /// An empty answer.
     Done,
 }
@@ -351,6 +354,10 @@ pub enum Msg {
     },
     /// A live event from the daemon.
     Event(Event),
+    /// What systemd knows about the daemon (while it is not reachable).
+    Diagnosis(Diagnosis),
+    /// Result of removing the kernel's GRE fallback devices after a reset.
+    KernelCleaned(Option<String>),
 }
 
 /// Output of [`App::update`], executed by the event loop.
@@ -364,6 +371,11 @@ pub enum Effect {
     Request(Request),
     /// Quit the TUI.
     Quit,
+    /// Ask systemd about the daemon (state and last log lines).
+    Diagnose,
+    /// Remove the kernel's GRE fallback devices if that is safe; the list
+    /// is the current interface list.
+    KernelCleanup(Vec<Interface>),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -399,6 +411,11 @@ pub struct App {
     pub interfaces_loaded: bool,
     /// Error listing the interfaces.
     pub interfaces_error: Option<String>,
+    /// What systemd says about the daemon while it is not reachable.
+    pub diagnosis: Option<Diagnosis>,
+    /// Remove the kernel's GRE fallback devices once the interface list
+    /// after a reset arrived.
+    cleanup_after_reset: bool,
     /// The event log.
     pub log: LogState,
     /// The MAC table.
@@ -446,6 +463,8 @@ impl App {
             interfaces: Vec::new(),
             interfaces_loaded: false,
             interfaces_error: None,
+            diagnosis: None,
+            cleanup_after_reset: false,
             log: LogState::default(),
             macs: MacState::default(),
             overview_selected: 0,
@@ -480,7 +499,14 @@ impl App {
             Msg::Mouse(mouse) => self.on_mouse(mouse, &mut fx),
             Msg::Tick => self.on_tick(&mut fx),
             Msg::Connected => self.on_connected(&mut fx),
-            Msg::ConnectFailed(e) | Msg::Disconnected(e) => self.on_down(&e),
+            Msg::ConnectFailed(e) | Msg::Disconnected(e) => self.on_down(&e, &mut fx),
+            Msg::Diagnosis(d) => self.diagnosis = Some(d),
+            Msg::KernelCleaned(message) => {
+                if let Some(m) = message {
+                    self.say(MessageKind::Info, m);
+                }
+                self.request_interfaces(&mut fx);
+            }
             Msg::Response { request, result } => self.on_response(request, result, &mut fx),
             Msg::Event(event) => self.log.push(event),
         }
@@ -541,6 +567,7 @@ impl App {
     fn on_connected(&mut self, fx: &mut Vec<Effect>) {
         self.conn = Conn::Connected;
         self.attempts = 0;
+        self.diagnosis = None;
         self.in_flight = InFlight::default();
         self.seen = None;
         self.log.resubscribe();
@@ -552,8 +579,11 @@ impl App {
         }
     }
 
-    fn on_down(&mut self, error: &ClientError) {
+    fn on_down(&mut self, error: &ClientError, fx: &mut Vec<Effect>) {
         self.attempts += 1;
+        if self.attempts == 1 || self.attempts.is_multiple_of(5) {
+            fx.push(Effect::Diagnose);
+        }
         self.conn = Conn::Down {
             error: error.to_string(),
             retry_in: RETRY_TICKS,
@@ -621,7 +651,7 @@ impl App {
     }
 
     fn request_interfaces(&mut self, fx: &mut Vec<Effect>) {
-        if self.is_connected() && !self.in_flight.interfaces && !self.interfaces_loaded {
+        if self.is_connected() && !self.in_flight.interfaces {
             self.in_flight.interfaces = true;
             fx.push(Effect::Request(Request::Interfaces));
         }
@@ -636,7 +666,7 @@ impl App {
         fx: &mut Vec<Effect>,
     ) {
         if let Err(ClientError::Closed) = result {
-            self.on_down(&ClientError::Closed);
+            self.on_down(&ClientError::Closed, fx);
             fx.push(Effect::Disconnect);
             return;
         }
@@ -644,7 +674,7 @@ impl App {
             (_, Ok(Reply::Status(status))) => self.on_status(*status, fx),
             (_, Ok(Reply::Config(texts))) => self.on_config(&texts),
             (_, Ok(Reply::History(events))) => self.log.set_history(events),
-            (_, Ok(Reply::Interfaces(list))) => self.on_interfaces(list),
+            (_, Ok(Reply::Interfaces(list))) => self.on_interfaces(list, fx),
             (_, Ok(Reply::Macs(entries))) => {
                 self.in_flight.macs = false;
                 self.macs.set_entries(entries);
@@ -680,7 +710,15 @@ impl App {
                 self.request_status(fx);
             }
             (Request::Join(_), Ok(Reply::Joined(joined))) => self.on_joined(&joined, fx),
-            (Request::Reset, Ok(_)) => self.on_reset(fx),
+            (Request::Reset, Ok(Reply::Reset(report))) => self.on_reset(&report, fx),
+            (Request::Reset, Err(e)) => {
+                // Whatever happened, show the real state of the site.
+                self.busy = None;
+                self.say(MessageKind::Error, format!("reset failed: {e}"));
+                self.request_status(fx);
+                self.request_config(fx);
+                self.request_interfaces(fx);
+            }
             (request, Err(e)) => self.on_request_failed(&request, &e),
             (_, Ok(_)) => {}
         }
@@ -825,11 +863,14 @@ impl App {
         self.clamp_selection();
     }
 
-    fn on_interfaces(&mut self, list: Vec<Interface>) {
+    fn on_interfaces(&mut self, list: Vec<Interface>, fx: &mut Vec<Effect>) {
         self.in_flight.interfaces = false;
         self.interfaces = list;
         self.interfaces_loaded = true;
         self.interfaces_error = None;
+        if std::mem::take(&mut self.cleanup_after_reset) {
+            fx.push(Effect::KernelCleanup(self.interfaces.clone()));
+        }
         if let Some(Modal::Form(form)) = &mut self.modal
             && form.kind == FormKind::Local
         {
@@ -1025,17 +1066,28 @@ impl App {
         }));
     }
 
-    fn on_reset(&mut self, fx: &mut Vec<Effect>) {
+    fn on_reset(&mut self, report: &ResetReport, fx: &mut Vec<Effect>) {
         self.busy = None;
         self.wizard = Wizard::new();
         self.wizard
             .prefill(&hostinfo::hostname(), hostinfo::default_address());
         self.invitation = None;
         self.view = View::Setup;
-        self.say(
-            MessageKind::Success,
-            "Reset done: this site is unconfigured again.",
-        );
+        if report.problems.is_empty() {
+            self.say(
+                MessageKind::Success,
+                "Reset done: this site is unconfigured again.",
+            );
+        } else {
+            self.say(
+                MessageKind::Error,
+                format!(
+                    "Reset incomplete: {}. Press R again; the log (5) has details.",
+                    report.problems.join("; ")
+                ),
+            );
+        }
+        self.cleanup_after_reset = true;
         self.request_status(fx);
         self.request_config(fx);
         self.request_interfaces(fx);

@@ -153,8 +153,15 @@ site.
 
 To start over on a site: `sudo wanderlan reset` removes the bridge, the
 tunnels, all rules, the configuration and the invitations; the site is
-unconfigured again, like after the installation. Remove it on another site
-too (TUI, Sites, `d`) if it leaves the network for good.
+unconfigured again, like after the installation. Every step runs even if an
+earlier one fails, and the daemon checks afterwards that nothing is left
+(otherwise it says what and the reset can be repeated). The kernel creates
+the devices `gre0`, `gretap0` and `erspan0` by itself when it loads its GRE
+module for the first tunnel; as root, outside containers and if no other GRE
+tunnel uses the module, the reset unloads it so they disappear too. Remove
+the site on another site too (TUI, Sites, `d`) if it leaves the network for
+good; until then the others keep listing it, which does not stop it from
+starting or joining another network.
 
 Without the TUI: write `/etc/wanderlan/mesh.toml` and `local.toml` (see
 `wanderlan init` or the examples), check them with `wanderlan validate`,
@@ -378,7 +385,13 @@ hardened systemd unit. Logs go to the journal: `journalctl -u wanderland`.
 ## Troubleshooting
 
 * **`wanderlan status` / the TUI says the daemon is not running**:
-  `systemctl status wanderland`, `journalctl -u wanderland -e`.
+  `systemctl status wanderland`, `journalctl -u wanderland -e`. The TUI shows
+  the state of the service and its last log lines itself. systemd restarts
+  the daemon after a crash; the network keeps running meanwhile.
+* **Typed `wanderland` instead of `wanderlan`**: harmless. `wanderland` is
+  the daemon; started from a shell it only explains that, and a second daemon
+  never starts while one runs (`/run/wanderlan/wanderland.lock`). If the API
+  socket is deleted, the daemon creates it again within seconds.
 * **Permission denied on the socket**: add yourself to the group
   `wanderlan` and log in again, or use `sudo`.
 * **"trunk interface … is already attached to vmbr0"**: the trunk must not be
@@ -481,7 +494,15 @@ scripts/check.sh              # cargo fmt --check, clippy -D warnings, tests
 scripts/cargo.sh test         # any cargo command in the build container
 scripts/build.sh amd64        # static binaries and .deb into dist/ (also arm64)
 scripts/integration.sh        # .deb in Debian 13 containers, full integration tests
+scripts/systemd-test.sh       # the daemon under systemd with the hardened unit
 ```
+
+`scripts/systemd-test.sh` boots two Debian 13 containers with systemd as
+PID 1 and the package installed, and goes through what users do: a new
+network, an invitation, a join, `wanderland` typed by mistake, a deleted
+socket, a reset (under `ProtectSystem=strict`), a new network while the old
+one still lists the site, a crash, restart and stop. After every step both
+services must be active and their journals free of internal errors.
 
 `scripts/integration.sh` loads the required kernel modules into the host
 kernel through a privileged helper container (on GitHub runners with sudo)

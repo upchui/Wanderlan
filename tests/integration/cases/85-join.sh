@@ -37,7 +37,23 @@ check "no nftables table is left" x site5 "! nft list table bridge wanderlan 2>/
 check "no tc rules are left on the trunk" x site5 "[ -z \"\$(tc filter show dev trunk0 ingress 2>/dev/null)\" ]"
 check "the configuration files are the package templates again" \
   x site5 "grep -q 'This site is not configured yet' /etc/wanderlan/mesh.toml && grep -q 'not configured yet' /etc/wanderlan/local.toml && ! grep -q '^self' /etc/wanderlan/local.toml"
-check "the state directory is gone" x site5 "[ ! -e /var/lib/wanderlan/confirmed ]"
+check "the state is gone" x site5 "[ ! -e /var/lib/wanderlan/confirmed ]"
+check "the state directory itself stays (systemd's StateDirectory)" x site5 "[ -d /var/lib/wanderlan ]"
+check "a second reset changes nothing and succeeds" x site5 "wanderlan reset --yes"
+
+begin "Reset: a new network while the old one still lists this site"
+
+# The other sites still list site5 and probe it with a newer revision; that
+# must not block a new network on site5 (it did: stale announcements).
+x site5 "printf '[mesh]\n\n[[site]]\nname = \"solo\"\naddress = \"10.100.13.10\"\n' > /tmp/solo-mesh.toml"
+x site5 "printf 'self = \"solo\"\ntrunk = \"trunk0\"\n' > /tmp/solo-local.toml"
+check "site5 starts its own network" \
+  x site5 "wanderlan apply --mesh /tmp/solo-mesh.toml --local /tmp/solo-local.toml >/dev/null && wanderlan confirm >/dev/null"
+check "site5 runs its own network" \
+  test "$(jqs site5 '"\(.state) \(.site) \(.sites | length)"')" = "running solo 1"
+check "site5 ignores the probes of its old network" \
+  test "$(jqs site5 '.peers | length')" = 0
+check "and resets again" x site5 "wanderlan reset --yes"
 
 # The other sites remove site5 (and its VLAN mappings).
 mesh_toml "10-50" site1 site2 site3 site4 >"$RUN_DIR/mesh-4.toml"

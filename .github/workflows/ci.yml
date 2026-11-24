@@ -1,7 +1,8 @@
 name: CI
 
 # Every push to a branch and every pull request: fmt, clippy, tests, the
-# packages for amd64 and arm64 with a smoke test, and the integration tests.
+# packages for amd64 and arm64 with a smoke test, the integration tests and
+# wanderland under systemd with the hardened unit.
 # A green run on main is published to the APT repository by publish.yml.
 on:
   push:
@@ -89,3 +90,26 @@ jobs:
           cache-from: type=gha,scope=build-amd64
       - name: Run integration tests
         run: tests/integration/run.sh
+
+  systemd:
+    name: systemd (hardened unit, user flows)
+    needs: version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Load kernel modules
+        run: scripts/load-modules.sh
+      - uses: docker/setup-buildx-action@v4
+      - name: Build systemdnode image (systemd as PID 1, installs the .deb)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: systemdnode
+          build-args: WANDERLAN_VERSION=${{ needs.version.outputs.version }}
+          load: true
+          tags: wanderlan-systemdnode
+          provenance: false
+          cache-from: type=gha,scope=build-amd64
+      - name: Run wanderland under systemd
+        run: tests/systemd/run.sh

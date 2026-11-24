@@ -1,0 +1,14 @@
+#!/bin/bash
+# Runs at boot of a systemd test node, before wanderland: the interface on
+# the trunk network (10.201.x.0/24) becomes trunk0 without an address, like
+# the LAN port of a real host.
+set -euo pipefail
+dev=$(ip -o -4 addr show | awk 'index($4, "10.201.") == 1 { print $2; exit }')
+if [ -z "$dev" ]; then
+  echo "no interface on the trunk network" >&2
+  exit 1
+fi
+ip addr flush dev "$dev"
+ip link set "$dev" down
+ip link set "$dev" name trunk0
+ip link set trunk0 up

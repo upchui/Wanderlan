@@ -865,10 +865,7 @@ fn parse_vid(text: &str) -> Result<u16, String> {
 /// Interfaces that can serve as trunk: no loopback, nothing wanderlan
 /// created; sorted by name.
 pub fn trunk_candidates(interfaces: &[Interface]) -> Vec<&Interface> {
-    let mut list: Vec<&Interface> = interfaces
-        .iter()
-        .filter(|i| i.name != "lo" && !i.managed)
-        .collect();
+    let mut list: Vec<&Interface> = interfaces.iter().filter(|i| i.is_listed()).collect();
     list.sort_by(|a, b| a.name.cmp(&b.name));
     list
 }

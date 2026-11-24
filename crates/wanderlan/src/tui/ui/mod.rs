@@ -104,8 +104,27 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
 
 /// The "daemon not reachable" screen. The TUI stays usable and retries.
 fn offline(frame: &mut Frame, app: &App, error: &str, retry_in: Option<u32>, area: Rect) {
-    let popup = area.centered(Constraint::Max(74), Constraint::Max(11));
+    let journal = app.diagnosis.as_ref().map_or(&[][..], |d| &d.journal[..]);
+    let extra = app.diagnosis.as_ref().map_or(0, |d| {
+        d.summary().map_or(0, |_| 3)
+            + if journal.is_empty() {
+                0
+            } else {
+                journal.len() + 2
+            }
+    });
+    let height = u16::try_from(11 + extra).unwrap_or(u16::MAX);
+    let popup = area.centered(Constraint::Max(74), Constraint::Max(height));
     let mut lines = vec![Line::styled(error.to_string(), theme::bad()), Line::raw("")];
+    if let Some(summary) = app.diagnosis.as_ref().and_then(|d| d.summary()) {
+        lines.push(Line::styled(summary, theme::bold()));
+        lines.push(Line::raw(""));
+    }
+    if !journal.is_empty() {
+        lines.push(Line::styled("Last log lines of the daemon:", theme::dim()));
+        lines.extend(journal.iter().map(|l| Line::raw(format!("  {l}"))));
+        lines.push(Line::raw(""));
+    }
     let retry = match retry_in {
         Some(secs) => format!(
             "Retrying in {secs} s (attempt {}). The TUI keeps running; the draft is kept.",

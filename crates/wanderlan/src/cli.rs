@@ -8,15 +8,16 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use wanderlan_core::api::{
-    self, Applied, ApplyFilesParams, ApplyParams, ConfigInput, ConfigTexts, Confirmed, Done, Event,
-    Interface, Invitation, InviteParams, JoinParams, Joined, Level, PortState, Request, SiteRules,
-    SiteState, Status, UnblockParams,
+    self, Applied, ApplyFilesParams, ApplyParams, ChangeSource, ConfigInput, ConfigTexts,
+    Confirmed, Done, Event, Interface, Invitation, InviteParams, JoinParams, Joined, Level,
+    PortState, Request, ResetReport, SiteRules, SiteState, Status, UnblockParams,
 };
 use wanderlan_core::config::{self, ConfigFile, Severity};
 use wanderlan_core::join;
 
 use crate::client::Client;
 use crate::hostinfo;
+use crate::kernel;
 use crate::tui::{self, TuiOptions};
 
 const EXAMPLE_MESH: &str = include_str!("../../../packaging/examples/mesh.toml");
@@ -376,18 +377,69 @@ async fn join_network(
             );
         }
         if st.pending.is_none() {
+            // The inviting site confirms on its own once this site answers;
+            // only then can it take this site online.
+            let mut in_sync = false;
+            for _ in 0..30 {
+                let st: Status = client.call(Request::Status).await?;
+                in_sync = st
+                    .peers
+                    .iter()
+                    .any(|p| p.name == joined.via && p.in_sync == Some(true));
+                if in_sync {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
             println!(
                 "Done: \"{}\" is part of the network (mesh revision {}). See `wanderlan status`.",
                 joined.site, st.revision
             );
+            if !in_sync {
+                println!(
+                    "\"{}\" has not confirmed the new site yet; check `wanderlan status` there.",
+                    joined.via
+                );
+            }
             return Ok(ExitCode::SUCCESS);
         }
     }
     bail!("no confirmation after two minutes; see `wanderlan status` and `wanderlan log`")
 }
 
+/// Waits until no automatic change (a site joining, a synchronised change)
+/// is pending, so that a change made now is not refused. A change made by a
+/// user must be confirmed or rolled back first.
+async fn settle(client: &Client) -> Result<()> {
+    let mut announced = false;
+    for _ in 0..120 {
+        let st: Status = client.call(Request::Status).await?;
+        let Some(pending) = st.pending else {
+            return Ok(());
+        };
+        match pending.source {
+            ChangeSource::Local => bail!(
+                "a change is waiting for confirmation ({} s left): run `wanderlan confirm` or `wanderlan rollback` first",
+                pending.remaining_secs
+            ),
+            ChangeSource::Join { site } if !announced => {
+                println!("Waiting until the joining site \"{site}\" is confirmed ...");
+                announced = true;
+            }
+            ChangeSource::Sync { peer } if !announced => {
+                println!("Waiting until the change from \"{peer}\" is confirmed ...");
+                announced = true;
+            }
+            _ => {}
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    bail!("the pending change was not confirmed within two minutes; see `wanderlan status`")
+}
+
 async fn set_online(socket: &Path, site: &str, online: bool, confirm: bool) -> Result<ExitCode> {
     let client = connect(socket).await?;
+    settle(&client).await?;
     let running: ConfigTexts = client.call(Request::GetConfig).await?;
     if !running.configured {
         bail!("this site is not part of a network");
@@ -444,8 +496,23 @@ async fn reset(socket: &Path, yes: bool) -> Result<ExitCode> {
             return Ok(ExitCode::FAILURE);
         }
     }
-    let _: Done = client.call(Request::Reset).await?;
-    println!("Reset done: this site is unconfigured again.");
+    let report: ResetReport = client.call(Request::Reset).await?;
+    let interfaces: Vec<Interface> = client.call(Request::Interfaces).await.unwrap_or_default();
+    if let Some(message) = kernel::remove_gre_fallback(&interfaces).message() {
+        println!("{message}");
+    }
+    if !report.problems.is_empty() {
+        eprintln!("The reset is incomplete:");
+        for problem in &report.problems {
+            eprintln!("  - {problem}");
+        }
+        eprintln!("Run `wanderlan reset` again; the log has details (`wanderlan log`).");
+        return Ok(ExitCode::FAILURE);
+    }
+    println!(
+        "Reset done ({} changes): this site is unconfigured again.",
+        report.removed
+    );
     println!("Other sites still list it until it is removed there (`wanderlan`, Sites, d).");
     Ok(ExitCode::SUCCESS)
 }

@@ -70,7 +70,7 @@ pub enum Request {
     /// only) → [`Joined`].
     Join(JoinParams),
     /// Removes the bridge, the tunnels, all rules, the configuration and the
-    /// invitations: the site is unconfigured again → [`Done`].
+    /// invitations: the site is unconfigured again → [`ResetReport`].
     Reset,
 }
 
@@ -281,6 +281,16 @@ pub enum ServerMessage {
 /// Empty result.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Done {}
+
+/// Result of [`Request::Reset`]. Every step runs even if an earlier one
+/// failed; afterwards the daemon checks that nothing is left.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetReport {
+    /// System changes made (interfaces, rules removed).
+    pub removed: usize,
+    /// What could not be undone, one sentence each; empty on success.
+    pub problems: Vec<String>,
+}
 
 /// Result of [`Request::Validate`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -581,7 +591,21 @@ pub struct Interface {
     pub managed: bool,
 }
 
+/// Devices the kernel creates by itself when a tunnel module is loaded
+/// (`ip_gre` creates `gre0`, `gretap0` and `erspan0`). They carry no traffic
+/// and are never offered as a trunk.
+pub const KERNEL_FALLBACK_DEVICES: [&str; 9] = [
+    "gre0", "gretap0", "erspan0", "ip6gre0", "ip6tnl0", "sit0", "tunl0", "ip_vti0", "ip6_vti0",
+];
+
 impl Interface {
+    /// True for an interface worth showing in a list of possible trunks:
+    /// not the loopback, not created by wanderlan, not a kernel fallback
+    /// device.
+    pub fn is_listed(&self) -> bool {
+        self.name != "lo" && !self.managed && !KERNEL_FALLBACK_DEVICES.contains(&self.name.as_str())
+    }
+
     /// True for an interface that can be the trunk: physical or a VLAN,
     /// bond or veth device, not created by wanderlan, not attached to another
     /// bridge or bond (attached to wanderlan's own bridge is fine).
@@ -591,7 +615,7 @@ impl Interface {
             .master
             .as_deref()
             .is_none_or(|m| m == crate::BRIDGE_NAME);
-        self.name != "lo" && kind_ok && master_ok && !self.managed
+        self.is_listed() && kind_ok && master_ok
     }
 }
 

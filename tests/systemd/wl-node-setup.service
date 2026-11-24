@@ -1,0 +1,13 @@
+[Unit]
+Description=Test node: prepare the trunk interface
+Before=wanderland.service
+DefaultDependencies=no
+After=local-fs.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/wl-node-setup
+
+[Install]
+WantedBy=multi-user.target

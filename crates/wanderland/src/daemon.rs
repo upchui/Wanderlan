@@ -6,6 +6,7 @@
 //! or timer ticks in one select loop.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future as _;
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -13,12 +14,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context as _, Result};
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 use wanderlan_core::api::{
     ApiError, Applied, ChangeSource, ConfigInput, ConfigTexts, Confirmed, Done, Interface,
     Invitation, JoinParams, Joined, Level, MacEntry, PeerStatus, PendingChange, PortState,
-    PortTraffic, Request, SiteState, SiteSummary, Status, Validation,
+    PortTraffic, Request, ResetReport, SiteState, SiteSummary, Status, Validation,
 };
 use wanderlan_core::config::{
     self, Config, ConfigFile, Diagnostic, Loaded, render_local, render_mesh, unified_diff,
@@ -165,13 +167,22 @@ pub async fn run(args: Args) -> Result<()> {
     let rates: Rates = Arc::new(RwLock::new(BTreeMap::new()));
 
     let mut tasks = vec![
-        probe::spawn(probe_rx, probes.clone(), probe_event_tx),
-        sync_net::spawn(offer_rx, inputs_tx.clone()),
-        stats::spawn(sys.clone(), rates.clone()),
-        api_server::spawn(args.socket.clone(), events.clone(), inputs_tx.clone())
-            .context("cannot start the API")?,
+        (
+            "probes",
+            probe::spawn(probe_rx, probes.clone(), probe_event_tx),
+        ),
+        ("sync", sync_net::spawn(offer_rx, inputs_tx.clone())),
+        ("statistics", stats::spawn(sys.clone(), rates.clone())),
+        (
+            "API",
+            api_server::spawn(args.socket.clone(), events.clone(), inputs_tx.clone())
+                .context("cannot start the API")?,
+        ),
     ];
-    tasks.push(fdb_guard::spawn(&sys, ports_rx, inputs_tx.clone()));
+    tasks.push((
+        "loop guard",
+        fdb_guard::spawn(&sys, ports_rx, inputs_tx.clone()),
+    ));
 
     let paths = Paths {
         config_dir: args.config_dir.clone(),
@@ -237,12 +248,22 @@ pub async fn run(args: Args) -> Result<()> {
                 info!("SIGHUP: reloading the configuration files");
                 ctl.reload_files().await;
             }
+            (name, why) = first_finished(&mut tasks) => {
+                // Exit without tearing anything down: systemd starts the
+                // daemon again, which adopts the existing interfaces.
+                for (_, task) in &tasks {
+                    task.abort();
+                }
+                anyhow::bail!(
+                    "internal error: the {name} service stopped ({why}); exiting so that systemd restarts wanderland"
+                );
+            }
             _ = sigterm.recv() => break,
             _ = sigint.recv() => break,
         }
     }
 
-    for task in tasks {
+    for (_, task) in tasks {
         task.abort();
     }
     info!("Stopping; removing everything wanderlan created");
@@ -252,6 +273,25 @@ pub async fn run(args: Args) -> Result<()> {
     let _ = std::fs::remove_file(&args.socket);
     info!("Stopped ({} changes undone)", removed.len());
     Ok(())
+}
+
+/// Waits until one of the background services ends (they never should).
+/// Must not be polled again after it returned.
+async fn first_finished(tasks: &mut [(&'static str, JoinHandle<()>)]) -> (&'static str, String) {
+    std::future::poll_fn(|cx| {
+        for (name, task) in tasks.iter_mut() {
+            if let std::task::Poll::Ready(result) = std::pin::Pin::new(task).poll(cx) {
+                let why = match result {
+                    Ok(()) => "it ended".to_string(),
+                    Err(e) if e.is_panic() => "it panicked, see above".to_string(),
+                    Err(e) => e.to_string(),
+                };
+                return std::task::Poll::Ready((*name, why));
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
 }
 
 /// Sleeps until the instant, or forever if there is none.
@@ -1073,8 +1113,9 @@ impl Controller {
 
     /// Back to the state after installation: everything wanderlan created is
     /// removed, the configuration files become the templates again and the
-    /// state (confirmed copies, invitations) is deleted.
-    async fn reset(&mut self) -> Result<Done, ApiError> {
+    /// state (confirmed copies, invitations) is deleted. Every step runs even
+    /// if an earlier one fails; the end state is checked afterwards.
+    async fn reset(&mut self) -> Result<ResetReport, ApiError> {
         if self.joining {
             return Err(ApiError::new(
                 "a join is in progress; wait until it has finished",
@@ -1091,18 +1132,48 @@ impl Controller {
         self.grace.clear();
         self.flushes.clear();
         self.invites.clear();
+        self.join_failures.clear();
+        self.generation += 1;
+        if let Ok(mut t) = self.probes.write() {
+            t.clear();
+        }
+        if let Ok(mut r) = self.rates.write() {
+            r.clear();
+        }
         self.publish();
-        let removed = reconcile::teardown(&self.sys, |c| info!("{c}"))
-            .await
-            .map_err(|e| ApiError::new(format!("cannot remove the interfaces: {e}")))?;
-        self.paths
-            .reset()
-            .map_err(|e| ApiError::new(format!("{e:#}")))?;
-        self.events.warn(format!(
-            "Reset: the bridge, the tunnels and all rules were removed ({} changes), the configuration and the invitations deleted; this site is unconfigured again. Other sites still list it until it is removed there (Sites, d).",
-            removed.len()
-        ));
-        Ok(Done {})
+        let mut problems = Vec::new();
+        let removed = match reconcile::teardown(&self.sys, |c| info!("{c}")).await {
+            Ok(changes) => changes.len(),
+            Err(e) => {
+                problems.push(format!("removing the interfaces and rules failed: {e}"));
+                0
+            }
+        };
+        if let Err(e) = self.paths.reset() {
+            problems.push(format!("{e:#}"));
+        }
+        match reconcile::Actual::observe(&self.sys).await {
+            Ok(actual) => {
+                let left: Vec<String> = reconcile::plan_teardown(&actual)
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect();
+                if !left.is_empty() {
+                    problems.push(format!("still present: {}", left.join("; ")));
+                }
+            }
+            Err(e) => problems.push(format!("cannot check the interfaces: {e}")),
+        }
+        problems.extend(self.paths.leftovers());
+        if problems.is_empty() {
+            self.events.warn(format!(
+                "Reset: the bridge, the tunnels and all rules were removed ({removed} changes), the configuration and the invitations deleted; this site is unconfigured again. Other sites still list it until it is removed there (Sites, d)."
+            ));
+        } else {
+            self.events
+                .error(format!("Reset incomplete: {}", problems.join("; ")));
+        }
+        Ok(ResetReport { removed, problems })
     }
 
     fn config_texts(&self) -> ConfigTexts {
@@ -1266,8 +1337,17 @@ impl Controller {
             )));
         }
         let fingerprint = config::fingerprint(&cfg.mesh);
+        // Only peers that stay peers (same name and address) and answer now
+        // count; a site of another or an old network must not block a change.
+        let current = self.direct_peers();
+        let relevant: BTreeSet<String> = topology::tunnels_for(&cfg.mesh, cfg.self_name())
+            .into_iter()
+            .filter(|t| current.get(&t.peer.name) == Some(&t.peer.address))
+            .map(|t| t.peer.name.clone())
+            .collect();
         let newer = self.probes.read().ok().and_then(|t| {
             t.iter()
+                .filter(|(name, p)| p.reachable && relevant.contains(*name))
                 .filter_map(|(name, p)| p.announce.map(|a| (name.clone(), a)))
                 .find(|(_, a)| a.revision > base && fingerprint_hex(&a.fingerprint) != fingerprint)
         });

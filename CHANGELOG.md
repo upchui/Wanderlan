@@ -67,6 +67,37 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
   the new site's VLANs, mappings and online state, unless it allowed the site
   to manage itself (`--self-managed`).
 
+### Robust operation
+
+- Reset under systemd: the unit protects `/var/lib` (`ProtectSystem=strict`),
+  so the reset failed with "Read-only file system"; it now empties
+  `/var/lib/wanderlan` instead of removing it. Every step of the reset runs
+  even if an earlier one fails, and the daemon checks the end state and
+  reports what is left. As root and outside containers the reset also
+  unloads the kernel module `ip_gre` if no other GRE tunnel uses it, so the
+  kernel's devices `gre0`, `gretap0` and `erspan0` disappear.
+- Starting a new network after a reset was refused ("peer … has a newer mesh
+  configuration") because announcements of the old network were kept; only
+  reachable peers of the new configuration count now.
+- Only one daemon runs: a second `wanderland` (e.g. typed instead of
+  `wanderlan`) stops without touching anything; it used to take over the API
+  socket and tear down the network when it was stopped. Started from a shell
+  without `--foreground`, `wanderland` only explains what it is. A deleted
+  API socket is created again within seconds.
+- `wanderlan join` returns once the inviting site has confirmed the new
+  site too, so `wanderlan online <site>` works right after it; `online`,
+  `offline` (and `manage`) wait for a pending join or synchronised change
+  instead of failing.
+- The daemon exits for a restart by systemd if one of its services stops;
+  panics are logged. The unit restarts it always (also after a kill) and
+  never gives up.
+- TUI: when the daemon is not reachable it shows the state of the service
+  and its last log lines; after a reset (also a failed one) everything is
+  reloaded; interface lists are always current and never offer the kernel's
+  fallback devices (`gre0`, …).
+- Tests: `scripts/systemd-test.sh` runs the package's hardened unit under
+  systemd through the steps users take (also in CI).
+
 ### More to see
 
 - Settings view (7): every setting with an explanation.

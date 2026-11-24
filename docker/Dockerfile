@@ -95,6 +95,27 @@ RUN cd /tmp/out \
 COPY tests/integration/node/ /usr/local/bin/
 ENTRYPOINT ["/usr/local/bin/node-entrypoint"]
 
+# A site that runs wanderland exactly like a real host: systemd as PID 1, the
+# hardened unit from the package (tests/systemd). Run privileged with a
+# private cgroup namespace.
+FROM ${DEBIAN_IMAGE} AS systemdnode
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      systemd systemd-sysv dbus iproute2 nftables iputils-ping jq procps kmod \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /out/ /tmp/out/
+RUN cd /tmp/out \
+ && apt-get update \
+ && apt-get install -y ./wanderlan_*.deb \
+ && rm -rf /var/lib/apt/lists/* /tmp/out
+COPY tests/integration/node/ /usr/local/bin/
+COPY tests/systemd/wl-node-setup /usr/local/bin/
+COPY tests/systemd/wl-node-setup.service /etc/systemd/system/
+RUN systemctl enable wl-node-setup.service wanderland.service \
+ && systemctl mask getty.target console-getty.service systemd-firstboot.service
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
+
 # Loads the kernel modules needed by the integration tests into the host
 # kernel (run privileged with /lib/modules mounted).
 FROM ubuntu:24.04 AS modloader

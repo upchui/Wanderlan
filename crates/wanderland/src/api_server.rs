@@ -18,36 +18,78 @@ use crate::events::EventLog;
 /// Group whose members may use the socket.
 const GROUP: &str = "wanderlan";
 
-/// Creates the socket and serves connections.
+/// How often the server checks that its socket file is still there.
+const SOCKET_CHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Identity of a socket file (device and inode).
+type FileId = (u64, u64);
+
+fn file_id(path: &Path) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .map(|m| (m.dev(), m.ino()))
+}
+
+/// Creates the socket and serves connections. If the socket file disappears
+/// or is replaced (someone deleted it, or a daemon started by mistake took
+/// it over), the server creates it again within a few seconds.
 pub fn spawn(
     path: PathBuf,
     events: Arc<EventLog>,
     inputs: mpsc::Sender<Input>,
 ) -> Result<JoinHandle<()>> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    }
-    match std::fs::remove_file(&path) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e).with_context(|| format!("cannot remove {}", path.display())),
-    }
-    let listener = UnixListener::bind(&path)
-        .with_context(|| format!("cannot listen on {}", path.display()))?;
-    restrict(&path)?;
+    let (mut listener, mut id) = bind(&path)?;
     Ok(tokio::spawn(async move {
+        let mut check = tokio::time::interval(SOCKET_CHECK);
+        check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    tokio::spawn(serve(stream, events.clone(), inputs.clone()));
-                }
-                Err(e) => {
-                    warn!("API socket accept failed: {e}");
-                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::select! {
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, _)) => {
+                        tokio::spawn(serve(stream, events.clone(), inputs.clone()));
+                    }
+                    Err(e) => {
+                        warn!("API socket accept failed: {e}");
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                },
+                _ = check.tick() => {
+                    if file_id(&path) == Some(id) {
+                        continue;
+                    }
+                    warn!(
+                        "The API socket {} was removed or replaced; creating it again",
+                        path.display()
+                    );
+                    match bind(&path) {
+                        Ok((l, i)) => {
+                            listener = l;
+                            id = i;
+                        }
+                        Err(e) => warn!("{e:#}; retrying in {} s", SOCKET_CHECK.as_secs()),
+                    }
                 }
             }
         }
     }))
+}
+
+/// Creates the socket file (replacing a stale one) with its permissions.
+fn bind(path: &Path) -> Result<(UnixListener, FileId)> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e).with_context(|| format!("cannot remove {}", path.display())),
+    }
+    let listener =
+        UnixListener::bind(path).with_context(|| format!("cannot listen on {}", path.display()))?;
+    restrict(path)?;
+    let id = file_id(path).with_context(|| format!("{} disappeared", path.display()))?;
+    Ok((listener, id))
 }
 
 /// Socket permissions: owner root, group wanderlan, mode 0660.

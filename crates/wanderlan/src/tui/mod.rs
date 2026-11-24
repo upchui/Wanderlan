@@ -106,6 +106,8 @@ struct Connection {
 enum Wake {
     Terminal(Option<io::Result<TermEvent>>),
     Answer(u64, Msg),
+    /// Result of local work (independent of the connection).
+    Local(Msg),
     DaemonEvent(Option<api::Event>),
     Tick,
 }
@@ -120,6 +122,7 @@ async fn next_daemon_event(conn: &mut Option<Connection>) -> Option<api::Event> 
 async fn event_loop(terminal: &mut Term, socket: &Path, mouse: bool) -> Result<()> {
     let mut app = App::new(socket.display().to_string(), mouse);
     let (answers_tx, mut answers) = mpsc::unbounded_channel::<(u64, Msg)>();
+    let (local_tx, mut local) = mpsc::unbounded_channel::<Msg>();
     let mut conn: Option<Connection> = None;
     let mut generation = 0u64;
     let mut input = EventStream::new();
@@ -151,6 +154,19 @@ async fn event_loop(terminal: &mut Term, socket: &Path, mouse: bool) -> Result<(
                     };
                     effects.extend(app.update(msg));
                 }
+                Effect::Diagnose => {
+                    let tx = local_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _ = tx.send(Msg::Diagnosis(crate::service::diagnose(6)));
+                    });
+                }
+                Effect::KernelCleanup(interfaces) => {
+                    let tx = local_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let result = crate::kernel::remove_gre_fallback(&interfaces);
+                        let _ = tx.send(Msg::KernelCleaned(result.message()));
+                    });
+                }
                 Effect::Request(request) => {
                     if let Some(c) = &conn {
                         let client = c.client.clone();
@@ -172,6 +188,7 @@ async fn event_loop(terminal: &mut Term, socket: &Path, mouse: bool) -> Result<(
         let wake = tokio::select! {
             ev = input.next() => Wake::Terminal(ev),
             Some((generation, msg)) = answers.recv() => Wake::Answer(generation, msg),
+            Some(msg) = local.recv() => Wake::Local(msg),
             ev = next_daemon_event(&mut conn) => Wake::DaemonEvent(ev),
             _ = tick.tick() => Wake::Tick,
         };
@@ -186,6 +203,7 @@ async fn event_loop(terminal: &mut Term, socket: &Path, mouse: bool) -> Result<(
             Wake::Terminal(Some(Ok(_))) => continue,
             Wake::Answer(g, msg) if conn.as_ref().is_some_and(|c| c.generation == g) => msg,
             Wake::Answer(..) => continue,
+            Wake::Local(msg) => msg,
             Wake::DaemonEvent(Some(event)) => Msg::Event(event),
             Wake::DaemonEvent(None) => {
                 conn = None;
@@ -213,12 +231,12 @@ async fn perform(client: &Client, request: Request) -> Result<Reply, ClientError
         }
         r @ Request::Invite(_) => Reply::Invitation(client.call(r).await?),
         r @ Request::Join(_) => Reply::Joined(client.call(r).await?),
+        r @ Request::Reset => Reply::Reset(client.call(r).await?),
         r @ Request::Invites => Reply::Invites(client.call(r).await?),
         r @ (Request::Rollback
         | Request::Unblock(_)
         | Request::ProbeNow
-        | Request::DeleteInvite(_)
-        | Request::Reset) => {
+        | Request::DeleteInvite(_)) => {
             let _: api::Done = client.call(r).await?;
             Reply::Done
         }

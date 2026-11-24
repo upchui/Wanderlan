@@ -26,3 +26,31 @@ else
   daemon_log_since site4 "$mark"
 fi
 expect_ping c-site4 10.20.0.13 "VLAN 20: site4 reaches site5"
+
+begin "A second daemon started by mistake changes nothing"
+
+mark=$(daemon_log_lines site4)
+out=$(x site4 "timeout 10 wanderland; echo \"exit=\$?\"" 2>&1)
+if grep -q 'already running' <<<"$out" && grep -q 'exit=1' <<<"$out"; then
+  pass "a second wanderland refuses to start"
+else
+  fail "unexpected output of a second wanderland: $out"
+fi
+out=$(x site4 "script -qec 'timeout 10 wanderland' /dev/null; echo \"exit=\$?\"" 2>&1)
+if grep -q 'The user interface is `wanderlan`' <<<"$out" && grep -q 'exit=2' <<<"$out"; then
+  pass "started from a terminal, wanderland only explains what it is"
+else
+  fail "unexpected output of wanderland in a terminal: $out"
+fi
+check "the API socket is still there" x site4 "test -S /run/wanderlan/wanderlan.sock"
+check "the tunnels are still there" x site4 "ip link show gt-site5 >/dev/null"
+changes=$(daemon_log_since site4 "$mark" | grep -cE "$CHANGE_RE" || true)
+check "the running daemon changed nothing ($changes changes)" test "$changes" = 0
+expect_ping c-site4 10.20.0.13 "VLAN 20: site4 still reaches site5"
+
+begin "A deleted API socket is created again"
+
+x site4 "rm -f /run/wanderlan/wanderlan.sock"
+wait_for 15 "the daemon created its socket again" \
+  x site4 "wanderlan status --json | jq -e '.state == \"running\"'"
+check "the log explains it" x site4 "grep -q 'was removed or replaced; creating it again' /var/log/wanderland.log"
