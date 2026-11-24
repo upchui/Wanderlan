@@ -1,0 +1,28 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MAC table  5 Log  6 Setup           "
+"┌ Shared VLANs (v) ────────────────────────────────────────────────────────────┐"
+"│ 10-50  (41 VLANs, stretched across all sites)                                │"
+"│ Untagged traffic is not bridged unless a site maps it (native).              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"┌ VLAN mappings: 2 (1 with conflicts) ─────────────────────────────────────────┐"
+"│#   SITE           LOCAL    SHARED   MEANING                                  │"
+"│1   haus3          native   20       untagged at haus3 = shared VLAN 20       │"
+"│2   haus3          130      20 !     VLAN 130 at haus3 = shared VLAN 20       │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"error: site "haus3" maps two local VLANs onto shared VLAN 20 (map #1 and #2)    "
+"                                                                                "
+"                                                                                "
+"                                                     draft: 1 error(s)  heim r7 "
+" v  VLANs   n  new map   e  edit   d  delete   a  apply   x  discard   ?  help  "

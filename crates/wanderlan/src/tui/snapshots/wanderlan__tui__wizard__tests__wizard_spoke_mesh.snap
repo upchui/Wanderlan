@@ -1,0 +1,25 @@
+---
+source: crates/wanderlan/src/tui/wizard.rs
+expression: render_mesh(&mesh)
+---
+# wanderlan mesh configuration, shared by all sites.
+# This file is kept identical on all sites by the wanderlan daemon.
+# Change it with the `wanderlan` TUI or edit it and run `wanderlan apply`.
+
+[mesh]
+revision = 0
+vlans = "10-50"
+control_port = 51821
+mtu_probe_interval = "5m"
+commit_timeout = "1m"
+
+[[site]]
+name = "haus4"
+role = "spoke"
+hub = "heim"
+address = "10.8.0.14"
+
+[[site]]
+name = "heim"
+role = "hub"
+address = "10.8.0.1"

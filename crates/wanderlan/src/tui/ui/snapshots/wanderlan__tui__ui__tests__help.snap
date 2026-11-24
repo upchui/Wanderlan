@@ -1,0 +1,28 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MAC table  5 Log  6 Setup           "
+"┌ Help (Esc closes, Up/Down scrolls) ──────────────────────────────────────────┐"
+"│ Everywhere                                                                   │"
+"│   1-6, Tab            switch view (Shift-Tab: previous)                      │"
+"│   a                   review the draft (diff) and apply it                   │"
+"│   x                   discard the draft                                      │"
+"│   c                   confirm a pending change                               │"
+"│   r                   roll a pending change back now                         │"
+"│   ?                   this help                                              │"
+"│   q                   quit (asks if the draft has unapplied changes)         │"
+"│   Ctrl-C              quit immediately                                       │"
+"│                                                                              │"
+"│ 1 Overview                                                                   │"
+"│   Up/Down             select a peer                                          │"
+"│   u                   unblock the port of the peer (loop guard)              │"
+"│   p                   measure the path MTU to all peers now                  │"
+"│   Green: reachable and up. Yellow: degraded (port down, config differs, late │"
+"│   replies). Red: unreachable or blocked by the loop guard.                   │"
+"│                                                                              │"
+"│ 2 Sites                                                                      │"
+"│   Up/Down             select a site                                          │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                                     draft: no changes  heim r7 "
+" Up/Down  scroll   Esc  close                                                   "

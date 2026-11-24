@@ -1,0 +1,28 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MAC table  5 Log  6 Setup           "
+"┌ Setup: Welcome ──────────────────────────────────────────────────────────────┐"
+"│                                                                              │"
+"│ wanderlan stretches VLANs across sites on layer 2. It does not build a VPN:  │"
+"│ the sites must already reach each other through an existing transport        │"
+"│ network (usually a VPN), and every site has an address in it.                │"
+"│                                                                              │"
+"│ This wizard creates a minimal configuration: this site and one peer that     │"
+"│ already runs wanderlan. The full mesh configuration then arrives             │"
+"│ automatically from that peer as soon as the peer lists this site.            │"
+"│                                                                              │"
+"│ Press Enter to start, Esc to leave the setup.                                │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                                                unconfigured r0 "
+" Enter  start   Esc  leave setup   ?  help   q  quit                            "

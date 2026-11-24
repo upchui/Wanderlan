@@ -1,0 +1,28 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MAC table  5 Log  6 Setup           "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"   ┌ Daemon not reachable ──────────────────────────────────────────────────┐   "
+"   │the wanderlan daemon is not running (/run/wanderlan/wanderlan.sock does │   "
+"   │not exist); start it with `systemctl start wanderland`                  │   "
+"   │                                                                        │   "
+"   │Retrying in 2 s (attempt 1). The TUI keeps running; the draft is kept.  │   "
+"   │                                                                        │   "
+"   │Socket: /run/wanderlan/wanderlan.sock (change with --socket or          │   "
+"   │WANDERLAN_SOCKET)                                                       │   "
+"   │                                                                        │   "
+"   │                                                                        │   "
+"   └────────────────────────────────────────────────────────────────────────┘   "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                        offline "
+" 1-6  views   ?  help   q  quit                                                 "

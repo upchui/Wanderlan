@@ -1,0 +1,28 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MAC table  5 Log  6 Setup           "
+"┌ Review: draft against the running configuration ─────────────────────────────┐"
+"│--- mesh.toml (running)                                                       │"
+"│+++ mesh.toml (draft)                                                         │"
+"│@@ -4,7 +4,7 @@                                                               │"
+"│                                                                              │"
+"│ [mesh]                                                                       │"
+"│ revision = 7                                                                 │"
+"│-vlans = "10-50"                                                              │"
+"│+vlans = "10-60"                                                              │"
+"│ control_port = 51821                                                         │"
+"│ mtu_probe_interval = "5m"                                                    │"
+"│ commit_timeout = "1m"                                                        │"
+"│                                                                              │"
+"│local.toml: unchanged                                                         │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│──────────────────────────────────────────────────────────────────────────────│"
+"│Enter applies the change. Then confirm it with c within 1m; otherwise it is   │"
+"│rolled back automatically.                                                    │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                                       draft: modified  heim r7 "
+" Enter  apply   Up/Down  scroll   Esc  back                                     "

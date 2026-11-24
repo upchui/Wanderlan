@@ -1,0 +1,28 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MAC table  5 Log  6 Setup           "
+" Filter                           sorted by MAC (asc)  6 of 6 entries           "
+"┌ Learned MAC addresses ───────────────────────────────────────────────────────┐"
+"│MAC               VLAN  PORT            SITE         AGE                      │"
+"│02:00:00:00:00:01 10    ens19           this site    0s                       │"
+"│3c:ec:ef:00:11:22 -     ens19           this site    -                        │"
+"│52:54:00:12:34:56 20    gt-buero        buero        12s                      │"
+"│52:54:00:aa:00:01 30    gt-buero        buero        2m                       │"
+"│52:54:00:ab:cd:ef 20    gt-haus2        haus2        45s                      │"
+"│de:ad:be:ef:00:01 10    gt-haus5        haus5        5s                       │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                                     draft: no changes  heim r7 "
+" /  filter   s  sort   o  order   1-6  views   ?  help   q  quit                "

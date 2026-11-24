@@ -1,0 +1,28 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MAC table  5 Log  6 Setup           "
+" Level all  Peer all  following  6 of 6 events                                  "
+"┌ Events (times in UTC) ───────────────────────────────────────────────────────┐"
+"│-- 2026-11-24 --                                                              │"
+"│10:00:00 info  -            daemon started, mesh revision 7                   │"
+"│10:00:02 info  buero        tunnel gt-buero is up                             │"
+"│10:00:03 info  buero        path MTU to buero is 1420, MSS 1338               │"
+"│10:01:05 warn  haus5        haus5 runs mesh revision 6 with a different       │"
+"│                            configuration; it will be updated by the sync     │"
+"│10:02:10 error haus2        loop detected on gt-haus2: own frames came back;  │"
+"│                            the port is blocked                               │"
+"│10:06:40 warn  haus6        haus6 does not answer control probes              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                                     draft: no changes  heim r7 "
+" l  level   p  peer   Up/Down  scroll   End  follow   1-6  views   ?  help      "
