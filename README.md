@@ -423,7 +423,10 @@ and an in-memory implementation), `wanderland` (daemon) and `wanderlan`
 One-time setup:
 
 1. Create the signing key (RSA 4096) outside the repository:
-   `scripts/gen-apt-key.sh ~/wanderlan-apt-key`.
+   `scripts/gen-apt-key.sh ~/wanderlan-apt-key`, and commit its public part
+   as `key.gpg` in the repository root (the release publishes it as
+   `key.gpg` on GitHub Pages as well). Current key fingerprint:
+   `F6C4 00CF 318B FD47 E3A6  B8A7 7BC2 D7AE 6699 82D4`.
 2. Store `private.asc` as the repository secret `APT_GPG_PRIVATE_KEY`
    (Settings → Secrets and variables → Actions) and keep a backup offline.
 3. After the first release, set GitHub Pages to "Deploy from a branch",
