@@ -19,7 +19,7 @@ use wanderlan_core::api::{
 };
 use wanderlan_core::config::{Diagnostic, has_errors, render_local, render_mesh};
 use wanderlan_core::policy;
-use wanderlan_core::topology::gretap_name;
+use wanderlan_core::topology::{self, gretap_name};
 
 use super::diff::{self, DiffLine};
 use super::draft::{Draft, Running};
@@ -1785,10 +1785,24 @@ impl App {
         };
         let selected = self.sites_selected;
         let count = draft.mesh.sites.len();
+        // Up/Down follow the tree shown (servers with their clients below).
+        let order: Vec<usize> = topology::tree_order(&draft.mesh)
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
+        let row = order
+            .iter()
+            .position(|i| *i == selected)
+            .unwrap_or_default();
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => self.sites_selected = selected.saturating_sub(1),
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.sites_selected = order.get(row.saturating_sub(1)).copied().unwrap_or(0);
+            }
             KeyCode::Down | KeyCode::Char('j') => {
-                self.sites_selected = (selected + 1).min(count.saturating_sub(1));
+                self.sites_selected = order
+                    .get((row + 1).min(order.len().saturating_sub(1)))
+                    .copied()
+                    .unwrap_or(0);
             }
             KeyCode::Char('n') => self.modal = Some(Modal::Form(Form::site(draft, None))),
             KeyCode::Enter | KeyCode::Char('e') if selected < count => {

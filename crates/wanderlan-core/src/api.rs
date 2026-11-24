@@ -461,6 +461,9 @@ pub struct PeerStatus {
     /// The local trunk this tunnel is bridged with.
     #[serde(default)]
     pub trunk: String,
+    /// For a client of this site: why its last change was not taken over.
+    #[serde(default)]
+    pub refused: Option<String>,
     /// The peer answers control probes.
     pub reachable: bool,
     /// Seconds since the last answered probe.
@@ -557,6 +560,10 @@ pub struct Status {
     /// trunks of single tunnels (each a segment of its own).
     #[serde(default)]
     pub trunks: Vec<PortTraffic>,
+    /// On a client: why its own change was not taken over by its server
+    /// (the server's state applies again).
+    #[serde(default)]
+    pub sync_problem: Option<String>,
 }
 
 fn online_default() -> bool {

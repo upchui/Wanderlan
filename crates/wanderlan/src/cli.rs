@@ -917,6 +917,9 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
     if let Some(e) = &st.last_error {
         println!("ERROR: {e}");
     }
+    if let Some(problem) = &st.sync_problem {
+        println!("WARNING: {problem}");
+    }
     if st.invites > 0 {
         println!(
             "{} open invitation(s) (`wanderlan invite list`)",
@@ -925,7 +928,14 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
     }
     if !st.sites.is_empty() {
         println!("\n{:<12} {:<15} {:<18} LINK", "SITE", "ADDRESS", "ROLE");
-        for s in &st.sites {
+        // Servers, each with its clients below.
+        let pairs: Vec<(&str, Option<&str>)> = st
+            .sites
+            .iter()
+            .map(|s| (s.name.as_str(), s.uplink.as_deref()))
+            .collect();
+        for (i, depth) in wanderlan_core::topology::tree_order_by(&pairs) {
+            let s = &st.sites[i];
             let link = if s.is_self {
                 "this site".to_string()
             } else if let Some(hop) = &s.via {
@@ -937,7 +947,7 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
             };
             println!(
                 "{:<12} {:<15} {:<18} {link}",
-                s.name,
+                wanderlan_core::topology::tree_name(&s.name, depth),
                 s.address,
                 role_text(s.uplink.as_deref())
             );
@@ -964,6 +974,13 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
             rate(p.rx_bps),
             rate(p.tx_bps),
             p.vlans,
+        );
+    }
+    for p in st.peers.iter().filter(|p| p.refused.is_some()) {
+        println!(
+            "CHANGE REFUSED from {}: {}",
+            p.name,
+            p.refused.as_deref().unwrap_or_default()
         );
     }
     Ok(ExitCode::SUCCESS)

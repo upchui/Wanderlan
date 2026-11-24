@@ -3,7 +3,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::netlink::Netlink;
-use super::nft::{MssRule, NftCli, NftOps};
+use super::nft::{CachedNft, MssRule, NftCli, NftOps};
+
+/// How long the MSS rules read from nftables are trusted.
+const NFT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 use super::tc::{IfTc, TcOps, TcRule};
 use super::{
     BridgeOptions, GretapParams, LinkState, LinkUpdate, NetOps, PortVlans, SysResult, VlanFlags,
@@ -14,8 +17,8 @@ use super::{
 pub struct LinuxSystem {
     /// rtnetlink backend.
     pub net: Netlink,
-    /// nftables backend.
-    pub nft: NftCli,
+    /// nftables backend (reads of the MSS rules are cached).
+    pub nft: CachedNft<NftCli>,
 }
 
 impl LinuxSystem {
@@ -23,7 +26,7 @@ impl LinuxSystem {
     pub fn connect() -> SysResult<Self> {
         Ok(Self {
             net: Netlink::connect()?,
-            nft: NftCli,
+            nft: CachedNft::new(NftCli, NFT_CACHE_TTL),
         })
     }
 }

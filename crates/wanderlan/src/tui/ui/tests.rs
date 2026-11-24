@@ -237,3 +237,54 @@ fn invite_form() {
     key(&mut app, KeyCode::Char('i'));
     insta::assert_snapshot!(render(&app));
 }
+
+#[test]
+fn overview_with_refused_client() {
+    let mut app = connected();
+    let mut status = fixtures::status();
+    status.peers[3].refused = Some("site \"heim\" is already used".into());
+    reply(&mut app, Request::Status, Reply::Status(Box::new(status)));
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
+fn peer_details_refused() {
+    let mut app = connected();
+    let mut status = fixtures::status();
+    status.peers[0].refused = Some("site \"heim\" is already used".into());
+    reply(&mut app, Request::Status, Reply::Status(Box::new(status)));
+    key(&mut app, KeyCode::Enter);
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
+fn overview_with_sync_problem() {
+    let mut app = connected();
+    let mut status = fixtures::status();
+    status.sync_problem =
+        Some("Your change was not taken over by \"buero\": site \"haus9\" is already used".into());
+    reply(&mut app, Request::Status, Reply::Status(Box::new(status)));
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
+fn sites_as_tree() {
+    let mut app = connected();
+    if let Some(d) = &mut app.draft {
+        // haus2 becomes a client of heim: it moves up below heim, next to haus6.
+        d.mesh.sites[2].uplink = Some("heim".into());
+        d.revalidate();
+    }
+    key(&mut app, KeyCode::Char('2'));
+    // Down twice from heim: haus2, then haus6 (the tree order, not the file order).
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    assert_eq!(app.sites_selected, 5);
+    key(&mut app, KeyCode::Down);
+    assert_eq!(
+        app.sites_selected, 1,
+        "after the clients of heim comes buero"
+    );
+    key(&mut app, KeyCode::Up);
+    insta::assert_snapshot!(render(&app));
+}

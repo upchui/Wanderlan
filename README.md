@@ -393,7 +393,15 @@ TCP and applies it; a server that sees changes of one of its clients fetches
 the client's part and takes over what the client is responsible for (itself,
 its own clients, the network settings), checked against its rights. Changes
 received this way are confirmed automatically as soon as a neighbour answers
-with them in effect.
+with them in effect. A newer revision with the same content (a change
+elsewhere in the network that does not concern this site) is taken over
+without applying anything.
+
+If a server cannot take over a change of its client (e.g. a new client with a
+name that is already used in the network), it marks the client as `refused`
+and tells it why. After 15 s the client takes the server's configuration
+back and shows the reason in its overview and in `wanderlan status`. A
+refused configuration is not fetched again for 10 minutes.
 
 A change that is based on an outdated revision is refused ("wait for the
 sync, reload and try again"), so concurrent edits do not silently overwrite
@@ -439,8 +447,8 @@ and in 80×24 (`--mouse` enables the mouse). `?` shows all keys.
 
 | Key | View |
 |-----|------|
-| `1` | Overview: this site with its role, the tunnel neighbours live (reply, round trip, path MTU, MSS, port state, MAC addresses, throughput, config in sync), traffic of the tunnels and of every trunk, and all known sites with role and link (`via hq` for sites without a tunnel from here). `Enter` on a neighbour: traffic graph, round-trip history, min/avg/max round trip, jitter, probe loss, latency, counters. |
-| `2` | Sites: name, address, VLANs, role, manager, tunnel. Invite (`i`), open invitations (`I`), online/offline (`o`), new (`n`), edit (`Enter`: VLANs, "Changes", "Connected to"), delete (`d`). |
+| `1` | Overview: this site with its role, the tunnel neighbours live (reply, round trip, path MTU, MSS, port state, MAC addresses, throughput, config in sync or `refused`), traffic of the tunnels and of every trunk, and all known sites with role and link (`via hq` for sites without a tunnel from here), each server with its clients indented below. `Enter` on a neighbour: traffic graph, round-trip history, min/avg/max round trip, jitter, probe loss, latency, counters. |
+| `2` | Sites: name, address, VLANs, role, manager, tunnel; clients indented below their server. Invite (`i`), open invitations (`I`), online/offline (`o`), new (`n`), edit (`Enter`: VLANs, "Changes", "Connected to"), delete (`d`). |
 | `3` | VLANs: the VLANs of the network (`v`), the own VLANs of this site (`o`) and the mappings (`n`, `Enter`, `d`) with their site and its role; conflicts are marked right away. |
 | `4` | MAC addresses: filter (`/`), sort (`s`, `o`). |
 | `5` | Log: live events, filter by level (`l`) and site (`p`). |
@@ -518,6 +526,13 @@ or `WANDERLAN_SOCKET`.
   `wanderlan confirm`).
 * **A change did not arrive at a site**: `wanderlan log` there and on its
   server shows why (e.g. not allowed for that site, or invalid there).
+* **"Your change was not taken over by …"** on a client, or `refused` in
+  the CONFIG column of its server: the server could not take over the
+  client's change; the reason follows (e.g. the name of a new client is
+  already used in the network, where the client cannot see it). The client
+  runs with the server's configuration again; correct the change and apply
+  it once more. The message goes away with the next change confirmed on the
+  client.
 
 ## Project decisions
 

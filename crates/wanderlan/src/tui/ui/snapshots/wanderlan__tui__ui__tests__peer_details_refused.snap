@@ -1,0 +1,28 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+"┌ buero (10.8.0.2) via gt-buero   Esc: close ──────────────────────────────────┐"
+"│ Tunnel       up   reachable   config change REFUSED                          │"
+"│ Round trip   12ms  min 11ms avg 13ms max 16ms  jitter 0.7ms                  │"
+"│ Probe loss   0 % of 60 probes   latency ~6.3ms one way (round trip / 2)      │"
+"│ Path MTU     1420   TCP MSS 1338   MACs behind it 12                         │"
+"│ VLANs        10-50   trunk ens19                                             │"
+"│ Received     1.2Mbit/s now, 1.2 GB in 1000000 pkts, 0 err, 0 drop            │"
+"│ Sent         345.6kbit/s now, 345.7 MB in 400000 pkts, 0 err, 0 drop         │"
+"│ Refused      site "heim" is already used                                     │"
+"│┌ Traffic (bit/s, last samples) ─────────────────────────────────────────────┐│"
+"││1.4M│                                                                     ⠠⠄││"
+"││    │                                                                       ││"
+"││    │                                                                       ││"
+"││    │                                                                       ││"
+"││    │                                                                       ││"
+"││    │                                                                     ⠈⠁││"
+"││0   │                                                                       ││"
+"│└────────────────────────────────────────────────────────────────────────────┘│"
+"│ Round trip   ██                                                              │"
+"│ history      ██                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                                     draft: no changes  heim r7 "
+" Esc  close                                                                     "

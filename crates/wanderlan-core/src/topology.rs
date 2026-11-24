@@ -149,6 +149,65 @@ pub fn via<'a>(mesh: &'a Mesh, from: &str, to: &str) -> Option<&'a str> {
     (next != to).then_some(next)
 }
 
+/// Display order of sites given as `(name, uplink)`: every server (or site
+/// whose uplink is unknown here), each followed by its clients, recursively.
+/// Returns `(index, depth)`; sites in an uplink loop come last at depth 0.
+pub fn tree_order_by<'a>(sites: &[(&'a str, Option<&'a str>)]) -> Vec<(usize, usize)> {
+    fn add<'a>(
+        sites: &[(&'a str, Option<&'a str>)],
+        index: usize,
+        depth: usize,
+        seen: &mut Vec<bool>,
+        out: &mut Vec<(usize, usize)>,
+    ) {
+        if seen.get(index).copied().unwrap_or(true) {
+            return;
+        }
+        if let Some(s) = seen.get_mut(index) {
+            *s = true;
+        }
+        out.push((index, depth));
+        let name = sites.get(index).map(|s| s.0);
+        for (child, (_, uplink)) in sites.iter().enumerate() {
+            if uplink.is_some() && *uplink == name {
+                add(sites, child, depth + 1, seen, out);
+            }
+        }
+    }
+    let mut seen = vec![false; sites.len()];
+    let mut out = Vec::with_capacity(sites.len());
+    for (i, (_, uplink)) in sites.iter().enumerate() {
+        let root = uplink.is_none_or(|u| !sites.iter().any(|(n, _)| *n == u));
+        if root {
+            add(sites, i, 0, &mut seen, &mut out);
+        }
+    }
+    for i in 0..sites.len() {
+        if !seen.get(i).copied().unwrap_or(true) {
+            add(sites, i, 0, &mut seen, &mut out);
+        }
+    }
+    out
+}
+
+/// A site name indented below its server: `alex`, `└ marcel`, `  └ x`.
+pub fn tree_name(name: &str, depth: usize) -> String {
+    match depth {
+        0 => name.to_string(),
+        d => format!("{}└ {name}", "  ".repeat(d - 1)),
+    }
+}
+
+/// [`tree_order_by`] for the sites of a mesh.
+pub fn tree_order(mesh: &Mesh) -> Vec<(usize, usize)> {
+    let sites: Vec<(&str, Option<&str>)> = mesh
+        .sites
+        .iter()
+        .map(|s| (s.name.as_str(), s.uplink.as_deref()))
+        .collect();
+    tree_order_by(&sites)
+}
+
 /// Everything about the mesh that determines over which ports frames
 /// travel: the tunnels and whether they connect servers. Two meshes with the
 /// same key have the same layer-2 paths, so learned MAC addresses stay
@@ -266,6 +325,34 @@ mod tests {
         assert_eq!(via(&mesh, "x", "site2"), Some("marcel"));
         assert_eq!(via(&mesh, "x", "x"), None);
         assert_eq!(via(&mesh, "x", "nowhere"), None);
+    }
+
+    #[test]
+    fn the_tree_order_puts_clients_under_their_server() {
+        let mesh = with_clients();
+        let order: Vec<(&str, usize)> = tree_order(&mesh)
+            .into_iter()
+            .map(|(i, d)| (mesh.sites[i].name.as_str(), d))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("alex", 0),
+                ("marcel", 1),
+                ("x", 2),
+                ("site2", 1),
+                ("dc", 0)
+            ]
+        );
+        // A loop does not hang and nothing is lost.
+        let looped = [("a", Some("b")), ("b", Some("a")), ("c", None)];
+        assert_eq!(tree_order_by(&looped).len(), 3);
+        // A client's view: its server (no uplink there) is the root.
+        let view = [("site2", Some("alex")), ("alex", None)];
+        assert_eq!(tree_order_by(&view), [(1, 0), (0, 1)]);
+        assert_eq!(tree_name("alex", 0), "alex");
+        assert_eq!(tree_name("marcel", 1), "└ marcel");
+        assert_eq!(tree_name("x", 2), "  └ x");
     }
 
     #[test]

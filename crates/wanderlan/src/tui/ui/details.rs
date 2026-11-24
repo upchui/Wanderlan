@@ -98,13 +98,14 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, area: Rect) {
     ])
     .areas(inner);
 
-    let config = match (peer.revision, peer.in_sync) {
-        (Some(r), Some(true)) => format!("revision {r}, same as here"),
-        (Some(r), Some(false)) => format!("revision {r}, DIFFERS"),
-        (Some(r), None) => format!("revision {r}"),
-        (None, _) => "-".into(),
+    let config = match (&peer.refused, peer.revision, peer.in_sync) {
+        (Some(_), _, _) => "change REFUSED".to_string(),
+        (None, Some(r), Some(true)) => format!("revision {r}, same as here"),
+        (None, Some(r), Some(false)) => format!("revision {r}, DIFFERS"),
+        (None, Some(r), None) => format!("revision {r}"),
+        (None, None, _) => "-".into(),
     };
-    let lines = vec![
+    let mut lines = vec![
         Line::from(vec![
             label("Tunnel"),
             Span::styled(port_state(peer.port_state).to_string(), health_style(peer)),
@@ -149,6 +150,12 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, area: Rect) {
             Span::raw(format!(" now, {}", counters(&peer.traffic, false))),
         ]),
     ];
+    if let Some(reason) = &peer.refused {
+        lines.push(Line::from(vec![
+            label("Refused"),
+            Span::styled(reason.clone(), theme::bad()),
+        ]));
+    }
     frame.render_widget(Paragraph::new(lines), facts);
 
     let samples: Vec<_> = app

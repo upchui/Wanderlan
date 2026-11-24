@@ -1,0 +1,28 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+"┌ Sites (draft): 6 ────────────────────────────────────────────────────────────┐"
+"│  NAME         ADDRESS         VLANS     ROLE            MANAGED BY TUNNEL    │"
+"│  heim         10.8.0.1        10-50     server          anyone     this site │"
+"│* └ haus2      10.8.0.11       20,30     client of heim  anyone     BLOCKED   │"
+"│  └ haus6      10.8.0.16       10-50     client of heim  buero      offline   │"
+"│  buero        10.8.0.2        10-50     server          anyone     up        │"
+"│  haus3        10.8.0.12       10-50     server          anyone     up        │"
+"│  haus5        10.8.0.15       10-50     server          anyone     up        │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" haus6: client of heim; VLANs and online state changed by buero (Enter: edit).  "
+"                                                                                "
+"                                                                                "
+"┌ Network settings (m) ────────────────┐┌ This host (l) ───────────────────────┐"
+"│ Default VLANs   10-50 (41 VLANs)     ││ This site       heim                 │"
+"│ Control port    51821                ││ Trunk           ens19                │"
+"│ MTU probe every 5m                   ││                                      │"
+"│ Commit timeout  1m                   ││ Only on this host (local.toml).      │"
+"│ MSS             from path MTU        ││                                      │"
+"└──────────────────────────────────────┘└──────────────────────────────────────┘"
+"                                                       draft: modified  heim r7 "
+" i  invite   I  invites   o  online   e  edit   d  delete   a  apply            "

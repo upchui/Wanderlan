@@ -234,6 +234,42 @@ else
   fail "unexpected answer for a used code: $reply"
 fi
 
+begin "Sync: a server refuses a change of its client"
+
+# site5 (a client of site2) adds a client of its own named like a site it
+# does not see: valid on site5, but the name is taken in the network.
+x site5 "printf '\n[[site]]\nname = \"site1\"\naddress = \"10.100.99.10\"\nuplink = \"site5\"\n' | cat /etc/wanderlan/mesh.toml - > /tmp/taken-name.toml"
+check "site5 adds a client named \"site1\"" \
+  x site5 "wanderlan apply --mesh /tmp/taken-name.toml >/dev/null && wanderlan confirm >/dev/null"
+wait_for 15 "site2 marks the change of site5 as refused" \
+  x site2 "wanderlan status --json | jq -e '.peers[] | select(.name == \"site5\") | .refused | test(\"already used\")'"
+check "site2's log says why" \
+  x site2 "wanderlan log | grep -q 'Not taking over the changes of client \"site5\"'"
+wait_eq 45 "site5 takes site2's configuration back" "site2 site5" \
+  jqs site5 '[.sites[].name] | sort | join(" ")'
+check "site5's status tells why" \
+  x site5 "wanderlan status | grep -q 'WARNING: Your change was not taken over by \"site2\": .*already used'"
+check "site5's log tells why" x site5 "wanderlan log | grep -q 'not taken over by \"site2\"'"
+wait_eq 30 "site2 no longer marks site5" null \
+  jqs site2 '.peers[] | select(.name == "site5") | .refused'
+wait_for 30 "site5 has no tunnel to the made-up site" x site5 "! ip link show gt-site1 2>/dev/null"
+
+begin "Sync: a new revision without new content is taken over silently"
+
+mark=$(daemon_log_lines site5)
+check "site1 lets only itself change site3" x site1 "wanderlan manage site3 --by site1 --confirm"
+check "and anyone again" x site1 "wanderlan manage site3 --anyone --confirm"
+rev=$(jqs site1 .revision)
+wait_eq 60 "site5 has revision $rev too (site3 is not in its view)" "$rev" jqs site5 .revision
+applied=$(daemon_log_since site5 "$mark" | grep -c 'was applied' || true)
+if [ "$applied" = 0 ]; then
+  pass "site5 took the revision over without applying anything"
+else
+  fail "site5 applied the new revision $applied time(s)"
+  daemon_log_since site5 "$mark"
+fi
+check "nothing is pending on site5" test "$(jqs site5 .pending)" = null
+
 begin "Join: a site that never comes up is removed again"
 
 code2=$(x site2 "wanderlan invite" | code_of)

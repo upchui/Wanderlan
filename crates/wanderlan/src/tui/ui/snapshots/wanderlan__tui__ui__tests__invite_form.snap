@@ -6,7 +6,7 @@ expression: render(&app)
 "┌ Sites (draft): 6 ────────────────────────────────────────────────────────────┐"
 "│  NAME         ADDRESS         VLANS     ROLE            MANAGED BY TUNNEL    │"
 "│  heim         10.8.0.1        10-50     server          anyone     this site │"
-"│  buero        10.8.0.2        10-50     server          anyone     up        │"
+"│  └ haus6      10.8.0.16       10-50     client of heim  buero      offline   │"
 "│ ┌ Invite a new site (it becomes a client of heim) ─────────────────────────┐ │"
 "│ │ Name                                                                     │ │"
 "│ │                  empty: the host name of the new site                    │ │"

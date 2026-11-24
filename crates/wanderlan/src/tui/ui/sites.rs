@@ -46,12 +46,11 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         "TUNNEL",
     ])
     .style(theme::header());
-    let rows: Vec<Row> = draft
-        .mesh
-        .sites
+    let order = topology::tree_order(&draft.mesh);
+    let rows: Vec<Row> = order
         .iter()
-        .enumerate()
-        .map(|(i, site)| {
+        .filter_map(|(i, depth)| draft.mesh.sites.get(*i).map(|s| (*i, *depth, s)))
+        .map(|(i, depth, site)| {
             let marker = match running.and_then(|m| m.site(&site.name)) {
                 None => Span::styled("+", theme::ok()),
                 Some(old) if old != site => Span::styled("*", theme::warn()),
@@ -73,7 +72,7 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
             let style = severity_style(draft.worst_within(&FieldPath::site(i)));
             Row::new(vec![
                 Cell::from(marker),
-                Cell::from(site.name.clone()),
+                Cell::from(topology::tree_name(&site.name, depth)),
                 Cell::from(site.address.to_string()),
                 {
                     let own = site
@@ -118,7 +117,11 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         .header(header)
         .block(titled(title))
         .row_highlight_style(theme::selected());
-    let mut state = TableState::default().with_selected(Some(app.sites_selected));
+    let row = order
+        .iter()
+        .position(|(i, _)| *i == app.sites_selected)
+        .unwrap_or_default();
+    let mut state = TableState::default().with_selected(Some(row));
     frame.render_stateful_widget(table, area, &mut state);
 }
 

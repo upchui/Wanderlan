@@ -58,6 +58,58 @@ const FOLLOW_UP_FLUSHES: [Duration; 2] = [Duration::from_secs(10), Duration::fro
 const GRACE: Duration = Duration::from_secs(300);
 /// Wait time after a failed fetch before trying the same peer again.
 const FETCH_BACKOFF: Duration = Duration::from_secs(30);
+/// How long a rejected configuration is not fetched again.
+const REJECT_TTL: Duration = Duration::from_secs(600);
+/// How long a client waits for its uplink to take over a change before it
+/// asks whether the uplink refused it.
+const RESYNC_AFTER: Duration = Duration::from_secs(15);
+/// How old the FDB snapshot used for the status may be.
+const FDB_CACHE_TTL: Duration = Duration::from_secs(5);
+/// First line of a client's view when its last change was refused; the
+/// reason follows. A TOML comment, so older daemons simply ignore it.
+const REFUSED_MARKER: &str = "# wanderlan: not taken over: ";
+
+/// What a fetched configuration is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchMode {
+    /// From a server or the uplink: it replaces the own mesh.
+    Replace,
+    /// From a client: its changes are merged into the own mesh.
+    Merge,
+    /// From the uplink after a change of this site was not taken over:
+    /// replaces the own mesh only if the uplink refused the change.
+    Resync,
+}
+
+/// The reason in the first line of a view whose change was refused.
+fn refusal(text: &str) -> Option<&str> {
+    text.lines().next()?.strip_prefix(REFUSED_MARKER)
+}
+
+/// Fingerprints of configurations that were rejected and are not fetched
+/// again for [`REJECT_TTL`]; after that they get another chance.
+#[derive(Debug, Default)]
+struct Rejected(BTreeMap<String, Instant>);
+
+impl Rejected {
+    fn insert(&mut self, fingerprint: String, now: Instant) {
+        self.0.retain(|_, until| *until > now);
+        self.0.insert(fingerprint, now + REJECT_TTL);
+    }
+
+    /// The fingerprints still rejected at `now`.
+    fn active(&self, now: Instant) -> BTreeSet<String> {
+        self.0
+            .iter()
+            .filter(|(_, until)| **until > now)
+            .map(|(fp, _)| fp.clone())
+            .collect()
+    }
+
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+}
 /// Shortest accepted confirmation timeout.
 const MIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -77,9 +129,8 @@ pub enum Input {
     Fetched {
         /// The peer.
         peer: String,
-        /// True for a client of this site: merge its view instead of
-        /// replacing the own mesh.
-        merge: bool,
+        /// What to do with it.
+        mode: FetchMode,
         /// The mesh text or an error.
         result: Result<String, String>,
     },
@@ -143,7 +194,18 @@ struct Controller {
     ports: watch::Sender<PortMap>,
     rates: Rates,
     inputs: mpsc::Sender<Input>,
-    rejected: BTreeSet<String>,
+    /// Fingerprints not to fetch again, until when.
+    rejected: Rejected,
+    /// Clients whose last change was refused here, with the reason.
+    refused: BTreeMap<String, String>,
+    /// Since when the uplink has not taken over a change of this site.
+    diverged_since: Option<Instant>,
+    /// Why the last change of this site was not taken over by its uplink.
+    sync_problem: Option<String>,
+    /// The version each client of this site should have (its view).
+    expected: BTreeMap<String, Version>,
+    /// The FDB as read last, for the status.
+    fdb_cache: std::sync::Mutex<Option<(Instant, Vec<wanderlan_core::sys::observe::FdbEntry>)>>,
     fetching: bool,
     fetch_backoff: BTreeMap<String, Instant>,
     grace: BTreeMap<String, (Ipv4Addr, Instant)>,
@@ -210,7 +272,12 @@ pub async fn run(args: Args) -> Result<()> {
         ports: ports_tx,
         rates,
         inputs: inputs_tx,
-        rejected: BTreeSet::new(),
+        rejected: Rejected::default(),
+        refused: BTreeMap::new(),
+        diverged_since: None,
+        sync_problem: None,
+        expected: BTreeMap::new(),
+        fdb_cache: std::sync::Mutex::new(None),
         fetching: false,
         fetch_backoff: BTreeMap::new(),
         grace: BTreeMap::new(),
@@ -527,6 +594,7 @@ impl Controller {
         // site (and a removed site) only its own view of the network.
         let mut announce_to = BTreeMap::new();
         let mut views = BTreeMap::new();
+        let mut expected = BTreeMap::new();
         let announce = match &self.confirmed {
             None => Announce::default(),
             Some(c) => {
@@ -539,7 +607,17 @@ impl Controller {
                     if client {
                         let v = view::view_for(&c.mesh, name);
                         announce_to.insert(name.clone(), version(&v));
-                        views.insert(*addr, render_mesh(&v));
+                        expected.insert(name.clone(), Version::of(&v));
+                        // A refused change: the client learns why.
+                        let text = match self.refused.get(name) {
+                            Some(reason) => format!(
+                                "{REFUSED_MARKER}{}\n{}",
+                                reason.replace('\n', " "),
+                                render_mesh(&v)
+                            ),
+                            None => render_mesh(&v),
+                        };
+                        views.insert(*addr, text);
                     } else {
                         views.insert(*addr, own.clone());
                     }
@@ -547,6 +625,7 @@ impl Controller {
                 version(&c.mesh)
             }
         };
+        self.expected = expected;
         let mtu_interval = self
             .config
             .as_ref()
@@ -605,11 +684,7 @@ impl Controller {
                 );
                 self.maybe_sync();
             }
-            Input::Fetched {
-                peer,
-                merge,
-                result,
-            } => self.fetched(peer, merge, result).await,
+            Input::Fetched { peer, mode, result } => self.fetched(peer, mode, result).await,
             Input::Loop(report) => {
                 if self.runtime.blocked.insert(report.port.clone()) {
                     let peer = report.port.strip_prefix(GRETAP_PREFIX).map(str::to_string);
@@ -686,89 +761,156 @@ impl Controller {
         let Some(confirmed) = &self.confirmed else {
             return;
         };
-        let me = confirmed.self_name();
-        let mesh = &confirmed.mesh;
-        let ours = Version::of(mesh);
-        let port = mesh.control_port;
+        let me = confirmed.self_name().to_string();
+        let ours = Version::of(&confirmed.mesh);
+        let port = confirmed.mesh.control_port;
+        let tunnels: Vec<(String, TunnelKind)> = topology::tunnels_for(&confirmed.mesh, &me)
+            .into_iter()
+            .map(|t| (t.peer.name.clone(), t.kind))
+            .collect();
         let now = Instant::now();
         let table = self.probes.read().map(|t| t.clone()).unwrap_or_default();
+        let rejected = self.rejected.active(now);
         let mut upstream: Vec<(String, Version)> = Vec::new();
         let mut client_changes: Option<(String, Version)> = None;
-        for t in topology::tunnels_for(mesh, me) {
-            let name = t.peer.name.as_str();
+        let mut adopt: Option<(String, u64)> = None;
+        let mut resync: Option<String> = None;
+        let mut in_sync_again: Vec<String> = Vec::new();
+        for (name, kind) in &tunnels {
             if self.fetch_backoff.get(name).is_some_and(|t| *t > now) {
                 continue;
             }
-            let Some(announce) = table.get(name).and_then(|p| p.announce) else {
+            let Some(probe) = table.get(name) else {
+                continue;
+            };
+            let Some(announce) = probe.announce else {
                 continue;
             };
             let theirs = Version {
                 revision: announce.revision,
                 fingerprint: fingerprint_hex(&announce.fingerprint),
             };
-            if self.rejected.contains(&theirs.fingerprint) {
-                continue;
-            }
-            match t.kind {
-                TunnelKind::Server => upstream.push((name.to_string(), theirs)),
+            match kind {
+                TunnelKind::Server | TunnelKind::Uplink
+                    if theirs.fingerprint == ours.fingerprint =>
+                {
+                    // Same content, only a newer revision number: no fetch.
+                    if theirs.revision > ours.revision && adopt.is_none() {
+                        adopt = Some((name.clone(), theirs.revision));
+                    }
+                    if *kind == TunnelKind::Uplink {
+                        self.diverged_since = None;
+                    }
+                }
+                _ if rejected.contains(&theirs.fingerprint) => {}
+                TunnelKind::Server => upstream.push((name.clone(), theirs)),
                 // The uplink has the last word on what this site knows.
                 TunnelKind::Uplink if theirs.revision > ours.revision => {
-                    upstream.push((name.to_string(), theirs));
+                    self.diverged_since = None;
+                    upstream.push((name.clone(), theirs));
                 }
-                TunnelKind::Uplink => {}
+                TunnelKind::Uplink => {
+                    // A change of this site that the uplink has not taken
+                    // over (yet): after a while, ask whether it refused it.
+                    let since = *self.diverged_since.get_or_insert(now);
+                    if probe.reachable && now.duration_since(since) >= RESYNC_AFTER {
+                        resync = Some(name.clone());
+                    }
+                }
                 TunnelKind::Client => {
-                    let expected = Version::of(&view::view_for(mesh, name));
-                    if client_changes.is_none()
-                        && theirs.fingerprint != expected.fingerprint
-                        && theirs.revision >= expected.revision
-                    {
-                        client_changes = Some((name.to_string(), theirs));
+                    let Some(expected) = self.expected.get(name) else {
+                        continue;
+                    };
+                    if theirs.fingerprint == expected.fingerprint {
+                        in_sync_again.push(name.clone());
+                    } else if client_changes.is_none() && theirs.revision >= expected.revision {
+                        client_changes = Some((name.clone(), theirs));
                     }
                 }
             }
         }
+        // A client that is in sync again has nothing refused any more.
+        let mut republish = false;
+        for name in in_sync_again {
+            republish |= self.refused.remove(&name).is_some();
+        }
+        if republish {
+            self.publish();
+        }
+        if let Some((peer, revision)) = adopt {
+            self.adopt_revision(&peer, revision);
+            return;
+        }
         // Newer versions from servers or the uplink first, then changes of
-        // a client.
+        // a client, then the question whether the uplink refused ours.
         let chosen = sync::choose(
             &ours,
             upstream.iter().map(|(n, v)| (n.as_str(), v.clone())),
-            &self.rejected,
+            &rejected,
         )
-        .map(|(n, v)| (n.to_string(), v, false))
-        .or_else(|| client_changes.map(|(n, v)| (n, v, true)));
-        let Some((peer, version, merge)) = chosen else {
+        .map(|(n, v)| (n.to_string(), Some(v), FetchMode::Replace))
+        .or_else(|| client_changes.map(|(n, v)| (n, Some(v), FetchMode::Merge)))
+        .or_else(|| resync.map(|n| (n, None, FetchMode::Resync)));
+        let Some((peer, version, mode)) = chosen else {
             return;
         };
         let peers = self.direct_peers();
         let Some(addr) = peers.get(&peer) else { return };
         let target = SocketAddrV4::new(*addr, port);
-        let text = if merge {
-            format!(
-                "Client \"{peer}\" has changes (revision {}, here: {}); fetching them",
-                version.revision, ours.revision
-            )
-        } else {
-            format!(
-                "Peer \"{peer}\" has mesh revision {} (here: {}); fetching it",
-                version.revision, ours.revision
-            )
-        };
-        self.events.emit(Level::Info, Some(&peer), text);
+        match (&mode, version) {
+            (FetchMode::Merge, Some(v)) => self.events.emit(
+                Level::Info,
+                Some(&peer),
+                format!(
+                    "Client \"{peer}\" has changes (revision {}, here: {}); fetching them",
+                    v.revision, ours.revision
+                ),
+            ),
+            (FetchMode::Resync, _) => {
+                // Asked again only after another wait.
+                self.diverged_since = Some(now);
+                debug!("Asking \"{peer}\" whether it took over the change of this site");
+            }
+            (_, Some(v)) => self.events.emit(
+                Level::Info,
+                Some(&peer),
+                format!(
+                    "Peer \"{peer}\" has mesh revision {} (here: {}); fetching it",
+                    v.revision, ours.revision
+                ),
+            ),
+            (_, None) => {}
+        }
         self.fetching = true;
         let inputs = self.inputs.clone();
         tokio::spawn(async move {
             let result = sync_net::fetch(target).await.map_err(|e| format!("{e:#}"));
-            let _ = inputs
-                .send(Input::Fetched {
-                    peer,
-                    merge,
-                    result,
-                })
-                .await;
+            let _ = inputs.send(Input::Fetched { peer, mode, result }).await;
         });
     }
 
-    async fn fetched(&mut self, peer: String, merge: bool, result: Result<String, String>) {
+    /// Remembers a fingerprint that is not fetched again for a while.
+    fn reject(&mut self, fingerprint: String) {
+        self.rejected.insert(fingerprint, Instant::now());
+    }
+
+    /// Takes over a newer revision number with the same content, without a
+    /// fetch, an apply or a countdown.
+    fn adopt_revision(&mut self, peer: &str, revision: u64) {
+        let Some(mut cfg) = self.confirmed.clone() else {
+            return;
+        };
+        cfg.mesh.revision = revision;
+        if let Err(e) = self.paths.write_confirmed(&cfg) {
+            warn!("cannot write the configuration files: {e:#}");
+            return;
+        }
+        debug!("Peer \"{peer}\" has revision {revision} with the same content; taken over");
+        self.confirmed = Some(cfg.clone());
+        self.set_config(Some(cfg));
+    }
+
+    async fn fetched(&mut self, peer: String, mode: FetchMode, result: Result<String, String>) {
         self.fetching = false;
         let text = match result {
             Ok(t) => t,
@@ -802,28 +944,53 @@ impl Controller {
         };
         let Some(mesh) = parsed else { return };
         let fingerprint = config::fingerprint(&mesh);
-        let mesh = if merge {
-            let Some(own) = self.confirmed.as_ref().map(|c| c.mesh.clone()) else {
-                return;
-            };
-            match view::merge(&own, &mesh, &peer) {
-                Ok(merged) => merged,
-                Err(e) => {
-                    self.rejected.insert(fingerprint);
-                    self.events.emit(
-                        Level::Warn,
-                        Some(&peer),
-                        format!("Not using the changes of client \"{peer}\": {e}"),
-                    );
+        let mesh = match mode {
+            FetchMode::Merge => {
+                let Some(own) = self.confirmed.as_ref().map(|c| c.mesh.clone()) else {
                     return;
+                };
+                match view::merge(&own, &mesh, &peer) {
+                    Ok(merged) => {
+                        self.refused.remove(&peer);
+                        merged
+                    }
+                    Err(e) => {
+                        self.reject(fingerprint);
+                        self.events.emit(
+                            Level::Warn,
+                            Some(&peer),
+                            format!("Not taking over the changes of client \"{peer}\": {e}"),
+                        );
+                        // The client learns why with its next fetch.
+                        self.refused.insert(peer, e);
+                        self.publish();
+                        return;
+                    }
                 }
             }
-        } else {
-            mesh
+            FetchMode::Resync => {
+                let Some(reason) = refusal(&text) else {
+                    // Not refused: the uplink may still take it over.
+                    return;
+                };
+                self.events.emit(
+                    Level::Warn,
+                    Some(&peer),
+                    format!(
+                        "The change of this site was not taken over by \"{peer}\": {reason}; its configuration applies again"
+                    ),
+                );
+                self.sync_problem = Some(format!(
+                    "Your change was not taken over by \"{peer}\": {reason}"
+                ));
+                self.diverged_since = None;
+                mesh
+            }
+            FetchMode::Replace => mesh,
         };
         match sync::accept(mesh, &local) {
             Err(e) => {
-                self.rejected.insert(fingerprint);
+                self.reject(fingerprint);
                 self.events.emit(
                     Level::Warn,
                     Some(&peer),
@@ -1224,6 +1391,13 @@ impl Controller {
         self.flushes.clear();
         self.invites.clear();
         self.join_failures.clear();
+        self.refused.clear();
+        self.diverged_since = None;
+        self.sync_problem = None;
+        self.expected.clear();
+        if let Ok(mut fdb) = self.fdb_cache.lock() {
+            *fdb = None;
+        }
         self.generation += 1;
         if let Ok(mut t) = self.probes.write() {
             t.clear();
@@ -1489,6 +1663,8 @@ impl Controller {
                 cfg.mesh.revision = base.max(cfg.mesh.revision) + 1;
             }
             self.rejected.clear();
+            // A change of its own: the last refusal is history.
+            self.sync_problem = None;
         }
         if let Err(e) = self.paths.write_confirmed(&cfg) {
             self.pending = Some(pending);
@@ -1525,18 +1701,30 @@ impl Controller {
         };
         let peer = match &pending.source {
             ChangeSource::Sync { peer } => {
-                self.rejected.insert(pending.fingerprint.clone());
+                self.reject(pending.fingerprint.clone());
                 Some(peer.clone())
             }
             ChangeSource::Join { site } => {
                 self.invites.release();
-                self.events.emit(
-                    Level::Warn,
-                    Some(site),
-                    format!(
+                // A site that was there before only wanted to hang off this
+                // site after joining again here.
+                let before = pending
+                    .previous
+                    .as_ref()
+                    .and_then(|c| c.mesh.site(site))
+                    .map(|s| s.uplink.clone());
+                let text = match before {
+                    Some(Some(up)) => format!(
+                        "Site \"{site}\" did not come up through this site in time; it stays a client of \"{up}\" and the invitation can be used again"
+                    ),
+                    Some(None) => format!(
+                        "Site \"{site}\" did not come up through this site in time; it stays a server and the invitation can be used again"
+                    ),
+                    None => format!(
                         "The new site \"{site}\" did not come up in time; it was removed again and its invitation can be used again"
                     ),
-                );
+                };
+                self.events.emit(Level::Warn, Some(site), text);
                 Some(site.clone())
             }
             ChangeSource::Local => None,
@@ -1699,7 +1887,29 @@ impl Controller {
 
     async fn status(&self) -> Status {
         let links = self.sys.links().await.unwrap_or_default();
-        let fdb = self.sys.fdb().await.unwrap_or_default();
+        // The FDB can be large and the TUI asks every second.
+        let cached = {
+            let guard = self
+                .fdb_cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard
+                .as_ref()
+                .filter(|(at, _)| at.elapsed() < FDB_CACHE_TTL)
+                .map(|(_, fdb)| fdb.clone())
+        };
+        let fdb = match cached {
+            Some(fdb) => fdb,
+            None => {
+                let fdb = self.sys.fdb().await.unwrap_or_default();
+                let mut guard = self
+                    .fdb_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *guard = Some((Instant::now(), fdb.clone()));
+                fdb
+            }
+        };
         let probes = self.probes.read().map(|t| t.clone()).unwrap_or_default();
         let rates = self.rates.read().map(|r| r.clone()).unwrap_or_default();
         let confirmed_fp = self
@@ -1734,6 +1944,7 @@ impl Controller {
                 invites: 0,
                 trunk_traffic: None,
                 trunks: Vec::new(),
+                sync_problem: None,
             };
         };
         let desired = desired::derive(cfg, &self.runtime);
@@ -1806,14 +2017,14 @@ impl Controller {
                     in_sync: announce.map(|a| {
                         let theirs = fingerprint_hex(&a.fingerprint);
                         if t.kind == TunnelKind::Client {
-                            self.confirmed.as_ref().is_some_and(|c| {
-                                theirs
-                                    == config::fingerprint(&view::view_for(&c.mesh, &t.peer.name))
-                            })
+                            self.expected
+                                .get(&t.peer.name)
+                                .is_some_and(|v| v.fingerprint == theirs)
                         } else {
                             theirs == confirmed_fp
                         }
                     }),
+                    refused: self.refused.get(&t.peer.name).cloned(),
                 }
             })
             .collect();
@@ -1877,6 +2088,36 @@ impl Controller {
             invites: self.invites.list().len(),
             trunk_traffic: trunks.first().cloned(),
             trunks,
+            sync_problem: self.sync_problem.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_refused_view_carries_its_reason_in_the_first_line() {
+        let view = format!("{REFUSED_MARKER}site \"x\" is already used\n[mesh]\nrevision = 4\n");
+        assert_eq!(refusal(&view), Some("site \"x\" is already used"));
+        assert_eq!(refusal("[mesh]\nrevision = 4\n"), None);
+        // Only the first line counts: a comment further down is no refusal.
+        assert_eq!(refusal(&format!("[mesh]\n{REFUSED_MARKER}no\n")), None);
+        // It is a TOML comment: the view still parses.
+        assert!(wanderlan_core::config::parse_mesh(&view).is_ok());
+    }
+
+    #[test]
+    fn a_rejected_configuration_gets_another_chance_later() {
+        let start = Instant::now();
+        let mut rejected = Rejected::default();
+        rejected.insert("aa".into(), start);
+        assert!(rejected.active(start).contains("aa"));
+        assert!(rejected.active(start + REJECT_TTL / 2).contains("aa"));
+        assert!(rejected.active(start + REJECT_TTL).is_empty());
+        // Expired entries are dropped when the next one is added.
+        rejected.insert("bb".into(), start + REJECT_TTL * 2);
+        assert_eq!(rejected.0.len(), 1);
     }
 }

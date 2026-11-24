@@ -6,6 +6,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use wanderlan_core::api::{PeerStatus, PortState, SiteState, SiteSummary, Status};
+use wanderlan_core::topology;
 
 use super::{health_style, port_state, titled};
 use crate::tui::app::App;
@@ -31,6 +32,7 @@ pub fn health(peer: &PeerStatus) -> Health {
         Health::Bad
     } else if peer.port_state != PortState::Up
         || peer.in_sync == Some(false)
+        || peer.refused.is_some()
         || peer.last_reply_secs.is_some_and(|s| s > LATE_REPLY_SECS)
     {
         Health::Degraded
@@ -160,10 +162,16 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
     if let Some(e) = &status.last_error {
         lines.push(Line::styled(format!(" Last error: {e}"), theme::bad()));
     }
+    if let Some(problem) = &status.sync_problem {
+        lines.push(Line::styled(format!(" {problem}"), theme::warn()));
+    }
     lines
 }
 
 fn config_cell(peer: &PeerStatus) -> String {
+    if peer.refused.is_some() {
+        return "refused".into();
+    }
     match (peer.revision, peer.in_sync) {
         (Some(r), Some(true)) => format!("r{r} ok"),
         (Some(r), Some(false)) => format!("r{r} diff"),
@@ -249,13 +257,18 @@ fn link(status: &Status, site: &SiteSummary) -> (String, Style) {
 
 fn draw_sites(frame: &mut Frame, status: &Status, area: Rect) {
     let header = Row::new(vec!["SITE", "ADDRESS", "VLANS", "ROLE", "LINK"]).style(theme::header());
-    let rows: Vec<Row> = status
+    let pairs: Vec<(&str, Option<&str>)> = status
         .sites
         .iter()
-        .map(|site| {
+        .map(|s| (s.name.as_str(), s.uplink.as_deref()))
+        .collect();
+    let rows: Vec<Row> = topology::tree_order_by(&pairs)
+        .into_iter()
+        .filter_map(|(i, depth)| status.sites.get(i).map(|s| (s, depth)))
+        .map(|(site, depth)| {
             let (link, style) = link(status, site);
             Row::new(vec![
-                Cell::from(site.name.clone()),
+                Cell::from(topology::tree_name(&site.name, depth)),
                 Cell::from(site.address.clone()),
                 Cell::from(site.vlans.clone()),
                 Cell::from(format::role(site.uplink.as_deref())),

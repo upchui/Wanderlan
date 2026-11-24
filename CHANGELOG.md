@@ -189,6 +189,31 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
   complete configuration reference, how it works, and the project
   decisions. The TUI help and the open questions follow suit.
 
+### Faster, and sync problems in plain sight
+
+- A server that cannot take over a change of its client says so: `refused`
+  in its overview (CONFIG column), the reason in the peer details and in
+  `wanderlan status`. The client learns the reason with its next fetch,
+  takes the server's configuration back after 15 s and shows "Your change
+  was not taken over by …" in its overview and status. Before, the client
+  kept its change silently and never got in sync again.
+- A refused configuration is not fetched again for 10 minutes, then it gets
+  another chance; before, it was skipped until the next restart.
+- A newer revision with the same content is taken over without fetching,
+  applying or a countdown (clients saw "applied (0 system changes)" for
+  every change elsewhere in the network).
+- The status reuses the forwarding table for 5 s instead of reading it on
+  every request; the MSS rules are read from `nft` at most every 2 minutes
+  (written ones are remembered), so a firewall reload is still repaired.
+  The expected version of each client is computed once per change instead
+  of every second.
+- Sites (2), the network list of the overview and `wanderlan status` show
+  each server with its clients indented below (`└ shop`); Up/Down follow
+  that order.
+- Log: a site that joined again through another site and did not come up in
+  time "stays a client of" its old server; the message no longer claims it
+  was removed.
+
 ### More to see
 
 - Settings view (7): every setting with an explanation.

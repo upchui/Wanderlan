@@ -9,6 +9,8 @@ use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use nftables::batch::Batch;
 use nftables::expr::{
@@ -282,6 +284,73 @@ impl NftOps for NftCli {
     }
 }
 
+/// The MSS rules as last read or written (`None`: no table), and when.
+type CachedRules = (Instant, Option<BTreeSet<MssRule>>);
+
+/// [`NftOps`] that remembers the MSS rules. Reading them runs `nft` twice,
+/// so a read within `ttl` of the last read or write answers from memory;
+/// writes always go through and update the memory. A table removed behind
+/// wanderlan's back (e.g. a firewall reload) is noticed within `ttl`.
+#[derive(Debug, Clone)]
+pub struct CachedNft<N> {
+    inner: N,
+    ttl: Duration,
+    cache: Arc<Mutex<Option<CachedRules>>>,
+}
+
+impl<N> CachedNft<N> {
+    /// Wraps `inner`.
+    pub fn new(inner: N, ttl: Duration) -> Self {
+        Self {
+            inner,
+            ttl,
+            cache: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn cached(&self) -> Option<Option<BTreeSet<MssRule>>> {
+        let guard = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < self.ttl)
+            .map(|(_, rules)| rules.clone())
+    }
+
+    fn store(&self, rules: Option<Option<BTreeSet<MssRule>>>) {
+        let mut guard = self
+            .cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = rules.map(|r| (Instant::now(), r));
+    }
+}
+
+impl<N: NftOps + Sync> NftOps for CachedNft<N> {
+    async fn mss_rules(&self) -> SysResult<Option<BTreeSet<MssRule>>> {
+        if let Some(rules) = self.cached() {
+            return Ok(rules);
+        }
+        let rules = self.inner.mss_rules().await?;
+        self.store(Some(rules.clone()));
+        Ok(rules)
+    }
+
+    async fn set_mss_rules(&self, rules: &BTreeSet<MssRule>) -> SysResult<()> {
+        let result = self.inner.set_mss_rules(rules).await;
+        self.store(result.is_ok().then(|| Some(rules.clone())));
+        result
+    }
+
+    async fn delete_table(&self) -> SysResult<()> {
+        let result = self.inner.delete_table().await;
+        self.store(result.is_ok().then_some(None));
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -321,5 +390,65 @@ mod tests {
         ] {
             assert!(json.contains(needle), "{needle} missing in {json}");
         }
+    }
+
+    /// Counts the reads of the rules.
+    #[derive(Default)]
+    struct Counting {
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    impl NftOps for Counting {
+        async fn mss_rules(&self) -> SysResult<Option<BTreeSet<MssRule>>> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(None)
+        }
+        async fn set_mss_rules(&self, _: &BTreeSet<MssRule>) -> SysResult<()> {
+            Ok(())
+        }
+        async fn delete_table(&self) -> SysResult<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_rules_are_read_from_nft_at_most_once_per_ttl() {
+        let cached = CachedNft::new(Counting::default(), Duration::from_secs(60));
+        assert_eq!(cached.mss_rules().await.unwrap(), None);
+        assert_eq!(cached.mss_rules().await.unwrap(), None);
+        assert_eq!(
+            cached
+                .inner
+                .reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        // A write is remembered.
+        let rules = BTreeSet::from([MssRule {
+            port: "gt-a".into(),
+            dir: PortDir::In,
+            ipv6: false,
+            mss: 1318,
+        }]);
+        cached.set_mss_rules(&rules).await.unwrap();
+        assert_eq!(cached.mss_rules().await.unwrap(), Some(rules));
+        cached.delete_table().await.unwrap();
+        assert_eq!(cached.mss_rules().await.unwrap(), None);
+        assert_eq!(
+            cached
+                .inner
+                .reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        // After the ttl it reads again.
+        let short = CachedNft::new(Counting::default(), Duration::ZERO);
+        short.mss_rules().await.unwrap();
+        short.mss_rules().await.unwrap();
+        assert_eq!(
+            short.inner.reads.load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
     }
 }

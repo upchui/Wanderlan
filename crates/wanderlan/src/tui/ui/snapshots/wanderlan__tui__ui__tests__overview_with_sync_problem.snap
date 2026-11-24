@@ -1,0 +1,28 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+" heim  server  address 10.8.0.1  trunk ens19  VLANs 10-50                       "
+" state running  mesh revision 7 (3f2a9c1b04de)  daemon 0.1.0                    "
+" tunnels in 1.4Mbit/s  out 394.6kbit/s  (Enter: details)                        "
+" 1 open invitation(s)  (Sites: I)                                               "
+" Blocked by the loop guard: gt-haus2  (select the peer, press u)                "
+" Your change was not taken over by "buero": site "haus9" is already used        "
+"┌ Direct peers (live) ─────────────────────────────────────────────────────────┐"
+"│PEER         PORT    REPLY RTT    PMTU MSS  MACS RX b/s TX b/s CONFIG         │"
+"│buero        up      1s    12ms   1420 1338   12   1.2M 345.6k r7 ok          │"
+"│haus2        BLOCKED 2s    3.1ms  1420 1338    0      0      0 r7 ok          │"
+"│haus3        up      1s    8.7ms  1420 1338    4  96.0k  31.0k r7 ok          │"
+"│haus5        up      3s    25ms   1392 1310    3  52.0k  18.0k r6 diff        │"
+"│haus6        down    lost  -      -    -       0      0      0 -              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"┌ Network: 6 sites ────────────────────────────────────────────────────────────┐"
+"│SITE         ADDRESS         VLANS        ROLE              LINK              │"
+"│heim         10.8.0.1        10-50        server            this site         │"
+"│└ haus6      10.8.0.16       10-50        client of heim    tunnel down       │"
+"│buero        10.8.0.2        10-50        server            tunnel up         │"
+"│haus2        10.8.0.11       20,30        server            tunnel BLOCKED    │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                                     draft: no changes  heim r7 "
+" Enter  details   u  unblock   p  probe MTU   1-7  views   ?  help   q  quit    "

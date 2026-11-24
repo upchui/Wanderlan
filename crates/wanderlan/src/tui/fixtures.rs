@@ -115,6 +115,7 @@ fn peer(name: &str, address: &str) -> PeerStatus {
         tx_bps: 0,
         revision: Some(7),
         in_sync: Some(true),
+        refused: None,
     }
 }
 
@@ -146,6 +147,7 @@ pub fn status() -> Status {
         fingerprint: "3f2a9c1b04de5566778899aabbccddeeff0011223344556677".into(),
         pending: None,
         last_error: None,
+        sync_problem: None,
         peers: vec![
             PeerStatus {
                 macs: 12,
@@ -220,6 +222,7 @@ pub fn unconfigured_status() -> Status {
         fingerprint: String::new(),
         pending: None,
         last_error: None,
+        sync_problem: None,
         peers: Vec::new(),
         sites: Vec::new(),
         blocked: Vec::new(),
