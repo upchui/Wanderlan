@@ -1,4 +1,4 @@
-# wanderlan
+# Wanderlan
 
 wanderlan connects several sites on layer 2, so that the same VLANs, subnets
 and DHCP servers are available at every site as if it were one network. All
@@ -79,6 +79,13 @@ server all have; there is no tunnel between clients.
   marcel (client of alex)     site2 (client of alex)
   VLAN 15                     VLAN 13
 ```
+
+**Who knows what.** Servers know the whole network. A client knows only
+itself, the site it is plugged into (which it sees as its server) and its
+own clients; it never learns about the clients of other servers, neither in
+the TUI nor in its `mesh.toml`. A client's changes (as far as it may make
+them: itself and its own clients) reach the network through its server,
+which takes them over into its own configuration.
 
 A site can be made a server or the client of another site later (TUI: Sites,
 `Enter`, "Connected to"; CLI: `wanderlan role <site> server|client <site>`;

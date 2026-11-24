@@ -136,6 +136,12 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
   `wanderlan role <site> server|client <site>`.
 - A client that joins again through another site becomes a client of that
   site.
+- Clients never see the clients of other servers: a client's configuration
+  (TUI, status, `mesh.toml`) contains only itself, its server and its own
+  clients; servers keep the whole network. Each peer gets its view in the
+  sync; a client's changes are merged by its server (only its own entry,
+  its own clients and the network settings, checked against its rights).
+  A client may only change itself and its own clients.
 - VLAN mappings (table and form) show whether a site is a server or a client:
   `marcel (client)`.
 - Sync: a higher revision with the same content (e.g. a site taken offline

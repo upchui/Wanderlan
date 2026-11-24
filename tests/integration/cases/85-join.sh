@@ -81,9 +81,15 @@ else
   fail "unexpected join output: $out"
 fi
 rev=$(jqs site2 .revision)
-for s in site1 site2 site3 site4 site5; do
+for s in site1 site2 site3 site4; do
   wait_eq 60 "$s has 5 sites (revision $rev)" "$rev 5" jqs "$s" '"\(.revision) \(.sites | length)"'
 done
+wait_eq 60 "site5 knows only site2 and itself (revision $rev)" "$rev site2 site5" \
+  jqs site5 '"\(.revision) \([.sites[].name] | sort | join(" "))"'
+check "site5's mesh.toml names no other site" \
+  x site5 "! grep -qE 'name = \"site(1|3|4)\"' /etc/wanderlan/mesh.toml && grep -q 'name = \"site2\"' /etc/wanderlan/mesh.toml"
+check "site5 sees site2 as its server" \
+  test "$(jqs site5 '.sites[] | select(.name == "site2") | .uplink')" = null
 check "site2 confirmed the new site automatically" test "$(jqs site2 .pending)" = null
 check "site5 has its address from the connection" \
   test "$(jqs site2 '.sites[] | select(.name == "site5") | .address')" = 10.100.13.10
@@ -166,12 +172,12 @@ if grep -q 'may not change the VLANs of the network' <<<"$out" && grep -q 'manag
 else
   fail "unexpected output when site5 changes the network's VLANs: $out"
 fi
-x site5 "sed '/^name = \"site1\"\$/a vlans = \"20\"' /etc/wanderlan/mesh.toml > /tmp/site1-vlans.toml"
-out=$(x site5 "wanderlan apply --mesh /tmp/site1-vlans.toml" 2>&1)
-if grep -q 'may not change site "site1"' <<<"$out"; then
-  pass "site5 may not change the VLANs of site1"
+x site5 "sed '/^name = \"site2\"\$/a vlans = \"20\"' /etc/wanderlan/mesh.toml > /tmp/site2-vlans.toml"
+out=$(x site5 "wanderlan apply --mesh /tmp/site2-vlans.toml" 2>&1)
+if grep -q 'is a client of "site2": it may only change itself and its own clients' <<<"$out"; then
+  pass "site5 may not change its server site2"
 else
-  fail "unexpected output when site5 changes site1: $out"
+  fail "unexpected output when site5 changes site2: $out"
 fi
 out=$(x site5 "wanderlan offline site5 --confirm" 2>&1)
 if grep -q 'may not change site "site5"' <<<"$out"; then
@@ -188,6 +194,10 @@ fi
 rev=$(jqs site2 .revision)
 wait_eq 60 "site5 has revision $rev" "$rev" jqs site5 .revision
 check "now site5 takes itself offline" x site5 "wanderlan offline site5 --confirm"
+wait_eq 30 "site2 took over the change of its client" false \
+  jqs site2 '.sites[] | select(.name == "site5") | .online'
+wait_eq 30 "and site1 has it too" false \
+  jqs site1 '.sites[] | select(.name == "site5") | .online'
 wait_for 30 "the tunnel to site5 is down at site2" \
   x site2 "ip -j link show gt-site5 | jq -e '.[0].flags | index(\"UP\") | not'"
 check "and online again" x site5 "wanderlan online site5 --confirm"
@@ -233,6 +243,8 @@ check "site5 is a client of site1 now (it joined through site1)" \
 wait_for 30 "site5's only tunnel leads to site1" \
   x site5 "[ \"\$(ip -j link show master br0 | jq -r '[.[].ifname | select(startswith(\"gt-\"))] | join(\" \")')\" = gt-site1 ]"
 wait_for 30 "site2 has no tunnel to site5 any more" x site2 "! ip link show gt-site5 2>/dev/null"
+wait_eq 30 "site5 now knows only site1 and itself" "site1 site5" \
+  jqs site5 '[.sites[].name] | sort | join(" ")'
 check "site1's invitation is used up" x site1 "wanderlan invite list | grep -q 'No open invitations'"
 check "site5 is still online (the state is kept)" \
   test "$(jqs site1 '.sites[] | select(.name == "site5") | .online')" = true

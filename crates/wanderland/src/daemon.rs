@@ -23,7 +23,7 @@ use wanderlan_core::api::{
     PortTraffic, Request, ResetReport, SiteState, SiteSummary, Status, Validation,
 };
 use wanderlan_core::config::{
-    self, Config, ConfigFile, Diagnostic, Loaded, render_local, render_mesh, unified_diff,
+    self, Config, ConfigFile, Diagnostic, Loaded, Mesh, render_local, render_mesh, unified_diff,
 };
 use wanderlan_core::desired::{self, OWNER_ALIAS, Runtime};
 use wanderlan_core::join::{self, JoinReply, JoinRequest};
@@ -37,7 +37,8 @@ use wanderlan_core::sys::nft::NftOps as _;
 use wanderlan_core::sys::nft::PortDir;
 use wanderlan_core::sys::observe::ObserveOps as _;
 use wanderlan_core::sys::{LinkKind, NetOps as _};
-use wanderlan_core::topology::{self, ForwardingKey, GRETAP_PREFIX};
+use wanderlan_core::topology::{self, ForwardingKey, GRETAP_PREFIX, TunnelKind};
+use wanderlan_core::view;
 
 use crate::Args;
 use crate::api_server;
@@ -76,6 +77,9 @@ pub enum Input {
     Fetched {
         /// The peer.
         peer: String,
+        /// True for a client of this site: merge its view instead of
+        /// replacing the own mesh.
+        merge: bool,
         /// The mesh text or an error.
         result: Result<String, String>,
     },
@@ -515,18 +519,38 @@ impl Controller {
             cfg.self_site()
                 .map(|s| SocketAddrV4::new(s.address, cfg.mesh.control_port))
         });
-        let announce = self
-            .confirmed
-            .as_ref()
-            .map_or_else(Announce::default, |c| Announce {
-                revision: c.mesh.revision,
-                fingerprint: fingerprint_bytes(&config::fingerprint(&c.mesh)),
-            });
+        let version = |m: &Mesh| Announce {
+            revision: m.revision,
+            fingerprint: fingerprint_bytes(&config::fingerprint(m)),
+        };
+        // Servers and the uplink get what this site knows; a client of this
+        // site (and a removed site) only its own view of the network.
+        let mut announce_to = BTreeMap::new();
+        let mut views = BTreeMap::new();
+        let announce = match &self.confirmed {
+            None => Announce::default(),
+            Some(c) => {
+                let own = render_mesh(&c.mesh);
+                for (name, addr) in peers.iter().chain(responders.iter()) {
+                    let client = c
+                        .mesh
+                        .site(name)
+                        .is_none_or(|s| s.uplink.as_deref() == Some(c.self_name()));
+                    if client {
+                        let v = view::view_for(&c.mesh, name);
+                        announce_to.insert(name.clone(), version(&v));
+                        views.insert(*addr, render_mesh(&v));
+                    } else {
+                        views.insert(*addr, own.clone());
+                    }
+                }
+                version(&c.mesh)
+            }
+        };
         let mtu_interval = self
             .config
             .as_ref()
             .and_then(|c| c.mesh.mss.is_none().then_some(c.mesh.mtu_probe_interval));
-        let allowed = peers.values().chain(responders.values()).copied().collect();
         self.probe_config.send_replace(ProbeConfig {
             bind,
             peers,
@@ -534,16 +558,9 @@ impl Controller {
             generation: self.generation,
             mtu_interval,
             announce,
+            announce_to,
         });
-        self.offer.send_replace(Offer {
-            bind,
-            allowed,
-            mesh: self
-                .confirmed
-                .as_ref()
-                .map(|c| render_mesh(&c.mesh))
-                .unwrap_or_default(),
-        });
+        self.offer.send_replace(Offer { bind, views });
     }
 
     async fn handle(&mut self, input: Input) {
@@ -588,7 +605,11 @@ impl Controller {
                 );
                 self.maybe_sync();
             }
-            Input::Fetched { peer, result } => self.fetched(peer, result).await,
+            Input::Fetched {
+                peer,
+                merge,
+                result,
+            } => self.fetched(peer, merge, result).await,
             Input::Loop(report) => {
                 if self.runtime.blocked.insert(report.port.clone()) {
                     let peer = report.port.strip_prefix(GRETAP_PREFIX).map(str::to_string);
@@ -655,7 +676,9 @@ impl Controller {
         self.maybe_sync();
     }
 
-    /// Fetches a newer mesh from a peer, if one announces it.
+    /// Fetches a newer mesh from a peer, if one announces it: from a server
+    /// or the uplink (replacing the own mesh), otherwise the changes of a
+    /// client (merged into the own mesh).
     fn maybe_sync(&mut self) {
         if self.pending.is_some() || self.fetching {
             return;
@@ -663,59 +686,89 @@ impl Controller {
         let Some(confirmed) = &self.confirmed else {
             return;
         };
-        let ours = Version::of(&confirmed.mesh);
-        let port = confirmed.mesh.control_port;
-        let peers = self.direct_peers();
+        let me = confirmed.self_name();
+        let mesh = &confirmed.mesh;
+        let ours = Version::of(mesh);
+        let port = mesh.control_port;
         let now = Instant::now();
-        let announced: Vec<(String, Version)> = self
-            .probes
-            .read()
-            .map(|t| {
-                t.iter()
-                    .filter(|(name, _)| peers.contains_key(*name))
-                    .filter(|(name, _)| self.fetch_backoff.get(*name).is_none_or(|t| *t <= now))
-                    .filter_map(|(name, p)| {
-                        p.announce.map(|a| {
-                            (
-                                name.clone(),
-                                Version {
-                                    revision: a.revision,
-                                    fingerprint: fingerprint_hex(&a.fingerprint),
-                                },
-                            )
-                        })
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let table = self.probes.read().map(|t| t.clone()).unwrap_or_default();
+        let mut upstream: Vec<(String, Version)> = Vec::new();
+        let mut client_changes: Option<(String, Version)> = None;
+        for t in topology::tunnels_for(mesh, me) {
+            let name = t.peer.name.as_str();
+            if self.fetch_backoff.get(name).is_some_and(|t| *t > now) {
+                continue;
+            }
+            let Some(announce) = table.get(name).and_then(|p| p.announce) else {
+                continue;
+            };
+            let theirs = Version {
+                revision: announce.revision,
+                fingerprint: fingerprint_hex(&announce.fingerprint),
+            };
+            if self.rejected.contains(&theirs.fingerprint) {
+                continue;
+            }
+            match t.kind {
+                TunnelKind::Server => upstream.push((name.to_string(), theirs)),
+                // The uplink has the last word on what this site knows.
+                TunnelKind::Uplink if theirs.revision > ours.revision => {
+                    upstream.push((name.to_string(), theirs));
+                }
+                TunnelKind::Uplink => {}
+                TunnelKind::Client => {
+                    let expected = Version::of(&view::view_for(mesh, name));
+                    if client_changes.is_none()
+                        && theirs.fingerprint != expected.fingerprint
+                        && theirs.revision >= expected.revision
+                    {
+                        client_changes = Some((name.to_string(), theirs));
+                    }
+                }
+            }
+        }
+        // Newer versions from servers or the uplink first, then changes of
+        // a client.
         let chosen = sync::choose(
             &ours,
-            announced.iter().map(|(n, v)| (n.as_str(), v.clone())),
+            upstream.iter().map(|(n, v)| (n.as_str(), v.clone())),
             &self.rejected,
-        );
-        let Some((peer, version)) = chosen else {
+        )
+        .map(|(n, v)| (n.to_string(), v, false))
+        .or_else(|| client_changes.map(|(n, v)| (n, v, true)));
+        let Some((peer, version, merge)) = chosen else {
             return;
         };
-        let Some(addr) = peers.get(peer) else { return };
+        let peers = self.direct_peers();
+        let Some(addr) = peers.get(&peer) else { return };
         let target = SocketAddrV4::new(*addr, port);
-        let peer = peer.to_string();
-        self.events.emit(
-            Level::Info,
-            Some(&peer),
+        let text = if merge {
+            format!(
+                "Client \"{peer}\" has changes (revision {}, here: {}); fetching them",
+                version.revision, ours.revision
+            )
+        } else {
             format!(
                 "Peer \"{peer}\" has mesh revision {} (here: {}); fetching it",
                 version.revision, ours.revision
-            ),
-        );
+            )
+        };
+        self.events.emit(Level::Info, Some(&peer), text);
         self.fetching = true;
         let inputs = self.inputs.clone();
         tokio::spawn(async move {
             let result = sync_net::fetch(target).await.map_err(|e| format!("{e:#}"));
-            let _ = inputs.send(Input::Fetched { peer, result }).await;
+            let _ = inputs
+                .send(Input::Fetched {
+                    peer,
+                    merge,
+                    result,
+                })
+                .await;
         });
     }
 
-    async fn fetched(&mut self, peer: String, result: Result<String, String>) {
+    async fn fetched(&mut self, peer: String, merge: bool, result: Result<String, String>) {
         self.fetching = false;
         let text = match result {
             Ok(t) => t,
@@ -749,6 +802,25 @@ impl Controller {
         };
         let Some(mesh) = parsed else { return };
         let fingerprint = config::fingerprint(&mesh);
+        let mesh = if merge {
+            let Some(own) = self.confirmed.as_ref().map(|c| c.mesh.clone()) else {
+                return;
+            };
+            match view::merge(&own, &mesh, &peer) {
+                Ok(merged) => merged,
+                Err(e) => {
+                    self.rejected.insert(fingerprint);
+                    self.events.emit(
+                        Level::Warn,
+                        Some(&peer),
+                        format!("Not using the changes of client \"{peer}\": {e}"),
+                    );
+                    return;
+                }
+            }
+        } else {
+            mesh
+        };
         match sync::accept(mesh, &local) {
             Err(e) => {
                 self.rejected.insert(fingerprint);
@@ -967,13 +1039,15 @@ impl Controller {
                     admission.name, invite.code
                 ),
             );
+            let mesh = render_mesh(&view::view_for(&confirmed.mesh, &admission.name));
             return JoinReply::Ok {
                 site: admission.name,
                 via,
-                mesh: render_mesh(&confirmed.mesh),
+                mesh,
             };
         }
-        let mesh = render_mesh(&admission.mesh);
+        // The new site gets its view of the network only.
+        let mesh = render_mesh(&view::view_for(&admission.mesh, &admission.name));
         let site = admission.name;
         if !admission.added {
             self.events.emit(
@@ -1353,29 +1427,39 @@ impl Controller {
                 c.mesh.revision
             )));
         }
-        let fingerprint = config::fingerprint(&cfg.mesh);
-        // A peer with the content this change is based on (only a higher
-        // revision number) does not make it outdated.
-        let base_fingerprint = self
-            .confirmed
-            .as_ref()
-            .map(|c| config::fingerprint(&c.mesh))
-            .unwrap_or_default();
+        // What a peer would have if it were up to date: a client of this
+        // site its view, any other peer the whole of what this site knows.
+        let me = cfg.self_name();
+        let expected = |mesh: &Mesh, peer: &str| {
+            let client = mesh
+                .site(peer)
+                .is_some_and(|s| s.uplink.as_deref() == Some(me));
+            if client {
+                config::fingerprint(&view::view_for(mesh, peer))
+            } else {
+                config::fingerprint(mesh)
+            }
+        };
         // Only peers that stay peers (same name and address) and answer now
         // count; a site of another or an old network must not block a change.
         let current = self.direct_peers();
-        let relevant: BTreeSet<String> = topology::tunnels_for(&cfg.mesh, cfg.self_name())
+        let relevant: BTreeSet<String> = topology::tunnels_for(&cfg.mesh, me)
             .into_iter()
             .filter(|t| current.get(&t.peer.name) == Some(&t.peer.address))
             .map(|t| t.peer.name.clone())
             .collect();
+        let base_mesh = self.confirmed.as_ref().map(|c| &c.mesh);
         let newer = self.probes.read().ok().and_then(|t| {
             t.iter()
                 .filter(|(name, p)| p.reachable && relevant.contains(*name))
                 .filter_map(|(name, p)| p.announce.map(|a| (name.clone(), a)))
-                .find(|(_, a)| {
+                .find(|(name, a)| {
                     let theirs = fingerprint_hex(&a.fingerprint);
-                    a.revision > base && theirs != fingerprint && theirs != base_fingerprint
+                    // A peer with the content this change is based on (only
+                    // a higher revision number) does not make it outdated.
+                    a.revision > base
+                        && theirs != expected(&cfg.mesh, name)
+                        && base_mesh.is_none_or(|m| theirs != expected(m, name))
                 })
         });
         if let Some((peer, a)) = newer {
@@ -1719,7 +1803,17 @@ impl Controller {
                     rx_bps,
                     tx_bps,
                     revision: announce.map(|a| a.revision),
-                    in_sync: announce.map(|a| fingerprint_hex(&a.fingerprint) == confirmed_fp),
+                    in_sync: announce.map(|a| {
+                        let theirs = fingerprint_hex(&a.fingerprint);
+                        if t.kind == TunnelKind::Client {
+                            self.confirmed.as_ref().is_some_and(|c| {
+                                theirs
+                                    == config::fingerprint(&view::view_for(&c.mesh, &t.peer.name))
+                            })
+                        } else {
+                            theirs == confirmed_fp
+                        }
+                    }),
                 }
             })
             .collect();

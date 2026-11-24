@@ -67,10 +67,22 @@ pub fn restricted_by<'a>(mesh: &'a Mesh, editor: &str) -> Option<&'a str> {
 
 /// True if `editor` may change the rules of `site` in `mesh`.
 pub fn may_change(mesh: &Mesh, site: &Site, editor: &str) -> bool {
+    // A client only changes itself and its own clients, never its server.
+    if client_of(mesh, editor).is_some()
+        && site.name != editor
+        && site.uplink.as_deref() != Some(editor)
+    {
+        return false;
+    }
     match manager(mesh, site) {
         Some(m) => editor == m || (editor == site.name && site.self_managed),
         None => restricted_by(mesh, editor).is_none(),
     }
+}
+
+/// The site `editor` is a client of, if it is a client.
+pub fn client_of<'a>(mesh: &'a Mesh, editor: &str) -> Option<&'a str> {
+    mesh.site(editor)?.uplink.as_deref()
 }
 
 /// True if `editor` may change the VLANs of the network (`mesh.vlans`).
@@ -100,6 +112,14 @@ pub fn managed_label(mesh: &Mesh, site: &Site) -> String {
 /// it may not.
 pub fn why_not(mesh: &Mesh, site: &Site, editor: &str, what: &str) -> String {
     let name = &site.name;
+    if let Some(up) = client_of(mesh, editor)
+        && site.name != editor
+        && site.uplink.as_deref() != Some(editor)
+    {
+        return format!(
+            "this site (\"{editor}\") is a client of \"{up}\": it may only change itself and its own clients, not {what} site \"{name}\""
+        );
+    }
     if let Some(m) = restricted_by(mesh, editor)
         && manager(mesh, site) != Some(editor)
     {
@@ -146,6 +166,18 @@ pub fn check_edit(old: &Mesh, new: &Mesh, editor: &str) -> Result<(), String> {
             Some(_) => continue,
         };
         return Err(why_not(old, site, editor, what));
+    }
+    // A client only adds clients of its own.
+    if let Some(up) = client_of(old, editor)
+        && let Some(added) = new
+            .sites
+            .iter()
+            .find(|s| old.site(&s.name).is_none() && s.uplink.as_deref() != Some(editor))
+    {
+        return Err(format!(
+            "this site (\"{editor}\") is a client of \"{up}\": it may only add clients of its own, not \"{}\"",
+            added.name
+        ));
     }
     Ok(())
 }
@@ -306,5 +338,34 @@ mod tests {
         assert!(why_not(&m, &m.sites[2], "b", "change").contains("only \"a\""));
         assert!(may_change_network_vlans(&m, "b"));
         assert!(!may_change_network_vlans(&m, "c"));
+    }
+
+    #[test]
+    fn a_client_changes_only_itself_and_its_own_clients() {
+        let mut old = mesh();
+        // d is a client of a (released, so its VLANs are its own), e a client of d.
+        old.sites[3].uplink = Some("a".into());
+        old.sites.push(Site {
+            uplink: Some("d".into()),
+            managed_by: Some("d".into()),
+            ..site("e", 5, None, false)
+        });
+        let mut new = old.clone();
+        new.sites[3].online = false;
+        new.sites[4].online = false;
+        assert!(check_edit(&old, &new, "d").is_ok(), "itself and its client");
+        let mut server = old.clone();
+        server.sites[1].online = false;
+        let err = check_edit(&old, &server, "d").unwrap_err();
+        assert!(err.contains("is a client of \"a\""), "{err}");
+        let mut added = old.clone();
+        added.sites.push(site("f", 6, None, false));
+        assert!(
+            check_edit(&old, &added, "d")
+                .unwrap_err()
+                .contains("only add clients")
+        );
+        added.sites[5].uplink = Some("d".into());
+        assert!(check_edit(&old, &added, "d").is_ok());
     }
 }

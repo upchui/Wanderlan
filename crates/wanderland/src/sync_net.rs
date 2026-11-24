@@ -1,13 +1,14 @@
 //! Configuration sync and joining over TCP on `<address>:<control_port>`.
 //!
-//! * `MESH`: the server answers with its confirmed `mesh.toml` (canonical
-//!   form) and closes the connection. Only direct peers (and peers removed
-//!   within the last minutes) are served.
+//! * `MESH`: the server answers with the confirmed `mesh.toml` as the asking
+//!   peer may see it (canonical form; a client gets only its view, see
+//!   `wanderlan_core::view`) and closes the connection. Only direct peers
+//!   (and peers removed within the last minutes) are served.
 //! * `JOIN <json>` ([`JoinRequest`]): a new site asks to join with an
 //!   invitation code; open to every address, the controller checks the code.
 //!   The answer is one JSON line ([`JoinReply`]).
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::Duration;
 
@@ -34,10 +35,9 @@ const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 pub struct Offer {
     /// Address to listen on.
     pub bind: Option<SocketAddrV4>,
-    /// Addresses allowed to fetch.
-    pub allowed: BTreeSet<Ipv4Addr>,
-    /// The confirmed mesh.toml.
-    pub mesh: String,
+    /// What each allowed address gets: the confirmed mesh.toml as that
+    /// peer may see it.
+    pub views: BTreeMap<Ipv4Addr, String>,
 }
 
 /// Starts the server; it follows changes of the offer.
@@ -111,10 +111,10 @@ async fn serve(
     .context("timeout")??;
     let line = line.trim();
     if line == "MESH" {
-        if !offer.allowed.contains(from.ip()) {
+        let Some(view) = offer.views.get(from.ip()) else {
             bail!("{from} is not a peer");
-        }
-        write.write_all(offer.mesh.as_bytes()).await?;
+        };
+        write.write_all(view.as_bytes()).await?;
     } else if let Some(json) = line.strip_prefix("JOIN ") {
         let reply = match serde_json::from_str::<JoinRequest>(json) {
             Ok(request) => ask_controller(*from.ip(), request, inputs).await,

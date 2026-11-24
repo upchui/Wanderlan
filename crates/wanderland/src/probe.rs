@@ -50,6 +50,22 @@ pub struct ProbeConfig {
     pub mtu_interval: Option<Duration>,
     /// What this site announces (mesh revision and fingerprint).
     pub announce: wire::Announce,
+    /// What this site announces to single peers instead: to a client the
+    /// version of the client's view of the network.
+    pub announce_to: BTreeMap<String, wire::Announce>,
+}
+
+impl ProbeConfig {
+    /// What to announce to the peer at `addr`.
+    fn announce_for(&self, addr: Ipv4Addr) -> wire::Announce {
+        self.peers
+            .iter()
+            .chain(self.responders.iter())
+            .find(|(_, a)| **a == addr)
+            .and_then(|(name, _)| self.announce_to.get(name))
+            .copied()
+            .unwrap_or(self.announce)
+    }
 }
 
 /// Measurements of one peer, as shown in the status.
@@ -264,7 +280,7 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
                         .find(|(_, a)| **a == *from.ip())
                         .map(|(n, _)| (n.clone(), false))
                 });
-            (peer, cfg.announce)
+            (peer, cfg.announce_for(*from.ip()))
         };
         let Some((peer, direct)) = peer else {
             debug!("ignoring probe from {from}, not a peer");
@@ -331,7 +347,7 @@ async fn probe_once(
     timeout: Duration,
 ) -> Option<Duration> {
     let seq = shared.seq.fetch_add(1, Ordering::Relaxed);
-    let announce = shared.config.borrow().announce;
+    let announce = shared.config.borrow().announce_for(*peer.ip());
     let packet = wire::request(seq, size, &announce);
     let (tx, rx) = oneshot::channel();
     if let Ok(mut p) = shared.pending.lock() {

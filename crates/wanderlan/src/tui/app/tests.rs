@@ -435,7 +435,7 @@ fn a_restricted_site_changes_no_vlans() {
             && app
                 .message
                 .as_ref()
-                .is_some_and(|m| m.text.contains("managed by \"buero\""))
+                .is_some_and(|m| m.text.contains("\"buero\""))
     };
     // The network's VLANs, in the VLAN view and in the settings.
     app.update(ch('3'));

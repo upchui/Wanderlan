@@ -16,6 +16,7 @@ pub mod reconcile;
 pub mod sync;
 pub mod sys;
 pub mod topology;
+pub mod view;
 
 /// Name of the bridge created by wanderlan.
 pub const BRIDGE_NAME: &str = "br0";
