@@ -6,10 +6,14 @@
 #   build     release build for TARGET plus .deb package (output in /out)
 #   artifacts the contents of /out only, for `docker build --output`
 #   testnode  slim Debian with the built .deb installed, simulates a site
+#   modloader loads the kernel modules for the integration tests
+#   aptrepo   apt-ftparchive and gpg to build the APT repository
 #   repotest  fresh Debian/Ubuntu that installs wanderlan from the APT repo
+#   repoe2e   repotest plus test tools, for two hosts with the example config
 
-ARG RUST_IMAGE=rust:1.99.1-bookworm
-ARG DEBIAN_IMAGE=debian:bookworm-slim
+ARG RUST_IMAGE=rust:1.99.1-trixie
+ARG DEBIAN_IMAGE=debian:trixie-slim
+ARG REPOTEST_BASE=debian:13
 
 FROM ${RUST_IMAGE} AS base
 ARG CARGO_DEB_VERSION=3.8.0
@@ -68,7 +72,7 @@ RUN --mount=type=cache,target=/src/target,id=wanderlan-target-build \
 FROM scratch AS artifacts
 COPY --from=build /out/ /
 
-# A simulated site for the integration tests: slim Debian with the package
+# A simulated site for the integration tests: slim Debian 13 with the package
 # installed exactly as a user would install it.
 FROM ${DEBIAN_IMAGE} AS testnode
 RUN apt-get update \
@@ -88,3 +92,43 @@ ENTRYPOINT ["/usr/local/bin/node-entrypoint"]
 FROM ubuntu:24.04 AS modloader
 RUN apt-get update && apt-get install -y --no-install-recommends kmod && rm -rf /var/lib/apt/lists/*
 ENTRYPOINT ["modprobe", "-a"]
+
+# Tools to build and sign the APT repository (apt-ftparchive, gpg).
+FROM ${DEBIAN_IMAGE} AS aptrepo
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends apt-utils gnupg gzip ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# A fresh Debian/Ubuntu that installs wanderlan from the published APT
+# repository with exactly the commands from the README.
+FROM ${REPOTEST_BASE} AS repotest
+ARG REPO_URL=https://upchui.github.io/Wanderlan
+ARG EXPECT_VERSION=""
+ARG CACHE_BUST=""
+ENV DEBIAN_FRONTEND=noninteractive
+# Prerequisites a minimal container lacks (a normal installation has them),
+# and "yes" to apt's question so the README commands run unchanged.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends curl gpg ca-certificates sudo \
+ && rm -rf /var/lib/apt/lists/* \
+ && echo 'APT::Get::Assume-Yes "true";' > /etc/apt/apt.conf.d/90assume-yes
+RUN echo "repotest ${CACHE_BUST}" \
+ && curl -fsSL ${REPO_URL}/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/wanderlan.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/wanderlan.gpg] ${REPO_URL}/apt stable main" | sudo tee /etc/apt/sources.list.d/wanderlan.list \
+ && sudo apt update && sudo apt install wanderlan
+RUN wanderlan --version && wanderland --version \
+ && installed=$(dpkg-query -W -f '${Version}' wanderlan) \
+ && echo "installed wanderlan ${installed}" \
+ && if [ -n "${EXPECT_VERSION}" ]; then test "${installed}" = "${EXPECT_VERSION}"; fi \
+ && getent group wanderlan \
+ && test -f /lib/systemd/system/wanderland.service -o -f /usr/lib/systemd/system/wanderland.service \
+ && wanderlan init | grep -q '^\[mesh\]' 
+
+# The repository installation plus test tools, to run two hosts with the
+# example configuration (tests/repotest).
+FROM repotest AS repoe2e
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends iproute2 iputils-ping procps jq \
+ && rm -rf /var/lib/apt/lists/*
+COPY tests/integration/node/ /usr/local/bin/
+ENTRYPOINT ["/usr/local/bin/node-entrypoint"]

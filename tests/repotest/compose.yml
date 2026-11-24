@@ -1,0 +1,52 @@
+# Two hosts that installed wanderlan from the APT repository, connected by a
+# transport network, each with a client on its trunk (see run.sh).
+name: wanderlan-repotest
+
+x-common: &common
+  image: ${REPOE2E_IMAGE:-wanderlan-repoe2e}
+  init: true
+  cap_add: [NET_ADMIN]
+  sysctls:
+    net.ipv6.conf.all.disable_ipv6: "1"
+    net.ipv6.conf.default.disable_ipv6: "1"
+
+services:
+  heim:
+    <<: *common
+    hostname: heim
+    environment: { ROLE: site, TRUNK_NET: "10.201.1." }
+    networks:
+      transport: { ipv4_address: 10.8.0.1 }
+      tr-heim: { ipv4_address: 10.201.1.10 }
+  buero:
+    <<: *common
+    hostname: buero
+    environment: { ROLE: site, TRUNK_NET: "10.201.2." }
+    networks:
+      transport: { ipv4_address: 10.8.0.2 }
+      tr-buero: { ipv4_address: 10.201.2.10 }
+  c-heim:
+    <<: *common
+    environment: { ROLE: client, TRUNK_NET: "10.201.1." }
+    networks:
+      tr-heim: { ipv4_address: 10.201.1.20 }
+  c-buero:
+    <<: *common
+    environment: { ROLE: client, TRUNK_NET: "10.201.2." }
+    networks:
+      tr-buero: { ipv4_address: 10.201.2.20 }
+
+networks:
+  transport:
+    internal: true
+    ipam:
+      # The example addresses 10.8.0.1/.2 are used by the sites themselves.
+      config: [{ subnet: 10.8.0.0/24, gateway: 10.8.0.254 }]
+  tr-heim:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.201.1.0/24 }]
+  tr-buero:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.201.2.0/24 }]

@@ -1,0 +1,188 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+
+jobs:
+  version:
+    name: check version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      deb_version: ${{ steps.v.outputs.deb_version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: v
+        name: Tag must match the workspace version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "deb_version=$version-1" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build (${{ matrix.arch }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Build binaries and .deb (native ${{ matrix.arch }})
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: artifacts
+          outputs: type=local,dest=dist
+          cache-from: type=gha,scope=release-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=release-${{ matrix.arch }}
+      - name: Smoke test of the package on Debian 13
+        run: |
+          docker build -f docker/Dockerfile --target testnode -t wanderlan-testnode .
+          docker run --rm --entrypoint sh wanderlan-testnode -c \
+            'wanderland --version && wanderlan --version && wanderlan validate /usr/share/doc/wanderlan/examples/mesh.toml --local /usr/share/doc/wanderlan/examples/local.toml'
+          file dist/wanderland-*-linux-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+
+  release:
+    name: GitHub release
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          notes=$(awk '/^## /{n++} n==1' ../CHANGELOG.md | tail -n +2)
+          gh release create "$GITHUB_REF_NAME" * \
+            --title "wanderlan ${{ needs.version.outputs.version }}" \
+            --notes "${notes:-See CHANGELOG.md}"
+
+  apt:
+    name: APT repository
+    needs: [version, release]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - name: Check out gh-pages (or start it)
+        run: |
+          if git ls-remote --exit-code --heads origin gh-pages >/dev/null; then
+            git fetch --depth 1 origin gh-pages
+            git worktree add pages origin/gh-pages
+            git -C pages switch -c gh-pages
+          else
+            git worktree add --orphan -b gh-pages pages
+          fi
+      - name: Add the packages and sign the repository
+        env:
+          APT_GPG_PRIVATE_KEY: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          APT_GPG_PASSPHRASE: ${{ secrets.APT_GPG_PASSPHRASE }}
+        run: |
+          if [ -z "$APT_GPG_PRIVATE_KEY" ]; then
+            echo "::error::the secret APT_GPG_PRIVATE_KEY is missing (see README, Maintainers)"
+            exit 1
+          fi
+          docker build -f docker/Dockerfile --target aptrepo -t wanderlan-aptrepo .
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/w" -w /w \
+            -e APT_GPG_PRIVATE_KEY -e APT_GPG_PASSPHRASE \
+            wanderlan-aptrepo scripts/apt-repo.sh pages dist/*.deb
+      - name: Publish gh-pages
+        run: |
+          cd pages
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "APT repository: wanderlan ${{ needs.version.outputs.deb_version }}"
+          git push origin gh-pages
+
+  repotest:
+    name: install from the repository (${{ matrix.base }})
+    needs: [version, apt]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        base: ["debian:13", "debian:12", "ubuntu:24.04"]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Wait until GitHub Pages serves the new version
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsSL "$PAGES_URL/apt/dists/stable/main/binary-amd64/Packages" \
+                | grep -qx "Version: ${{ needs.version.outputs.deb_version }}"; then
+              echo "published"; exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::the new version did not appear on $PAGES_URL"
+          exit 1
+      - name: Install with the README commands
+        run: |
+          docker build -f docker/Dockerfile --target repotest \
+            --build-arg REPOTEST_BASE=${{ matrix.base }} \
+            --build-arg REPO_URL="$PAGES_URL" \
+            --build-arg EXPECT_VERSION=${{ needs.version.outputs.deb_version }} \
+            --build-arg CACHE_BUST="$GITHUB_RUN_ID" \
+            -t wanderlan-repotest .
+      - name: Downgrade to an older version, if there is one
+        run: |
+          docker run --rm wanderlan-repotest bash -c '
+            set -e
+            versions=$(apt-cache madison wanderlan | awk "{print \$3}")
+            echo "$versions"
+            older=$(echo "$versions" | sed -n 2p)
+            if [ -n "$older" ]; then
+              apt-get install -y --allow-downgrades "wanderlan=$older"
+              test "$(dpkg-query -W -f "\${Version}" wanderlan)" = "$older"
+              echo "downgrade to $older works"
+            else
+              echo "only one version published so far"
+            fi'
+
+  acceptance:
+    name: two hosts with the example configuration (Debian 13)
+    needs: [version, repotest]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Load kernel modules
+        run: scripts/load-modules.sh
+      - name: Install from the repository and run the example configuration
+        run: REPO_URL="$PAGES_URL" tests/repotest/run.sh

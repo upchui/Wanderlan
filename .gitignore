@@ -2,3 +2,4 @@
 /dist
 /tests/integration/.run
 *.rejected
+/.claude/worktrees/

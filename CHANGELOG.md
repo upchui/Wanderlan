@@ -4,6 +4,48 @@ All notable changes to wanderlan are documented in this file.
 
 ## [Unreleased]
 
+### Milestone 7 – TUI and CLI
+
+- Interactive terminal UI (`wanderlan` without arguments, ratatui +
+  crossterm, keyboard first, `--mouse` optional, works in 80×24 and over
+  SSH): overview with live peer status, sites with forms and in-field
+  validation, mesh and local settings, VLAN range and mapping table with
+  immediate conflict marking, MAC table (filter, sort), live log (filter by
+  level and peer), setup wizard on first start.
+- Changes are collected in a draft; `a` shows the diff against the running
+  configuration and applies it; a countdown banner shows pending changes
+  (also those from the sync), `c` confirms, `r` rolls back; `?` help.
+- Without a daemon the TUI explains why and reconnects every 2 s.
+- CLI: `status [--json]`, `validate`, `apply`, `confirm`, `rollback`, `init`,
+  `export`, `unblock`, `log [-f]`, `probe`.
+- Tests: state machine unit tests, snapshot tests of every screen at 80×24,
+  and an integration test that drives the TUI in tmux.
+
+### Milestone 6 – Daemon API, commit with rollback, loop guard, sync
+
+- Unix socket API `/run/wanderlan/wanderlan.sock` (JSON lines, mode 0660,
+  group `wanderlan`): status, event subscription, get/validate/apply
+  configuration, apply edited files, confirm, rollback, interfaces, MAC
+  table, unblock, MTU probe.
+- Commit with rollback: every change must be confirmed within
+  `commit_timeout`, otherwise the previous state is restored; edited files
+  that are not confirmed are restored and kept as `*.rejected`, also across
+  a restart. Confirming a local change raises the mesh revision.
+- Loop guard: MAC addresses flapping between GRETAP ports shut down the
+  offending port (spoke ports first) until `wanderlan unblock`.
+- Automatic sync of `mesh.toml`: probes announce revision and fingerprint,
+  sites fetch a newer mesh from a direct peer over TCP, apply it with the
+  commit timer and confirm it automatically once a peer is reachable;
+  rejected versions are not fetched again, removed peers may fetch for 5
+  minutes, changes based on an outdated revision are refused.
+- Event log (ring buffer, also to journald), throughput per port.
+- Netlink dumps on one socket are serialised (concurrent dumps fail with
+  EBUSY); a restarted daemon keeps the existing MSS rules.
+- Integration tests: rollback after the deadline, rollback of edited files,
+  invalid configurations with line numbers, an external layer-2 loop cut by
+  the loop guard, sync of a change to all sites, refusal of outdated
+  changes, a new site fetching the mesh from its hub.
+
 ### Milestone 5 – MTU and MSS
 
 - Control probes between the daemons (UDP on `<address>:control_port`, only
