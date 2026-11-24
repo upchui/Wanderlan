@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    # Members of this group may use the wanderlan TUI/CLI without root.
+    if ! getent group wanderlan >/dev/null; then
+        groupadd --system wanderlan
+    fi
+    mkdir -p /var/lib/wanderlan
+    chown root:wanderlan /var/lib/wanderlan
+    chmod 0750 /var/lib/wanderlan
+fi
+
+#DEBHELPER#
+
+exit 0

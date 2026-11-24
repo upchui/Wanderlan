@@ -1,6 +1,6 @@
 [package]
 name = "wanderlan"
-description = "Terminal UI and command line for the wanderlan layer-2 mesh"
+description = "Stretches VLANs across sites on layer 2 (GRETAP and a VLAN-aware bridge)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -15,3 +15,28 @@ clap.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.deb]
+name = "wanderlan"
+maintainer = "wanderlan maintainers <upchui@users.noreply.github.com>"
+copyright = "2026, wanderlan contributors"
+extended-description = """\
+wanderlan stretches VLANs across several sites on layer 2: one GRETAP tunnel \
+per peer site, a Linux bridge with VLAN filtering, VLAN mappings, MSS \
+clamping and loop protection. It builds no VPN; the sites must already reach \
+each other through an existing transport network such as a VPN."""
+section = "net"
+priority = "optional"
+depends = "nftables"
+assets = [
+    ["target/release/wanderland", "usr/bin/", "755"],
+    ["target/release/wanderlan", "usr/bin/", "755"],
+    ["../../packaging/etc/mesh.toml", "etc/wanderlan/mesh.toml", "644"],
+    ["../../packaging/etc/local.toml", "etc/wanderlan/local.toml", "644"],
+    ["../../packaging/examples/mesh.toml", "usr/share/doc/wanderlan/examples/mesh.toml", "644"],
+    ["../../packaging/examples/local.toml", "usr/share/doc/wanderlan/examples/local.toml", "644"],
+    ["../../packaging/modules-load.conf", "usr/lib/modules-load.d/wanderlan.conf", "644"],
+    ["../../README.md", "usr/share/doc/wanderlan/README.md", "644"],
+]
+maintainer-scripts = "../../packaging/debian/"
+systemd-units = { unit-name = "wanderland", unit-scripts = "../../packaging/systemd/", enable = true, start = true, restart-after-upgrade = true }

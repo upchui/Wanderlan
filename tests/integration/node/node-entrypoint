@@ -1,0 +1,49 @@
+#!/bin/bash
+# Entry point of the integration test containers.
+#   ROLE=router  plain IPv4 router between all underlay networks
+#   ROLE=site    a wanderlan site: underlay + trunk interface (renamed trunk0)
+#   ROLE=client  a host on the trunk of a site (VLAN subinterfaces added by tests)
+set -euo pipefail
+
+# Prints the interface that has an IPv4 address starting with the prefix.
+find_if() {
+  ip -o -4 addr show | awk -v p="$1" 'index($4, p) == 1 { print $2; exit }'
+}
+
+# Renames the interface on the given network to trunk0 and removes its address.
+make_trunk() {
+  local dev
+  dev=$(find_if "$1")
+  if [ -z "$dev" ]; then
+    echo "no interface on $1" >&2
+    exit 1
+  fi
+  ip addr flush dev "$dev"
+  ip link set "$dev" down
+  ip link set "$dev" name trunk0
+  ip link set trunk0 up
+}
+
+case "${ROLE:-site}" in
+  router)
+    ;;
+  site)
+    make_trunk "$TRUNK_NET"
+    ip route replace default via "$GATEWAY"
+    # Start the daemon like systemd would, if this site was configured before
+    # (e.g. after a container restart).
+    if grep -qs '^self' /etc/wanderlan/local.toml; then
+      wl-daemon start
+    fi
+    ;;
+  client)
+    make_trunk "$TRUNK_NET"
+    ;;
+  *)
+    echo "unknown ROLE ${ROLE}" >&2
+    exit 1
+    ;;
+esac
+
+touch /run/node-ready
+exec sleep infinity

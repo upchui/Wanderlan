@@ -1,0 +1,44 @@
+#!/bin/bash
+# Starts and stops wanderland inside a test container (stands in for systemd).
+set -euo pipefail
+PIDFILE=/run/wanderland.pid
+LOG=/var/log/wanderland.log
+
+running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
+
+case "${1:-}" in
+  start)
+    if running; then exit 0; fi
+    setsid /usr/bin/wanderland --reconcile-interval "${RECONCILE_INTERVAL:-5}" >>"$LOG" 2>&1 < /dev/null &
+    echo $! > "$PIDFILE"
+    ;;
+  stop)
+    if running; then
+      pid=$(cat "$PIDFILE")
+      kill -TERM "$pid"
+      for _ in $(seq 1 100); do
+        kill -0 "$pid" 2>/dev/null || break
+        sleep 0.1
+      done
+      if kill -0 "$pid" 2>/dev/null; then
+        echo "wanderland did not stop" >&2
+        exit 1
+      fi
+    fi
+    rm -f "$PIDFILE"
+    ;;
+  reload)
+    running && kill -HUP "$(cat "$PIDFILE")"
+    ;;
+  restart)
+    "$0" stop
+    "$0" start
+    ;;
+  status)
+    running
+    ;;
+  *)
+    echo "usage: wl-daemon start|stop|reload|restart|status" >&2
+    exit 2
+    ;;
+esac

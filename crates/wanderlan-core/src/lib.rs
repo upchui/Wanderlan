@@ -6,6 +6,9 @@
 //! traits so that all logic can be tested without root privileges.
 
 pub mod config;
+pub mod desired;
+pub mod reconcile;
+pub mod sys;
 pub mod topology;
 
 /// Name of the bridge created by wanderlan.

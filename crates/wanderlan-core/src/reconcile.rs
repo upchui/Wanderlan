@@ -1,0 +1,642 @@
+//! Reconciliation: compare the desired with the actual state and change only
+//! what differs.
+//!
+//! [`plan`] is a pure function from a snapshot of the system to a list of
+//! [`Change`]s. [`reconcile`] repeats observe → plan → apply until nothing is
+//! left to do, so changes that depend on each other (create a port, then add
+//! its VLANs) converge in a few rounds. Applying the same configuration again
+//! plans no changes at all.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+
+use crate::config::VlanSet;
+use crate::desired::{Desired, GRETAP_MTU, OWNER_ALIAS};
+use crate::sys::{
+    BridgeOptions, GretapParams, LinkKind, LinkState, LinkUpdate, NetOps, PortVlans, SysError,
+    VlanFlags,
+};
+use crate::topology::GRETAP_PREFIX;
+
+/// Maximum number of observe/plan/apply rounds before giving up.
+pub const MAX_ROUNDS: usize = 6;
+
+/// A snapshot of the parts of the system wanderlan looks at.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Actual {
+    /// All links by name.
+    pub links: BTreeMap<String, LinkState>,
+    /// VLAN entries by link index.
+    pub vlans: BTreeMap<u32, PortVlans>,
+}
+
+impl Actual {
+    /// Reads the current state from the system.
+    pub async fn observe<N: NetOps>(net: &N) -> Result<Self, SysError> {
+        let links = net
+            .links()
+            .await?
+            .into_iter()
+            .map(|l| (l.name.clone(), l))
+            .collect();
+        let vlans = net.port_vlans().await?;
+        Ok(Self { links, vlans })
+    }
+
+    fn by_index(&self, index: u32) -> Option<&LinkState> {
+        self.links.values().find(|l| l.index == index)
+    }
+
+    fn vlans_of(&self, link: &LinkState) -> PortVlans {
+        self.vlans.get(&link.index).cloned().unwrap_or_default()
+    }
+}
+
+/// Returns true if wanderlan created this link.
+pub fn is_owned(link: &LinkState) -> bool {
+    link.alias.as_deref() == Some(OWNER_ALIAS)
+}
+
+/// One change to the system.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    /// Create the bridge.
+    CreateBridge {
+        name: String,
+        options: BridgeOptions,
+    },
+    /// Change bridge options.
+    SetBridgeOptions {
+        name: String,
+        options: BridgeOptions,
+    },
+    /// Create a GRETAP tunnel.
+    CreateGretap {
+        name: String,
+        peer: String,
+        params: GretapParams,
+    },
+    /// Delete a link created by wanderlan.
+    DeleteLink { name: String, reason: String },
+    /// Set the MTU of a link.
+    SetMtu { name: String, mtu: u32 },
+    /// Attach a link to the bridge.
+    Attach { name: String, bridge: String },
+    /// Set split-horizon isolation of a bridge port.
+    SetIsolated { name: String, isolated: bool },
+    /// Bring a link up or down.
+    SetUp {
+        name: String,
+        up: bool,
+        reason: Option<String>,
+    },
+    /// Add or update VLAN entries of a port.
+    AddVlans {
+        port: String,
+        vlans: Vec<(u16, VlanFlags)>,
+    },
+    /// Remove VLAN entries from a port.
+    DelVlans { port: String, vids: Vec<u16> },
+}
+
+fn vid_list(vids: impl IntoIterator<Item = u16>) -> String {
+    let mut set = VlanSet::new();
+    for v in vids {
+        // VLAN IDs in the system are always valid, insertion cannot fail.
+        let _ = set.insert_checked(i64::from(v));
+    }
+    set.to_string()
+}
+
+impl fmt::Display for Change {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::CreateBridge { name, .. } => write!(
+                f,
+                "Creating bridge {name} with VLAN filtering, STP off and no default VLAN"
+            ),
+            Self::SetBridgeOptions { name, options } => write!(
+                f,
+                "Setting bridge {name} options (VLAN filtering {}, STP {}, default VLAN {})",
+                on_off(options.vlan_filtering),
+                on_off(options.stp),
+                options.default_pvid
+            ),
+            Self::CreateGretap { name, peer, params } => write!(
+                f,
+                "Creating GRETAP tunnel {name} to site \"{peer}\" ({} -> {})",
+                params.local, params.remote
+            ),
+            Self::DeleteLink { name, reason } => write!(f, "Deleting interface {name} ({reason})"),
+            Self::SetMtu { name, mtu } => write!(f, "Setting MTU of {name} to {mtu}"),
+            Self::Attach { name, bridge } => write!(f, "Attaching {name} to bridge {bridge}"),
+            Self::SetIsolated {
+                name,
+                isolated: true,
+            } => write!(
+                f,
+                "Isolating port {name} (split horizon: no forwarding between hub tunnels)"
+            ),
+            Self::SetIsolated {
+                name,
+                isolated: false,
+            } => {
+                write!(f, "Removing isolation from port {name}")
+            }
+            Self::SetUp { name, up, reason } => {
+                write!(f, "Bringing {name} {}", if *up { "up" } else { "down" })?;
+                if let Some(reason) = reason {
+                    write!(f, " ({reason})")?;
+                }
+                Ok(())
+            }
+            Self::AddVlans { port, vlans } => {
+                let mut by_flags: BTreeMap<VlanFlags, Vec<u16>> = BTreeMap::new();
+                for (vid, flags) in vlans {
+                    by_flags.entry(*flags).or_default().push(*vid);
+                }
+                let parts: Vec<String> = by_flags
+                    .into_iter()
+                    .map(|(flags, vids)| format!("{} ({flags})", vid_list(vids)))
+                    .collect();
+                write!(f, "Adding VLANs {} to port {port}", parts.join(", "))
+            }
+            Self::DelVlans { port, vids } => write!(
+                f,
+                "Removing VLANs {} from port {port}",
+                vid_list(vids.iter().copied())
+            ),
+        }
+    }
+}
+
+fn on_off(v: bool) -> &'static str {
+    if v { "on" } else { "off" }
+}
+
+/// Reasons why the desired state cannot be reached safely.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PlanError {
+    /// An interface with a name wanderlan needs exists and is not ours.
+    #[error(
+        "interface {0} already exists and was not created by wanderlan; remove or rename it, wanderlan will not touch it"
+    )]
+    Foreign(String),
+    /// The configured trunk interface does not exist.
+    #[error("trunk interface {0} does not exist")]
+    TrunkMissing(String),
+    /// The trunk is attached to another bridge or bond.
+    #[error("trunk interface {trunk} is already attached to {master}; detach it first")]
+    TrunkEnslaved { trunk: String, master: String },
+}
+
+/// Computes the changes needed to get from `actual` to `desired`.
+pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError> {
+    let mut deletes = Vec::new();
+    let mut bridge_changes = Vec::new();
+    let mut creates = Vec::new();
+    let mut settings = Vec::new();
+    let mut vlan_dels = Vec::new();
+    let mut vlan_adds = Vec::new();
+    let mut ups = Vec::new();
+
+    // Bridge.
+    let bridge = actual.links.get(&desired.bridge);
+    match bridge {
+        Some(link) if !is_owned(link) => return Err(PlanError::Foreign(link.name.clone())),
+        Some(link) => match &link.kind {
+            LinkKind::Bridge(options) if *options == desired.bridge_options => {}
+            LinkKind::Bridge(_) => bridge_changes.push(Change::SetBridgeOptions {
+                name: link.name.clone(),
+                options: desired.bridge_options,
+            }),
+            _ => {
+                deletes.push(Change::DeleteLink {
+                    name: link.name.clone(),
+                    reason: "it is not a bridge".into(),
+                });
+                bridge_changes.push(Change::CreateBridge {
+                    name: desired.bridge.clone(),
+                    options: desired.bridge_options,
+                });
+            }
+        },
+        None => bridge_changes.push(Change::CreateBridge {
+            name: desired.bridge.clone(),
+            options: desired.bridge_options,
+        }),
+    }
+    let bridge_index = bridge
+        .filter(|l| matches!(l.kind, LinkKind::Bridge(_)))
+        .map(|l| l.index);
+
+    // Stale or changed tunnels.
+    let wanted: BTreeMap<&str, _> = desired
+        .tunnels
+        .iter()
+        .map(|t| (t.name.as_str(), t))
+        .collect();
+    for link in actual.links.values() {
+        if !is_owned(link) || !link.name.starts_with(GRETAP_PREFIX) {
+            continue;
+        }
+        match (wanted.get(link.name.as_str()), &link.kind) {
+            (None, _) => deletes.push(Change::DeleteLink {
+                name: link.name.clone(),
+                reason: "the site is no longer a peer".into(),
+            }),
+            (Some(spec), LinkKind::Gretap(params)) if *params != spec.params => {
+                deletes.push(Change::DeleteLink {
+                    name: link.name.clone(),
+                    reason: format!(
+                        "tunnel endpoints changed to {} -> {}",
+                        spec.params.local, spec.params.remote
+                    ),
+                });
+            }
+            (Some(_), LinkKind::Gretap(_)) => {}
+            (Some(_), _) => deletes.push(Change::DeleteLink {
+                name: link.name.clone(),
+                reason: "it is not a GRETAP interface".into(),
+            }),
+        }
+    }
+    let deleted: BTreeSet<String> = deletes
+        .iter()
+        .filter_map(|c| match c {
+            Change::DeleteLink { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+
+    // Trunk.
+    let trunk = actual
+        .links
+        .get(&desired.trunk.name)
+        .ok_or_else(|| PlanError::TrunkMissing(desired.trunk.name.clone()))?;
+    if let Some(master) = trunk.master
+        && Some(master) != bridge_index
+    {
+        let master = actual
+            .by_index(master)
+            .map_or_else(|| format!("interface #{master}"), |l| l.name.clone());
+        return Err(PlanError::TrunkEnslaved {
+            trunk: trunk.name.clone(),
+            master,
+        });
+    }
+    port_changes(
+        PortWanted {
+            name: &desired.trunk.name,
+            mtu: None,
+            isolated: false,
+            up: true,
+            up_reason: None,
+            vlans: &desired.trunk.vlans,
+        },
+        trunk,
+        bridge_index,
+        &desired.bridge,
+        actual,
+        &mut settings,
+        &mut vlan_dels,
+        &mut vlan_adds,
+        &mut ups,
+    );
+
+    // Tunnels.
+    for spec in &desired.tunnels {
+        match actual.links.get(&spec.name) {
+            Some(link) if !is_owned(link) => return Err(PlanError::Foreign(link.name.clone())),
+            Some(link) if !deleted.contains(&link.name) => port_changes(
+                PortWanted {
+                    name: &spec.name,
+                    mtu: Some(GRETAP_MTU),
+                    isolated: spec.isolated,
+                    up: spec.enabled,
+                    up_reason: (!spec.enabled).then(|| "blocked by the loop guard".to_string()),
+                    vlans: &spec.vlans,
+                },
+                link,
+                bridge_index,
+                &desired.bridge,
+                actual,
+                &mut settings,
+                &mut vlan_dels,
+                &mut vlan_adds,
+                &mut ups,
+            ),
+            _ => creates.push(Change::CreateGretap {
+                name: spec.name.clone(),
+                peer: spec.peer.clone(),
+                params: spec.params,
+            }),
+        }
+    }
+
+    // The bridge device itself carries no VLANs (it has no address).
+    if let Some(link) = bridge.filter(|l| bridge_index == Some(l.index)) {
+        let current = actual.vlans_of(link);
+        if !current.is_empty() {
+            vlan_dels.push(Change::DelVlans {
+                port: link.name.clone(),
+                vids: current.keys().copied().collect(),
+            });
+        }
+        if !link.admin_up {
+            ups.push(Change::SetUp {
+                name: link.name.clone(),
+                up: true,
+                reason: None,
+            });
+        }
+    }
+
+    let mut out = deletes;
+    out.extend(bridge_changes);
+    out.extend(creates);
+    out.extend(settings);
+    out.extend(vlan_dels);
+    out.extend(vlan_adds);
+    out.extend(ups);
+    Ok(out)
+}
+
+struct PortWanted<'a> {
+    name: &'a str,
+    mtu: Option<u32>,
+    isolated: bool,
+    up: bool,
+    up_reason: Option<String>,
+    vlans: &'a PortVlans,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn port_changes(
+    want: PortWanted<'_>,
+    link: &LinkState,
+    bridge_index: Option<u32>,
+    bridge: &str,
+    actual: &Actual,
+    settings: &mut Vec<Change>,
+    vlan_dels: &mut Vec<Change>,
+    vlan_adds: &mut Vec<Change>,
+    ups: &mut Vec<Change>,
+) {
+    let name = want.name.to_string();
+    if let Some(mtu) = want.mtu
+        && link.mtu != mtu
+    {
+        settings.push(Change::SetMtu {
+            name: name.clone(),
+            mtu,
+        });
+    }
+    let attached = bridge_index.is_some() && link.master == bridge_index;
+    if !attached {
+        settings.push(Change::Attach {
+            name: name.clone(),
+            bridge: bridge.to_string(),
+        });
+    }
+    if attached {
+        // Port settings and VLANs only exist once the link is a bridge port.
+        if link.isolated.unwrap_or(false) != want.isolated {
+            settings.push(Change::SetIsolated {
+                name: name.clone(),
+                isolated: want.isolated,
+            });
+        }
+        let current = actual.vlans_of(link);
+        let dels: Vec<u16> = current
+            .keys()
+            .filter(|vid| !want.vlans.contains_key(vid))
+            .copied()
+            .collect();
+        let adds: Vec<(u16, VlanFlags)> = want
+            .vlans
+            .iter()
+            .filter(|(vid, flags)| current.get(vid) != Some(flags))
+            .map(|(vid, flags)| (*vid, *flags))
+            .collect();
+        if !dels.is_empty() {
+            vlan_dels.push(Change::DelVlans {
+                port: name.clone(),
+                vids: dels,
+            });
+        }
+        if !adds.is_empty() {
+            vlan_adds.push(Change::AddVlans {
+                port: name.clone(),
+                vlans: adds,
+            });
+        }
+    }
+    if link.admin_up != want.up {
+        ups.push(Change::SetUp {
+            name,
+            up: want.up,
+            reason: want.up_reason,
+        });
+    }
+}
+
+/// Changes that remove everything wanderlan created: all links marked as
+/// ours. Deleting the bridge also detaches the trunk.
+pub fn plan_teardown(actual: &Actual) -> Vec<Change> {
+    let mut out: Vec<Change> = actual
+        .links
+        .values()
+        .filter(|l| is_owned(l))
+        .map(|l| Change::DeleteLink {
+            name: l.name.clone(),
+            reason: "wanderlan is stopping".into(),
+        })
+        .collect();
+    // Delete tunnels before the bridge so the trunk is detached last.
+    out.sort_by_key(|c| match c {
+        Change::DeleteLink { name, .. } if name.starts_with(GRETAP_PREFIX) => 0,
+        _ => 1,
+    });
+    out
+}
+
+/// Error from [`reconcile`] or [`teardown`].
+#[derive(Debug, thiserror::Error)]
+pub enum ReconcileError {
+    /// The desired state is not reachable.
+    #[error(transparent)]
+    Plan(#[from] PlanError),
+    /// A system operation failed.
+    #[error(transparent)]
+    Sys(#[from] SysError),
+    /// Changes kept coming back.
+    #[error("the system state did not converge after {MAX_ROUNDS} rounds; still pending: {0}")]
+    NoConvergence(String),
+}
+
+/// Applies one change.
+pub async fn apply<N: NetOps>(net: &N, actual: &Actual, change: &Change) -> Result<(), SysError> {
+    let index_of =
+        |name: &str| -> Result<u32, SysError> {
+            actual.links.get(name).map(|l| l.index).ok_or_else(|| {
+                SysError::new(format!("{change}"), format!("interface {name} vanished"))
+            })
+        };
+    match change {
+        Change::CreateBridge { name, options } => {
+            net.create_bridge(name, options).await?;
+        }
+        Change::SetBridgeOptions { name, options } => {
+            net.set_bridge_options(index_of(name)?, name, options)
+                .await?;
+        }
+        Change::CreateGretap { name, params, .. } => {
+            net.create_gretap(name, params, GRETAP_MTU).await?;
+        }
+        Change::DeleteLink { name, .. } => net.delete_link(index_of(name)?).await?,
+        Change::SetMtu { name, mtu } => {
+            let update = LinkUpdate {
+                mtu: Some(*mtu),
+                ..LinkUpdate::default()
+            };
+            net.update_link(index_of(name)?, &update).await?;
+        }
+        Change::Attach { name, bridge } => {
+            let update = LinkUpdate {
+                master: Some(Some(index_of(bridge)?)),
+                ..LinkUpdate::default()
+            };
+            net.update_link(index_of(name)?, &update).await?;
+        }
+        Change::SetIsolated { name, isolated } => {
+            net.set_port_isolated(index_of(name)?, *isolated).await?;
+        }
+        Change::SetUp { name, up, .. } => {
+            let update = LinkUpdate {
+                up: Some(*up),
+                ..LinkUpdate::default()
+            };
+            net.update_link(index_of(name)?, &update).await?;
+        }
+        Change::AddVlans { port, vlans } => {
+            let link = actual
+                .links
+                .get(port)
+                .ok_or_else(|| SysError::new(format!("{change}"), "port vanished"))?;
+            let is_bridge = matches!(link.kind, LinkKind::Bridge(_));
+            net.add_vlans(link.index, is_bridge, vlans).await?;
+        }
+        Change::DelVlans { port, vids } => {
+            let link = actual
+                .links
+                .get(port)
+                .ok_or_else(|| SysError::new(format!("{change}"), "port vanished"))?;
+            let is_bridge = matches!(link.kind, LinkKind::Bridge(_));
+            net.del_vlans(link.index, is_bridge, vids).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Returns true if the change creates or deletes a link, which invalidates
+/// interface indices of the current snapshot.
+fn changes_links(change: &Change) -> bool {
+    matches!(
+        change,
+        Change::CreateBridge { .. } | Change::CreateGretap { .. } | Change::DeleteLink { .. }
+    )
+}
+
+/// Brings the system into the desired state. Calls `log` for every change
+/// before it is applied and returns all applied changes.
+pub async fn reconcile<N: NetOps>(
+    net: &N,
+    desired: &Desired,
+    mut log: impl FnMut(&Change),
+) -> Result<Vec<Change>, ReconcileError> {
+    let mut applied = Vec::new();
+    for _ in 0..MAX_ROUNDS {
+        let mut actual = Actual::observe(net).await?;
+        let changes = plan(desired, &actual)?;
+        if changes.is_empty() {
+            return Ok(applied);
+        }
+        for change in changes {
+            log(&change);
+            apply(net, &actual, &change).await?;
+            if changes_links(&change) {
+                if let Change::CreateBridge { name, .. } | Change::CreateGretap { name, .. } =
+                    &change
+                {
+                    mark_owned(net, name).await?;
+                }
+                actual = Actual::observe(net).await?;
+            }
+            applied.push(change);
+        }
+    }
+    let pending = plan(desired, &Actual::observe(net).await?)?;
+    if pending.is_empty() {
+        Ok(applied)
+    } else {
+        let list: Vec<String> = pending.iter().map(ToString::to_string).collect();
+        Err(ReconcileError::NoConvergence(list.join("; ")))
+    }
+}
+
+/// Sets the owner alias on a freshly created link. If that fails the link is
+/// removed again so that no unmarked interface is left behind.
+async fn mark_owned<N: NetOps>(net: &N, name: &str) -> Result<(), SysError> {
+    let link = net
+        .links()
+        .await?
+        .into_iter()
+        .find(|l| l.name == name)
+        .ok_or_else(|| {
+            SysError::new(
+                format!("mark {name} as managed"),
+                "interface not found after creation",
+            )
+        })?;
+    let update = LinkUpdate {
+        alias: Some(OWNER_ALIAS.to_string()),
+        ..LinkUpdate::default()
+    };
+    if let Err(e) = net.update_link(link.index, &update).await {
+        let _ = net.delete_link(link.index).await;
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Removes everything wanderlan created.
+pub async fn teardown<N: NetOps>(
+    net: &N,
+    mut log: impl FnMut(&Change),
+) -> Result<Vec<Change>, ReconcileError> {
+    let mut applied = Vec::new();
+    for _ in 0..2 {
+        let actual = Actual::observe(net).await?;
+        let changes = plan_teardown(&actual);
+        if changes.is_empty() {
+            return Ok(applied);
+        }
+        // Deleting links does not change the indices of the remaining ones.
+        for change in changes {
+            log(&change);
+            apply(net, &actual, &change).await?;
+            applied.push(change);
+        }
+    }
+    let pending = plan_teardown(&Actual::observe(net).await?);
+    if pending.is_empty() {
+        Ok(applied)
+    } else {
+        let list: Vec<String> = pending.iter().map(ToString::to_string).collect();
+        Err(ReconcileError::NoConvergence(list.join("; ")))
+    }
+}
+
+#[cfg(test)]
+mod tests;

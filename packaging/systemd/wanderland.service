@@ -1,0 +1,50 @@
+[Unit]
+Description=wanderlan layer-2 mesh daemon
+Documentation=https://github.com/upchui/Wanderlan
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/wanderland
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+
+# Runs as root but with CAP_NET_ADMIN as its only capability.
+User=root
+Group=wanderlan
+UMask=0007
+CapabilityBoundingSet=CAP_NET_ADMIN
+AmbientCapabilities=CAP_NET_ADMIN
+NoNewPrivileges=yes
+
+RuntimeDirectory=wanderlan
+RuntimeDirectoryMode=0750
+StateDirectory=wanderlan
+StateDirectoryMode=0750
+ProtectSystem=strict
+ReadWritePaths=/etc/wanderlan
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

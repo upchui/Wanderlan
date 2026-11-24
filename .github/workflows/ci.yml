@@ -27,3 +27,51 @@ jobs:
           push: false
           cache-from: type=gha,scope=check
           cache-to: type=gha,mode=max,scope=check
+
+  build:
+    name: package (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            rust_target: ""
+          - arch: arm64
+            rust_target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: Build binaries and .deb
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: artifacts
+          build-args: RUST_TARGET=${{ matrix.rust_target }}
+          outputs: type=local,dest=dist
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wanderlan-${{ matrix.arch }}
+          path: dist/
+
+  integration:
+    name: integration tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Load kernel modules
+        run: scripts/load-modules.sh
+      - uses: docker/setup-buildx-action@v3
+      - name: Build testnode image (installs the .deb)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: testnode
+          load: true
+          tags: wanderlan-testnode
+          cache-from: type=gha,scope=build-amd64
+      - name: Run integration tests
+        run: tests/integration/run.sh
