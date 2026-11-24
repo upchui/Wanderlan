@@ -1,11 +1,12 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
+assertion_line: 92
 expression: render(&app)
 ---
-" wanderlan  1 Overview  2 Sites  3 VLANs  4 MAC table  5 Log  6 Setup           "
-"┌ Shared VLANs (v) ────────────────────────────────────────────────────────────┐"
-"│ 10-50  (41 VLANs, stretched across all sites)                                │"
-"│ Untagged traffic is not bridged unless a site maps it (native).              │"
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+"┌ VLANs of the network (v) ────────────────────────────────────────────────────┐"
+"│ 10-50  (41 VLANs)                                                            │"
+"│ Default of every site (native = untagged); limit a site in Sites (2).        │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "┌ VLAN mappings: 2 (1 with conflicts) ─────────────────────────────────────────┐"
 "│#   SITE           LOCAL    SHARED   MEANING                                  │"

@@ -10,12 +10,15 @@ use std::time::Duration;
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
+use std::collections::{BTreeMap, VecDeque};
+
 use wanderlan_core::api::{
     ApiError, Applied, ApplyParams, ChangeSource, ConfigInput, ConfigTexts, Confirmed, Event,
-    Interface, Invitation, Joined, MacEntry, PeerStatus, PendingChange, PortState, Request,
-    SiteState, Status, UnblockParams,
+    Interface, Invitation, InviteParams, Joined, MacEntry, PeerStatus, PendingChange, PortState,
+    Request, SiteRules, SiteState, Status, UnblockParams,
 };
 use wanderlan_core::config::{Diagnostic, has_errors, render_local, render_mesh};
+use wanderlan_core::policy;
 use wanderlan_core::topology::gretap_name;
 
 use super::diff::{self, DiffLine};
@@ -38,7 +41,7 @@ const STATUS_TIMEOUT_TICKS: u64 = 5;
 /// Seconds left at which the countdown banner turns red.
 pub const URGENT_SECS: u64 = 10;
 
-/// The views, reachable with the digit keys 1-6.
+/// The views, reachable with the digit keys 1-7.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     /// Sites and live peer status.
@@ -53,17 +56,20 @@ pub enum View {
     Log,
     /// Setup wizard.
     Setup,
+    /// All settings of the network and of this host.
+    Settings,
 }
 
 impl View {
     /// All views in tab order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Overview,
         Self::Sites,
         Self::Vlans,
         Self::Macs,
         Self::Log,
         Self::Setup,
+        Self::Settings,
     ];
 
     /// Tab title.
@@ -72,9 +78,10 @@ impl View {
             Self::Overview => "Overview",
             Self::Sites => "Sites",
             Self::Vlans => "VLANs",
-            Self::Macs => "MAC table",
+            Self::Macs => "MACs",
             Self::Log => "Log",
             Self::Setup => "Setup",
+            Self::Settings => "Settings",
         }
     }
 
@@ -267,6 +274,30 @@ pub enum Modal {
     Review(Review),
     /// A yes/no question.
     Ask(Ask),
+    /// The open invitations of this site.
+    Invites {
+        /// Selected row.
+        selected: usize,
+    },
+    /// Traffic and details of one peer.
+    Peer {
+        /// The peer.
+        name: String,
+    },
+}
+
+/// Samples kept per peer for the traffic graphs (one per status answer).
+pub const HISTORY_LEN: usize = 120;
+
+/// One sample of a peer's traffic.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct Sample {
+    /// Receive rate in bit/s.
+    pub rx_bps: u64,
+    /// Transmit rate in bit/s.
+    pub tx_bps: u64,
+    /// Round-trip time in milliseconds.
+    pub rtt_ms: Option<f64>,
 }
 
 /// A typed answer of the daemon.
@@ -288,6 +319,8 @@ pub enum Reply {
     Macs(Vec<MacEntry>),
     /// Answer to `invite`.
     Invitation(Invitation),
+    /// Answer to `invites`.
+    Invites(Vec<Invitation>),
     /// Answer to `join`.
     Joined(Joined),
     /// An empty answer.
@@ -380,6 +413,12 @@ pub struct App {
     pub wizard: Wizard,
     /// The invitation created last (shown in the overview while open).
     pub invitation: Option<Invitation>,
+    /// The open invitations (list popup).
+    pub invitations: Vec<Invitation>,
+    /// Traffic history per peer, oldest first.
+    pub history: BTreeMap<String, VecDeque<Sample>>,
+    /// Selected row in the settings view.
+    pub settings_selected: usize,
     /// Popup, if any.
     pub modal: Option<Modal>,
     /// Status line message.
@@ -414,6 +453,9 @@ impl App {
             maps_selected: 0,
             wizard: Wizard::new(),
             invitation: None,
+            invitations: Vec::new(),
+            history: BTreeMap::new(),
+            settings_selected: 0,
             modal: None,
             message: None,
             busy: None,
@@ -622,7 +664,21 @@ impl App {
                 MessageKind::Info,
                 "Measuring the path MTU to all peers; the overview updates shortly.",
             ),
-            (Request::Invite, Ok(Reply::Invitation(inv))) => self.on_invitation(inv, fx),
+            (Request::Invite(_), Ok(Reply::Invitation(inv))) => self.on_invitation(inv, fx),
+            (_, Ok(Reply::Invites(list))) => {
+                self.invitations = list;
+                if let Some(Modal::Invites { selected }) = &mut self.modal {
+                    *selected = (*selected).min(self.invitations.len().saturating_sub(1));
+                }
+            }
+            (Request::DeleteInvite(p), Ok(_)) => {
+                self.say(
+                    MessageKind::Success,
+                    format!("Invitation {} deleted.", p.code),
+                );
+                fx.push(Effect::Request(Request::Invites));
+                self.request_status(fx);
+            }
             (Request::Join(_), Ok(Reply::Joined(joined))) => self.on_joined(&joined, fx),
             (Request::Reset, Ok(_)) => self.on_reset(fx),
             (request, Err(e)) => self.on_request_failed(&request, &e),
@@ -662,7 +718,7 @@ impl App {
             Request::Unblock(_) => "unblock",
             Request::ProbeNow => "MTU probe",
             Request::Validate(_) | Request::Apply(_) | Request::ApplyFiles(_) => "apply",
-            Request::Invite | Request::Invites | Request::DeleteInvite(_) => "invitation",
+            Request::Invite(_) | Request::Invites | Request::DeleteInvite(_) => "invitation",
             Request::Join(_) => {
                 self.wizard.step = Step::Summary;
                 self.wizard.error = Some(match error {
@@ -700,6 +756,7 @@ impl App {
         if status.invites == 0 {
             self.invitation = None;
         }
+        self.record_history(&status);
         if !self.wizard_offered {
             self.wizard_offered = true;
             if status.state == SiteState::Unconfigured {
@@ -838,7 +895,7 @@ impl App {
             MessageKind::Success,
             "Setup complete. Creating an invitation for the next site ...",
         );
-        fx.push(Effect::Request(Request::Invite));
+        fx.push(Effect::Request(Request::Invite(SiteRules::default())));
     }
 
     fn on_invitation(&mut self, invitation: Invitation, fx: &mut Vec<Effect>) {
@@ -850,12 +907,90 @@ impl App {
         self.request_status(fx);
     }
 
-    fn invite(&mut self, fx: &mut Vec<Effect>) {
+    /// Opens the form for a new invitation.
+    fn invite(&mut self) {
         if !self.is_connected() {
             self.say(MessageKind::Error, "Not connected to the daemon.");
             return;
         }
-        fx.push(Effect::Request(Request::Invite));
+        match &self.draft {
+            Some(draft) => self.modal = Some(Modal::Form(Form::invite(draft))),
+            None => self.not_configured(),
+        }
+    }
+
+    /// Opens the list of open invitations.
+    fn show_invites(&mut self, fx: &mut Vec<Effect>) {
+        self.modal = Some(Modal::Invites { selected: 0 });
+        fx.push(Effect::Request(Request::Invites));
+    }
+
+    /// Records one traffic sample per peer from a status answer.
+    fn record_history(&mut self, status: &Status) {
+        for peer in &status.peers {
+            let samples = self.history.entry(peer.name.clone()).or_default();
+            samples.push_back(Sample {
+                rx_bps: peer.rx_bps,
+                tx_bps: peer.tx_bps,
+                rtt_ms: peer.rtt_ms,
+            });
+            while samples.len() > HISTORY_LEN {
+                samples.pop_front();
+            }
+        }
+        self.history
+            .retain(|name, _| status.peers.iter().any(|p| &p.name == name));
+    }
+
+    /// True if this site may change the rules of `site` (VLANs, mappings,
+    /// online); otherwise says who may.
+    fn may_change(&mut self, site: &str) -> bool {
+        let Some(running) = self.running.as_ref().and_then(|r| r.mesh.as_ref()) else {
+            return true;
+        };
+        let Some(entry) = running.site(site) else {
+            return true;
+        };
+        let me = self
+            .running
+            .as_ref()
+            .and_then(|r| r.local.self_name.clone())
+            .unwrap_or_default();
+        if policy::may_change(running, entry, &me) {
+            return true;
+        }
+        let text = format!(
+            "{site} is managed by {}; change its VLANs, mappings and online state there.",
+            policy::managers(entry)
+        );
+        self.say(MessageKind::Error, text);
+        false
+    }
+
+    /// Toggles online/offline of the selected site in the draft.
+    fn toggle_online(&mut self) {
+        let Some(name) = self
+            .draft
+            .as_ref()
+            .and_then(|d| d.mesh.sites.get(self.sites_selected))
+            .map(|s| s.name.clone())
+        else {
+            return;
+        };
+        if !self.may_change(&name) {
+            return;
+        }
+        let Some(draft) = &mut self.draft else { return };
+        let Some(site) = draft.mesh.sites.iter_mut().find(|s| s.name == name) else {
+            return;
+        };
+        site.online = !site.online;
+        let state = if site.online { "online" } else { "offline" };
+        draft.revalidate();
+        self.say(
+            MessageKind::Info,
+            format!("{name} goes {state} when the draft is applied (a)."),
+        );
     }
 
     fn start_join(&mut self, fx: &mut Vec<Effect>) {
@@ -908,7 +1043,8 @@ impl App {
 
     fn on_setup_key(&mut self, key: &KeyEvent, fx: &mut Vec<Effect>) {
         match key.code {
-            KeyCode::Char('i') => self.invite(fx),
+            KeyCode::Char('i') => self.invite(),
+            KeyCode::Char('I') => self.show_invites(fx),
             KeyCode::Char('R') => self.ask_reset(),
             _ => {}
         }
@@ -980,6 +1116,7 @@ impl App {
             }
             View::Log => self.on_log_key(key),
             View::Setup => self.on_setup_key(key, fx),
+            View::Settings => self.on_settings_key(key, fx),
         }
     }
 
@@ -1014,7 +1151,7 @@ impl App {
         match key.code {
             KeyCode::Tab => self.set_view(self.view.offset(1), fx),
             KeyCode::BackTab => self.set_view(self.view.offset(-1), fx),
-            KeyCode::Char(c @ '1'..='6') => {
+            KeyCode::Char(c @ '1'..='7') => {
                 let index = c.to_digit(10).map_or(0, |d| d as usize - 1);
                 if let Some(&view) = View::ALL.get(index) {
                     self.set_view(view, fx);
@@ -1107,6 +1244,15 @@ impl App {
             );
             return;
         }
+        if let Some(running) = &self.running
+            && let Some(old) = &running.mesh
+            && let Some(me) = &running.local.self_name
+            && let Err(e) = policy::check_edit(old, &draft.mesh, me)
+        {
+            self.say(MessageKind::Error, e);
+            return;
+        }
+        let Some(draft) = &self.draft else { return };
         self.modal = Some(Modal::Review(Review {
             origin: Origin::Draft,
             mesh: draft.mesh_text(),
@@ -1171,12 +1317,50 @@ impl App {
                 KeyCode::Char('n' | 'N') | KeyCode::Esc => None,
                 _ => Some(Modal::Ask(ask)),
             },
-            Modal::Form(form) => self.on_form_key(form, key),
+            Modal::Form(form) => self.on_form_key(form, key, fx),
+            Modal::Invites { selected } => self.on_invites_key(selected, key, fx),
+            Modal::Peer { name } => match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
+                _ => Some(Modal::Peer { name }),
+            },
             Modal::Review(review) => self.on_review_key(review, key, fx),
         }
     }
 
-    fn on_form_key(&mut self, mut form: Form, key: &KeyEvent) -> Option<Modal> {
+    fn on_invites_key(
+        &mut self,
+        selected: usize,
+        key: &KeyEvent,
+        fx: &mut Vec<Effect>,
+    ) -> Option<Modal> {
+        let count = self.invitations.len();
+        let selected = match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => return None,
+            KeyCode::Up | KeyCode::Char('k') => selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => (selected + 1).min(count.saturating_sub(1)),
+            KeyCode::Char('n' | 'i') => {
+                self.invite();
+                return self.modal.take();
+            }
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if let Some(inv) = self.invitations.get(selected) {
+                    fx.push(Effect::Request(Request::DeleteInvite(InviteParams {
+                        code: inv.code.clone(),
+                    })));
+                }
+                selected
+            }
+            _ => selected,
+        };
+        Some(Modal::Invites { selected })
+    }
+
+    fn on_form_key(
+        &mut self,
+        mut form: Form,
+        key: &KeyEvent,
+        fx: &mut Vec<Effect>,
+    ) -> Option<Modal> {
         let Some(draft) = &self.draft else {
             return None;
         };
@@ -1184,6 +1368,19 @@ impl App {
             FormEvent::Nothing => {}
             FormEvent::Changed => form.revalidate(draft),
             FormEvent::Cancel => return None,
+            FormEvent::Submit if form.kind == FormKind::Invite => {
+                if form.submit(draft).is_some() {
+                    if form.notes.iter().any(Diagnostic::is_error) {
+                        self.say(
+                            MessageKind::Error,
+                            "The rules do not fit the network (see the notes in the form).",
+                        );
+                    } else {
+                        fx.push(Effect::Request(Request::Invite(form.invite_rules())));
+                        return None;
+                    }
+                }
+            }
             FormEvent::Submit => {
                 if let Some(new) = form.submit(draft) {
                     match form.kind {
@@ -1369,6 +1566,46 @@ impl App {
             KeyCode::Char('p') if self.is_connected() => {
                 fx.push(Effect::Request(Request::ProbeNow));
             }
+            KeyCode::Enter => {
+                if let Some(peer) = self.selected_peer() {
+                    self.modal = Some(Modal::Peer {
+                        name: peer.name.clone(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn on_settings_key(&mut self, key: &KeyEvent, fx: &mut Vec<Effect>) {
+        let rows = super::ui::settings::ROWS.len();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.settings_selected = self.settings_selected.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.settings_selected = (self.settings_selected + 1).min(rows.saturating_sub(1));
+            }
+            KeyCode::Enter | KeyCode::Char('e') => {
+                let Some(row) = super::ui::settings::ROWS.get(self.settings_selected) else {
+                    return;
+                };
+                if self.draft.is_none() {
+                    self.not_configured();
+                    return;
+                }
+                if row.local {
+                    self.request_interfaces(fx);
+                }
+                let Some(draft) = &self.draft else { return };
+                let mut form = if row.local {
+                    Form::local(draft, &self.interfaces)
+                } else {
+                    Form::mesh(draft)
+                };
+                form.focus_on(row.key);
+                self.modal = Some(Modal::Form(form));
+            }
             _ => {}
         }
     }
@@ -1397,6 +1634,21 @@ impl App {
     }
 
     fn on_sites_key(&mut self, key: &KeyEvent, fx: &mut Vec<Effect>) {
+        let selected_site = self
+            .draft
+            .as_ref()
+            .and_then(|d| d.mesh.sites.get(self.sites_selected))
+            .map(|s| s.name.clone());
+        let edits = matches!(
+            key.code,
+            KeyCode::Enter | KeyCode::Char('e' | 'd') | KeyCode::Delete
+        );
+        if edits
+            && let Some(name) = &selected_site
+            && !self.may_change(name)
+        {
+            return;
+        }
         let Some(draft) = &self.draft else {
             self.not_configured();
             return;
@@ -1413,7 +1665,9 @@ impl App {
                 self.modal = Some(Modal::Form(Form::site(draft, Some(selected))));
             }
             KeyCode::Char('m') => self.modal = Some(Modal::Form(Form::mesh(draft))),
-            KeyCode::Char('i') => self.invite(fx),
+            KeyCode::Char('i') => self.invite(),
+            KeyCode::Char('I') => self.show_invites(fx),
+            KeyCode::Char('o') if selected < count => self.toggle_online(),
             KeyCode::Char('l') => {
                 self.modal = Some(Modal::Form(Form::local(draft, &self.interfaces)));
                 self.request_interfaces(fx);
@@ -1464,6 +1718,21 @@ impl App {
     }
 
     fn on_vlans_key(&mut self, key: &KeyEvent) {
+        let selected_map_site = self
+            .draft
+            .as_ref()
+            .and_then(|d| d.mesh.maps.get(self.maps_selected))
+            .map(|m| m.site.clone());
+        let edits = matches!(
+            key.code,
+            KeyCode::Enter | KeyCode::Char('e' | 'd') | KeyCode::Delete
+        );
+        if edits
+            && let Some(site) = &selected_map_site
+            && !self.may_change(site)
+        {
+            return;
+        }
         let Some(draft) = &self.draft else {
             self.not_configured();
             return;

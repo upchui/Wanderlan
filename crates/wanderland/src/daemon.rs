@@ -17,8 +17,8 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 use wanderlan_core::api::{
     ApiError, Applied, ChangeSource, ConfigInput, ConfigTexts, Confirmed, Done, Interface,
-    Invitation, JoinParams, Joined, Level, MacEntry, PeerStatus, PendingChange, PortState, Request,
-    SiteState, SiteSummary, Status, Validation,
+    Invitation, JoinParams, Joined, Level, MacEntry, PeerStatus, PendingChange, PortState,
+    PortTraffic, Request, SiteState, SiteSummary, Status, Validation,
 };
 use wanderlan_core::config::{
     self, Config, ConfigFile, Diagnostic, Loaded, render_local, render_mesh, unified_diff,
@@ -27,6 +27,7 @@ use wanderlan_core::desired::{self, OWNER_ALIAS, Runtime};
 use wanderlan_core::join::{self, JoinReply, JoinRequest};
 use wanderlan_core::loopguard::format_mac;
 use wanderlan_core::mtu::wire::Announce;
+use wanderlan_core::policy;
 use wanderlan_core::reconcile::{self, Change};
 use wanderlan_core::sync::{self, Version};
 use wanderlan_core::sys::linux::LinuxSystem;
@@ -782,13 +783,15 @@ impl Controller {
                 self.publish();
                 to_value(&Done {})
             }
-            Request::Invite => {
-                if self.confirmed.is_none() {
+            Request::Invite(rules) => {
+                let Some(confirmed) = &self.confirmed else {
                     return Err(ApiError::new(
                         "this site is not part of a network yet; set it up first (wanderlan)",
                     ));
-                }
-                let invite = self.invites.create(now_secs()).map_err(api_err)?;
+                };
+                join::check_rules(&confirmed.mesh, confirmed.self_name(), &rules)
+                    .map_err(|e| ApiError::new(format!("the rules cannot be used: {e}")))?;
+                let invite = self.invites.create(now_secs(), rules).map_err(api_err)?;
                 let invitation = self.invitation(&invite);
                 self.events.info(format!(
                     "Invitation {} created; on the new site run: {}",
@@ -841,6 +844,7 @@ impl Controller {
             command,
             created_secs: invite.created_secs,
             in_use: self.invites.is_reserved(&invite.code),
+            rules: invite.rules.clone(),
         }
     }
 
@@ -888,9 +892,11 @@ impl Controller {
         }
         let admission = match join::add_site(
             &confirmed.mesh,
+            confirmed.self_name(),
             &request.name,
             request.name_is_default,
             from,
+            &invite.rules,
         ) {
             Ok(a) => a,
             Err(e) => {
@@ -1184,6 +1190,12 @@ impl Controller {
         }
         if let Some(base) = base_revision {
             self.check_base(base, &cfg)?;
+        }
+        if source == ChangeSource::Local
+            && let Some(confirmed) = &self.confirmed
+        {
+            policy::check_edit(&confirmed.mesh, &cfg.mesh, confirmed.self_name())
+                .map_err(ApiError::new)?;
         }
         let warnings: Vec<Diagnostic> = config::validate(&cfg.mesh, Some(&cfg.local))
             .into_iter()
@@ -1509,6 +1521,7 @@ impl Controller {
                 state: SiteState::Unconfigured,
                 site: None,
                 address: None,
+                online: false,
                 trunk: None,
                 vlans: None,
                 revision: 0,
@@ -1519,6 +1532,7 @@ impl Controller {
                 sites: Vec::new(),
                 blocked,
                 invites: 0,
+                trunk_traffic: None,
             };
         };
         let desired = desired::derive(cfg, &self.runtime);
@@ -1530,8 +1544,11 @@ impl Controller {
             .map(|t| {
                 let port = t.ifname();
                 let link = links.iter().find(|l| l.name == port);
+                let self_online = me.is_none_or(|s| s.online);
                 let port_state = if self.runtime.blocked.contains(&port) {
                     PortState::Blocked
+                } else if !self_online || !t.peer.online {
+                    PortState::Offline
                 } else {
                     match link {
                         None => PortState::Missing,
@@ -1576,6 +1593,8 @@ impl Controller {
                         .and_then(|r| r.elapsed().ok())
                         .map(|d| d.as_secs()),
                     rtt_ms: probe.and_then(|p| p.rtt_ms),
+                    rtt_stats: probe.and_then(probe::PeerProbe::rtt_stats),
+                    traffic: link.map(|l| l.traffic).unwrap_or_default(),
                     pmtu: probe.and_then(|p| p.pmtu),
                     mss,
                     macs,
@@ -1593,7 +1612,8 @@ impl Controller {
             .map(|s| SiteSummary {
                 name: s.name.clone(),
                 address: s.address.to_string(),
-                vlans: cfg.mesh.vlans_of(s).to_string(),
+                vlans: cfg.mesh.effective_vlans(s).to_string(),
+                online: s.online,
                 is_self: s.name == cfg.self_name(),
                 direct: direct.contains(s.name.as_str()),
             })
@@ -1607,8 +1627,9 @@ impl Controller {
             },
             site: Some(cfg.self_name().to_string()),
             address: me.map(|s| s.address.to_string()),
+            online: me.is_none_or(|s| s.online),
             trunk: Some(cfg.trunk().to_string()),
-            vlans: me.map(|s| cfg.mesh.vlans_of(s).to_string()),
+            vlans: me.map(|s| cfg.mesh.effective_vlans(s).to_string()),
             revision: cfg.mesh.revision,
             fingerprint: config::fingerprint(&cfg.mesh),
             pending,
@@ -1617,6 +1638,15 @@ impl Controller {
             sites,
             blocked,
             invites: self.invites.list().len(),
+            trunk_traffic: links.iter().find(|l| l.name == cfg.trunk()).map(|l| {
+                let (rx_bps, tx_bps) = rates.get(&l.name).copied().unwrap_or_default();
+                PortTraffic {
+                    name: l.name.clone(),
+                    rx_bps,
+                    tx_bps,
+                    traffic: l.traffic,
+                }
+            }),
         }
     }
 }

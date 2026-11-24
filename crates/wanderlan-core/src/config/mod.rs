@@ -20,7 +20,7 @@ pub use validate::{
     COMMIT_TIMEOUT_RANGE, IFNAME_MAX, MSS_MAX, MSS_MIN, PROBE_INTERVAL_MIN, ifname_error,
     site_name_error, validate,
 };
-pub use vlan::{VID_MAX, VID_MIN, VlanSet, VlanSetError};
+pub use vlan::{NATIVE_VID, VID_MAX, VID_MIN, VlanSet, VlanSetError};
 
 /// A complete, valid configuration of a configured site.
 #[derive(Debug, Clone, PartialEq, Eq)]

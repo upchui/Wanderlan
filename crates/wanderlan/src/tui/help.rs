@@ -38,17 +38,20 @@ pub const SECTIONS: &[Section] = &[
         title: "1 Overview",
         keys: &[
             ("Up/Down", "select a peer"),
+            ("Enter", "details: traffic graph, round trips, counters"),
             ("u", "unblock the port of the peer (loop guard)"),
             ("p", "measure the path MTU to all peers now"),
         ],
-        text: "Green: reachable and up. Yellow: degraded (port down, config differs, \
-               late replies). Red: unreachable or blocked by the loop guard.",
+        text: "Green: reachable and up. Yellow: degraded (port down or offline, \
+               config differs, late replies). Red: unreachable or blocked by the loop guard.",
     },
     Section {
         title: "2 Sites",
         keys: &[
             ("Up/Down", "select a site"),
-            ("i", "invite a new site (shows the command to run there)"),
+            ("i", "invite a new site with its own rules (code + command)"),
+            ("I", "open invitations: show, delete"),
+            ("o", "take the site online / offline (in the draft)"),
             ("n", "new site by hand"),
             (
                 "e, Enter",
@@ -106,6 +109,11 @@ pub const SECTIONS: &[Section] = &[
             ("Esc", "cancel"),
         ],
         text: "Problems are marked at the field as you type.",
+    },
+    Section {
+        title: "7 Settings",
+        keys: &[("Up/Down", "choose a setting"), ("Enter", "change it")],
+        text: "Every setting of the network and of this host, with an explanation.",
     },
     Section {
         title: "6 Setup",
@@ -176,6 +184,13 @@ pub fn bar(app: &App) -> Vec<Binding> {
         return match modal {
             Modal::Help { .. } => vec![("Up/Down", "scroll"), ("Esc", "close")],
             Modal::Ask(_) => vec![("y", "yes"), ("n", "no")],
+            Modal::Invites { .. } => vec![
+                ("Up/Down", "choose"),
+                ("n", "new"),
+                ("d", "delete"),
+                ("Esc", "close"),
+            ],
+            Modal::Peer { .. } => vec![("Esc", "close")],
             Modal::Form(_) => vec![
                 ("Tab", "next field"),
                 ("Left/Right", "choose"),
@@ -198,18 +213,18 @@ pub fn bar(app: &App) -> Vec<Binding> {
     }
     let common: [Binding; 2] = [("?", "help"), ("q", "quit")];
     let mut keys: Vec<Binding> = if !matches!(app.conn, Conn::Connected) {
-        vec![("1-6", "views")]
+        vec![("1-7", "views")]
     } else {
         match app.view {
-            View::Overview => vec![("Up/Down", "peer"), ("u", "unblock"), ("p", "probe MTU")],
+            View::Overview => vec![("Enter", "details"), ("u", "unblock"), ("p", "probe MTU")],
             View::Sites => vec![
                 ("i", "invite"),
-                ("n", "new"),
+                ("I", "invites"),
+                ("o", "online"),
                 ("e", "edit"),
                 ("d", "delete"),
-                ("m", "network"),
-                ("l", "local"),
             ],
+            View::Settings => vec![("Up/Down", "choose"), ("Enter", "change")],
             View::Vlans => vec![
                 ("v", "VLANs"),
                 ("n", "new map"),
@@ -259,7 +274,7 @@ pub fn bar(app: &App) -> Vec<Binding> {
             keys.push(("a", "apply"));
             keys.push(("x", "discard"));
         } else {
-            keys.push(("1-6", "views"));
+            keys.push(("1-7", "views"));
         }
     }
     keys.dedup();

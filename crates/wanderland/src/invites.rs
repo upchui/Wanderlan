@@ -11,6 +11,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
+use wanderlan_core::api::SiteRules;
 use wanderlan_core::join::{CODE_LEN, code_from_bytes, normalize_code};
 
 /// One stored invitation.
@@ -20,6 +21,9 @@ pub struct Invite {
     pub code: String,
     /// Unix time of creation.
     pub created_secs: u64,
+    /// Rules for the site that joins with it.
+    #[serde(default)]
+    pub rules: SiteRules,
 }
 
 /// The invitations of this site.
@@ -55,7 +59,7 @@ impl Invites {
     }
 
     /// Creates and stores a new invitation.
-    pub fn create(&mut self, now_secs: u64) -> Result<Invite> {
+    pub fn create(&mut self, now_secs: u64, rules: SiteRules) -> Result<Invite> {
         let mut bytes = [0u8; CODE_LEN];
         std::fs::File::open("/dev/urandom")
             .and_then(|mut f| f.read_exact(&mut bytes))
@@ -63,6 +67,7 @@ impl Invites {
         let invite = Invite {
             code: code_from_bytes(&bytes),
             created_secs: now_secs,
+            rules,
         };
         self.list.push(invite.clone());
         self.save()?;
@@ -147,8 +152,13 @@ mod tests {
     fn invitations_survive_a_restart_and_are_used_once() {
         let path = temp("once");
         let mut inv = Invites::load(path.clone());
-        let a = inv.create(1).unwrap();
-        let b = inv.create(2).unwrap();
+        let a = inv.create(1, SiteRules::default()).unwrap();
+        let rules = SiteRules {
+            name: Some("branch".into()),
+            native: Some(14),
+            ..SiteRules::default()
+        };
+        let b = inv.create(2, rules.clone()).unwrap();
         assert_ne!(a.code, b.code);
         assert_eq!(a.code.len(), 11);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -156,6 +166,7 @@ mod tests {
 
         let mut inv = Invites::load(path.clone());
         assert_eq!(inv.list().len(), 2);
+        assert_eq!(inv.list()[1].rules, rules, "rules are stored");
         let typed = a.code.to_lowercase().replace('-', "");
         assert!(inv.find_free(&typed).is_some());
         inv.reserve(&typed);

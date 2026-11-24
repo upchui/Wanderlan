@@ -1,0 +1,29 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+assertion_line: 224
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+"┌ Sites (draft): 6 ────────────────────────────────────────────────────────────┐"
+"│  NAME         ADDRESS         VLANS                TUNNEL                    │"
+"│  heim         10.8.0.1        10-50                this site                 │"
+"│  buero        10.8.0.2        10-50                up                        │"
+"│ ┌ Invite a new site ───────────────────────────────────────────────────────┐ │"
+"│ │ Name                                                                     │ │"
+"│ │                  empty: the host name of the new site                    │ │"
+"│ │ VLANs                                                                    │ │"
+"│ │                  empty: the network's VLANs (10-50)                      │ │"
+"│ │ Untagged                                                                 │ │"
+"└─│                  empty: no mapping; or a VLAN for its untagged traffic   │─┘"
+" +│ Translations                                                             │  "
+"  │                  local:shared, e.g. 130:30, 140:40                       │  "
+"  │ Changes            only this site                                        │  "
+"┌ │                  who may change the VLANs of the new site later          │─┐"
+"│ │                                                                          │ │"
+"│ │                                                                          │ │"
+"│ └──────────────────────────────────────────────────────────────────────────┘ │"
+"│ Commit timeout  1m                   ││ Only on this host (local.toml).      │"
+"│ MSS             from path MTU        ││                                      │"
+"└──────────────────────────────────────┘└──────────────────────────────────────┘"
+"                                                     draft: no changes  heim r7 "
+" Tab  next field   Left/Right  choose   Enter  save to draft   Esc  cancel      "

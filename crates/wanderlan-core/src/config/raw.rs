@@ -59,6 +59,9 @@ struct RawSite {
     name: Option<Spanned<String>>,
     address: Option<Spanned<String>>,
     vlans: Option<Spanned<RawVlans>>,
+    online: Option<Spanned<bool>>,
+    managed_by: Option<Spanned<String>>,
+    self_managed: Option<Spanned<bool>>,
     /// Since 0.2 there are no roles; read and ignored with a warning.
     role: Option<Spanned<String>>,
     /// Since 0.2 there are no hubs; read and ignored with a warning.
@@ -261,14 +264,20 @@ fn lower_section(lw: &mut Lowering, s: RawMeshSection, mesh: &mut Mesh) {
         None => DEFAULT_CONTROL_PORT,
     };
 
+    // Without (or with an empty) `vlans` every VLAN and the untagged
+    // traffic pass, like on a trunk between two switches.
     let path = FieldPath::mesh("vlans");
-    let vlans = lw.take(&path, s.vlans);
-    if let Some(vlans) = lw.required(path.clone(), vlans, "mesh.vlans (e.g. \"10-50\")") {
-        match parse_vlans(vlans) {
-            Ok(set) => mesh.vlans = set,
-            Err(e) => lw.error(path, format!("mesh.vlans: {e}")),
-        }
-    }
+    mesh.vlans = match lw.take(&path, s.vlans) {
+        None => VlanSet::all(),
+        Some(RawVlans::Text(t)) if t.trim().is_empty() => VlanSet::all(),
+        Some(vlans) => match parse_vlans(vlans) {
+            Ok(set) => set,
+            Err(e) => {
+                lw.error(path, format!("mesh.vlans: {e}"));
+                VlanSet::all()
+            }
+        },
+    };
 
     let path = FieldPath::mesh("mtu_probe_interval");
     mesh.mtu_probe_interval = match lw.take(&path, s.mtu_probe_interval) {
@@ -318,6 +327,13 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<Site> {
     let address = lw.take(&addr_path, s.address);
     let vlans_path = FieldPath::site_field(i, "vlans");
     let vlans = lw.take(&vlans_path, s.vlans);
+    let online = lw
+        .take(&FieldPath::site_field(i, "online"), s.online)
+        .unwrap_or(true);
+    let managed_by = lw.take(&FieldPath::site_field(i, "managed_by"), s.managed_by);
+    let self_managed = lw
+        .take(&FieldPath::site_field(i, "self_managed"), s.self_managed)
+        .unwrap_or(false);
 
     let label = name
         .as_deref()
@@ -334,12 +350,16 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<Site> {
         }
     }
     let name = lw.required(name_path, name, &format!("{label}: name"));
-    let vlans = vlans.and_then(|v| match parse_vlans(v) {
-        Ok(set) => Some(set),
-        Err(e) => {
-            lw.error(vlans_path, format!("{label}: vlans: {e}"));
-            None
-        }
+    let vlans = vlans.and_then(|v| match v {
+        // Empty: the default VLANs of the network.
+        RawVlans::Text(t) if t.trim().is_empty() => None,
+        v => match parse_vlans(v) {
+            Ok(set) => Some(set),
+            Err(e) => {
+                lw.error(vlans_path, format!("{label}: vlans: {e}"));
+                None
+            }
+        },
     });
     let address = lw
         .required(addr_path.clone(), address, &format!("{label}: address"))
@@ -358,6 +378,9 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<Site> {
         name: name?,
         address: address?,
         vlans,
+        online,
+        managed_by,
+        self_managed,
     })
 }
 

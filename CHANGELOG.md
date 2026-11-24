@@ -46,6 +46,35 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
   tunnels, all VLAN and MSS rules, the configuration and the invitations; the
   site is unconfigured again, like after the installation.
 
+### VLANs like a switch trunk
+
+- Without `vlans` (or empty, or `"all"`) every VLAN and the untagged traffic
+  pass. This is the new default of the setup wizard.
+- `native` in a VLAN list is the untagged traffic (carried as VLAN 1 between
+  the sites, like the default native VLAN of switches), e.g.
+  `vlans = "native,10-50"`. A site's own native mapping takes precedence.
+
+### Invitations with rules, online/offline, managed sites
+
+- An invitation carries rules for the new site: name, VLANs, VLAN for its
+  untagged traffic, translations (`wanderlan invite --name … --vlans …
+  --native … --map L:S`; TUI: Sites, `i`). Open invitations can be listed
+  and deleted in the TUI (Sites, `I`).
+- New sites start offline (`[[site]] online = false`): their tunnels stay
+  down until a user takes them online (`wanderlan online <site>`, TUI: `o`).
+  The state is part of the shared configuration and survives restarts.
+- The inviting site manages the new site (`managed_by`): only it may change
+  the new site's VLANs, mappings and online state, unless it allowed the site
+  to manage itself (`--self-managed`).
+
+### More to see
+
+- Settings view (7): every setting with an explanation.
+- Peer details (Overview, Enter): traffic graph, round-trip history,
+  min/avg/max round trip, jitter, probe loss, estimated latency, byte,
+  packet, error and drop counters. The overview shows the total traffic of
+  the tunnels and the trunk.
+
 ## [0.1.0] - 2026-11-24
 
 First release. Everything below this line went into it.

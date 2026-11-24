@@ -1,0 +1,29 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+assertion_line: 166
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+"┌ Settings (Enter: change) ────────────────────────────────────────────────────┐"
+"│Network (all sites)                                                           │"
+"│  VLANs                10-50 (41 VLANs)                                       │"
+"│  Commit timeout       1m                                                     │"
+"│  Path MTU check       every 5m                                               │"
+"│  TCP MSS              from the path MTU                                      │"
+"│  Control port         51821                                                  │"
+"│This host                                                                     │"
+"│  This site            heim                                                   │"
+"│  Trunk                ens19                                                  │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" Every change must be confirmed (c) within this time, otherwise it is rolled    "
+" back, so nobody locks themselves out. 10 s to 1 h.                             "
+"                                                                                "
+" Changes go into the draft; a reviews and applies them, c confirms.             "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                                                "
+"                                                     draft: no changes  heim r7 "
+" Up/Down  choose   Enter  change   1-7  views   ?  help   q  quit               "

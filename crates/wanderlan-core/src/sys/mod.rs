@@ -105,10 +105,8 @@ pub struct LinkState {
     pub mtu: u32,
     /// Bridge port isolation, if the link is a bridge port.
     pub isolated: Option<bool>,
-    /// Received bytes.
-    pub rx_bytes: u64,
-    /// Transmitted bytes.
-    pub tx_bytes: u64,
+    /// Counters (bytes, packets, errors, drops).
+    pub traffic: crate::api::Traffic,
 }
 
 /// Flags of a bridge VLAN entry on a port.

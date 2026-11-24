@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 
 use crate::BRIDGE_NAME;
-use crate::config::{Config, LocalVid};
+use crate::config::{Config, LocalVid, NATIVE_VID};
 use crate::mtu;
 use crate::sys::nft::{MssRule, PortDir};
 use crate::sys::tc::{Direction, TcAction, TcRule};
@@ -90,18 +90,33 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
 
     let own = cfg
         .self_site()
-        .map(|s| mesh.vlans_of(s).clone())
+        .map(|s| mesh.effective_vlans(s))
         .unwrap_or_default();
-    let shared: PortVlans = own.iter().map(|v| (v, VlanFlags::TAGGED)).collect();
+    // The native VLAN leaves the trunk untagged (and untagged frames belong
+    // to it); on the tunnels every VLAN is tagged.
+    let shared: PortVlans = own
+        .iter()
+        .map(|v| {
+            let flags = if v == NATIVE_VID {
+                VlanFlags::NATIVE
+            } else {
+                VlanFlags::TAGGED
+            };
+            (v, flags)
+        })
+        .collect();
     let (trunk_vlans, tc) = trunk_mapping(cfg, &shared);
 
+    let self_online = cfg.self_site().is_none_or(|s| s.online);
     let tunnels: Vec<TunnelSpec> = topology::tunnels_for(mesh, me)
         .into_iter()
         .map(|t| {
             let name = t.ifname();
-            let theirs = mesh.vlans_of(t.peer);
+            let theirs = mesh.effective_vlans(t.peer);
             TunnelSpec {
-                enabled: !blocked.contains(&name),
+                // Down while blocked by the loop guard, or while this site or
+                // the peer is offline (set up but not taken online yet).
+                enabled: !blocked.contains(&name) && self_online && t.peer.online,
                 name,
                 peer: t.peer.name.clone(),
                 params: GretapParams {
@@ -288,6 +303,69 @@ mod tests {
             vec![20, 30]
         );
         assert_eq!(vids(&haus2, "gt-heim"), vec![20, 30]);
+    }
+
+    #[test]
+    fn offline_sites_have_their_tunnels_down() {
+        let mesh = MESH.replace(
+            "name = \"buero\"\naddress = \"10.8.0.2\"\n",
+            "name = \"buero\"\naddress = \"10.8.0.2\"\nonline = false\n",
+        );
+        let at = |site: &str| {
+            let local = format!("self = \"{site}\"\ntrunk = \"ens19\"\n");
+            let Loaded::Configured(cfg) = load(&mesh, &local).unwrap().loaded else {
+                panic!("configured");
+            };
+            derive(&cfg, &Runtime::default())
+                .tunnels
+                .iter()
+                .map(|t| (t.name.clone(), t.enabled))
+                .collect::<Vec<_>>()
+        };
+        // At heim only the tunnel to buero is down; at buero all are.
+        assert_eq!(
+            at("heim"),
+            vec![
+                ("gt-buero".to_string(), false),
+                ("gt-haus2".to_string(), true),
+                ("gt-haus3".to_string(), true),
+            ]
+        );
+        assert!(at("buero").iter().all(|(_, enabled)| !enabled));
+    }
+
+    #[test]
+    fn native_vlan_is_untagged_on_the_trunk_and_tagged_in_tunnels() {
+        // All VLANs: VLAN 1 (native) is untagged on the trunk; haus3 maps its
+        // untagged traffic to VLAN 20, so the native VLAN does not reach it.
+        let mesh = MESH.replace("vlans = \"10-50\"", "vlans = \"all\"");
+        let local = "self = \"heim\"\ntrunk = \"ens19\"\n";
+        let Loaded::Configured(cfg) = load(&mesh, local).unwrap().loaded else {
+            panic!("configured");
+        };
+        let d = derive(&cfg, &Runtime::default());
+        assert_eq!(d.trunk.vlans.get(&1), Some(&VlanFlags::NATIVE));
+        assert_eq!(d.trunk.vlans.get(&4094), Some(&VlanFlags::TAGGED));
+        assert_eq!(d.trunk.vlans.len(), 4094);
+        let tunnel = |name: &str| {
+            d.tunnels
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.vlans.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(tunnel("gt-buero").get(&1), Some(&VlanFlags::TAGGED));
+        assert_eq!(tunnel("gt-buero").len(), 4094);
+        assert_eq!(tunnel("gt-haus3").get(&1), None, "haus3 maps native to 20");
+        assert_eq!(tunnel("gt-haus3").len(), 4093);
+
+        let local = "self = \"haus3\"\ntrunk = \"ens19\"\n";
+        let Loaded::Configured(cfg) = load(&mesh, local).unwrap().loaded else {
+            panic!("configured");
+        };
+        let d = derive(&cfg, &Runtime::default());
+        assert_eq!(d.trunk.vlans.get(&1), None);
+        assert_eq!(d.trunk.vlans.get(&20), Some(&VlanFlags::NATIVE));
     }
 
     #[test]

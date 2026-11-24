@@ -47,7 +47,9 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
                 Some(old) if old != site => Span::styled("*", theme::warn()),
                 Some(_) => Span::raw(" "),
             };
-            let (tunnel, tunnel_style) = if Some(site.name.as_str()) == own {
+            let (tunnel, tunnel_style) = if !site.online {
+                ("offline".to_string(), theme::warn())
+            } else if Some(site.name.as_str()) == own {
                 ("this site".to_string(), theme::bold())
             } else {
                 match app.peer(&site.name) {
@@ -112,6 +114,22 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
         let mut line = diagnostic_line(first);
         line.push_span(Span::styled(more, theme::dim()));
         lines.push(line);
+    }
+    if let Some(site) = draft.mesh.sites.get(app.sites_selected)
+        && let Some(by) = &site.managed_by
+    {
+        let itself = if site.self_managed {
+            format!(" and {} itself", site.name)
+        } else {
+            String::new()
+        };
+        lines.push(Line::styled(
+            format!(
+                " {} is managed by {by}{itself}: only there its VLANs and online state change.",
+                site.name
+            ),
+            theme::dim(),
+        ));
     }
     if lines.is_empty() {
         let marks = "+ new, * changed (not applied yet). a: review and apply the draft.";

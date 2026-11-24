@@ -274,3 +274,127 @@ fn lost_connection_while_applying_marks_the_review_failed() {
     assert!(matches!(review.state, ReviewState::Failed(_)));
     assert!(matches!(app.conn, Conn::Down { .. }));
 }
+
+#[test]
+fn an_invitation_carries_the_rules_of_the_form() {
+    let mut app = connected();
+    app.update(ch('2'));
+    app.update(ch('i'));
+    assert!(matches!(app.modal, Some(Modal::Form(_))));
+    for c in "haus7".chars() {
+        app.update(ch(c));
+    }
+    app.update(key(KeyCode::Tab));
+    for c in "native,20,30".chars() {
+        app.update(ch(c));
+    }
+    app.update(key(KeyCode::Tab));
+    app.update(key(KeyCode::Tab));
+    for c in "130:30".chars() {
+        app.update(ch(c));
+    }
+    let fx = app.update(key(KeyCode::Enter));
+    let sent: Vec<_> = requests(&fx)
+        .into_iter()
+        .filter_map(|r| match r {
+            Request::Invite(rules) => Some(rules.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent.len(), 1, "{fx:?}");
+    assert_eq!(sent[0].name.as_deref(), Some("haus7"));
+    assert_eq!(sent[0].vlans.as_deref(), Some("native,20,30"));
+    assert_eq!(sent[0].translations.len(), 1);
+    assert!(!sent[0].allow_self);
+    assert!(app.modal.is_none());
+    assert!(
+        !app.draft_dirty(),
+        "an invitation does not change the draft"
+    );
+}
+
+#[test]
+fn invalid_invitation_rules_stay_in_the_form() {
+    let mut app = connected();
+    app.update(ch('2'));
+    app.update(ch('i'));
+    // A name that exists already.
+    for c in "buero".chars() {
+        app.update(ch(c));
+    }
+    let fx = app.update(key(KeyCode::Enter));
+    assert!(
+        !requests(&fx)
+            .iter()
+            .any(|r| matches!(r, Request::Invite(_)))
+    );
+    assert!(matches!(app.modal, Some(Modal::Form(_))));
+}
+
+#[test]
+fn a_site_goes_online_through_the_draft() {
+    let mut app = connected();
+    app.update(ch('2'));
+    let haus3 = app
+        .draft
+        .as_ref()
+        .and_then(|d| d.mesh.sites.iter().position(|s| s.name == "haus3"))
+        .unwrap();
+    app.sites_selected = haus3;
+    app.update(ch('o'));
+    assert!(app.draft_dirty());
+    let site = app.draft.as_ref().unwrap().mesh.site("haus3").unwrap();
+    assert!(!site.online);
+}
+
+#[test]
+fn a_site_managed_elsewhere_cannot_be_changed_here() {
+    let mut app = connected();
+    app.update(ch('2'));
+    let haus6 = app
+        .draft
+        .as_ref()
+        .and_then(|d| d.mesh.sites.iter().position(|s| s.name == "haus6"))
+        .unwrap();
+    app.sites_selected = haus6;
+    app.update(ch('o'));
+    assert!(!app.draft_dirty(), "haus6 is managed by buero");
+    assert!(
+        app.message
+            .as_ref()
+            .is_some_and(|m| m.text.contains("managed by only \"buero\""))
+    );
+    app.update(ch('e'));
+    assert!(app.modal.is_none());
+}
+
+#[test]
+fn enter_on_a_peer_opens_its_details_and_history_grows() {
+    let mut app = connected();
+    for _ in 0..3 {
+        app.update(reply(
+            Request::Status,
+            Reply::Status(Box::new(fixtures::status())),
+        ));
+    }
+    assert_eq!(app.history.get("buero").map(VecDeque::len), Some(4));
+    app.update(key(KeyCode::Enter));
+    assert!(matches!(&app.modal, Some(Modal::Peer { name }) if name == "buero"));
+    app.update(key(KeyCode::Esc));
+    assert!(app.modal.is_none());
+}
+
+#[test]
+fn settings_open_the_form_at_the_chosen_setting() {
+    let mut app = connected();
+    app.update(ch('7'));
+    app.update(key(KeyCode::Down));
+    app.update(key(KeyCode::Enter));
+    match &app.modal {
+        Some(Modal::Form(form)) => {
+            assert_eq!(form.kind, FormKind::Mesh);
+            assert_eq!(form.fields[form.focus].key, "commit_timeout");
+        }
+        other => panic!("expected the network form, got {other:?}"),
+    }
+}

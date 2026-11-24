@@ -6,7 +6,7 @@
 //! largest packet that reaches the peer unfragmented. Requests and replies
 //! also announce the sender's mesh revision for the configuration sync.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -29,6 +29,8 @@ const MTU_TIMEOUT: Duration = Duration::from_millis(400);
 const MTU_ATTEMPTS: usize = 3;
 /// Consecutive lost probes after which a peer counts as unreachable.
 const LOST_LIMIT: u32 = 3;
+/// Probes kept for the round-trip statistics (5 minutes at 5 s).
+const RTT_WINDOW: usize = 60;
 /// Size of reachability probes.
 const RTT_SIZE: u16 = 128;
 
@@ -68,6 +70,42 @@ pub struct PeerProbe {
     pub announce: Option<wire::Announce>,
     #[serde(skip)]
     lost: u32,
+    /// Recent probes: round trip in ms, or `None` if unanswered.
+    #[serde(skip)]
+    recent: VecDeque<Option<f64>>,
+}
+
+impl PeerProbe {
+    /// Round-trip statistics over the recent probes.
+    pub fn rtt_stats(&self) -> Option<wanderlan_core::api::RttStats> {
+        let answered: Vec<f64> = self.recent.iter().flatten().copied().collect();
+        if answered.is_empty() {
+            return None;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let count = |n: usize| n as f64;
+        let min_ms = answered.iter().copied().fold(f64::INFINITY, f64::min);
+        let max_ms = answered.iter().copied().fold(0.0, f64::max);
+        let avg_ms = answered.iter().sum::<f64>() / count(answered.len());
+        let jitter_ms = if answered.len() > 1 {
+            answered
+                .windows(2)
+                .map(|w| (w[1] - w[0]).abs())
+                .sum::<f64>()
+                / count(answered.len() - 1)
+        } else {
+            0.0
+        };
+        let lost = self.recent.iter().filter(|r| r.is_none()).count();
+        Some(wanderlan_core::api::RttStats {
+            min_ms,
+            avg_ms,
+            max_ms,
+            jitter_ms,
+            loss_percent: 100.0 * count(lost) / count(self.recent.len()),
+            samples: u32::try_from(self.recent.len()).unwrap_or(u32::MAX),
+        })
+    }
 }
 
 /// Shared measurement table.
@@ -388,6 +426,12 @@ fn update_reachability(table: &ProbeTable, name: &str, rtt: Option<Duration>) ->
         return false;
     };
     let entry = t.entry(name.to_string()).or_default();
+    entry
+        .recent
+        .push_back(rtt.map(|r| r.as_secs_f64() * 1000.0));
+    while entry.recent.len() > RTT_WINDOW {
+        entry.recent.pop_front();
+    }
     match rtt {
         Some(rtt) => {
             let was = entry.reachable;
@@ -405,5 +449,35 @@ fn update_reachability(table: &ProbeTable, name: &str, rtt: Option<Duration>) ->
             }
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn round_trip_statistics() {
+        let mut p = PeerProbe::default();
+        assert!(p.rtt_stats().is_none());
+        p.recent = [Some(10.0), Some(14.0), None, Some(12.0)].into();
+        let s = p.rtt_stats().unwrap();
+        assert!((s.min_ms - 10.0).abs() < 1e-9);
+        assert!((s.max_ms - 14.0).abs() < 1e-9);
+        assert!((s.avg_ms - 12.0).abs() < 1e-9);
+        // |14-10| and |12-14| over the answered probes.
+        assert!((s.jitter_ms - 3.0).abs() < 1e-9);
+        assert!((s.loss_percent - 25.0).abs() < 1e-9);
+        assert_eq!(s.samples, 4);
+    }
+
+    #[test]
+    fn the_window_is_limited() {
+        let table: ProbeTable = Arc::new(RwLock::new(BTreeMap::new()));
+        for _ in 0..RTT_WINDOW + 10 {
+            update_reachability(&table, "a", Some(Duration::from_millis(5)));
+        }
+        let t = table.read().unwrap();
+        assert_eq!(t["a"].recent.len(), RTT_WINDOW);
     }
 }

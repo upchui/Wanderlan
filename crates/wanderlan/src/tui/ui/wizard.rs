@@ -129,7 +129,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         }
         Step::Vlans => {
             page.text(
-                "The VLAN IDs the network carries, e.g. 10-50 or 10-50,60. Later every site can be limited to some of them, and VLANs can be mapped per site (VLANs, 3).",
+                "Empty: all VLANs and the untagged traffic pass, like on a trunk between two switches. Or list them, e.g. native,10-50 (native = untagged). Later every site can be limited to some of them, and VLANs can be mapped per site (VLANs, 3).",
                 Style::new(),
             );
             page.blank();
@@ -290,7 +290,15 @@ fn summary(page: &mut Page, app: &App) {
             page.value("This site", w.name.value().trim().to_string());
             page.value("Address", w.address.value().trim().to_string());
             page.value("Trunk", w.trunk(&app.interfaces));
-            page.value("VLANs", w.vlans.value().trim().to_string());
+            let vlans = w.vlans.value().trim();
+            page.value(
+                "VLANs",
+                if vlans.is_empty() {
+                    "all (every VLAN and untagged)".to_string()
+                } else {
+                    vlans.to_string()
+                },
+            );
             page.blank();
             page.text(
                 "Enter shows the configuration files and applies them. Afterwards add more sites with an invitation.",

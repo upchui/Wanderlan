@@ -4,11 +4,13 @@
 //! Screen layout (80×24 and up): tab bar, countdown banner (only while a
 //! change waits for confirmation), the view, a status line and the help bar.
 
+mod details;
 mod log;
 mod macs;
 mod overview;
 mod popup;
 mod review;
+pub mod settings;
 mod sites;
 mod vlans;
 mod wizard;
@@ -55,6 +57,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Modal::Form(f) => popup::form(frame, f, body),
             Modal::Ask(a) => popup::ask(frame, a, body),
             Modal::Help { scroll } => popup::help(frame, *scroll, body),
+            Modal::Invites { selected } => details::invites(frame, app, *selected, body),
+            Modal::Peer { name } => details::peer(frame, app, name, body),
         }
     }
 }
@@ -94,6 +98,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         View::Macs => macs::draw(frame, &app.macs, area),
         View::Log => log::draw(frame, &app.log, area),
         View::Setup => wizard::draw(frame, app, area),
+        View::Settings => settings::draw(frame, app, area),
     }
 }
 
@@ -215,6 +220,7 @@ fn port_state(state: PortState) -> &'static str {
         PortState::Down => "down",
         PortState::Blocked => "BLOCKED",
         PortState::Missing => "missing",
+        PortState::Offline => "offline",
     }
 }
 

@@ -59,8 +59,9 @@ pub enum Request {
     Unblock(UnblockParams),
     /// Measures the path MTU to all peers again → [`Done`].
     ProbeNow,
-    /// Creates an invitation for a new site → [`Invitation`].
-    Invite,
+    /// Creates an invitation for a new site with rules for it →
+    /// [`Invitation`].
+    Invite(SiteRules),
     /// Lists the open invitations of this site → [`Vec<Invitation>`].
     Invites,
     /// Deletes an open invitation → [`Done`].
@@ -112,6 +113,70 @@ pub struct UnblockParams {
     pub port: String,
 }
 
+/// Rules for the site that joins with an invitation; everything is
+/// optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteRules {
+    /// Name of the new site; without it, the host name of the joining site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// VLANs of the new site, e.g. `native,10-50`; without them, the
+    /// network's VLANs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vlans: Option<String>,
+    /// Shared VLAN that takes the untagged traffic of the new site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native: Option<u16>,
+    /// Translations: local VLAN at the new site → shared VLAN.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub translations: Vec<Translation>,
+    /// The new site may change its own rules too; otherwise only the
+    /// inviting site may.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_self: bool,
+}
+
+/// A VLAN translation of [`SiteRules`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Translation {
+    /// VLAN ID on the trunk of the site.
+    pub local: u16,
+    /// VLAN ID in the shared network.
+    pub shared: u16,
+}
+
+impl SiteRules {
+    /// True if the invitation sets nothing (the network's defaults apply).
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Short description, e.g. `name site5, VLANs native,10-50, native → 20`.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(n) = &self.name {
+            parts.push(format!("name {n}"));
+        }
+        if let Some(v) = &self.vlans {
+            parts.push(format!("VLANs {v}"));
+        }
+        if let Some(n) = self.native {
+            parts.push(format!("native → {n}"));
+        }
+        for t in &self.translations {
+            parts.push(format!("{} → {}", t.local, t.shared));
+        }
+        if self.allow_self {
+            parts.push("may change itself".into());
+        }
+        if parts.is_empty() {
+            "defaults of the network".into()
+        } else {
+            parts.join(", ")
+        }
+    }
+}
+
 /// Parameters of [`Request::DeleteInvite`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InviteParams {
@@ -148,6 +213,9 @@ pub struct Invitation {
     /// True while a site is joining with it (not used up yet).
     #[serde(default)]
     pub in_use: bool,
+    /// Rules for the new site.
+    #[serde(default)]
+    pub rules: SiteRules,
 }
 
 /// Result of [`Request::Join`].
@@ -311,6 +379,59 @@ pub enum PortState {
     Blocked,
     /// Not created (yet).
     Missing,
+    /// Down on purpose: this site or the peer is offline (`online = false`).
+    Offline,
+}
+
+/// Counters of an interface since it was created.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Traffic {
+    /// Received bytes.
+    pub rx_bytes: u64,
+    /// Transmitted bytes.
+    pub tx_bytes: u64,
+    /// Received packets.
+    pub rx_packets: u64,
+    /// Transmitted packets.
+    pub tx_packets: u64,
+    /// Receive errors.
+    pub rx_errors: u64,
+    /// Transmit errors.
+    pub tx_errors: u64,
+    /// Received packets dropped.
+    pub rx_dropped: u64,
+    /// Packets dropped before sending.
+    pub tx_dropped: u64,
+}
+
+/// Round-trip times of the control probes over the last minutes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct RttStats {
+    /// Shortest round trip in milliseconds.
+    pub min_ms: f64,
+    /// Average round trip in milliseconds.
+    pub avg_ms: f64,
+    /// Longest round trip in milliseconds.
+    pub max_ms: f64,
+    /// Jitter: mean difference between consecutive round trips (ms).
+    pub jitter_ms: f64,
+    /// Probes without answer, in percent.
+    pub loss_percent: f64,
+    /// Probes in the window.
+    pub samples: u32,
+}
+
+/// Traffic of a local port (the trunk).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortTraffic {
+    /// Interface name.
+    pub name: String,
+    /// Receive rate in bit/s.
+    pub rx_bps: u64,
+    /// Transmit rate in bit/s.
+    pub tx_bps: u64,
+    /// Counters.
+    pub traffic: Traffic,
 }
 
 /// Status of one direct peer.
@@ -333,6 +454,9 @@ pub struct PeerStatus {
     pub last_reply_secs: Option<u64>,
     /// Round-trip time in milliseconds.
     pub rtt_ms: Option<f64>,
+    /// Round-trip statistics over the last minutes.
+    #[serde(default)]
+    pub rtt_stats: Option<RttStats>,
     /// Measured path MTU.
     pub pmtu: Option<u16>,
     /// TCP MSS clamped on this port.
@@ -343,6 +467,9 @@ pub struct PeerStatus {
     pub rx_bps: u64,
     /// Transmit rate in bit/s.
     pub tx_bps: u64,
+    /// Counters of the tunnel port.
+    #[serde(default)]
+    pub traffic: Traffic,
     /// Mesh revision announced by the peer.
     pub revision: Option<u64>,
     /// Whether the peer runs the same mesh configuration.
@@ -359,6 +486,9 @@ pub struct SiteSummary {
     /// Shared VLANs the site takes part in.
     #[serde(default)]
     pub vlans: String,
+    /// False while the site is offline: its tunnels stay down.
+    #[serde(default = "online_default")]
+    pub online: bool,
     /// True for this site.
     pub is_self: bool,
     /// True if there is a tunnel to this site.
@@ -376,6 +506,9 @@ pub struct Status {
     pub site: Option<String>,
     /// Transport address of this site.
     pub address: Option<String>,
+    /// False while this site is offline: its tunnels stay down.
+    #[serde(default = "online_default")]
+    pub online: bool,
     /// Trunk interface.
     pub trunk: Option<String>,
     /// Shared VLANs.
@@ -397,6 +530,13 @@ pub struct Status {
     /// Open invitations of this site.
     #[serde(default)]
     pub invites: usize,
+    /// Traffic of the trunk.
+    #[serde(default)]
+    pub trunk_traffic: Option<PortTraffic>,
+}
+
+fn online_default() -> bool {
+    true
 }
 
 /// Severity of an event.

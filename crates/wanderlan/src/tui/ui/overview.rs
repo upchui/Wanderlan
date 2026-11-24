@@ -90,6 +90,25 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
         Span::styled("  daemon ", theme::dim()),
         Span::raw(status.version.clone()),
     ]));
+    if !status.peers.is_empty() {
+        let rx: u64 = status.peers.iter().map(|p| p.rx_bps).sum();
+        let tx: u64 = status.peers.iter().map(|p| p.tx_bps).sum();
+        let mut spans = vec![
+            Span::styled(" tunnels ", theme::dim()),
+            Span::styled(format!("in {}bit/s", format::rate(rx)), theme::ok()),
+            Span::styled(format!("  out {}bit/s", format::rate(tx)), theme::warn()),
+        ];
+        if let Some(t) = &status.trunk_traffic {
+            spans.push(Span::styled(format!("  trunk {} ", t.name), theme::dim()));
+            spans.push(Span::raw(format!(
+                "in {}bit/s out {}bit/s",
+                format::rate(t.rx_bps),
+                format::rate(t.tx_bps)
+            )));
+        }
+        spans.push(Span::styled("  (Enter: details)", theme::dim()));
+        lines.push(Line::from(spans));
+    }
     match (&app.invitation, status.invites) {
         (_, 0) => {}
         (Some(inv), _) => lines.push(Line::from(vec![
@@ -98,7 +117,7 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
         ])),
         (None, n) => lines.push(Line::from(vec![
             Span::styled(format!(" {n} open invitation(s)"), theme::warn()),
-            Span::styled("  (wanderlan invite list)", theme::dim()),
+            Span::styled("  (Sites: I)", theme::dim()),
         ])),
     }
     if !status.blocked.is_empty() {

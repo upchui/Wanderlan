@@ -73,8 +73,7 @@ impl FakeNet {
                 oper_up: false,
                 mtu: 1500,
                 isolated: None,
-                rx_bytes: 0,
-                tx_bytes: 0,
+                traffic: crate::api::Traffic::default(),
             },
         );
         index
@@ -188,8 +187,7 @@ impl NetOps for FakeNet {
                 oper_up: false,
                 mtu: 1500,
                 isolated: None,
-                rx_bytes: 0,
-                tx_bytes: 0,
+                traffic: crate::api::Traffic::default(),
             },
         );
         Ok(())
@@ -234,8 +232,7 @@ impl NetOps for FakeNet {
                 oper_up: false,
                 mtu,
                 isolated: None,
-                rx_bytes: 0,
-                tx_bytes: 0,
+                traffic: crate::api::Traffic::default(),
             },
         );
         Ok(())

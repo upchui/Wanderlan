@@ -1,4 +1,4 @@
-//! View 3: shared VLANs and the mapping table. Conflicts are marked from
+//! View 3: the VLANs of the network and the mapping table. Conflicts are marked from
 //! the draft's diagnostics, which are recomputed on every edit.
 
 use ratatui::Frame;
@@ -57,19 +57,23 @@ fn draw_vlans(frame: &mut Frame, draft: &Draft, area: Rect) {
             severity_style(draft.worst_at(&path)).patch(theme::bold()),
         ),
         Span::styled(
-            format!("  ({} VLANs, stretched across all sites)", vlans.len()),
+            if vlans.is_all() {
+                "  (every VLAN and the untagged traffic)".to_string()
+            } else {
+                format!("  ({} VLANs)", vlans.len())
+            },
             theme::dim(),
         ),
     ])];
     match draft.at(&path).next() {
         Some(d) => lines.push(diagnostic_line(d)),
         None => lines.push(Line::styled(
-            " Untagged traffic is not bridged unless a site maps it (native).",
+            " Default of every site (native = untagged); limit a site in Sites (2).",
             theme::dim(),
         )),
     }
     frame.render_widget(
-        Paragraph::new(lines).block(titled(" Shared VLANs (v) ")),
+        Paragraph::new(lines).block(titled(" VLANs of the network (v) ")),
         area,
     );
 }

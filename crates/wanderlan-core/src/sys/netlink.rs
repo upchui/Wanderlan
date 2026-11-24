@@ -62,7 +62,7 @@ fn parse_link(msg: &LinkMessage) -> LinkState {
     let mut kind_name = String::new();
     let mut kind = None;
     let mut isolated = None;
-    let (mut rx_bytes, mut tx_bytes) = (0, 0);
+    let mut traffic = crate::api::Traffic::default();
     for attr in &msg.attributes {
         match attr {
             LinkAttribute::IfName(n) => name.clone_from(n),
@@ -71,8 +71,16 @@ fn parse_link(msg: &LinkMessage) -> LinkState {
             LinkAttribute::Mtu(m) => mtu = *m,
             LinkAttribute::OperState(s) => oper_up = matches!(s, State::Up | State::Unknown),
             LinkAttribute::Stats64(st) => {
-                rx_bytes = st.rx_bytes;
-                tx_bytes = st.tx_bytes;
+                traffic = crate::api::Traffic {
+                    rx_bytes: st.rx_bytes,
+                    tx_bytes: st.tx_bytes,
+                    rx_packets: st.rx_packets,
+                    tx_packets: st.tx_packets,
+                    rx_errors: st.rx_errors,
+                    tx_errors: st.tx_errors,
+                    rx_dropped: st.rx_dropped,
+                    tx_dropped: st.tx_dropped,
+                };
             }
             LinkAttribute::LinkInfo(infos) => {
                 for info in infos {
@@ -108,8 +116,7 @@ fn parse_link(msg: &LinkMessage) -> LinkState {
         oper_up,
         mtu,
         isolated,
-        rx_bytes,
-        tx_bytes,
+        traffic,
     }
 }
 

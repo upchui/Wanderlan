@@ -39,6 +39,8 @@ address = "10.8.0.15"
 [[site]]
 name = "haus6"
 address = "10.8.0.16"
+online = false
+managed_by = "buero"
 
 [[map]]
 site = "haus3"
@@ -88,6 +90,21 @@ fn peer(name: &str, address: &str) -> PeerStatus {
         reachable: true,
         last_reply_secs: Some(1),
         rtt_ms: Some(12.4),
+        rtt_stats: Some(wanderlan_core::api::RttStats {
+            min_ms: 11.2,
+            avg_ms: 12.6,
+            max_ms: 15.9,
+            jitter_ms: 0.7,
+            loss_percent: 0.0,
+            samples: 60,
+        }),
+        traffic: wanderlan_core::api::Traffic {
+            rx_bytes: 1_234_567_890,
+            tx_bytes: 345_678_901,
+            rx_packets: 1_000_000,
+            tx_packets: 400_000,
+            ..wanderlan_core::api::Traffic::default()
+        },
         pmtu: Some(1420),
         mss: Some(1338),
         macs: 0,
@@ -103,6 +120,7 @@ fn summary(name: &str, address: &str, vlans: &str) -> SiteSummary {
         name: name.into(),
         address: address.into(),
         vlans: vlans.into(),
+        online: true,
         is_self: name == "heim",
         direct: name != "heim",
     }
@@ -116,6 +134,7 @@ pub fn status() -> Status {
         state: SiteState::Running,
         site: Some("heim".into()),
         address: Some("10.8.0.1".into()),
+        online: true,
         trunk: Some("ens19".into()),
         vlans: Some("10-50".into()),
         revision: 7,
@@ -177,6 +196,7 @@ pub fn status() -> Status {
         ],
         blocked: vec!["gt-haus2".into()],
         invites: 1,
+        trunk_traffic: None,
     }
 }
 
@@ -187,6 +207,7 @@ pub fn unconfigured_status() -> Status {
         state: SiteState::Unconfigured,
         site: None,
         address: None,
+        online: false,
         trunk: None,
         vlans: None,
         revision: 0,
@@ -197,6 +218,7 @@ pub fn unconfigured_status() -> Status {
         sites: Vec::new(),
         blocked: Vec::new(),
         invites: 0,
+        trunk_traffic: None,
     }
 }
 

@@ -10,7 +10,11 @@ use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::{MAX_SITE_NAME_LEN, Mesh, Site, has_errors, site_name_error, validate};
+use crate::api::SiteRules;
+use crate::config::{
+    LocalVid, MAX_SITE_NAME_LEN, Mesh, Site, VlanMap, VlanSet, has_errors, site_name_error,
+    validate,
+};
 
 /// Version of the join protocol.
 pub const PROTOCOL: u32 = 1;
@@ -87,6 +91,9 @@ pub enum JoinError {
     /// The resulting configuration would be invalid.
     #[error("the network configuration would become invalid: {0}")]
     Invalid(String),
+    /// The rules of the invitation cannot be read.
+    #[error("{0}")]
+    InvalidRules(String),
 }
 
 /// What [`add_site`] decided.
@@ -101,20 +108,29 @@ pub struct Admission {
     pub added: bool,
 }
 
-/// Adds the site `name` at `address` to `mesh` (revision + 1).
+/// Adds the site `name` at `address` to `mesh` (revision + 1), with the
+/// rules of the invitation. The new site starts **offline**: its tunnels
+/// stay down until a user takes it online.
 ///
+/// * The name in the rules wins over the requested name.
 /// * A site with the same name and address is already a member: the mesh
-///   stays as it is.
+///   stays as it is (rules are not applied again).
 /// * A default name (the host name) that is taken gets a suffix `-2`, `-3`,
 ///   ...; a default name whose address already belongs to a site joins as
 ///   that site.
 /// * A chosen name that is taken, or an address of another site, is refused.
 pub fn add_site(
     mesh: &Mesh,
+    inviter: &str,
     name: &str,
     name_is_default: bool,
     address: Ipv4Addr,
+    rules: &SiteRules,
 ) -> Result<Admission, JoinError> {
+    let (name, name_is_default) = match rules.name.as_deref() {
+        Some(n) => (n, false),
+        None => (name, name_is_default),
+    };
     let unchanged = |name: &str| Admission {
         mesh: mesh.clone(),
         name: name.to_string(),
@@ -142,13 +158,37 @@ pub fn add_site(
         }
         Some(_) => free_name(mesh, name),
     };
+    let vlans = match rules.vlans.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(text) => Some(
+            text.parse::<VlanSet>()
+                .map_err(|e| JoinError::InvalidRules(format!("VLANs \"{text}\": {e}")))?,
+        ),
+    };
     let mut new = mesh.clone();
     new.revision = mesh.revision + 1;
     new.sites.push(Site {
         name: name.clone(),
         address,
-        vlans: None,
+        vlans,
+        online: false,
+        managed_by: Some(inviter.to_string()),
+        self_managed: rules.allow_self,
     });
+    if let Some(shared) = rules.native {
+        new.maps.push(VlanMap {
+            site: name.clone(),
+            local: LocalVid::Native,
+            shared,
+        });
+    }
+    for t in &rules.translations {
+        new.maps.push(VlanMap {
+            site: name.clone(),
+            local: LocalVid::Vid(t.local),
+            shared: t.shared,
+        });
+    }
     let diags = validate(&new, None);
     if has_errors(&diags) {
         let first = diags
@@ -163,6 +203,16 @@ pub fn add_site(
         name,
         added: true,
     })
+}
+
+/// Checks the rules of a new invitation against the network as it is now,
+/// with an address no site has.
+pub fn check_rules(mesh: &Mesh, inviter: &str, rules: &SiteRules) -> Result<(), JoinError> {
+    let address = (1..=254u8)
+        .map(|last| Ipv4Addr::new(192, 0, 2, last))
+        .find(|a| mesh.sites.iter().all(|s| s.address != *a))
+        .unwrap_or(Ipv4Addr::new(198, 51, 100, 1));
+    add_site(mesh, inviter, "new-site", true, address, rules).map(|_| ())
 }
 
 /// `base-2`, `base-3`, ... (shortened to fit) that is not used yet.
@@ -247,59 +297,151 @@ mod tests {
             name: "site1".into(),
             address: Ipv4Addr::new(10, 13, 0, 103),
             vlans: None,
+            online: true,
+            managed_by: None,
+            self_managed: false,
         });
         mesh
+    }
+
+    fn none() -> SiteRules {
+        SiteRules::default()
     }
 
     const NEW: Ipv4Addr = Ipv4Addr::new(10, 13, 0, 104);
 
     #[test]
     fn a_new_site_is_added_with_the_next_revision() {
-        let a = add_site(&mesh(), "site2", false, NEW).unwrap();
+        let a = add_site(&mesh(), "site1", "site2", false, NEW, &none()).unwrap();
         assert!(a.added);
         assert_eq!(a.name, "site2");
         assert_eq!(a.mesh.revision, 5);
         assert_eq!(a.mesh.sites.len(), 2);
         assert_eq!(a.mesh.site("site2").unwrap().address, NEW);
+        assert!(
+            !a.mesh.site("site2").unwrap().online,
+            "new sites start offline"
+        );
+    }
+
+    #[test]
+    fn the_rules_of_the_invitation_shape_the_new_site() {
+        let rules = SiteRules {
+            name: Some("branch".into()),
+            vlans: Some("native,10-20".into()),
+            native: None,
+            translations: vec![crate::api::Translation {
+                local: 130,
+                shared: 15,
+            }],
+            allow_self: true,
+        };
+        let a = add_site(&mesh(), "site1", "wanderlan", true, NEW, &rules).unwrap();
+        assert_eq!(a.name, "branch", "the name of the invitation wins");
+        let site = a.mesh.site("branch").unwrap();
+        assert_eq!(site.vlans.as_ref().unwrap().to_string(), "native,10-20");
+        assert_eq!(a.mesh.maps_of("branch").count(), 1);
+        assert_eq!(site.managed_by.as_deref(), Some("site1"));
+        assert!(site.self_managed);
+
+        let native = SiteRules {
+            native: Some(14),
+            ..SiteRules::default()
+        };
+        let b = add_site(&mesh(), "site1", "client", false, NEW, &native).unwrap();
+        assert!(
+            b.mesh
+                .maps_of("client")
+                .any(|m| m.local == LocalVid::Native && m.shared == 14)
+        );
+
+        // Rules are checked when the invitation is created.
+        assert!(check_rules(&mesh(), "site1", &rules).is_ok());
+        let bad = SiteRules {
+            native: Some(99),
+            ..SiteRules::default()
+        };
+        assert!(matches!(
+            check_rules(&mesh(), "site1", &bad),
+            Err(JoinError::Invalid(_))
+        ));
+        let taken = SiteRules {
+            name: Some("site1".into()),
+            ..SiteRules::default()
+        };
+        assert!(matches!(
+            check_rules(&mesh(), "site1", &taken),
+            Err(JoinError::NameTaken { .. })
+        ));
+        let unreadable = SiteRules {
+            vlans: Some("ten".into()),
+            ..SiteRules::default()
+        };
+        assert!(matches!(
+            check_rules(&mesh(), "site1", &unreadable),
+            Err(JoinError::InvalidRules(_))
+        ));
     }
 
     #[test]
     fn a_member_joining_again_gets_the_mesh_unchanged() {
-        let first = add_site(&mesh(), "site2", false, NEW).unwrap();
-        let again = add_site(&first.mesh, "site2", false, NEW).unwrap();
+        let first = add_site(&mesh(), "site1", "site2", false, NEW, &none()).unwrap();
+        let again = add_site(&first.mesh, "site1", "site2", false, NEW, &none()).unwrap();
         assert!(!again.added);
         assert_eq!(again.mesh, first.mesh);
         // With its host name it joins as the site that has its address.
-        let by_host = add_site(&first.mesh, "wanderlan", true, NEW).unwrap();
+        let by_host = add_site(&first.mesh, "site1", "wanderlan", true, NEW, &none()).unwrap();
         assert!(!by_host.added);
         assert_eq!(by_host.name, "site2");
     }
 
     #[test]
     fn a_taken_default_name_gets_a_suffix() {
-        let a = add_site(&mesh(), "site1", true, NEW).unwrap();
+        let a = add_site(&mesh(), "site1", "site1", true, NEW, &none()).unwrap();
         assert_eq!(a.name, "site1-2");
-        let b = add_site(&a.mesh, "site1", true, Ipv4Addr::new(10, 13, 0, 105)).unwrap();
+        let b = add_site(
+            &a.mesh,
+            "site1",
+            "site1",
+            true,
+            Ipv4Addr::new(10, 13, 0, 105),
+            &none(),
+        )
+        .unwrap();
         assert_eq!(b.name, "site1-3");
-        let long = add_site(&mesh(), "abcdefghijkl", true, NEW).unwrap();
+        let long = add_site(&mesh(), "site1", "abcdefghijkl", true, NEW, &none()).unwrap();
         assert_eq!(long.name, "abcdefghijkl");
-        let longer =
-            add_site(&long.mesh, "abcdefghijkl", true, Ipv4Addr::new(10, 1, 1, 1)).unwrap();
+        let longer = add_site(
+            &long.mesh,
+            "site1",
+            "abcdefghijkl",
+            true,
+            Ipv4Addr::new(10, 1, 1, 1),
+            &none(),
+        )
+        .unwrap();
         assert_eq!(longer.name, "abcdefghij-2");
     }
 
     #[test]
     fn a_chosen_name_or_a_foreign_address_is_refused() {
         assert!(matches!(
-            add_site(&mesh(), "site1", false, NEW),
+            add_site(&mesh(), "site1", "site1", false, NEW, &none()),
             Err(JoinError::NameTaken { .. })
         ));
         assert!(matches!(
-            add_site(&mesh(), "other", false, Ipv4Addr::new(10, 13, 0, 103)),
+            add_site(
+                &mesh(),
+                "site1",
+                "other",
+                false,
+                Ipv4Addr::new(10, 13, 0, 103),
+                &none()
+            ),
             Err(JoinError::AddressTaken { .. })
         ));
         assert!(matches!(
-            add_site(&mesh(), "Bad_Name", false, NEW),
+            add_site(&mesh(), "site1", "Bad_Name", false, NEW, &none()),
             Err(JoinError::InvalidName(_))
         ));
     }

@@ -211,12 +211,9 @@ async fn perform(client: &Client, request: Request) -> Result<Reply, ClientError
             let _: api::Validation = client.call(r).await?;
             Reply::Done
         }
-        r @ Request::Invite => Reply::Invitation(client.call(r).await?),
+        r @ Request::Invite(_) => Reply::Invitation(client.call(r).await?),
         r @ Request::Join(_) => Reply::Joined(client.call(r).await?),
-        r @ Request::Invites => {
-            let _: Vec<api::Invitation> = client.call(r).await?;
-            Reply::Done
-        }
+        r @ Request::Invites => Reply::Invites(client.call(r).await?),
         r @ (Request::Rollback
         | Request::Unblock(_)
         | Request::ProbeNow

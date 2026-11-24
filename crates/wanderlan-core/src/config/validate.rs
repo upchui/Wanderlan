@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use super::diag::{ConfigFile, Diagnostic, FieldPath};
 use super::model::{Local, LocalVid, MAX_SITE_NAME_LEN, Mesh};
+use super::vlan::NATIVE_VID;
 use crate::topology::GRETAP_PREFIX;
 
 /// Smallest accepted fixed MSS.
@@ -103,12 +104,6 @@ impl Validator {
                 "mesh.vlans must contain at least one VLAN",
             );
         }
-        if mesh.vlans.contains(1) {
-            self.warning(
-                FieldPath::mesh("vlans"),
-                "mesh.vlans includes VLAN 1, which is the default VLAN of most switches",
-            );
-        }
         if mesh.mtu_probe_interval < PROBE_INTERVAL_MIN {
             self.error(
                 FieldPath::mesh("mtu_probe_interval"),
@@ -202,7 +197,7 @@ impl Validator {
                     FieldPath::map_field(i, "site"),
                     format!("map #{}: site \"{site}\" does not exist", i + 1),
                 ),
-                Some(vlans) if !vlans.contains(map.shared) => self.error(
+                Some(vlans) if map.shared != NATIVE_VID && !vlans.contains(map.shared) => self.error(
                     FieldPath::map_field(i, "shared"),
                     format!(
                         "map #{}: shared VLAN {} is not one of the VLANs of site \"{site}\" ({vlans})",
@@ -211,6 +206,24 @@ impl Validator {
                     ),
                 ),
                 Some(_) => {}
+            }
+            if map.shared == NATIVE_VID {
+                self.error(
+                    FieldPath::map_field(i, "shared"),
+                    format!(
+                        "map #{}: VLAN 1 is the native VLAN (untagged traffic) and cannot be a mapping target; add `native` to the VLANs of the sites instead",
+                        i + 1
+                    ),
+                );
+            }
+            if map.local == LocalVid::Vid(NATIVE_VID) {
+                self.error(
+                    FieldPath::map_field(i, "local"),
+                    format!(
+                        "map #{}: VLAN 1 is the native VLAN (untagged traffic); write local = \"native\"",
+                        i + 1
+                    ),
+                );
             }
             if map.local == LocalVid::Vid(map.shared) {
                 self.error(

@@ -91,6 +91,9 @@ mod tests {
             name: name.into(),
             address: Ipv4Addr::new(10, 0, 0, last),
             vlans: None,
+            online: true,
+            managed_by: None,
+            self_managed: false,
         }
     }
 

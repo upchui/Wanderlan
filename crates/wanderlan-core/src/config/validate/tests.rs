@@ -329,10 +329,35 @@ fn vlan_list_syntax_and_errors() {
 }
 
 #[test]
-fn vlans_are_required() {
-    let mesh = EXAMPLE_MESH.replace("vlans = \"10-50\"", "");
-    let line = line_of(&mesh, "", "[mesh]");
-    assert_error(&mesh, line, "mesh.vlans");
+fn without_vlans_everything_passes() {
+    for mesh in [
+        EXAMPLE_MESH.replace("vlans = \"10-50\"", ""),
+        EXAMPLE_MESH.replace("vlans = \"10-50\"", "vlans = \"\""),
+        EXAMPLE_MESH.replace("vlans = \"10-50\"", "vlans = \"all\""),
+    ] {
+        let outcome = load(&mesh, LOCAL).expect("valid");
+        let Loaded::Configured(cfg) = outcome.loaded else {
+            panic!("configured");
+        };
+        assert!(cfg.mesh.vlans.is_all());
+        assert!(render_mesh(&cfg.mesh).contains("vlans = \"all\""));
+    }
+    // An empty list of a site means the default of the network.
+    let mesh = EXAMPLE_MESH.replace("vlans = \"20,30\"", "vlans = \"\"");
+    let Loaded::Configured(cfg) = load(&mesh, LOCAL).unwrap().loaded else {
+        panic!("configured");
+    };
+    assert_eq!(cfg.mesh.site("haus2").unwrap().vlans, None);
+}
+
+#[test]
+fn vlan_1_is_the_native_vlan_and_no_mapping_target() {
+    let mesh = EXAMPLE_MESH.replace("shared = 30", "shared = 1");
+    let line = line_of(&mesh, "local = 130", "shared = 1");
+    assert_error(&mesh, line, "VLAN 1 is the native VLAN");
+    let mesh = EXAMPLE_MESH.replace("local = 130", "local = 1");
+    let line = line_of(&mesh, "", "local = 1");
+    assert_error(&mesh, line, "write local = \"native\"");
 }
 
 #[test]

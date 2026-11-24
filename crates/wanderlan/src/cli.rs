@@ -9,8 +9,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use wanderlan_core::api::{
     self, Applied, ApplyFilesParams, ApplyParams, ConfigInput, ConfigTexts, Confirmed, Done, Event,
-    Interface, Invitation, InviteParams, JoinParams, Joined, Level, PortState, Request, SiteState,
-    Status, UnblockParams,
+    Interface, Invitation, InviteParams, JoinParams, Joined, Level, PortState, Request, SiteRules,
+    SiteState, Status, UnblockParams,
 };
 use wanderlan_core::config::{self, ConfigFile, Severity};
 use wanderlan_core::join;
@@ -103,6 +103,25 @@ pub enum Command {
     Invite {
         #[command(subcommand)]
         action: Option<InviteAction>,
+        #[command(flatten)]
+        rules: RuleArgs,
+    },
+    /// Take a site online: its tunnels come up (sites that joined with an
+    /// invitation start offline).
+    Online {
+        /// The site.
+        site: String,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Take a site offline: its tunnels go down until it is online again.
+    Offline {
+        /// The site.
+        site: String,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
     },
     /// Join an existing network with an invitation.
     ///
@@ -128,6 +147,56 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+}
+
+/// Rules for the site that joins with a new invitation.
+#[derive(Debug, clap::Args)]
+pub struct RuleArgs {
+    /// Name of the new site (default: its host name).
+    #[arg(long)]
+    name: Option<String>,
+    /// VLANs of the new site, e.g. native,10-50 (default: the network's).
+    #[arg(long)]
+    vlans: Option<String>,
+    /// Shared VLAN for the untagged traffic of the new site.
+    #[arg(long)]
+    native: Option<u16>,
+    /// Translation LOCAL:SHARED, e.g. 130:30 (repeatable).
+    #[arg(long = "map", value_name = "LOCAL:SHARED", value_parser = parse_translation)]
+    maps: Vec<api::Translation>,
+    /// The new site may change its own VLANs and mappings too (otherwise
+    /// only this site may).
+    #[arg(long)]
+    self_managed: bool,
+}
+
+impl RuleArgs {
+    fn into_rules(self) -> SiteRules {
+        SiteRules {
+            name: self.name,
+            vlans: self.vlans,
+            native: self.native,
+            translations: self.maps,
+            allow_self: self.self_managed,
+        }
+    }
+}
+
+fn parse_translation(text: &str) -> Result<api::Translation, String> {
+    let (local, shared) = text
+        .split_once(':')
+        .ok_or_else(|| format!("\"{text}\" is not LOCAL:SHARED, e.g. 130:30"))?;
+    let vid = |v: &str| {
+        v.trim()
+            .parse::<u16>()
+            .ok()
+            .filter(|v| (1..=4094).contains(v))
+            .ok_or_else(|| format!("\"{v}\" is not a VLAN ID (1-4094)"))
+    };
+    Ok(api::Translation {
+        local: vid(local)?,
+        shared: vid(shared)?,
+    })
 }
 
 /// What `wanderlan invite` does.
@@ -194,7 +263,11 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             println!("Measuring the path MTU to all peers; see `wanderlan status`.");
             Ok(ExitCode::SUCCESS)
         }
-        Some(Command::Invite { action }) => invite(&socket, action).await,
+        Some(Command::Invite { action, rules }) => invite(&socket, action, rules).await,
+        Some(Command::Online { site, confirm }) => set_online(&socket, &site, true, confirm).await,
+        Some(Command::Offline { site, confirm }) => {
+            set_online(&socket, &site, false, confirm).await
+        }
         Some(Command::Join {
             target,
             code,
@@ -205,13 +278,15 @@ pub async fn run(args: Args) -> Result<ExitCode> {
     }
 }
 
-async fn invite(socket: &Path, action: Option<InviteAction>) -> Result<ExitCode> {
+async fn invite(socket: &Path, action: Option<InviteAction>, rules: RuleArgs) -> Result<ExitCode> {
     let client = connect(socket).await?;
     match action {
         None => {
-            let inv: Invitation = client.call(Request::Invite).await?;
+            let inv: Invitation = client.call(Request::Invite(rules.into_rules())).await?;
             println!("Invitation {} created. On the new site run:\n", inv.code);
             println!("    {}\n", inv.command);
+            println!("Rules for the new site: {}.", inv.rules.summary());
+            println!("It starts offline; take it online with `wanderlan online <site>`.");
             println!("The code works once and stays valid until it is used or deleted");
             println!("(`wanderlan invite delete {}`).", inv.code);
         }
@@ -230,6 +305,7 @@ async fn invite(socket: &Path, action: Option<InviteAction>) -> Result<ExitCode>
                     ""
                 };
                 println!("{}  created {created}  {}{state}", inv.code, inv.command);
+                println!("             rules: {}", inv.rules.summary());
             }
         }
         Some(InviteAction::Delete { code }) => {
@@ -308,6 +384,47 @@ async fn join_network(
         }
     }
     bail!("no confirmation after two minutes; see `wanderlan status` and `wanderlan log`")
+}
+
+async fn set_online(socket: &Path, site: &str, online: bool, confirm: bool) -> Result<ExitCode> {
+    let client = connect(socket).await?;
+    let running: ConfigTexts = client.call(Request::GetConfig).await?;
+    if !running.configured {
+        bail!("this site is not part of a network");
+    }
+    let mut mesh = config::parse_mesh(&running.mesh)
+        .ok()
+        .and_then(|p| p.mesh)
+        .context("cannot read the running configuration")?;
+    let word = if online { "online" } else { "offline" };
+    let Some(entry) = mesh.sites.iter_mut().find(|s| s.name == site) else {
+        bail!("there is no site \"{site}\"");
+    };
+    if entry.online == online {
+        println!("{site} is already {word}.");
+        return Ok(ExitCode::SUCCESS);
+    }
+    entry.online = online;
+    let applied: Applied = client
+        .call(Request::Apply(ApplyParams {
+            config: ConfigInput {
+                mesh: config::render_mesh(&mesh),
+                local: running.local,
+            },
+            base_revision: Some(running.revision),
+            timeout_secs: None,
+        }))
+        .await?;
+    if confirm {
+        let c: Confirmed = client.call(Request::Confirm).await?;
+        println!("{site} is {word} (mesh revision {}).", c.revision);
+    } else {
+        println!(
+            "{site} is {word} now. Run `wanderlan confirm` within {} seconds to keep it, otherwise it is rolled back.",
+            applied.confirm_within_secs
+        );
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn reset(socket: &Path, yes: bool) -> Result<ExitCode> {
@@ -456,7 +573,8 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
     }
     match &st.site {
         Some(site) => println!(
-            "Site {site}, address {}, trunk {}, VLANs {}",
+            "Site {site}{}, address {}, trunk {}, VLANs {}",
+            if st.online { "" } else { " (OFFLINE)" },
             st.address.as_deref().unwrap_or("?"),
             st.trunk.as_deref().unwrap_or("?"),
             st.vlans.as_deref().unwrap_or("?"),
@@ -517,6 +635,7 @@ fn port_state(s: PortState) -> &'static str {
         PortState::Down => "down",
         PortState::Blocked => "BLOCKED",
         PortState::Missing => "missing",
+        PortState::Offline => "offline",
     }
 }
 

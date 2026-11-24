@@ -1,6 +1,6 @@
 ---
 source: crates/wanderlan/src/tui/wizard.rs
-assertion_line: 543
+assertion_line: 551
 expression: render_mesh(&mesh)
 ---
 # wanderlan mesh configuration, shared by all sites.
@@ -9,7 +9,7 @@ expression: render_mesh(&mesh)
 
 [mesh]
 revision = 0
-vlans = "10-50"
+vlans = "all"
 control_port = 51821
 mtu_probe_interval = "5m"
 commit_timeout = "1m"

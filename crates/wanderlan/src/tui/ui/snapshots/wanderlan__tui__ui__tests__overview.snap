@@ -1,12 +1,13 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 57
+assertion_line: 59
 expression: render(&connected())
 ---
-" wanderlan  1 Overview  2 Sites  3 VLANs  4 MAC table  5 Log  6 Setup           "
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
 " heim  address 10.8.0.1  trunk ens19  VLANs 10-50                               "
 " state running  mesh revision 7 (3f2a9c1b04de)  daemon 0.1.0                    "
-" 1 open invitation(s)  (wanderlan invite list)                                  "
+" tunnels in 1.4Mbit/s  out 394.6kbit/s  (Enter: details)                        "
+" 1 open invitation(s)  (Sites: I)                                               "
 " Blocked by the loop guard: gt-haus2  (select the peer, press u)                "
 "┌ Direct peers (live) ─────────────────────────────────────────────────────────┐"
 "│PEER         PORT    REPLY RTT    PMTU MSS  MACS RX b/s TX b/s CONFIG         │"
@@ -23,7 +24,6 @@ expression: render(&connected())
 "│haus2        10.8.0.11       20,30                tunnel BLOCKED              │"
 "│haus3        10.8.0.12       10-50                tunnel up                   │"
 "│haus5        10.8.0.15       10-50                tunnel up                   │"
-"│haus6        10.8.0.16       10-50                tunnel down                 │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "                                                     draft: no changes  heim r7 "
-" Up/Down  peer   u  unblock   p  probe MTU   1-6  views   ?  help   q  quit     "
+" Enter  details   u  unblock   p  probe MTU   1-7  views   ?  help   q  quit    "

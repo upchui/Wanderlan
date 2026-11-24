@@ -58,6 +58,15 @@ fn render_mesh_inner(mesh: &Mesh, with_revision: bool) -> String {
         if let Some(vlans) = &site.vlans {
             let _ = writeln!(out, "vlans = {}", quote(&vlans.to_string()));
         }
+        if !site.online {
+            out.push_str("online = false\n");
+        }
+        if let Some(by) = &site.managed_by {
+            let _ = writeln!(out, "managed_by = {}", quote(by));
+        }
+        if site.self_managed {
+            out.push_str("self_managed = true\n");
+        }
     }
     for map in &mesh.maps {
         out.push_str("\n[[map]]\n");

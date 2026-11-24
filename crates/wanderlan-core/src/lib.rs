@@ -11,6 +11,7 @@ pub mod desired;
 pub mod join;
 pub mod loopguard;
 pub mod mtu;
+pub mod policy;
 pub mod reconcile;
 pub mod sync;
 pub mod sys;

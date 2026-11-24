@@ -36,6 +36,23 @@ pub fn rate(bps: u64) -> String {
     }
 }
 
+/// A byte count: `950 B`, `12.5 KB`, `1.2 MB`, `3.4 GB`, `1.1 TB`.
+pub fn bytes(n: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let v = n as f64;
+    if n < 1000 {
+        format!("{n} B")
+    } else if v < 1e6 {
+        format!("{:.1} KB", v / 1e3)
+    } else if v < 1e9 {
+        format!("{:.1} MB", v / 1e6)
+    } else if v < 1e12 {
+        format!("{:.1} GB", v / 1e9)
+    } else {
+        format!("{:.1} TB", v / 1e12)
+    }
+}
+
 /// A duration as written in the configuration (`5m`, `90s`).
 pub fn duration(d: Duration) -> String {
     humantime::format_duration(d).to_string()

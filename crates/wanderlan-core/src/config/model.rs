@@ -71,6 +71,20 @@ impl Mesh {
         site.vlans.as_ref().unwrap_or(&self.vlans)
     }
 
+    /// VLANs a site actually exchanges with the other sites: its VLANs,
+    /// without the native VLAN if the site puts its untagged traffic into
+    /// another VLAN (a native mapping).
+    pub fn effective_vlans(&self, site: &Site) -> VlanSet {
+        let mut vlans = self.vlans_of(site).clone();
+        if self
+            .maps_of(&site.name)
+            .any(|m| m.local == LocalVid::Native)
+        {
+            vlans.remove(super::vlan::NATIVE_VID);
+        }
+        vlans
+    }
+
     /// Returns the VLAN mappings of one site.
     pub fn maps_of<'a>(&'a self, site: &'a str) -> impl Iterator<Item = &'a VlanMap> + 'a {
         self.maps.iter().filter(move |m| m.site == site)
@@ -88,6 +102,15 @@ pub struct Site {
     /// Shared VLANs this site takes part in, like the allowed VLANs of a
     /// switch port; `None` means the mesh default (`mesh.vlans`).
     pub vlans: Option<VlanSet>,
+    /// False while the site is offline: all its tunnels stay down (the
+    /// control channel still works). New sites joining with an invitation
+    /// start offline until a user takes them online.
+    pub online: bool,
+    /// The site that invited this one; only it may change the rules of this
+    /// site (VLANs, mappings, online). `None`: every site may.
+    pub managed_by: Option<String>,
+    /// The site may also change its own rules.
+    pub self_managed: bool,
 }
 
 /// The local side of a VLAN mapping.
@@ -146,11 +169,17 @@ mod tests {
             name: "a".into(),
             address: Ipv4Addr::new(10, 0, 0, 1),
             vlans: None,
+            online: true,
+            managed_by: None,
+            self_managed: false,
         });
         mesh.sites.push(Site {
             name: "b".into(),
             address: Ipv4Addr::new(10, 0, 0, 2),
             vlans: Some(VlanSet::from_range(14, 14)),
+            online: true,
+            managed_by: None,
+            self_managed: false,
         });
         assert!(mesh.site("c").is_none());
         let a = mesh.site("a").unwrap();

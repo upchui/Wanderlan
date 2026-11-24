@@ -1,4 +1,5 @@
-//! Throughput of the tunnel ports, sampled from the interface counters.
+//! Throughput of the interfaces (tunnels and trunk), sampled from the
+//! interface counters.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
@@ -7,10 +8,9 @@ use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use wanderlan_core::sys::NetOps as _;
 use wanderlan_core::sys::linux::LinuxSystem;
-use wanderlan_core::topology::GRETAP_PREFIX;
 
 /// Sampling interval.
-const INTERVAL: Duration = Duration::from_secs(5);
+const INTERVAL: Duration = Duration::from_secs(2);
 
 /// Receive and transmit rate in bit/s per interface.
 pub type Rates = Arc<RwLock<BTreeMap<String, (u64, u64)>>>;
@@ -28,7 +28,8 @@ pub fn spawn(sys: LinuxSystem, rates: Rates) -> JoinHandle<()> {
             let now = Instant::now();
             let mut out = BTreeMap::new();
             let mut next = BTreeMap::new();
-            for link in links.iter().filter(|l| l.name.starts_with(GRETAP_PREFIX)) {
+            for link in &links {
+                let (rx_bytes, tx_bytes) = (link.traffic.rx_bytes, link.traffic.tx_bytes);
                 if let Some((then, rx, tx)) = last.get(&link.name) {
                     let secs = now.duration_since(*then).as_secs_f64().max(0.001);
                     let rate = |new: u64, old: u64| {
@@ -42,10 +43,10 @@ pub fn spawn(sys: LinuxSystem, rates: Rates) -> JoinHandle<()> {
                     };
                     out.insert(
                         link.name.clone(),
-                        (rate(link.rx_bytes, *rx), rate(link.tx_bytes, *tx)),
+                        (rate(rx_bytes, *rx), rate(tx_bytes, *tx)),
                     );
                 }
-                next.insert(link.name.clone(), (now, link.rx_bytes, link.tx_bytes));
+                next.insert(link.name.clone(), (now, rx_bytes, tx_bytes));
             }
             last = next;
             if let Ok(mut r) = rates.write() {

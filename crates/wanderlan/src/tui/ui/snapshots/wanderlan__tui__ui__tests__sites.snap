@@ -1,9 +1,9 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 78
+assertion_line: 80
 expression: render(&app)
 ---
-" wanderlan  1 Overview  2 Sites  3 VLANs  4 MAC table  5 Log  6 Setup           "
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
 "┌ Sites (draft): 6 ────────────────────────────────────────────────────────────┐"
 "│  NAME         ADDRESS         VLANS                TUNNEL                    │"
 "│  heim         10.8.0.1        10-50                this site                 │"
@@ -11,7 +11,7 @@ expression: render(&app)
 "│  haus2        10.8.0.11       20,30                BLOCKED                   │"
 "│  haus3        10.8.0.12       10-50                up                        │"
 "│  haus5        10.8.0.15       10-50                up                        │"
-"│  haus6        10.8.0.16       10-50                down                      │"
+"│  haus6        10.8.0.16       10-50                offline                   │"
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
@@ -26,4 +26,4 @@ expression: render(&app)
 "│ MSS             from path MTU        ││                                      │"
 "└──────────────────────────────────────┘└──────────────────────────────────────┘"
 "                                                     draft: no changes  heim r7 "
-" i  invite   n  new   e  edit   d  delete   m  network   l  local   1-6  views  "
+" i  invite   I  invites   o  online   e  edit   d  delete   1-7  views          "

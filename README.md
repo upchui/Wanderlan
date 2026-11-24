@@ -123,18 +123,33 @@ On **every further site** install the package and run that command:
 sudo wanderlan join 10.8.0.1 K7F3Q-9QX2M
 ```
 
-That is all: the new site gets its name from the host name (`--name` to
-choose one), picks the trunk automatically (`--trunk` if there is more than
-one candidate), and receives the configuration of the network; the inviting
-site adds it with the address the request came from. Both sides confirm
+The new site gets its name from the host name (`--name` to choose one),
+picks the trunk automatically (`--trunk` if there is more than one
+candidate), and receives the configuration of the network; the inviting site
+adds it with the address the request came from. Both sides confirm
 automatically as soon as they reach each other, and all other sites build
 their tunnel to the new site through the configuration sync. In the TUI the
 wizard offers the same as **Join an existing network**.
 
+A new site starts **offline**: its tunnels exist but stay down, while the
+control channel already shows whether it is reachable, its round trip and
+path MTU. Check everything, then take it online on the inviting site:
+`sudo wanderlan online <site> --confirm` (TUI: Sites, `o`, `a`, `c`). Online
+stays online, also across restarts, until someone takes it offline.
+
 Invitations can be created on **any** site of the network (`wanderlan
-invite`, or `i` in the TUI); the command contains that site's address. A code
-works once and stays valid until it is used or deleted (`wanderlan invite
-list`, `wanderlan invite delete <code>`).
+invite`, or `i` in the TUI); the command contains that site's address. An
+invitation can carry **rules for the new site**: name (`--name`), VLANs
+(`--vlans native,10-50`), the VLAN for its untagged traffic (`--native 20`),
+translations (`--map 130:30`). A code works once and stays valid until it is
+used or deleted (`wanderlan invite list`, `wanderlan invite delete <code>`;
+TUI: Sites, `I`).
+
+The site that created the invitation **manages** the new site: only it may
+change the new site's VLANs, mappings and online state, or remove it. With
+`--self-managed` the new site may change its own rules too. Sites without a
+manager (the first site, sites added by hand) may be changed from every
+site.
 
 To start over on a site: `sudo wanderlan reset` removes the bridge, the
 tunnels, all rules, the configuration and the invitations; the site is
@@ -201,7 +216,7 @@ shared = 30
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `mesh.vlans` | – (required) | VLANs of the network, used by every site without its own `vlans`: `"10-50"`, `"10,20,30-40"` or a list `[10, "20-30"]`. Only these VLANs are bridged; VLAN 1 and untagged traffic are not, unless a site maps them. |
+| `mesh.vlans` | `all` | VLANs of the network, used by every site without its own `vlans`. Missing, empty or `"all"`: every VLAN and the untagged traffic, like a trunk between two switches. Otherwise e.g. `"native,10-50"`, `"10,20,30-40"` or a list `[10, "20-30"]`. `native` is the untagged traffic (the native VLAN, carried as VLAN 1 between the sites, so tagged VLAN 1 on a trunk is the same network, like on most switches). |
 | `mesh.mtu_probe_interval` | `5m` | Interval of the path MTU measurement (at least 10 s). |
 | `mesh.mss` | unset | Fixed TCP MSS (536–1460) instead of measuring. |
 | `mesh.commit_timeout` | `60s` | Time to confirm a change (10 s–1 h). |
@@ -210,9 +225,12 @@ shared = 30
 | `site.name` | – | Unique, `a-z`, `0-9`, `-`, at most 12 characters (it becomes part of the interface name `gt-<name>`). |
 | `site.address` | – | Unique IPv4 address of the site in the transport network. |
 | `site.vlans` | `mesh.vlans` | VLANs this site takes part in, like the allowed VLANs of a switch port. A tunnel carries the VLANs both of its sites take part in. |
+| `site.online` | `true` | `false`: all tunnels of the site stay down. Sites that join with an invitation start with `false`. |
+| `site.managed_by` | – | The site that invited this one; only it (and the site itself with `self_managed = true`) may change the site's VLANs, mappings and online state. |
+| `site.self_managed` | `false` | The site may change its own rules too. |
 | `map.site` | – | Site the mapping applies to. |
-| `map.local` | – | `"native"` (untagged) or a local VLAN ID. |
-| `map.shared` | – | The VLAN ID in the shared network; must be one of the VLANs of the site. |
+| `map.local` | – | `"native"` (untagged) or a local VLAN ID (not 1). |
+| `map.shared` | – | The VLAN ID in the shared network; must be one of the VLANs of the site, not 1 (the native VLAN). |
 
 The configuration is checked when it is loaded; every problem is reported
 with file and line, e.g.
@@ -230,8 +248,13 @@ and `hub` still load; these keys are ignored with a warning.
 
 ### VLAN mappings
 
-* **Native**: untagged frames on the trunk of that site belong to the shared
-  VLAN, and the shared VLAN leaves the trunk untagged.
+* **Native VLAN of the network** (`native` in the VLANs, part of `all`):
+  untagged traffic of all sites is one network and leaves every trunk
+  untagged. Careful: if the untagged LANs of two sites are already connected
+  by another path, this is a loop (the loop guard cuts the tunnel).
+* **Native mapping** of a site: its untagged frames belong to the shared
+  VLAN, and the shared VLAN leaves its trunk untagged; the native VLAN of the
+  network then does not reach this site.
 * **Translation** `local = L`, `shared = S`: frames tagged L on the trunk are
   rewritten to S when they enter, S is rewritten to L when it leaves (tc
   `clsact` + `flower` + `vlan modify`). At that site, frames that arrive
@@ -292,12 +315,13 @@ through `/run/wanderlan/wanderlan.sock`.
 
 | Key | View |
 |-----|------|
-| `1` | Overview: all sites, live status per peer (last reply, RTT, path MTU, MSS, port state, MAC addresses, throughput, config in sync) |
-| `2` | Sites: add (`n`), edit (`e`), delete (`d`); mesh settings (`m`), local settings (`l`) |
-| `3` | VLANs: shared range (`v`), mapping table, conflicts are marked immediately |
+| `1` | Overview: all sites, live status per peer (last reply, RTT, path MTU, MSS, port state, MAC addresses, throughput, config in sync), total traffic of the tunnels and the trunk. `Enter` on a peer: details with a traffic graph (received/sent), round-trip history, min/avg/max round trip, jitter, probe loss, estimated one-way latency (round trip / 2), byte/packet/error/drop counters |
+| `2` | Sites: invite a site with its rules (`i`), open invitations (`I`: show, delete), online/offline (`o`), add by hand (`n`), edit (`e`), delete (`d`) |
+| `3` | VLANs: VLANs of the network (`v`), mapping table, conflicts are marked immediately |
 | `4` | MAC table: filter (`/`), sort (`s`, `o`) |
 | `5` | Log: live events, filter by level and peer |
-| `6` | Setup wizard |
+| `6` | Setup: new network or join; on a configured site: invite (`i`, `I`) and reset (`R`) |
+| `7` | Settings: every setting of the network and of this host with an explanation; `Enter` changes it |
 
 Changes are collected in a draft. `a` shows the diff against the running
 configuration and applies it; while a change waits for confirmation a
@@ -317,9 +341,10 @@ discards the draft, `?` shows all keys, `q` quits.
 | `wanderlan unblock <port>` | Re-enable a port shut down by the loop guard |
 | `wanderlan log [-f]` | Event log |
 | `wanderlan probe` | Measure the path MTU to all peers now |
-| `wanderlan invite` | Create an invitation; prints `wanderlan join <address> <code>` for the new site |
+| `wanderlan invite [--name N] [--vlans V] [--native VID] [--map L:S]... [--self-managed]` | Create an invitation with rules for the new site; prints `wanderlan join <address> <code>` |
 | `wanderlan invite list` / `wanderlan invite delete <code>` | Open invitations of this site |
 | `wanderlan join <address>[:port] <code> [--name N] [--trunk IF]` | Join a network (on an unconfigured site) |
+| `wanderlan online <site> [--confirm]` / `wanderlan offline <site> [--confirm]` | Take a site online (its tunnels come up) or offline |
 | `wanderlan reset [--yes]` | Remove everything wanderlan set up on this site; unconfigured again |
 
 The socket can be changed with `--socket` or `WANDERLAN_SOCKET`.
@@ -412,6 +437,17 @@ Deviations from the original specification, and why:
   every other site in the transport network, but there is nothing to decide
   per site except its VLANs. The loop guard also watches trunk-to-tunnel
   moves, the typical sign of a loop through two sites' LANs.
+* **Who may change a site** (project decision): the inviting site manages
+  the sites it invited (`managed_by`), unless it allows them to manage
+  themselves. Every wanderland enforces this for changes made on it (TUI,
+  CLI, edited files). It is an agreement between the daemons, not a
+  cryptographic protection: someone with root on a site could bypass it.
+* **New sites start offline** (project decision): the tunnels of a joined
+  site come up only when a user takes it online, after checking that it is
+  set up correctly; the state is part of the shared configuration.
+* **Native = VLAN 1 between the sites**: untagged traffic travels as VLAN 1
+  in the tunnels, like the default native VLAN of most switches. An empty
+  VLAN list means all VLANs plus native, like a plain trunk.
 * **Joining with invitation codes**: a site joins with the address of any
   member and a one-time code created there; the member adds it with the
   source address of the request (no address has to be typed) and answers

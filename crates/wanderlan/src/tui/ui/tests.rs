@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
-use wanderlan_core::api::{ChangeSource, PendingChange, Request};
+use wanderlan_core::api::{
+    ChangeSource, Invitation, PendingChange, Request, SiteRules, Translation,
+};
 use wanderlan_core::config::VlanSet;
 
 use super::draw;
@@ -153,5 +155,71 @@ fn daemon_not_running() {
     app.update(Msg::ConnectFailed(ClientError::NotRunning {
         path: PathBuf::from("/run/wanderlan/wanderlan.sock"),
     }));
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
+fn settings_view() {
+    let mut app = connected();
+    key(&mut app, KeyCode::Char('7'));
+    key(&mut app, KeyCode::Down);
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
+fn peer_details() {
+    let mut app = connected();
+    for _ in 0..30 {
+        reply(
+            &mut app,
+            Request::Status,
+            Reply::Status(Box::new(fixtures::status())),
+        );
+    }
+    key(&mut app, KeyCode::Enter);
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
+fn invitations() {
+    let mut app = connected();
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Char('I'));
+    let invitation = |code: &str, rules: SiteRules| Invitation {
+        code: code.into(),
+        command: format!("wanderlan join 10.8.0.1 {code}"),
+        created_secs: 1_795_514_400,
+        in_use: false,
+        rules,
+    };
+    reply(
+        &mut app,
+        Request::Invites,
+        Reply::Invites(vec![
+            invitation("K7F3Q-9QX2M", SiteRules::default()),
+            invitation(
+                "M0K8J-S8T4F",
+                SiteRules {
+                    name: Some("haus7".into()),
+                    vlans: Some("native,20,30".into()),
+                    native: None,
+                    translations: vec![Translation {
+                        local: 130,
+                        shared: 30,
+                    }],
+                    allow_self: true,
+                },
+            ),
+        ]),
+    );
+    key(&mut app, KeyCode::Down);
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
+fn invite_form() {
+    let mut app = connected();
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Char('i'));
     insta::assert_snapshot!(render(&app));
 }

@@ -21,8 +21,9 @@ use wanderlan_core::{BRIDGE_NAME, topology::GRETAP_PREFIX};
 use super::form::trunk_candidates;
 use super::input::{Outcome, TextInput};
 
-/// Default VLANs offered for a new network.
-pub const DEFAULT_VLANS: &str = "10-50";
+/// Default VLANs offered for a new network: empty, i.e. all VLANs and the
+/// untagged traffic, like a trunk between two switches.
+pub const DEFAULT_VLANS: &str = "";
 
 /// What the wizard sets up.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,9 +396,7 @@ impl Wizard {
         match self.step {
             Step::Name => site_name_error(self.name.value().trim()).map_or(Ok(()), Err),
             Step::Address => parse_address(self.address.value()).map(|_| ()),
-            Step::Vlans => VlanSet::from_str(self.vlans.value())
-                .map(|_| ())
-                .map_err(|e| format!("{e} (e.g. 10-50 or 10-50,60)")),
+            Step::Vlans => self.parse_vlans().map(|_| ()),
             Step::Target => {
                 join::parse_target(self.target.value(), DEFAULT_CONTROL_PORT).map(|_| ())
             }
@@ -435,13 +434,16 @@ impl Wizard {
     /// Builds the configuration of a new network: this site alone.
     pub fn build(&self, interfaces: &[Interface]) -> Result<(Mesh, Local), String> {
         let name = self.name.value().trim().to_string();
-        let vlans = VlanSet::from_str(self.vlans.value()).map_err(|e| e.to_string())?;
+        let vlans = self.parse_vlans()?;
         self.check_trunk(interfaces)?;
         let mut mesh = Mesh::new(vlans);
         mesh.sites.push(Site {
             name: name.clone(),
             address: parse_address(self.address.value())?,
             vlans: None,
+            online: true,
+            managed_by: None,
+            self_managed: false,
         });
         let local = Local {
             self_name: Some(name),
@@ -457,6 +459,15 @@ impl Wizard {
             return Err(first);
         }
         Ok((mesh, local))
+    }
+
+    /// The VLANs of the new network; empty means all VLANs and untagged.
+    fn parse_vlans(&self) -> Result<VlanSet, String> {
+        let text = self.vlans.value();
+        if text.trim().is_empty() {
+            return Ok(VlanSet::all());
+        }
+        VlanSet::from_str(text).map_err(|e| format!("{e} (e.g. native,10-50; empty for all)"))
     }
 
     /// The join request.

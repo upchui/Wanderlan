@@ -11,7 +11,7 @@ use std::str::FromStr as _;
 use std::time::Duration;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use wanderlan_core::api::Interface;
+use wanderlan_core::api::{Interface, SiteRules, Translation};
 use wanderlan_core::config::{
     Diagnostic, FieldPath, LocalVid, Severity, Site, VID_MAX, VID_MIN, VlanMap, VlanSet,
     ifname_error, site_name_error,
@@ -34,6 +34,8 @@ pub enum FormKind {
     Vlans,
     /// `local.toml`.
     Local,
+    /// Rules for a new invitation (the draft is not changed).
+    Invite,
 }
 
 /// The editable value of a field.
@@ -204,13 +206,68 @@ impl Form {
                 "vlans",
                 "VLANs",
                 format!(
-                    "VLANs this site takes part in; empty: all VLANs of the network ({})",
+                    "empty: the network's VLANs ({}); or e.g. native,20,30",
                     draft.mesh.vlans
                 ),
                 vlans,
             ),
         ];
         Self::new(FormKind::Site(index), title, fields, draft)
+    }
+
+    /// Form for a new invitation: rules for the site that joins with it.
+    pub fn invite(draft: &Draft) -> Self {
+        let fields = vec![
+            Field::text("name", "Name", "empty: the host name of the new site", ""),
+            Field::text(
+                "vlans",
+                "VLANs",
+                format!("empty: the network's VLANs ({})", draft.mesh.vlans),
+                "",
+            ),
+            Field::text(
+                "native",
+                "Untagged",
+                "empty: no mapping; or a VLAN for its untagged traffic",
+                "",
+            ),
+            Field::text(
+                "translations",
+                "Translations",
+                "local:shared, e.g. 130:30, 140:40",
+                "",
+            ),
+            Field::choice(
+                "self_managed",
+                "Changes",
+                "who may change the VLANs of the new site later",
+                vec!["only this site".into(), "this site and the new site".into()],
+                "only this site",
+            ),
+        ];
+        Self::new(FormKind::Invite, "Invite a new site", fields, draft)
+    }
+
+    /// The rules of an invitation form.
+    pub fn invite_rules(&self) -> SiteRules {
+        let text = |key: &str| {
+            let v = self.value(key);
+            (!v.trim().is_empty()).then(|| v.trim().to_string())
+        };
+        SiteRules {
+            name: text("name"),
+            vlans: text("vlans"),
+            native: text("native").and_then(|v| v.parse().ok()),
+            translations: parse_translations(&self.value("translations")).unwrap_or_default(),
+            allow_self: self.value("self_managed") != "only this site",
+        }
+    }
+
+    /// Moves the focus to the field `key` (Settings view).
+    pub fn focus_on(&mut self, key: &str) {
+        if let Some(i) = self.fields.iter().position(|f| f.key == key) {
+            self.focus = i;
+        }
     }
 
     /// Form for a new VLAN mapping (`None`) or an existing one.
@@ -290,7 +347,7 @@ impl Form {
     /// Form for the shared VLANs only.
     pub fn vlans(draft: &Draft) -> Self {
         let fields = vec![vlans_field(&draft.mesh.vlans)];
-        Self::new(FormKind::Vlans, "Shared VLANs", fields, draft)
+        Self::new(FormKind::Vlans, "VLANs of the network", fields, draft)
     }
 
     /// Form for `local.toml`.
@@ -469,6 +526,7 @@ impl Form {
     fn index(&self, draft: &Draft) -> Option<usize> {
         match self.kind {
             FormKind::Site(i) => Some(i.unwrap_or(draft.mesh.sites.len())),
+            FormKind::Invite => Some(draft.mesh.sites.len()),
             FormKind::Map(i) => Some(i.unwrap_or(draft.mesh.maps.len())),
             FormKind::Mesh | FormKind::Vlans | FormKind::Local => None,
         }
@@ -477,7 +535,7 @@ impl Form {
     fn entity_path(&self, draft: &Draft) -> Option<FieldPath> {
         let i = self.index(draft)?;
         match self.kind {
-            FormKind::Site(_) => Some(FieldPath::site(i)),
+            FormKind::Site(_) | FormKind::Invite => Some(FieldPath::site(i)),
             FormKind::Map(_) => Some(FieldPath::map(i)),
             FormKind::Mesh | FormKind::Vlans | FormKind::Local => None,
         }
@@ -487,7 +545,7 @@ impl Form {
     fn path_of(&self, key: &str, draft: &Draft) -> FieldPath {
         let i = self.index(draft).unwrap_or_default();
         match self.kind {
-            FormKind::Site(_) => FieldPath::site_field(i, key),
+            FormKind::Site(_) | FormKind::Invite => FieldPath::site_field(i, key),
             FormKind::Map(_) => FieldPath::map_field(i, key),
             FormKind::Mesh | FormKind::Vlans => FieldPath::mesh(key),
             FormKind::Local => FieldPath::local(key),
@@ -502,6 +560,10 @@ impl Form {
                 let site = self.parse_site()?;
                 match index.and_then(|i| candidate.mesh.sites.get_mut(i)) {
                     Some(slot) => {
+                        let mut site = site;
+                        site.online = slot.online;
+                        site.managed_by.clone_from(&slot.managed_by);
+                        site.self_managed = slot.self_managed;
                         let old = std::mem::replace(slot, site.clone());
                         if old.name != site.name {
                             candidate.rename_references(&old.name, &site.name);
@@ -531,6 +593,7 @@ impl Form {
                 mesh.mss = mss?;
             }
             FormKind::Vlans => candidate.mesh.vlans = self.parse_vlans()?,
+            FormKind::Invite => self.build_invite(&mut candidate)?,
             FormKind::Local => {
                 let own = self.value("self");
                 let trunk = self.value("trunk");
@@ -544,6 +607,90 @@ impl Form {
         }
         candidate.revalidate();
         Some(candidate)
+    }
+
+    /// The network as it would be with the invited site (at an address no
+    /// site has), to check the rules before the invitation is created.
+    fn build_invite(&mut self, candidate: &mut Draft) -> Option<()> {
+        let name = self.value("name");
+        let name = name.trim();
+        if !name.is_empty()
+            && let Some(msg) = site_name_error(name)
+        {
+            self.set_error("name", msg);
+        }
+        let vlans_text = self.value("vlans");
+        let vlans = if vlans_text.trim().is_empty() {
+            None
+        } else {
+            match VlanSet::from_str(&vlans_text) {
+                Ok(set) => Some(set),
+                Err(e) => {
+                    self.set_error(
+                        "vlans",
+                        format!("{e} (e.g. native,10-50; empty: the network's)"),
+                    );
+                    return None;
+                }
+            }
+        };
+        let native_text = self.value("native");
+        let native = if native_text.trim().is_empty() {
+            None
+        } else {
+            match parse_vid(native_text.trim()) {
+                Ok(v) => Some(v),
+                Err(msg) => {
+                    self.set_error("native", msg);
+                    return None;
+                }
+            }
+        };
+        let translations = match parse_translations(&self.value("translations")) {
+            Ok(t) => t,
+            Err(msg) => {
+                self.set_error("translations", msg);
+                return None;
+            }
+        };
+        if self.fields.iter().any(|f| f.error.is_some()) {
+            return None;
+        }
+        let site_name = if name.is_empty() {
+            (1..)
+                .map(|n| format!("new-site{n}"))
+                .find(|n| candidate.mesh.site(n).is_none())
+                .unwrap_or_default()
+        } else {
+            name.to_string()
+        };
+        let address = (1..=254u8)
+            .map(|last| Ipv4Addr::new(192, 0, 2, last))
+            .find(|a| candidate.mesh.sites.iter().all(|s| s.address != *a))
+            .unwrap_or(Ipv4Addr::new(198, 51, 100, 1));
+        candidate.mesh.sites.push(Site {
+            name: site_name.clone(),
+            address,
+            vlans,
+            online: false,
+            managed_by: candidate.local.self_name.clone(),
+            self_managed: false,
+        });
+        if let Some(shared) = native {
+            candidate.mesh.maps.push(VlanMap {
+                site: site_name.clone(),
+                local: LocalVid::Native,
+                shared,
+            });
+        }
+        for t in translations {
+            candidate.mesh.maps.push(VlanMap {
+                site: site_name.clone(),
+                local: LocalVid::Vid(t.local),
+                shared: t.shared,
+            });
+        }
+        Some(())
     }
 
     fn parse_site(&mut self) -> Option<Site> {
@@ -586,6 +733,9 @@ impl Form {
             name,
             address,
             vlans,
+            online: true,
+            managed_by: None,
+            self_managed: false,
         })
     }
 
@@ -623,8 +773,13 @@ impl Form {
         })
     }
 
+    /// The VLANs of the network; empty means all VLANs and untagged.
     fn parse_vlans(&mut self) -> Option<VlanSet> {
-        match VlanSet::from_str(&self.value("vlans")) {
+        let text = self.value("vlans");
+        if text.trim().is_empty() {
+            return Some(VlanSet::all());
+        }
+        match VlanSet::from_str(&text) {
             Ok(set) => Some(set),
             Err(e) => {
                 self.set_error("vlans", e.to_string());
@@ -670,12 +825,34 @@ impl Form {
 }
 
 fn vlans_field(vlans: &VlanSet) -> Field {
+    let value = if vlans.is_all() {
+        String::new()
+    } else {
+        vlans.to_string()
+    };
     Field::text(
         "vlans",
-        "Shared VLANs",
-        "VLANs stretched across all sites, e.g. 10-50,60",
-        vlans.to_string(),
+        "VLANs",
+        "empty: all VLANs and untagged; or e.g. native,10-50",
+        value,
     )
+}
+
+/// Parses `130:30, 140:40`.
+fn parse_translations(text: &str) -> Result<Vec<Translation>, String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(|t| {
+            let (local, shared) = t
+                .split_once(':')
+                .ok_or_else(|| format!("\"{t}\" is not local:shared, e.g. 130:30"))?;
+            Ok(Translation {
+                local: parse_vid(local.trim())?,
+                shared: parse_vid(shared.trim())?,
+            })
+        })
+        .collect()
 }
 
 fn parse_vid(text: &str) -> Result<u16, String> {

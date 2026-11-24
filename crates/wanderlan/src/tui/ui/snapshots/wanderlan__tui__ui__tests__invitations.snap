@@ -1,0 +1,29 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+assertion_line: 216
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+"┌ Sites (draft): 6 ────────────────────────────────────────────────────────────┐"
+"│  NAME         ADDRESS         VLANS                TUNNEL                    │"
+"│  heim         10.8.0.1        10-50                this site                 │"
+"│  buero        10.8.0.2        10-50                up                        │"
+"│  haus2        10.8.0.11       20,30                BLOCKED                   │"
+"│  haus3        10.8.0.12       10-50                up                        │"
+"┌ Open invitations ────────────────────────────────────────────────────────────┐"
+"│CODE         RULES FOR THE NEW SITE                                           │"
+"│K7F3Q-9QX2M  defaults of the network                                          │"
+"│M0K8J-S8T4F  name haus7, VLANs native,20,30, 130 → 30, may change itself      │"
+"│                                                                              │"
+"│ On the new site run:                                                         │"
+"│ wanderlan join 10.8.0.1 M0K8J-S8T4F                                          │"
+"│ n  new   d  delete   Esc  close                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"│ Default VLANs   10-50 (41 VLANs)     ││ This site       heim                 │"
+"│ Control port    51821                ││ Trunk           ens19                │"
+"│ MTU probe every 5m                   ││                                      │"
+"│ Commit timeout  1m                   ││ Only on this host (local.toml).      │"
+"│ MSS             from path MTU        ││                                      │"
+"└──────────────────────────────────────┘└──────────────────────────────────────┘"
+"                                                     draft: no changes  heim r7 "
+" Up/Down  choose   n  new   d  delete   Esc  close                              "

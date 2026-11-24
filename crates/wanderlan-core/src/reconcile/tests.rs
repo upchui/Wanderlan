@@ -170,8 +170,7 @@ async fn foreign_interfaces_are_not_touched() {
         oper_up: true,
         mtu: 1500,
         isolated: None,
-        rx_bytes: 0,
-        tx_bytes: 0,
+        traffic: crate::api::Traffic::default(),
     });
     let err = reconcile(&net, &desired("heim"), |_| {}).await.unwrap_err();
     assert!(
@@ -191,8 +190,7 @@ async fn foreign_interfaces_are_not_touched() {
         oper_up: false,
         mtu: 1500,
         isolated: None,
-        rx_bytes: 0,
-        tx_bytes: 0,
+        traffic: crate::api::Traffic::default(),
     });
     let err = plan(&desired("heim"), &Actual::observe(&net).await.unwrap()).unwrap_err();
     assert_eq!(err, PlanError::Foreign("gt-buero".into()));
@@ -215,8 +213,7 @@ async fn trunk_problems_are_reported() {
         oper_up: true,
         mtu: 1500,
         isolated: None,
-        rx_bytes: 0,
-        tx_bytes: 0,
+        traffic: crate::api::Traffic::default(),
     });
     let trunk = net.link("ens19").unwrap();
     net.update_link(

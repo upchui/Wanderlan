@@ -1,4 +1,7 @@
-//! Sets of VLAN IDs, e.g. `"10-50"` or `"10,20,30-40"`.
+//! Sets of VLAN IDs, e.g. `"10-50"`, `"native,10,20,30-40"` or `"all"`.
+//!
+//! VLAN 1 is the native VLAN, like on most switches: untagged traffic on the
+//! trunks. It is written `native`; between the sites it travels as VLAN 1.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -8,6 +11,8 @@ use std::str::FromStr;
 pub const VID_MIN: u16 = 1;
 /// Highest usable VLAN ID.
 pub const VID_MAX: u16 = 4094;
+/// The native VLAN: untagged traffic on the trunks.
+pub const NATIVE_VID: u16 = 1;
 
 /// A set of VLAN IDs in the range 1..=4094.
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
@@ -37,6 +42,21 @@ impl VlanSet {
         Self((first..=last).collect())
     }
 
+    /// Every VLAN and the native VLAN (untagged traffic).
+    pub fn all() -> Self {
+        Self::from_range(VID_MIN, VID_MAX)
+    }
+
+    /// True if the set holds every VLAN and the native VLAN.
+    pub fn is_all(&self) -> bool {
+        self.0.len() == usize::from(VID_MAX - VID_MIN + 1)
+    }
+
+    /// True if the native VLAN (untagged traffic) is part of the set.
+    pub fn has_native(&self) -> bool {
+        self.contains(NATIVE_VID)
+    }
+
     /// Adds a single VLAN ID after checking its range.
     pub fn insert_checked(&mut self, vid: i64) -> Result<(), VlanSetError> {
         let vid = check_vid(vid)?;
@@ -44,11 +64,20 @@ impl VlanSet {
         Ok(())
     }
 
-    /// Adds one item of the textual syntax: `"20"` or `"10-50"`.
+    /// Adds one item of the textual syntax: `"20"`, `"10-50"`, `"native"`
+    /// or `"all"`.
     pub fn insert_item(&mut self, item: &str) -> Result<(), VlanSetError> {
         let item = item.trim();
         if item.is_empty() {
             return Err(VlanSetError::Syntax(item.to_string()));
+        }
+        if item.eq_ignore_ascii_case("native") || item.eq_ignore_ascii_case("untagged") {
+            self.0.insert(NATIVE_VID);
+            return Ok(());
+        }
+        if item.eq_ignore_ascii_case("all") {
+            self.0.extend(VID_MIN..=VID_MAX);
+            return Ok(());
         }
         match item.split_once('-') {
             Some((a, b)) => {
@@ -148,9 +177,18 @@ impl FromIterator<u16> for VlanSet {
 }
 
 impl fmt::Display for VlanSet {
+    /// `all`, or `native` first and then the tagged VLANs as ranges.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.is_all() {
+            return f.write_str("all");
+        }
         let mut first = true;
-        for (a, b) in self.ranges() {
+        if self.has_native() {
+            f.write_str("native")?;
+            first = false;
+        }
+        let tagged: Self = self.iter().filter(|v| *v != NATIVE_VID).collect();
+        for (a, b) in tagged.ranges() {
             if !first {
                 f.write_str(",")?;
             }
@@ -180,6 +218,26 @@ mod tests {
         let set: VlanSet = "10-12, 20,30-31".parse().unwrap();
         assert_eq!(set.iter().collect::<Vec<_>>(), vec![10, 11, 12, 20, 30, 31]);
         assert_eq!(set.to_string(), "10-12,20,30-31");
+    }
+
+    #[test]
+    fn native_and_all() {
+        let set: VlanSet = "native,10-50".parse().unwrap();
+        assert!(set.has_native());
+        assert_eq!(set.len(), 42);
+        assert_eq!(set.to_string(), "native,10-50");
+        assert_eq!(
+            "1-50".parse::<VlanSet>().unwrap().to_string(),
+            "native,2-50"
+        );
+        assert_eq!("Untagged".parse::<VlanSet>().unwrap().to_string(), "native");
+        let all: VlanSet = "all".parse().unwrap();
+        assert!(all.is_all() && all.has_native());
+        assert_eq!(all, VlanSet::all());
+        assert_eq!(all.to_string(), "all");
+        assert_eq!("1-4094".parse::<VlanSet>().unwrap().to_string(), "all");
+        assert_eq!(all.ranges(), vec![(1, 4094)]);
+        assert!(!"2-4094".parse::<VlanSet>().unwrap().is_all());
     }
 
     #[test]

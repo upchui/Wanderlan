@@ -40,6 +40,8 @@ code=$(x heim "wanderlan invite" | awk '$1 == "wanderlan" && $2 == "join" {print
 echo "invitation: $code"
 x buero "wl-daemon start"
 x buero "wanderlan join 10.8.0.1 $code" || exit 1
+# A new site starts offline; the inviting site takes it online.
+x heim "wanderlan online buero --confirm" || exit 1
 
 ok=1
 for _ in $(seq 1 30); do
