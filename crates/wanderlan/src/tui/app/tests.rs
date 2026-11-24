@@ -539,3 +539,32 @@ fn a_tunnel_gets_its_own_trunk_in_the_settings() {
     app.update(key(KeyCode::Enter));
     assert!(app.draft.as_ref().unwrap().local.tunnel_trunks.is_empty());
 }
+
+#[test]
+fn a_restricted_site_sets_its_own_vlans() {
+    let mut app = restricted();
+    app.update(ch('3'));
+    app.update(ch('o'));
+    assert!(matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::OwnVlans(0)));
+    for c in "50".chars() {
+        app.update(ch(c));
+    }
+    app.update(key(KeyCode::Enter));
+    assert!(app.modal.is_none(), "saved");
+    let heim = app
+        .draft
+        .as_ref()
+        .unwrap()
+        .mesh
+        .site("heim")
+        .unwrap()
+        .clone();
+    assert_eq!(heim.own_vlans.map(|v| v.to_string()).as_deref(), Some("50"));
+    // The rights allow it: the review opens.
+    app.update(ch('a'));
+    assert!(
+        matches!(app.modal, Some(Modal::Review(_))),
+        "{:?}",
+        app.message
+    );
+}

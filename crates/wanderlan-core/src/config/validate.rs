@@ -183,6 +183,35 @@ impl Validator {
                     format!("site \"{name}\": vlans must contain at least one VLAN"),
                 );
             }
+            if let Some(own) = &site.own_vlans {
+                let path = FieldPath::site_field(i, "own_vlans");
+                let native = mesh
+                    .maps_of(name)
+                    .find(|m| m.local == LocalVid::Native)
+                    .map(|m| m.shared);
+                if let Some(shared) = native
+                    && own.contains(NATIVE_VID)
+                {
+                    self.error(
+                        path.clone(),
+                        format!(
+                            "site \"{name}\": own_vlans cannot contain native: its untagged traffic is VLAN {shared}"
+                        ),
+                    );
+                }
+                let both: super::vlan::VlanSet = own
+                    .iter()
+                    .filter(|v| mesh.vlans_of(site).contains(*v))
+                    .collect();
+                if !both.is_empty() {
+                    self.warning(
+                        path,
+                        format!(
+                            "site \"{name}\": own_vlans {both} are already VLANs of the site (they reach its server too)"
+                        ),
+                    );
+                }
+            }
         }
     }
 

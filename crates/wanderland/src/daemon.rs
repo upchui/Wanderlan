@@ -1824,7 +1824,16 @@ impl Controller {
             .map(|s| SiteSummary {
                 name: s.name.clone(),
                 address: s.address.to_string(),
-                vlans: cfg.mesh.effective_vlans(s).to_string(),
+                vlans: {
+                    // Own VLANs (towards its own clients only) with a "+".
+                    let own = cfg.mesh.own_vlans(s);
+                    let vlans = cfg.mesh.effective_vlans(s);
+                    if own.is_empty() {
+                        vlans.to_string()
+                    } else {
+                        format!("{vlans} +{own}")
+                    }
+                },
                 online: s.online,
                 is_self: s.name == cfg.self_name(),
                 direct: direct.contains(s.name.as_str()),

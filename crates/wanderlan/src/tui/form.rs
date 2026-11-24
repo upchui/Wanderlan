@@ -40,6 +40,9 @@ pub enum FormKind {
     Invite,
     /// The trunk of the tunnel to one site (index in the mesh), local.toml.
     TunnelTrunk(usize),
+    /// The own VLANs of one site (index in the mesh): on its trunk and
+    /// towards its own clients only.
+    OwnVlans(usize),
 }
 
 /// The editable value of a field.
@@ -236,6 +239,7 @@ impl Form {
                 choices,
                 &current,
             ),
+            own_vlans_field(existing),
             Field::choice(
                 "uplink",
                 "Connected to",
@@ -391,6 +395,19 @@ impl Form {
     }
 
     /// Form for the shared VLANs only.
+    /// Form for the own VLANs of the site `site` (index in the mesh).
+    pub fn own_vlans(draft: &Draft, site: usize) -> Self {
+        let s = draft.mesh.sites.get(site);
+        let name = s.map(|s| s.name.clone()).unwrap_or_default();
+        let fields = vec![own_vlans_field(s)];
+        Self::new(
+            FormKind::OwnVlans(site),
+            format!("Own VLANs of {name}"),
+            fields,
+            draft,
+        )
+    }
+
     pub fn vlans(draft: &Draft) -> Self {
         let fields = vec![vlans_field(&draft.mesh.vlans)];
         Self::new(FormKind::Vlans, "VLANs of the network", fields, draft)
@@ -606,6 +623,7 @@ impl Form {
     fn index(&self, draft: &Draft) -> Option<usize> {
         match self.kind {
             FormKind::Site(i) => Some(i.unwrap_or(draft.mesh.sites.len())),
+            FormKind::OwnVlans(i) => Some(i),
             FormKind::Invite => Some(draft.mesh.sites.len()),
             FormKind::Map(i) => Some(i.unwrap_or(draft.mesh.maps.len())),
             FormKind::Mesh | FormKind::Vlans | FormKind::Local | FormKind::TunnelTrunk(_) => None,
@@ -615,7 +633,9 @@ impl Form {
     fn entity_path(&self, draft: &Draft) -> Option<FieldPath> {
         let i = self.index(draft)?;
         match self.kind {
-            FormKind::Site(_) | FormKind::Invite => Some(FieldPath::site(i)),
+            FormKind::Site(_) | FormKind::Invite | FormKind::OwnVlans(_) => {
+                Some(FieldPath::site(i))
+            }
             FormKind::Map(_) => Some(FieldPath::map(i)),
             FormKind::Mesh | FormKind::Vlans | FormKind::Local | FormKind::TunnelTrunk(_) => None,
         }
@@ -625,7 +645,9 @@ impl Form {
     fn path_of(&self, key: &str, draft: &Draft) -> FieldPath {
         let i = self.index(draft).unwrap_or_default();
         match self.kind {
-            FormKind::Site(_) | FormKind::Invite => FieldPath::site_field(i, key),
+            FormKind::Site(_) | FormKind::Invite | FormKind::OwnVlans(_) => {
+                FieldPath::site_field(i, key)
+            }
             FormKind::Map(_) => FieldPath::map_field(i, key),
             FormKind::Mesh | FormKind::Vlans => FieldPath::mesh(key),
             FormKind::Local => FieldPath::local(key),
@@ -644,6 +666,7 @@ impl Form {
                 let site = self.parse_site()?;
                 let (managed_by, self_managed) = parse_changes(&self.value("changes"));
                 let uplink = parse_connection(&self.value("uplink"));
+                let own_vlans = self.parse_own_vlans()?;
                 match index.and_then(|i| candidate.mesh.sites.get_mut(i)) {
                     Some(slot) => {
                         let mut site = site;
@@ -651,6 +674,7 @@ impl Form {
                         site.managed_by = managed_by;
                         site.self_managed = self_managed;
                         site.uplink = uplink;
+                        site.own_vlans = own_vlans;
                         let old = std::mem::replace(slot, site.clone());
                         if old.name != site.name {
                             candidate.rename_references(&old.name, &site.name);
@@ -660,6 +684,7 @@ impl Form {
                         managed_by,
                         self_managed,
                         uplink,
+                        own_vlans,
                         ..site
                     }),
                 }
@@ -690,6 +715,10 @@ impl Form {
                 candidate.mesh.vlans = self.guard_network_vlans(draft, vlans)?;
             }
             FormKind::Invite => self.build_invite(&mut candidate)?,
+            FormKind::OwnVlans(site) => {
+                let own = self.parse_own_vlans()?;
+                candidate.mesh.sites.get_mut(site)?.own_vlans = own;
+            }
             FormKind::TunnelTrunk(site) => {
                 let name = candidate.mesh.sites.get(site)?.name.clone();
                 let trunk = self.value("trunk");
@@ -780,6 +809,7 @@ impl Form {
             name: site_name.clone(),
             address,
             vlans,
+            own_vlans: None,
             online: false,
             managed_by: candidate.local.self_name.clone(),
             uplink: candidate.local.self_name.clone(),
@@ -842,6 +872,7 @@ impl Form {
             name,
             address,
             vlans,
+            own_vlans: None,
             online: true,
             managed_by: None,
             self_managed: false,
@@ -899,6 +930,22 @@ impl Form {
             return None;
         }
         Some(vlans)
+    }
+
+    /// The own VLANs field: empty or "none" for none.
+    fn parse_own_vlans(&mut self) -> Option<Option<VlanSet>> {
+        let text = self.value("own_vlans");
+        let text = text.trim();
+        if text.is_empty() || text == "none" {
+            return Some(None);
+        }
+        match VlanSet::from_str(text) {
+            Ok(set) => Some(Some(set)),
+            Err(e) => {
+                self.set_error("own_vlans", format!("{e} (e.g. 50,60-70; empty for none)"));
+                None
+            }
+        }
     }
 
     fn parse_vlans(&mut self) -> Option<VlanSet> {
@@ -995,6 +1042,18 @@ pub fn trunk_candidates(interfaces: &[Interface]) -> Vec<&Interface> {
     let mut list: Vec<&Interface> = interfaces.iter().filter(|i| i.is_listed()).collect();
     list.sort_by(|a, b| a.name.cmp(&b.name));
     list
+}
+
+/// The own VLANs of a site as a form field.
+fn own_vlans_field(site: Option<&Site>) -> Field {
+    Field::text(
+        "own_vlans",
+        "Own VLANs",
+        "its trunk and its own clients only, never its server; empty: none",
+        site.and_then(|s| s.own_vlans.as_ref())
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+    )
 }
 
 /// The "Connected to" choice of a server.
@@ -1108,7 +1167,7 @@ mod tests {
         let form = Form::site(&d, None);
         assert_eq!(
             form.fields.iter().map(|f| f.key).collect::<Vec<_>>(),
-            ["name", "address", "vlans", "changes", "uplink"]
+            ["name", "address", "vlans", "changes", "own_vlans", "uplink"]
         );
         assert_eq!(form.value("changes"), "only heim", "managed by this site");
         // Empty required fields are errors, but hidden until touched.

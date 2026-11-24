@@ -205,6 +205,28 @@ expect_ping c-site5 10.20.0.1 "VLAN 20: traffic flows again"
 rev=$(jqs site5 .revision)
 wait_eq 60 "site2 has revision $rev" "$rev" jqs site2 .revision
 check "site2 withdraws the release" x site2 "wanderlan manage site5 --self-managed no --confirm"
+
+begin "Own VLANs: a restricted client adds VLANs towards its own side only"
+
+rev=$(jqs site2 .revision)
+wait_eq 60 "site5 has revision $rev" "$rev" jqs site5 .revision
+check "site5 (restricted) sets its own VLANs" x site5 "wanderlan own-vlans site5 60 --confirm"
+wait_eq 30 "site5's trunk carries VLAN 60 too" "10-19,20:pu,21-50,60" vlan_summary site5 trunk0
+check "the tunnel to its server does not carry it (site5's side)" \
+  test "$(vlan_summary site5 gt-site2)" = "10-50"
+check "nor on site2's side" test "$(vlan_summary site2 gt-site5)" = "10-50"
+wait_eq 30 "site2 took the own VLANs over" "10-50 +60" \
+  jqs site2 '.sites[] | select(.name == "site5") | .vlans'
+out=$(x site1 "wanderlan own-vlans site5 70" 2>&1)
+if grep -q 'may not change' <<<"$out"; then
+  pass "site1 may not set the own VLANs of site5"
+else
+  fail "unexpected output when site1 sets site5's own VLANs: $out"
+fi
+check "site5 removes them again" x site5 "wanderlan own-vlans site5 none --confirm"
+wait_eq 30 "site5's trunk is as before" "10-19,20:pu,21-50" vlan_summary site5 trunk0
+wait_eq 30 "site2 took that over too (nothing pending)" "10-50 null" \
+  jqs site2 '"\(.sites[] | select(.name == "site5") | .vlans) \(.pending)"'
 reply=$(raw_join router 10.100.2.10 "$code1" ghost)
 if grep -q 'unknown or already used invitation code' <<<"$reply"; then
   pass "a used code is refused"

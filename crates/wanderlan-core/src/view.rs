@@ -176,6 +176,7 @@ mod tests {
             name: name.into(),
             address: Ipv4Addr::new(10, 0, 0, last),
             vlans: None,
+            own_vlans: None,
             online: true,
             managed_by: uplink.map(Into::into),
             self_managed: true,
@@ -335,5 +336,27 @@ mod tests {
             .online = false;
         let err = merge(&mesh, &view, "site2").unwrap_err();
         assert!(err.contains("may not change"), "{err}");
+    }
+
+    #[test]
+    fn a_restricted_client_sets_its_own_vlans_through_its_server() {
+        let mut mesh = full();
+        mesh.sites
+            .iter_mut()
+            .find(|s| s.name == "site2")
+            .unwrap()
+            .self_managed = false;
+        let mut view = view_for(&mesh, "site2");
+        view.revision = 8;
+        view.sites
+            .iter_mut()
+            .find(|s| s.name == "site2")
+            .unwrap()
+            .own_vlans = Some(VlanSet::from_range(50, 50));
+        let merged = merge(&mesh, &view, "site2").unwrap();
+        assert_eq!(
+            merged.site("site2").unwrap().own_vlans,
+            Some(VlanSet::from_range(50, 50))
+        );
     }
 }

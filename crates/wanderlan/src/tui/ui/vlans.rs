@@ -18,7 +18,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         return;
     };
     let [vlans, table, detail] = Layout::vertical([
-        Constraint::Length(4),
+        Constraint::Length(5),
         Constraint::Min(4),
         Constraint::Length(3),
     ])
@@ -76,6 +76,23 @@ fn draw_vlans(frame: &mut Frame, draft: &Draft, restricted_by: Option<&str>, are
             theme::dim(),
         )),
     }
+    // The own VLANs of this site: always its own business.
+    let me = draft.local.self_name.as_deref().unwrap_or_default();
+    let own = draft
+        .mesh
+        .site(me)
+        .and_then(|s| s.own_vlans.as_ref())
+        .map_or_else(|| "none".to_string(), ToString::to_string);
+    let up = draft
+        .mesh
+        .site(me)
+        .and_then(|s| s.uplink.as_deref())
+        .map_or_else(String::new, |u| format!(", never to {u}"));
+    lines.push(Line::from(vec![
+        Span::styled(format!(" Own VLANs of {me} (o): "), theme::dim()),
+        Span::styled(own, theme::bold()),
+        Span::styled(format!("  trunk and own clients only{up}"), theme::dim()),
+    ]));
     let title = if restricted_by.is_some() {
         " VLANs of the network (read only) "
     } else {

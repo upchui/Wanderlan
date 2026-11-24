@@ -167,6 +167,16 @@ pub fn check_edit(old: &Mesh, new: &Mesh, editor: &str) -> Result<(), String> {
         };
         return Err(why_not(old, site, editor, what));
     }
+    // Its own VLANs: the site itself, or whoever may change it.
+    for site in &old.sites {
+        if let Some(now) = new.site(&site.name)
+            && now.own_vlans != site.own_vlans
+            && editor != site.name
+            && !may_change(old, site, editor)
+        {
+            return Err(why_not(old, site, editor, "change the own VLANs of"));
+        }
+    }
     // A client only adds clients of its own.
     if let Some(up) = client_of(old, editor)
         && let Some(added) = new
@@ -194,6 +204,7 @@ mod tests {
             name: name.into(),
             address: Ipv4Addr::new(10, 0, 0, last),
             vlans: None,
+            own_vlans: None,
             online: true,
             managed_by: managed_by.map(Into::into),
             self_managed,
@@ -367,5 +378,20 @@ mod tests {
         );
         added.sites[5].uplink = Some("d".into());
         assert!(check_edit(&old, &added, "d").is_ok());
+    }
+
+    #[test]
+    fn a_restricted_site_sets_its_own_vlans() {
+        let old = mesh();
+        assert_eq!(restricted_by(&old, "c"), Some("a"));
+        let mut new = old.clone();
+        new.sites[2].own_vlans = Some(VlanSet::from_range(60, 60));
+        assert!(check_edit(&old, &new, "c").is_ok(), "c itself");
+        assert!(check_edit(&old, &new, "a").is_ok(), "its manager");
+        let err = check_edit(&old, &new, "b").unwrap_err();
+        assert!(
+            err.contains("may not change the own VLANs of site \"c\""),
+            "{err}"
+        );
     }
 }

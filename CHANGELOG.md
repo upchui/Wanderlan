@@ -169,6 +169,15 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
 - Renaming a site in the TUI also renames it where it manages other sites
   (`managed_by`) and in `[tunnels.<site>]`.
 
+### Own VLANs
+
+- A site can have own VLANs (`[[site]] own_vlans = "50"`): on its trunk and
+  towards its own clients, never towards its server. The site itself may
+  always set them, also when its server manages everything else (a
+  restricted client). TUI: VLANs, `o`, and the site form; CLI:
+  `wanderlan own-vlans <site> <vlans|none>`. The Sites view shows them as
+  `13 +50`.
+
 ### Documentation
 
 - README rewritten around what wanderlan is today: concepts (servers and

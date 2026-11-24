@@ -132,9 +132,15 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
         .self_site()
         .map(|s| mesh.effective_vlans(s))
         .unwrap_or_default();
+    // The site's own VLANs: on its trunk and towards its own clients only.
+    let own_extra = cfg
+        .self_site()
+        .map(|s| mesh.own_vlans(s))
+        .unwrap_or_default();
+    let downwards: crate::config::VlanSet = own.iter().chain(own_extra.iter()).collect();
     // The native VLAN leaves the trunk untagged (and untagged frames belong
     // to it); on the tunnels every VLAN is tagged.
-    let shared: PortVlans = own
+    let shared: PortVlans = downwards
         .iter()
         .map(|v| {
             let flags = if v == NATIVE_VID {
@@ -153,7 +159,23 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
         .into_iter()
         .map(|t| {
             let name = t.ifname();
-            let theirs = mesh.effective_vlans(t.peer);
+            // What the tunnel carries: the VLANs both ends take part in; on
+            // the way down (site and its client) the own VLANs of the upper
+            // site too, never those of the lower one.
+            let ours: crate::config::VlanSet = match t.kind {
+                topology::TunnelKind::Client => downwards.clone(),
+                topology::TunnelKind::Server | topology::TunnelKind::Uplink => own.clone(),
+            };
+            let theirs: crate::config::VlanSet = match t.kind {
+                topology::TunnelKind::Uplink => mesh
+                    .effective_vlans(t.peer)
+                    .iter()
+                    .chain(mesh.own_vlans(t.peer).iter())
+                    .collect(),
+                topology::TunnelKind::Server | topology::TunnelKind::Client => {
+                    mesh.effective_vlans(t.peer)
+                }
+            };
             // Down while blocked by the loop guard, or while this site or the
             // peer is offline (set up but not taken online yet).
             let down_reason = if blocked.contains(&name) {
@@ -178,7 +200,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
                     pmtudisc: false,
                 },
                 isolated: t.isolated(),
-                vlans: own
+                vlans: ours
                     .iter()
                     .filter(|v| theirs.contains(*v))
                     .map(|v| (v, VlanFlags::TAGGED))
@@ -649,5 +671,50 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["heim"]
         );
+    }
+
+    #[test]
+    fn own_vlans_go_to_the_trunk_and_down_but_never_up() {
+        // heim: server; buero: client of heim (VLANs 20, own 60);
+        // haus2: client of buero.
+        let mesh = MESH
+            .replace(
+                "name = \"buero\"\naddress = \"10.8.0.2\"\n",
+                "name = \"buero\"\naddress = \"10.8.0.2\"\nvlans = \"20\"\nown_vlans = \"60\"\nuplink = \"heim\"\n",
+            )
+            .replace(
+                "name = \"haus2\"\naddress = \"10.8.0.11\"\n",
+                "name = \"haus2\"\naddress = \"10.8.0.11\"\nuplink = \"buero\"\n",
+            )
+            .replace("vlans = \"20,30\"", "vlans = \"20,60\"");
+        let derive_for = |me: &str| {
+            let local = format!("self = \"{me}\"\ntrunk = \"ens19\"\n");
+            match load(&mesh, &local).unwrap().loaded {
+                Loaded::Configured(cfg) => derive(&cfg, &Runtime::default()),
+                Loaded::Unconfigured { .. } => panic!("configured"),
+            }
+        };
+        let vids = |d: &Desired, peer: &str| -> Vec<u16> {
+            d.tunnels
+                .iter()
+                .find(|t| t.peer == peer)
+                .unwrap()
+                .vlans
+                .keys()
+                .copied()
+                .collect()
+        };
+        let buero = derive_for("buero");
+        assert_eq!(
+            buero.trunk().vlans.keys().copied().collect::<Vec<_>>(),
+            [20, 60],
+            "own VLANs on the trunk"
+        );
+        assert_eq!(vids(&buero, "heim"), [20], "never up to the server");
+        assert_eq!(vids(&buero, "haus2"), [20, 60], "down to its client");
+        let heim = derive_for("heim");
+        assert_eq!(vids(&heim, "buero"), [20], "the server agrees");
+        let haus2 = derive_for("haus2");
+        assert_eq!(vids(&haus2, "buero"), [20, 60], "the client agrees");
     }
 }

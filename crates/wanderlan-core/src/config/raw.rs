@@ -59,6 +59,7 @@ struct RawSite {
     name: Option<Spanned<String>>,
     address: Option<Spanned<String>>,
     vlans: Option<Spanned<RawVlans>>,
+    own_vlans: Option<Spanned<RawVlans>>,
     online: Option<Spanned<bool>>,
     managed_by: Option<Spanned<String>>,
     self_managed: Option<Spanned<bool>>,
@@ -353,6 +354,8 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
     let address = lw.take(&addr_path, s.address);
     let vlans_path = FieldPath::site_field(i, "vlans");
     let vlans = lw.take(&vlans_path, s.vlans);
+    let own_path = FieldPath::site_field(i, "own_vlans");
+    let own_vlans = lw.take(&own_path, s.own_vlans);
     let online = lw
         .take(&FieldPath::site_field(i, "online"), s.online)
         .unwrap_or(true);
@@ -393,6 +396,16 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
             }
         },
     });
+    let own_vlans = own_vlans.and_then(|v| match v {
+        RawVlans::Text(t) if t.trim().is_empty() || t.trim() == "none" => None,
+        v => match parse_vlans(v) {
+            Ok(set) => Some(set),
+            Err(e) => {
+                lw.error(own_path, format!("{label}: own_vlans: {e}"));
+                None
+            }
+        },
+    });
     let address = lw
         .required(addr_path.clone(), address, &format!("{label}: address"))
         .and_then(|a| match a.trim().parse::<Ipv4Addr>() {
@@ -411,6 +424,7 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
             name: name?,
             address: address?,
             vlans,
+            own_vlans,
             online,
             managed_by,
             self_managed,

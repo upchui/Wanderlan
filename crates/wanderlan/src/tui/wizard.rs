@@ -441,6 +441,7 @@ impl Wizard {
             name: name.clone(),
             address: parse_address(self.address.value())?,
             vlans: None,
+            own_vlans: None,
             online: true,
             managed_by: None,
             self_managed: false,

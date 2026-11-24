@@ -75,9 +75,18 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
                 Cell::from(marker),
                 Cell::from(site.name.clone()),
                 Cell::from(site.address.to_string()),
-                match &site.vlans {
-                    Some(v) => Cell::from(v.to_string()),
-                    None => Cell::from(Span::styled(draft.mesh.vlans.to_string(), theme::dim())),
+                {
+                    let own = site
+                        .own_vlans
+                        .as_ref()
+                        .map_or_else(String::new, |o| format!(" +{o}"));
+                    match &site.vlans {
+                        Some(v) => Cell::from(format!("{v}{own}")),
+                        None => Cell::from(Span::styled(
+                            format!("{}{own}", draft.mesh.vlans),
+                            theme::dim(),
+                        )),
+                    }
                 },
                 Cell::from(format::role(site.uplink.as_deref())),
                 Cell::from(policy::managed_label(&draft.mesh, site)),

@@ -551,3 +551,29 @@ fn the_trunk_of_a_tunnel_is_checked() {
         outcome.warnings
     );
 }
+
+#[test]
+fn own_vlans_are_checked() {
+    let mesh = CLIENTS.replace(
+        "uplink = \"alex\"",
+        "uplink = \"alex\"\nvlans = \"13\"\nown_vlans = \"native,50\"",
+    ) + "\n[[map]]\nsite = \"site2\"\nlocal = \"native\"\nshared = 13\n";
+    let err = single_error(&mesh, "self = \"alex\"\ntrunk = \"ens19\"\n");
+    assert!(
+        err.message.contains("own_vlans cannot contain native"),
+        "{err}"
+    );
+    let fine = mesh.replace("own_vlans = \"native,50\"", "own_vlans = \"13,50\"");
+    let outcome = load(&fine, "self = \"alex\"\ntrunk = \"ens19\"\n").expect("only a warning");
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.message.contains("own_vlans 13 are already VLANs")),
+        "{:?}",
+        outcome.warnings
+    );
+    let parsed = parse_mesh(&fine).unwrap().mesh.unwrap();
+    let text = render_mesh(&parsed);
+    assert!(text.contains("own_vlans = \"13,50\""), "{text}");
+}

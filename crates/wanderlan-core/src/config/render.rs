@@ -58,6 +58,9 @@ fn render_mesh_inner(mesh: &Mesh, with_revision: bool) -> String {
         if let Some(vlans) = &site.vlans {
             let _ = writeln!(out, "vlans = {}", quote(&vlans.to_string()));
         }
+        if let Some(own) = site.own_vlans.as_ref().filter(|v| !v.is_empty()) {
+            let _ = writeln!(out, "own_vlans = {}", quote(&own.to_string()));
+        }
         if !site.online {
             out.push_str("online = false\n");
         }

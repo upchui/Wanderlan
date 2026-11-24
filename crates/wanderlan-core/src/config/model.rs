@@ -85,6 +85,20 @@ impl Mesh {
         vlans
     }
 
+    /// The site's own VLANs: on its trunk and towards its own clients only,
+    /// never towards its uplink or other servers. Without the native VLAN if
+    /// the site puts its untagged traffic into another VLAN.
+    pub fn own_vlans(&self, site: &Site) -> VlanSet {
+        let mut vlans = site.own_vlans.clone().unwrap_or_default();
+        if self
+            .maps_of(&site.name)
+            .any(|m| m.local == LocalVid::Native)
+        {
+            vlans.remove(super::vlan::NATIVE_VID);
+        }
+        vlans
+    }
+
     /// Returns the VLAN mappings of one site.
     pub fn maps_of<'a>(&'a self, site: &'a str) -> impl Iterator<Item = &'a VlanMap> + 'a {
         self.maps.iter().filter(move |m| m.site == site)
@@ -102,6 +116,9 @@ pub struct Site {
     /// Shared VLANs this site takes part in, like the allowed VLANs of a
     /// switch port; `None` means the mesh default (`mesh.vlans`).
     pub vlans: Option<VlanSet>,
+    /// VLANs of the site's own, set by the site itself: on its trunk and
+    /// towards its own clients, never towards its uplink.
+    pub own_vlans: Option<VlanSet>,
     /// False while the site is offline: all its tunnels stay down (the
     /// control channel still works). New sites joining with an invitation
     /// start offline until a user takes them online.
@@ -184,6 +201,7 @@ mod tests {
             name: "a".into(),
             address: Ipv4Addr::new(10, 0, 0, 1),
             vlans: None,
+            own_vlans: None,
             online: true,
             managed_by: None,
             self_managed: false,
@@ -193,6 +211,7 @@ mod tests {
             name: "b".into(),
             address: Ipv4Addr::new(10, 0, 0, 2),
             vlans: Some(VlanSet::from_range(14, 14)),
+            own_vlans: None,
             online: true,
             managed_by: None,
             self_managed: false,

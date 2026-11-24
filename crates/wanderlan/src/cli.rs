@@ -160,6 +160,20 @@ pub enum Command {
         #[arg(long)]
         confirm: bool,
     },
+    /// Set the own VLANs of a site: on its trunk and towards its own clients
+    /// only, never towards its server. A site may always set its own.
+    ///
+    /// Example: `wanderlan own-vlans site2 50,60-70`, `wanderlan own-vlans site2 none`.
+    #[command(name = "own-vlans")]
+    OwnVlans {
+        /// The site.
+        site: String,
+        /// VLANs, e.g. 50,60-70, or "none".
+        vlans: String,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Bridge the tunnel to a site with a trunk of its own (a segment of its
     /// own on this site), or with the default trunk again ("default").
     Trunk {
@@ -352,6 +366,30 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             interface,
             confirm,
         }) => set_trunk(&socket, &site, &interface, confirm).await,
+        Some(Command::OwnVlans {
+            site,
+            vlans,
+            confirm,
+        }) => {
+            let own = match vlans.trim() {
+                "" | "none" => None,
+                text => Some(
+                    text.parse::<config::VlanSet>()
+                        .map_err(|e| anyhow!("{text}: {e}"))?,
+                ),
+            };
+            edit_site(&socket, &site, confirm, |entry, _| {
+                if entry.own_vlans == own {
+                    return Err(format!("{} already has these own VLANs.", entry.name));
+                }
+                entry.own_vlans.clone_from(&own);
+                Ok(match &own {
+                    Some(v) => format!("{} has the own VLANs {v}", entry.name),
+                    None => format!("{} has no own VLANs", entry.name),
+                })
+            })
+            .await
+        }
         Some(Command::Manage {
             site,
             by,

@@ -1881,6 +1881,19 @@ impl App {
                     self.modal = Some(Modal::Form(Form::vlans(draft)));
                 }
             }
+            KeyCode::Char('o') => {
+                // Its own VLANs: always this site's own business.
+                let me = draft.local.self_name.as_deref();
+                match draft
+                    .mesh
+                    .sites
+                    .iter()
+                    .position(|s| Some(s.name.as_str()) == me)
+                {
+                    Some(i) => self.modal = Some(Modal::Form(Form::own_vlans(draft, i))),
+                    None => self.not_configured(),
+                }
+            }
             KeyCode::Char('n') => self.modal = Some(Modal::Form(Form::map(draft, None, None))),
             KeyCode::Enter | KeyCode::Char('e') if selected < count => {
                 self.modal = Some(Modal::Form(Form::map(draft, Some(selected), None)));
