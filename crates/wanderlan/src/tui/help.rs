@@ -23,7 +23,7 @@ pub const SECTIONS: &[Section] = &[
     Section {
         title: "Everywhere",
         keys: &[
-            ("1-6, Tab", "switch view (Shift-Tab: previous)"),
+            ("1-7, Tab", "switch view (Shift-Tab: previous)"),
             ("a", "review the draft (diff) and apply it"),
             ("x", "discard the draft"),
             ("c", "confirm a pending change"),
@@ -65,13 +65,14 @@ pub const SECTIONS: &[Section] = &[
             ("l", "local settings of this host: self, trunk"),
             ("u", "unblock the tunnel port to the site"),
         ],
-        text: "Every site has a tunnel to every other site. Edit a site to limit it \
-               to some VLANs (like the allowed VLANs of a switch port).",
+        text: "Servers are connected with each other; a client has one tunnel, to its \
+               server. Edit a site to limit it to some VLANs (like the allowed VLANs \
+               of a switch port), to choose who may change it and what it is connected to.",
     },
     Section {
         title: "3 VLANs",
         keys: &[
-            ("v", "edit the default VLANs of the network (e.g. 10-50,60)"),
+            ("v", "VLANs of the network (empty: all; e.g. native,10-50)"),
             ("n", "new mapping (native or local VLAN -> shared VLAN)"),
             ("e, Enter", "edit the mapping"),
             ("d, Del", "delete the mapping"),

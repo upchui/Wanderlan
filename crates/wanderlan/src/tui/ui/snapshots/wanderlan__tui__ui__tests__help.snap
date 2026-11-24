@@ -1,12 +1,11 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 114
 expression: render(&app)
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
 "┌ Help (Esc closes, Up/Down scrolls) ──────────────────────────────────────────┐"
 "│ Everywhere                                                                   │"
-"│   1-6, Tab            switch view (Shift-Tab: previous)                      │"
+"│   1-7, Tab            switch view (Shift-Tab: previous)                      │"
 "│   a                   review the draft (diff) and apply it                   │"
 "│   x                   discard the draft                                      │"
 "│   c                   confirm a pending change                               │"

@@ -169,6 +169,14 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
 - Renaming a site in the TUI also renames it where it manages other sites
   (`managed_by`) and in `[tunnels.<site>]`.
 
+### Documentation
+
+- README rewritten around what wanderlan is today: concepts (servers and
+  clients, VLANs like a switch trunk, mappings, who knows and who may
+  change what), a quick start that follows the wizard, everyday tasks, a
+  complete configuration reference, how it works, and the project
+  decisions. The TUI help and the open questions follow suit.
+
 ### More to see
 
 - Settings view (7): every setting with an explanation.

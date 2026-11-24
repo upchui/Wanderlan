@@ -1,100 +1,132 @@
-# Wanderlan
+# wanderlan
 
-wanderlan connects several sites on layer 2, so that the same VLANs, subnets
-and DHCP servers are available at every site as if it were one network. All
-sites together behave like one big switch: plug a site in, choose which VLANs
-it takes part in, map VLAN IDs or put untagged traffic into a VLAN.
-
-wanderlan does **not** build a VPN. The sites must already reach each other
-through an existing transport network, usually a VPN set up beforehand
-(WireGuard, IPsec, a provider network, …). Every site has an **address** in
-that network. On top of it wanderlan builds the layer-2 part:
+wanderlan stretches VLANs between sites on layer 2, over a network that
+already connects them (usually a VPN). It works like plugging switches
+together: one site is the **server**, every further site is a **client**
+plugged into it with an invitation code, and for every site you decide
+which VLANs it gets, which VLAN its untagged traffic belongs to and which
+VLAN IDs are translated.
 
 ```
-Clients ─ trunk ─ br0 ─┬─ gt-<peer1> ─┐
-                       └─ gt-<peer2> ─┴─ existing VPN / transport network
+                  hq   (server, VLANs: all)
+                 /    \
+  office (client of hq)   lab (client of hq)
+  VLANs 10, 20            untagged traffic = VLAN 30
 ```
 
-* servers and clients: the servers are connected with each other, every
-  other site is a client plugged into the site that invited it (one GRETAP
-  tunnel `gt-<peer>` per connection, between the site addresses),
-* a Linux bridge `br0` with VLAN filtering (STP off) with the local trunk and
-  all tunnels as ports,
-* VLANs per site (like the allowed VLANs of a switch port) and VLAN mappings
-  per site (untagged → VLAN, VLAN → VLAN),
-* joining with an invitation code: `wanderlan join <address> <code>`,
-* TCP MSS clamping from measured path MTUs, GRE fragmentation as safety net,
-* loop protection (split horizon between servers, a tree below them, plus a
-  loop guard),
-* changes with automatic rollback unless confirmed,
-* automatic synchronisation of the shared configuration between all sites,
-* an interactive terminal UI (`wanderlan`) and a daemon (`wanderland`).
+`office` and `lab` each have one tunnel, to `hq`. They have no tunnel to
+each other and do not even know about each other; whether traffic flows
+between two sites is decided by the VLANs alone.
 
-Gateways and DHCP servers of the stretched VLANs stay on your existing
-routers; wanderlan neither assigns addresses in the VLANs nor routes.
+wanderlan does **not** build a VPN, route or hand out addresses: the sites
+must already reach each other through an existing transport network
+(WireGuard, IPsec, a provider network, ...), and gateways and DHCP servers of
+the stretched VLANs stay where they are. On top of the transport network each
+site runs a small daemon (`wanderland`) that builds a VLAN-aware Linux
+bridge and GRETAP tunnels, and a terminal UI (`wanderlan`) to set it up and
+watch it.
 
 ## Contents
 
+- [Concepts](#concepts)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Quick start](#quick-start)
+- [Everyday tasks](#everyday-tasks)
 - [Configuration](#configuration)
+- [How it works](#how-it-works)
 - [Terminal UI](#terminal-ui)
 - [Command line](#command-line)
-- [How it works](#how-it-works)
 - [Troubleshooting](#troubleshooting)
-- [Design decisions](#design-decisions)
+- [Project decisions](#project-decisions)
 - [Development](#development)
 - [Maintainers: releases and the APT repository](#maintainers-releases-and-the-apt-repository)
 
+## Concepts
+
+### Servers and clients
+
+The first site of a network is a **server**. A site that joins with an
+invitation becomes a **client** of the site that invited it, like a cable
+plugged into a switch: its only tunnel leads to that site (its *uplink*), so
+a client only has to reach its server in the transport network. Servers are
+connected with each other (every server with every other server), so servers
+must reach each other.
+
+A client can invite sites too; they become its own clients. A site can be
+made a server or the client of another site later. Every view shows the role
+(`server`, `client of hq`).
+
+### VLANs like a switch trunk
+
+Every site takes part in a set of VLANs, like the allowed VLANs of a switch
+port. Without a list it takes part in **all** VLANs and in the untagged
+traffic, like a plain trunk between two switches. `native` in a list stands
+for the untagged traffic, e.g. `native,10-50`; between the sites it travels as
+VLAN 1, the default native VLAN of most switches.
+
+A tunnel carries the VLANs that **both** of its ends take part in. So two
+clients exchange traffic only in a VLAN that they and their server all have;
+a VLAN the server does not take part in does not pass it.
+
+### VLAN mappings
+
+Per site, untagged traffic can be put into a VLAN (`native → 30`: what
+arrives untagged at that site's trunk is VLAN 30 everywhere else, and VLAN 30
+leaves its trunk untagged), and local VLAN IDs can be translated (`130 → 30`:
+VLAN 130 at that site is VLAN 30 everywhere else). The VLAN mapping views
+show next to each site whether it is a server or a client.
+
+### Who knows what
+
+Servers know the whole network. A client knows only itself, its server and
+its own clients: it never learns about the clients of other servers, neither
+in the terminal UI nor in its configuration files. Changes made on a client
+(to itself and to its own clients) reach the network through its server.
+
+### Who may change what
+
+The site that created an invitation **manages** the site that joined with it.
+
+| Change | Who |
+|--------|-----|
+| VLANs, mappings, online state of a managed site, removing it | its manager; the site itself too if it was released ("may change its own VLANs") |
+| The same for a site without a manager (the first site) and the VLANs of the network | every site that is not *restricted* |
+| Timeouts, MTU check, MSS, control port, invitations | every site |
+
+A site that joined and was not released is **restricted**: it cannot change
+any VLANs, only those of sites it invited itself. A client may in any case
+only change itself and its own clients, never its server. The daemons enforce
+this among themselves; it is not a cryptographic protection.
+
+### Online, offline and confirmed changes
+
+A site that joins starts **offline**: its tunnel exists but stays down, while
+the control channel already shows whether it is reachable, its round trip and
+path MTU. Once everything is right, its manager takes it online; online stays
+online, also across restarts, until someone takes it offline.
+
+Every change is applied immediately and must be **confirmed** within the
+commit timeout (60 s by default); otherwise the previous state comes back.
+So a change that cuts you off undoes itself.
+
 ## Requirements
 
-* **Debian 13 (trixie)** is the target platform. Debian 12, Ubuntu 24.04 and
-  Proxmox VE 9 (based on Debian 13) and 8 work as well; the binaries are
-  static (musl) for amd64 and arm64.
-* A VM or small host per site, connected to the local network with a
-  **VLAN trunk** (an interface that carries the VLANs tagged). The trunk must
-  not be part of another bridge or bond.
-* An **existing transport network** between the sites (usually a VPN) in
-  which every site has an IPv4 address. It must carry
-  * GRE (IP protocol 47) between the site addresses, and
-  * UDP and TCP on the control port (default 51821) between the site
-    addresses (path MTU probes, configuration sync).
-* Kernel modules `bridge`, `ip_gre`, `sch_ingress`, `cls_flower`, `act_vlan`,
-  `act_gact`, `nf_tables` (all part of the standard kernels; the package loads
-  them at boot).
-
-**Servers and clients.** The first site is a **server**. A site that joins
-with an invitation is a **client** of the site that invited it, like a cable
-plugged into a switch: its only tunnel leads there, so **a client only has to
-reach that site** in the transport network. Servers are connected with each
-other, so servers must reach each other. Whether two sites exchange traffic
-is decided by the VLANs alone: every tunnel carries the VLANs both of its
-ends take part in, so two clients meet only in a VLAN that they and their
-server all have; there is no tunnel between clients.
-
-```
-        alex (server, VLANs all)
-       /                        \
-  marcel (client of alex)     site2 (client of alex)
-  VLAN 15                     VLAN 13
-```
-
-**Who knows what.** Servers know the whole network. A client knows only
-itself, the site it is plugged into (which it sees as its server) and its
-own clients; it never learns about the clients of other servers, neither in
-the TUI nor in its `mesh.toml`. A client's changes (as far as it may make
-them: itself and its own clients) reach the network through its server,
-which takes them over into its own configuration.
-
-A site can be made a server or the client of another site later (TUI: Sites,
-`Enter`, "Connected to"; CLI: `wanderlan role <site> server|client <site>`;
-`mesh.toml`: `uplink = "<site>"`). Every view shows the role (`server`,
-`client of alex`); sites without a tunnel from here show `via alex`.
+* **Debian 13 (trixie)**; Debian 12, Ubuntu 24.04 and Proxmox VE 8/9 work as
+  well. The binaries are static (musl) for amd64 and arm64.
+* Per site a VM or small host with a **trunk**: an interface that carries the
+  VLANs tagged (and the untagged network) to the switch or hypervisor. It
+  must not be part of another bridge or bond.
+* An **existing transport network** in which every site has an IPv4 address.
+  Between each client and its server, and between all servers, it must carry
+  * GRE (IP protocol 47), and
+  * UDP and TCP on the control port (default 51821): probes, configuration
+    sync, joining.
+* The kernel modules `bridge`, `ip_gre`, `sch_ingress`, `cls_flower`,
+  `act_vlan`, `act_gact` and `nf_tables` (standard kernels have them; the
+  package loads them at boot).
 
 ## Installation
-
-Add the APT repository and install the package:
 
 ```
 curl -fsSL https://upchui.github.io/Wanderlan/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/wanderlan.gpg
@@ -102,29 +134,19 @@ echo "deb [signed-by=/usr/share/keyrings/wanderlan.gpg] https://upchui.github.io
 sudo apt update && sudo apt install wanderlan
 ```
 
-On minimal installations `curl` and `gpg` may be missing:
-`sudo apt install curl gpg`.
+(On minimal installations first `sudo apt install curl gpg`.)
 
-Every commit on `main` that passes all tests is published automatically,
-as version `<version>+<build>.g<commit>` (e.g. `0.1.0+57.gc256ea5-1`);
-updates come with `sudo apt upgrade`. The last 20 of these builds and every
-tagged release (e.g. `0.1.0-1`) stay in the repository:
-`apt-cache madison wanderlan` lists them and
-`sudo apt install wanderlan=<version>` downgrades.
+Every commit on `main` that passes all tests is published as
+`<version>+<build>.g<commit>-1`, so `sudo apt upgrade` always brings the
+newest build. The last 20 builds and every tagged release stay in the
+repository: `apt-cache madison wanderlan` lists them,
+`sudo apt install wanderlan=<version>` goes back. Update all sites to the
+same build.
 
-The package installs
-
-| Path | Content |
-|------|---------|
-| `/usr/bin/wanderland` | the daemon |
-| `/usr/bin/wanderlan` | terminal UI and command line |
-| `/usr/lib/systemd/system/wanderland.service` | systemd unit, enabled and started |
-| `/etc/wanderlan/mesh.toml`, `local.toml` | configuration (conffiles, empty templates) |
-| `/usr/share/doc/wanderlan/examples/` | example configuration (`wanderlan init` prints it too; minimal images such as Docker's `-slim` skip `/usr/share/doc`) |
-| `/usr/lib/modules-load.d/wanderlan.conf` | kernel modules loaded at boot |
-
-and creates the group `wanderlan`. Members of this group can use the TUI and
-the command line without root:
+The package installs the daemon `wanderland` (systemd service, enabled and
+started), the terminal UI and command line `wanderlan`, empty configuration
+files in `/etc/wanderlan/`, examples in `/usr/share/doc/wanderlan/examples/`
+and the group `wanderlan`. Its members can use `wanderlan` without root:
 
 ```
 sudo usermod -aG wanderlan $USER    # then log in again
@@ -132,430 +154,392 @@ sudo usermod -aG wanderlan $USER    # then log in again
 
 ## Quick start
 
-On the **first site** (say `heim` at transport address `10.8.0.1`):
+On the **first site** (here `hq` at transport address `10.8.0.1`):
 
 1. Run `wanderlan`. On a site without configuration the setup wizard opens;
-   choose **Start a new network**. The name (from the host name), the trunk
-   (the interface that does not lead to the transport network) and the
-   address are suggested; add the VLANs of the network (e.g. `10-50`).
-2. Review the change and apply it, then confirm it with `c` within the
-   commit timeout (60 s by default), otherwise it is rolled back.
-3. The wizard creates an invitation right away and shows the command for the
-   next site, e.g. `wanderlan join 10.8.0.1 K7F3Q-9QX2M`.
+   choose **Start a new network**. Name (from the host name), trunk (the
+   interface that does not lead to the transport network) and address are
+   suggested. Leave the VLANs empty for all VLANs, or limit them, e.g.
+   `native,10-50`.
+2. Review the change (`Enter`), then confirm it with `c`.
+3. The invitation form for the next site opens: its name, VLANs, the VLAN
+   for its untagged traffic, translations and whether it may change its own
+   VLANs. `Enter` creates the code and shows the command, e.g.
+   `wanderlan join 10.8.0.1 K7F3Q-9QX2M` (`Esc` skips this; `i` in Sites
+   later).
 
-On **every further site** install the package and run that command:
+On the **new site** install the package and run that command:
 
 ```
 sudo wanderlan join 10.8.0.1 K7F3Q-9QX2M
 ```
 
-The new site gets its name from the host name (`--name` to choose one),
-picks the trunk automatically (`--trunk` if there is more than one
-candidate), and receives the configuration of the network; the inviting site
-adds it with the address the request came from, as its client. Both sides
-confirm automatically as soon as they reach each other; the other sites
-learn about the new site through the configuration sync (they need no tunnel
-to it). A client that joins again through another site (e.g. after a reset)
-becomes a client of that site. In the TUI the
-wizard offers the same as **Join an existing network**.
+It takes its name from the host name (`--name` to choose one), picks its
+trunk itself (`--trunk` if there are several candidates), receives its part
+of the configuration and reports when both sides agree. In the TUI the
+wizard offers the same under **Join an existing network**.
 
-A new site starts **offline**: its tunnels exist but stay down, while the
-control channel already shows whether it is reachable, its round trip and
-path MTU. Check everything, then take it online on the inviting site:
-`sudo wanderlan online <site> --confirm` (TUI: Sites, `o`, `a`, `c`). Online
-stays online, also across restarts, until someone takes it offline.
+Back on `hq`, check the new site in the overview (reachable, round trip,
+path MTU) and take it online: Sites (`2`), select it, `o`, `a`, `c`, or
 
-Invitations can be created on **any** site of the network (`wanderlan
-invite`, or `i` in the TUI); the command contains that site's address. An
-invitation can carry **rules for the new site**: name (`--name`), VLANs
-(`--vlans native,10-50`), the VLAN for its untagged traffic (`--native 20`),
-translations (`--map 130:30`). A code works once and stays valid until it is
-used or deleted (`wanderlan invite list`, `wanderlan invite delete <code>`;
-TUI: Sites, `I`).
+```
+sudo wanderlan online office --confirm
+```
 
-The site that created the invitation **manages** the new site. Who may
-change what:
+## Everyday tasks
 
-| Change | Who |
-|--------|-----|
-| VLANs, mappings, online state of a managed site, removing it | its manager; the site itself too if it was released (`--self-managed`, TUI: "Changes") |
-| The same for a site without a manager (the first site) and the VLANs of the network | every site that is not *restricted* |
-| Timeouts, MTU check, MSS, control port, invitations | every site |
+Keys refer to the terminal UI (`wanderlan`); every change ends with `a`
+(review and apply) and `c` (confirm).
 
-A site is *restricted* if it joined with an invitation and was not
-released: it cannot change any VLANs, neither its own nor those of other
-sites or of the network, only those of sites it invited itself. Released,
-it has the same rights as the site that invited it. Change who manages a
-site in the TUI (Sites, `Enter`, field "Changes") or with `wanderlan manage
-<site> [--by S | --anyone] [--self-managed yes|no]`; Settings (7) shows who
-manages this site and which sites it manages. After "Start a new network"
-the setup opens the invitation form, so the rules (and whether the new site
-may change them) are chosen right away. This is an agreement between the
-daemons, not a cryptographic protection.
+**Invite a site.** Sites, `i`: name, VLANs, untagged VLAN, translations and
+"Changes" (whether it may change its own VLANs). CLI:
+`wanderlan invite --name lab --native 30 --map 130:30`. A code works once and
+stays valid until used or deleted: Sites, `I` (`d` deletes), or
+`wanderlan invite list` / `wanderlan invite delete <code>`. Codes can be
+created on any site; the new site becomes a client of that site.
 
-To start over on a site: `sudo wanderlan reset` removes the bridge, the
-tunnels, all rules, the configuration and the invitations; the site is
-unconfigured again, like after the installation. Every step runs even if an
-earlier one fails, and the daemon checks afterwards that nothing is left
-(otherwise it says what and the reset can be repeated). The kernel creates
-the devices `gre0`, `gretap0` and `erspan0` by itself when it loads its GRE
-module for the first tunnel; as root, outside containers and if no other GRE
-tunnel uses the module, the reset unloads it so they disappear too. Remove
-the site on another site too (TUI, Sites, `d`) if it leaves the network for
-good; until then the others keep listing it, which does not stop it from
-starting or joining another network.
+**Take a site online or offline.** Sites, select it, `o`; or
+`wanderlan online <site> --confirm` / `wanderlan offline <site> --confirm`.
 
-Without the TUI: write `/etc/wanderlan/mesh.toml` and `local.toml` (see
-`wanderlan init` or the examples), check them with `wanderlan validate`,
-then `sudo wanderlan apply` and `sudo wanderlan confirm`.
+**Choose the VLANs of a site.** Sites, `Enter` on the site, field "VLANs"
+(empty: the VLANs of the network). The VLANs of the network: VLANs (`3`),
+`v`, or Settings (`7`).
+
+**Put untagged traffic into a VLAN, translate a VLAN.** VLANs (`3`), `n`:
+site, local VLAN `native` (or a local VLAN ID, e.g. `130`), shared VLAN
+(e.g. `30`).
+
+**Let a site change its own VLANs, move it.** Sites, `Enter` on the site:
+"Changes" (only its manager / the manager and the site / any site) and
+"Connected to" (server, or client of a site). CLI:
+`wanderlan manage <site> --self-managed yes`,
+`wanderlan role <site> client <server>`, `wanderlan role <site> server`.
+
+**Give a tunnel its own trunk.** Normally all tunnels share the trunk. A
+tunnel can be bridged with another local interface instead, as a segment of
+its own at this site (bridge `wl-<interface>`, same VLANs and mappings): only
+the network on that interface reaches the other site through this one.
+Settings (`7`), "Trunk per tunnel", or `wanderlan trunk <site> ens20`
+(`default` to undo).
+
+```
+hq
+  ens19 ── br0 ───────┬── gt-office ══ office
+                      └── gt-lab    ══ lab
+  ens20 ── wl-ens20 ───── gt-dc     ══ dc
+```
+
+**Start over on a site.** Setup (`6`), `R`, or `sudo wanderlan reset`: the
+bridges, tunnels, all rules, the configuration and the invitations are
+removed and the site is unconfigured again, like after the installation
+(also the kernel's `gre0`/`gretap0`/`erspan0` when it runs as root outside a
+container and no other GRE tunnel needs them). Join again with a new
+invitation; a client that joins through another site becomes that site's
+client. If the site leaves for good, delete it on its server (Sites, `d`).
+
+**Edit the files by hand.** Edit `/etc/wanderlan/mesh.toml` or `local.toml`,
+check with `wanderlan validate /etc/wanderlan/mesh.toml --local
+/etc/wanderlan/local.toml`, then `sudo wanderlan apply` and
+`sudo wanderlan confirm`. Edits that are not confirmed are restored and kept
+as `*.rejected`.
 
 ## Configuration
 
-All sites share **`/etc/wanderlan/mesh.toml`**; the daemon keeps it identical
-on all sites. What is specific to a host is in **`/etc/wanderlan/local.toml`**,
-which is never synchronised.
+Two files in `/etc/wanderlan/`, both maintained by the daemon:
+
+* `mesh.toml`: the network. A server holds the whole network; a client only
+  its part of it (itself, its server, its own clients). The daemons keep the
+  files in sync.
+* `local.toml`: this host only, never synchronised.
 
 `local.toml`:
 
 ```toml
-self = "haus2"     # name of this site in mesh.toml
-trunk = "ens19"    # local interface carrying the VLANs
+self = "hq"         # which site of mesh.toml this host is
+trunk = "ens19"     # the interface carrying the VLANs
+
+# Optional: the tunnel to dc uses a trunk of its own (a segment of its own).
+[tunnels.dc]
+trunk = "ens20"
 ```
 
-`mesh.toml`:
+`mesh.toml` on `hq` (a server):
 
 ```toml
 [mesh]
-vlans = "10-50"               # VLANs of every site that does not list its own
-mtu_probe_interval = "5m"     # how often the path MTU to each peer is measured
-# mss = 1300                  # optional: fixed TCP MSS instead of measuring
+# vlans = "all"               # VLANs of every site without its own list
 commit_timeout = "60s"        # changes are rolled back unless confirmed in time
+# mtu_probe_interval = "5m"   # how often the path MTU to each peer is measured
+# mss = 1300                  # fixed TCP MSS instead of measuring
 # control_port = 51821        # UDP/TCP port for probes, sync and joining
-# revision = 12               # maintained by wanderlan, do not edit by hand
+revision = 12                 # maintained by wanderlan
 
 [[site]]
-name = "heim"
-address = "10.8.0.1"          # address of the site in the transport network
+name = "hq"
+address = "10.8.0.1"          # address in the transport network
 
 [[site]]
-name = "buero"
+name = "dc"                   # a second server
 address = "10.8.0.2"
 
 [[site]]
-name = "haus2"
+name = "office"
 address = "10.8.0.11"
-vlans = "20,30"               # haus2 only takes part in VLANs 20 and 30
+vlans = "10,20"               # office only takes part in VLANs 10 and 20
+managed_by = "hq"             # invited by hq
+uplink = "hq"                 # a client of hq
 
 [[site]]
-name = "haus3"
+name = "lab"
 address = "10.8.0.12"
+online = false                # joined, not taken online yet
+managed_by = "hq"
+uplink = "hq"
 
-[[map]]                       # untagged traffic on the trunk of haus3 is VLAN 20
-site = "haus3"
+[[map]]                       # untagged traffic at lab is VLAN 30
+site = "lab"
 local = "native"
-shared = 20
-
-[[map]]                       # local VLAN 130 at haus3 is shared VLAN 30
-site = "haus3"
-local = 130
 shared = 30
 ```
+
+The `mesh.toml` of `lab` contains only `hq` (as its server), `lab` and lab's
+mapping.
 
 ### Settings
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `mesh.vlans` | `all` | VLANs of the network, used by every site without its own `vlans`. Missing, empty or `"all"`: every VLAN and the untagged traffic, like a trunk between two switches. Otherwise e.g. `"native,10-50"`, `"10,20,30-40"` or a list `[10, "20-30"]`. `native` is the untagged traffic (the native VLAN, carried as VLAN 1 between the sites, so tagged VLAN 1 on a trunk is the same network, like on most switches). |
+| `mesh.vlans` | all | VLANs of every site without its own list. Missing, empty or `"all"`: every VLAN and the untagged traffic. Otherwise e.g. `"native,10-50"`, `"10,20,30-40"` or `[10, "20-30"]`. |
+| `mesh.commit_timeout` | `60s` | Time to confirm a change (10 s to 1 h). |
 | `mesh.mtu_probe_interval` | `5m` | Interval of the path MTU measurement (at least 10 s). |
-| `mesh.mss` | unset | Fixed TCP MSS (536–1460) instead of measuring. |
-| `mesh.commit_timeout` | `60s` | Time to confirm a change (10 s–1 h). |
-| `mesh.control_port` | `51821` | Port of the daemon-to-daemon control channel. |
-| `mesh.revision` | `0` | Revision counter used by the sync; raised automatically. |
-| `site.name` | – | Unique, `a-z`, `0-9`, `-`, at most 12 characters (it becomes part of the interface name `gt-<name>`). |
-| `site.address` | – | Unique IPv4 address of the site in the transport network. |
-| `site.vlans` | `mesh.vlans` | VLANs this site takes part in, like the allowed VLANs of a switch port. A tunnel carries the VLANs both of its sites take part in. |
-| `site.online` | `true` | `false`: all tunnels of the site stay down. Sites that join with an invitation start with `false`. |
-| `site.managed_by` | – | The site that invited this one; only it (and the site itself with `self_managed = true`) may change the site's VLANs, mappings and online state. |
-| `site.self_managed` | `false` | The site may change its own rules too. |
-| `map.site` | – | Site the mapping applies to. |
-| `map.local` | – | `"native"` (untagged) or a local VLAN ID (not 1). |
-| `map.shared` | – | The VLAN ID in the shared network; must be one of the VLANs of the site, not 1 (the native VLAN). |
+| `mesh.mss` | unset | Fixed TCP MSS (536 to 1460) instead of the measured value. |
+| `mesh.control_port` | `51821` | UDP and TCP port of the daemons on the site addresses. |
+| `mesh.revision` | `0` | Revision counter of the sync; raised by the daemon. |
+| `site.name` | | Unique; `a-z`, `0-9` and `-`, at most 12 characters (it is part of the interface name `gt-<name>`). |
+| `site.address` | | Unique IPv4 address of the site in the transport network. |
+| `site.vlans` | `mesh.vlans` | VLANs this site takes part in. |
+| `site.uplink` | none | The site this one is a client of; none: a server. `""` marks a server explicitly. |
+| `site.online` | `true` | `false`: the tunnels of the site stay down. Sites that join start with `false`. |
+| `site.managed_by` | none | The site that manages this one (the inviting site). |
+| `site.self_managed` | `false` | The site may also change its own VLANs, mappings and online state. |
+| `map.site` | | The site the mapping belongs to. |
+| `map.local` | | `"native"` (untagged) or a local VLAN ID (not 1). |
+| `map.shared` | | The VLAN in the network; one of the VLANs of the site, not 1. |
+| `self` (local) | | Which site of `mesh.toml` this host is. |
+| `trunk` (local) | | The interface carrying the VLANs. |
+| `tunnels.<site>.trunk` (local) | `trunk` | A trunk of its own for the tunnel to `<site>`. |
 
-The configuration is checked when it is loaded; every problem is reported
-with file and line, e.g.
-
-```
-mesh.toml:24: error: site "haus2": vlans: VLAN ID 5000 is outside 1-4094
-mesh.toml:42: error: map #2: shared VLAN 60 is not one of the VLANs of site "haus3" (10-50)
-```
-
-Rules: names and addresses are unique; shared VLANs of mappings are VLANs of
-their site; per site at most one native mapping, no local VLAN mapped twice
-and no two local VLANs onto the same shared VLAN; `self` exists in the mesh;
-unknown keys are errors (typos). Configurations of wanderlan 0.1 with `role`
-and `hub` still load; these keys are ignored with a warning.
-
-### VLAN mappings
-
-* **Native VLAN of the network** (`native` in the VLANs, part of `all`):
-  untagged traffic of all sites is one network and leaves every trunk
-  untagged. Careful: if the untagged LANs of two sites are already connected
-  by another path, this is a loop (the loop guard cuts the tunnel).
-* **Native mapping** of a site: its untagged frames belong to the shared
-  VLAN, and the shared VLAN leaves its trunk untagged; the native VLAN of the
-  network then does not reach this site.
-* **Translation** `local = L`, `shared = S`: frames tagged L on the trunk are
-  rewritten to S when they enter, S is rewritten to L when it leaves (tc
-  `clsact` + `flower` + `vlan modify`). At that site, frames that arrive
-  already tagged S are dropped, so the local VLAN S and the translated VLAN
-  never merge; if L is itself a shared VLAN, it is not available as shared
-  VLAN at that site (the validator warns about it).
-
-### Trunk per tunnel
-
-Normally all tunnels of a site share its trunk: the site is one switch.
-A tunnel can get a trunk of its own (`local.toml`, only on this host; TUI:
-Settings, "Trunk per tunnel"; CLI: `wanderlan trunk <site> <interface>`):
+Every file is checked when it is loaded or applied; problems are reported
+with file and line:
 
 ```
-heim
-  ens19 ── br0 ───────┬── gt-haus2 ══ haus2
-                      └── gt-haus3 ══ haus3
-  ens20 ── wl-ens20 ───── gt-buero ══ buero
+mesh.toml:24: error: site "office": vlans: VLAN ID 5000 is outside 1-4094
+mesh.toml:42: error: map #2: shared VLAN 60 is not one of the VLANs of site "office" (10,20)
 ```
 
-```toml
-trunk = "ens19"
+Names and addresses are unique, uplinks lead to an existing site and never
+in a circle, mappings use VLANs of their site (at most one native mapping
+per site, no local VLAN mapped twice, no two local VLANs onto one shared
+VLAN), `self` exists, and unknown keys are errors (typos). Older files load
+too: `role` and `hub` (wanderlan 0.1) are ignored with a warning, and a site
+with `managed_by` but without `uplink` is a client of its manager.
 
-[tunnels.buero]
-trunk = "ens20"
-```
+## How it works
 
-Each further trunk is a segment of its own at this site (bridge
-`wl-<trunk>`, with the same VLANs and mappings as the default trunk): the
-network on ens20 reaches buero, the network on ens19 reaches haus2 and
-haus3, and the two do not see each other at heim. buero, haus2 and haus3
-still reach each other over their own tunnels. `wanderlan trunk <site>
-default` puts the tunnel back on the default trunk; the extra bridge is
-removed. The interface that leads to the other site (transport) is refused.
+### On each site
 
-### Changes, rollback and synchronisation
+The daemon creates, and removes again when it stops:
 
-Every change of the running configuration (TUI, `wanderlan apply`, or a
-configuration received from a peer) is applied immediately and must be
-confirmed within `commit_timeout`; otherwise the previous state is restored.
-So nobody locks themselves out when working through the tunnel itself.
+* `br0`: a bridge with VLAN filtering, STP off, no default VLAN and no
+  netfilter calls, with the trunk as a port;
+* `wl-<interface>`: the same for every further trunk ("trunk per tunnel");
+* `gt-<peer>`: a GRETAP tunnel (`ignore-df`, `nopmtudisc`, MTU 1500) to its
+  server, to each of its clients and, on a server, to every other server. The
+  ports between servers are `isolated` (split horizon: a frame from one
+  server is never forwarded to another server); the ports of clients and
+  uplinks are ordinary ports, a tree that is loop-free by itself;
+* the VLANs of the site on the trunk (VLAN 1 untagged as the native VLAN) and
+  on every tunnel the VLANs both ends take part in;
+* tc `clsact` filters on the trunk for translations (recognised by their
+  action cookie `wl:…`);
+* the nftables table `bridge wanderlan` for MSS clamping.
 
-Confirming a local change raises `mesh.revision` and writes the files. The
-daemons announce revision and fingerprint of their `mesh.toml` to their
-peers; a site that sees a newer revision at a direct peer fetches it, applies
-it and confirms it automatically as soon as a peer is reachable with the new
-configuration. Configurations that fail are not fetched again. A change that
-is based on an outdated revision is refused ("reload and try again"), so
-concurrent edits do not silently overwrite each other.
+Everything it creates carries the interface alias `wanderlan`; foreign
+interfaces are never touched (a foreign `br0` or `gt-*` stops the
+configuration with an error). After a restart it adopts what is there
+without changes. After a topology change it flushes the learned MAC
+addresses, again after 10 s and 30 s while the other sites follow.
 
-If you edit the files by hand, run `sudo wanderlan apply` (and `confirm`);
-not confirmed edits are restored and kept as `mesh.toml.rejected`.
-`systemctl reload wanderland` (SIGHUP) takes the files as they are, without
-raising the revision.
+### Synchronisation
+
+The daemons talk to their tunnel neighbours over UDP on the control port
+every 5 s: reachability, round trip, path MTU and the revision and
+fingerprint of their configuration. Each neighbour is told the version it
+should have: servers and the uplink the whole configuration of this site, a
+client only its own part. A site that sees a newer version fetches it over
+TCP and applies it; a server that sees changes of one of its clients fetches
+the client's part and takes over what the client is responsible for (itself,
+its own clients, the network settings), checked against its rights. Changes
+received this way are confirmed automatically as soon as a neighbour answers
+with them in effect.
+
+A change that is based on an outdated revision is refused ("wait for the
+sync, reload and try again"), so concurrent edits do not silently overwrite
+each other. `systemctl reload wanderland` (SIGHUP) takes the files as they
+are, without raising the revision.
 
 ### MTU and MSS
 
-The daemon measures the path MTU to every peer by binary search with UDP
-probes that have the DF bit set, at start, every `mtu_probe_interval` and
-when a peer becomes reachable again. From it, the TCP MSS is
+The daemon measures the path MTU to every neighbour by binary search with UDP
+probes that have the DF bit set: at start, every `mtu_probe_interval` and
+when a neighbour becomes reachable again. TCP SYNs entering or leaving a
+tunnel port are clamped to
 
 `MSS = path MTU − 20 (outer IP) − 4 (GRE) − 18 (Ethernet + VLAN tag) − 40 (inner IP + TCP)`
 
-and TCP SYNs that enter or leave a tunnel port with a larger MSS are
-clamped in the nftables table `bridge wanderlan` (IPv6: 20 bytes less).
-Ports without a measurement use the smallest measured value. GRETAP
-fragmentation (`ignore-df`, `nopmtudisc`, MTU 1500) stays on as safety net,
-so non-TCP traffic larger than the path still arrives.
+(IPv6: 20 bytes less; ports without a measurement use the smallest measured
+value). GRE fragmentation stays on as a safety net, so non-TCP packets larger
+than the path still arrive.
 
-### Loop guard
+### Loops
 
-Split horizon keeps the network itself loop-free, but the LANs of two sites
-may also be connected by another path. The daemon watches the bridge's
-forwarding database: if the same MAC address keeps moving between the trunk
-and a tunnel, or between two tunnels (5 times within 10 s), it shuts the
-tunnel port down (never the trunk), logs it
-and shows it in the TUI. The port stays down until it is re-enabled with
-`wanderlan unblock gt-<site>` (or `u` in the TUI) or the configuration
-changes.
+The network itself is loop-free: split horizon between the servers, a tree
+below them. The LANs of two sites may still be connected by another path.
+The loop guard watches the forwarding database of every bridge: if a MAC
+address keeps moving between the trunk and a tunnel, or between two tunnels
+(5 times within 10 s), it shuts the tunnel port down (never the trunk),
+logs it and shows it in the TUI until `wanderlan unblock gt-<site>` (`u` in
+the TUI) or the configuration changes.
+
+### Operation
+
+`wanderland` runs as the systemd service `wanderland`, as root with
+`CAP_NET_ADMIN` as its only capability and a hardened unit; systemd restarts
+it after a crash, and the network keeps running meanwhile. Only one daemon
+runs at a time: `wanderland` started from a shell only explains that it is
+the daemon. Logs go to the journal (`journalctl -u wanderland`) and to the
+event log (`wanderlan log`).
 
 ## Terminal UI
 
-`wanderlan` without arguments starts the TUI (keyboard first, works over
-SSH and in 80×24; `--mouse` enables the mouse). It talks to the daemon only
-through `/run/wanderlan/wanderlan.sock`.
+`wanderlan` without arguments starts the TUI: keyboard first, works over SSH
+and in 80×24 (`--mouse` enables the mouse). `?` shows all keys.
 
 | Key | View |
 |-----|------|
-| `1` | Overview: all sites, live status per peer (last reply, RTT, path MTU, MSS, port state, MAC addresses, throughput, config in sync), total traffic of the tunnels and the trunk. `Enter` on a peer: details with a traffic graph (received/sent), round-trip history, min/avg/max round trip, jitter, probe loss, estimated one-way latency (round trip / 2), byte/packet/error/drop counters |
-| `2` | Sites: invite a site with its rules (`i`), open invitations (`I`: show, delete), online/offline (`o`), add by hand (`n`), edit (`e`), delete (`d`) |
-| `3` | VLANs: VLANs of the network (`v`), mapping table, conflicts are marked immediately |
-| `4` | MAC table: filter (`/`), sort (`s`, `o`) |
-| `5` | Log: live events, filter by level and peer |
-| `6` | Setup: new network or join; on a configured site: invite (`i`, `I`) and reset (`R`) |
-| `7` | Settings: every setting of the network and of this host with an explanation; `Enter` changes it |
+| `1` | Overview: this site with its role, the tunnel neighbours live (reply, round trip, path MTU, MSS, port state, MAC addresses, throughput, config in sync), traffic of the tunnels and of every trunk, and all known sites with role and link (`via hq` for sites without a tunnel from here). `Enter` on a neighbour: traffic graph, round-trip history, min/avg/max round trip, jitter, probe loss, latency, counters. |
+| `2` | Sites: name, address, VLANs, role, manager, tunnel. Invite (`i`), open invitations (`I`), online/offline (`o`), new (`n`), edit (`Enter`: VLANs, "Changes", "Connected to"), delete (`d`). |
+| `3` | VLANs: the VLANs of the network (`v`) and the mappings (`n`, `Enter`, `d`) with their site and its role; conflicts are marked right away. |
+| `4` | MAC addresses: filter (`/`), sort (`s`, `o`). |
+| `5` | Log: live events, filter by level (`l`) and site (`p`). |
+| `6` | Setup: new network or join; on a configured site invite (`i`) and reset (`R`). |
+| `7` | Settings: every setting with an explanation, the trunk of every tunnel, and the role and rights of this site. |
 
-Changes are collected in a draft. `a` shows the diff against the running
-configuration and applies it; while a change waits for confirmation a
-banner shows the remaining time, `c` confirms and `r` rolls back. `x`
-discards the draft, `?` shows all keys, `q` quits.
+Changes are collected in a draft. `a` shows the difference to the running
+configuration and applies it; a banner counts down until it is confirmed
+(`c`) or rolled back (`r`). `x` discards the draft, `q` quits. When the
+daemon is not reachable, the TUI shows the state of the service and its last
+log lines and keeps trying.
 
 ## Command line
 
 | Command | Purpose |
 |---------|---------|
-| `wanderlan status [--json]` | State of this site and its peers |
-| `wanderlan validate <mesh.toml> [--local <local.toml>]` | Check files (offline) |
-| `wanderlan apply [--mesh F] [--local F] [--timeout 60s]` | Apply files (default: those in `/etc/wanderlan`) |
-| `wanderlan confirm` / `wanderlan rollback` | Confirm or revert the pending change |
-| `wanderlan init [--dir D]` | Print or write the example configuration |
-| `wanderlan export` | Print the running `mesh.toml` |
-| `wanderlan unblock <port>` | Re-enable a port shut down by the loop guard |
+| `wanderlan status [--json]` | This site, all known sites with role and link, the tunnel neighbours |
 | `wanderlan log [-f]` | Event log |
-| `wanderlan probe` | Measure the path MTU to all peers now |
-| `wanderlan invite [--name N] [--vlans V] [--native VID] [--map L:S]... [--self-managed]` | Create an invitation with rules for the new site; prints `wanderlan join <address> <code>` |
+| `wanderlan invite [--name N] [--vlans V] [--native VID] [--map L:S]... [--self-managed]` | Create an invitation with rules; prints `wanderlan join <address> <code>` |
 | `wanderlan invite list` / `wanderlan invite delete <code>` | Open invitations of this site |
 | `wanderlan join <address>[:port] <code> [--name N] [--trunk IF]` | Join a network (on an unconfigured site) |
-| `wanderlan online <site> [--confirm]` / `wanderlan offline <site> [--confirm]` | Take a site online (its tunnels come up) or offline |
-| `wanderlan manage <site> [--by S \| --anyone] [--self-managed yes\|no] [--confirm]` | Who may change a site's VLANs, mappings and online state |
-| `wanderlan role <site> server\|client <site> [--confirm]` | Make a site a server or the client of another site |
-| `wanderlan trunk <site> <interface\|default> [--confirm]` | Give the tunnel to a site a trunk of its own (a segment of its own here), or the default trunk again |
-| `wanderlan reset [--yes]` | Remove everything wanderlan set up on this site; unconfigured again |
+| `wanderlan online <site>` / `wanderlan offline <site>` | Take a site online or offline |
+| `wanderlan manage <site> [--by S \| --anyone] [--self-managed yes\|no]` | Who may change a site |
+| `wanderlan role <site> server\|client <server>` | Make a site a server or a client |
+| `wanderlan trunk <site> <interface\|default>` | Trunk of the tunnel to a site |
+| `wanderlan apply [--mesh F] [--local F] [--timeout 60s]` | Apply files (default: those in `/etc/wanderlan`) |
+| `wanderlan confirm` / `wanderlan rollback` | Confirm or revert the pending change |
+| `wanderlan validate <mesh.toml> [--local <local.toml>]` | Check files without applying them |
+| `wanderlan init [--dir D]` / `wanderlan export` | Print or write the example configuration / print the running `mesh.toml` |
+| `wanderlan probe` / `wanderlan unblock <port>` | Measure the path MTU now / re-enable a port the loop guard shut down |
+| `wanderlan reset [--yes]` | Remove everything wanderlan set up on this site |
 
-The socket can be changed with `--socket` or `WANDERLAN_SOCKET`.
-
-## How it works
-
-On each site the daemon creates, and removes again when it stops:
-
-* `br0`: bridge, `vlan_filtering 1`, STP off, no default VLAN, no
-  netfilter calls; marked with the interface alias `wanderlan`;
-* `gt-<peer>` to its uplink, its clients and, on a server, every other
-  server: GRETAP from the own to the peer's address, `ignore-df`,
-  `nopmtudisc`, MTU 1500, marked with the alias `wanderlan`; the ports
-  between servers are `isolated` (split horizon: a frame from one server is
-  never forwarded to another server), the ports of clients and uplinks are
-  ordinary ports (a tree, loop-free by itself);
-* the VLANs of the site on the trunk; on each tunnel the VLANs both sites
-  take part in;
-* tc `clsact` filters on the trunk for translations (recognised by their
-  action cookie `wl:…`);
-* the nftables table `bridge wanderlan` for MSS clamping.
-
-It adopts what it created before (after a restart nothing changes) and never
-touches interfaces it did not create: if a foreign `br0` or `gt-*` exists it
-refuses to start the configuration instead. After every topology change it
-flushes the learned MAC addresses (again after 10 s and 30 s, while the other
-sites follow).
-
-The daemon runs as root with `CAP_NET_ADMIN` as its only capability and a
-hardened systemd unit. Logs go to the journal: `journalctl -u wanderland`.
+Commands that change the configuration (`online`, `offline`, `manage`,
+`role`, `trunk`) take `--confirm` to confirm right away; without it, run
+`wanderlan confirm` within the commit timeout. They wait for a change that is
+still being synchronised. The daemon's socket can be chosen with `--socket`
+or `WANDERLAN_SOCKET`.
 
 ## Troubleshooting
 
-* **`wanderlan status` / the TUI says the daemon is not running**:
-  `systemctl status wanderland`, `journalctl -u wanderland -e`. The TUI shows
-  the state of the service and its last log lines itself. systemd restarts
-  the daemon after a crash; the network keeps running meanwhile.
-* **Typed `wanderland` instead of `wanderlan`**: harmless. `wanderland` is
-  the daemon; started from a shell it only explains that, and a second daemon
-  never starts while one runs (`/run/wanderlan/wanderland.lock`). If the API
-  socket is deleted, the daemon creates it again within seconds.
-* **Permission denied on the socket**: add yourself to the group
-  `wanderlan` and log in again, or use `sudo`.
+* **The TUI says the daemon is not reachable**: it shows the state of the
+  service and its last log lines; more with `systemctl status wanderland` and
+  `journalctl -u wanderland -e`.
+* **Typed `wanderland` instead of `wanderlan`**: harmless; the daemon only
+  explains what it is and never runs twice.
+* **Permission denied on the socket**: join the group `wanderlan` and log in
+  again, or use `sudo`.
 * **"trunk interface … is already attached to vmbr0"**: the trunk must not be
-  part of another bridge or bond (on Proxmox use a dedicated NIC or VLAN-aware
-  VM interface).
+  part of another bridge or bond (on Proxmox: a dedicated NIC for the VM).
 * **"interface br0 already exists and was not created by wanderlan"**: remove
-  or rename the existing interface; wanderlan does not modify foreign
-  interfaces.
-* **Tunnel up but no traffic**: check that GRE (IP protocol 47) passes between
-  the site addresses in both directions (firewalls on the hosts, the VPN's
-  allowed IPs/policies); `tcpdump -ni any proto gre`. Check that the VLAN is
-  one of the site's VLANs and that the switch port is a trunk with that VLAN.
-* **Nothing from a client arrives (TX 0 towards all peers)**: the client
-  probably sends untagged; untagged traffic is only bridged with a native
-  mapping for that site (VLANs, 3, `n`), otherwise tag it (on Proxmox: VLAN
-  tag on the VM's network device). On Proxmox also switch off the firewall
-  (or its MAC filter) on the trunk NIC of the wanderlan VM: it drops frames
-  with foreign source MACs, which is all bridged traffic.
-* **`wanderlan join` fails**: the code is used up or wrong (create a new one
-  with `wanderlan invite`), or TCP on the control port of the inviting site
-  is not reachable. A site that does not answer within `commit_timeout` after
-  joining is removed again on the inviting site; its code can be used again.
-* **Peer "does not answer control probes" / no path MTU / no sync**: allow UDP
-  and TCP on the control port (51821) between the site addresses; check that
-  the peer lists this site in its configuration (`wanderlan status` on both).
+  or rename it; wanderlan does not touch foreign interfaces.
+* **A new site gets no traffic**: it starts offline; take it online on its
+  server (Sites, `o`).
+* **Tunnel up but no traffic in a VLAN**: the VLAN must be one of the VLANs of
+  both ends (`status` shows the VLANs per tunnel; for two clients also their
+  server's), and the switch port or VM must carry it tagged. GRE (IP protocol
+  47) must pass between the site addresses in both directions:
+  `tcpdump -ni any proto gre`.
+* **Untagged clients get nothing (e.g. no DHCP)**: the site must take part in
+  `native` (the default "all" does), or put its untagged traffic into a VLAN
+  with a mapping. On Proxmox, switch off the firewall (or its MAC filter) on
+  the trunk NIC of the wanderlan VM: it drops frames with foreign source MAC
+  addresses, which is all bridged traffic.
+* **`wanderlan join` fails**: the code is used up or wrong, or TCP on the
+  control port of the inviting site is not reachable. A site that does not
+  come up within the commit timeout is removed again; its code works again.
+* **A neighbour "does not answer control probes"**: allow UDP and TCP on the
+  control port between the site addresses.
 * **Large transfers stall**: compare the path MTU in `wanderlan status` with
-  your VPN's MTU; set `mss` in the configuration if probes are filtered.
-* **A port is BLOCKED**: the loop guard found MAC flapping; look for a second
-  layer-2 path between sites (e.g. two sites bridged by another link), fix
-  it, then `wanderlan unblock gt-<site>`.
-* **My change was rolled back**: confirm within `commit_timeout` (`c` in the
-  TUI, `wanderlan confirm`). Rejected hand-edited files are kept as
-  `/etc/wanderlan/*.rejected`.
-* **A synchronised change did not arrive at a site**: `wanderlan log` shows
-  why (e.g. invalid for that site, rolled back); fix the configuration and
-  confirm a new revision.
-* **Proxmox with the Proxmox firewall**: `br_netfilter` may be loaded;
-  wanderlan disables netfilter calls on `br0`, host firewalls must still let
-  GRE and the control port through.
+  the MTU of the VPN; set `mss` if probes are filtered.
+* **A port is BLOCKED**: the loop guard found a loop through another layer-2
+  path between sites; remove it, then `wanderlan unblock gt-<site>`.
+* **A change was rolled back**: confirm within the commit timeout (`c`,
+  `wanderlan confirm`).
+* **A change did not arrive at a site**: `wanderlan log` there and on its
+  server shows why (e.g. not allowed for that site, or invalid there).
 
-## Design decisions
+## Project decisions
 
-Deviations from the original specification, and why:
-
-* **No VPN inside wanderlan.** Transport and encryption are left to an
-  existing VPN, decided by the project owner; wanderlan only handles layer 2
-  and VLANs. Consequently there are no keys, endpoints or WireGuard settings;
-  sites are identified by their transport `address`, and GRE is unencrypted
-  on top of that (trusted) transport.
-* **Automatic configuration sync** (also a project decision), see above.
-  Every site may change the mesh; trust between the sites is implied by the
-  shared layer 2.
-* **Servers and clients instead of hubs and spokes** (project decision: "like
-  a switch you plug a cable into"). Roles are not configured up front: a
-  site that joins is a client of the site that invited it and only has to
-  reach that site; servers form a mesh with split horizon. Clients never get
-  a tunnel to each other; the VLANs decide who meets whom. The loop guard
-  also watches trunk-to-tunnel moves, the typical sign of a loop through two
-  sites' LANs.
-* **Who may change a site** (project decision): the inviting site manages
-  the sites it invited (`managed_by`), unless it allows them to manage
-  themselves. Every wanderland enforces this for changes made on it (TUI,
-  CLI, edited files). It is an agreement between the daemons, not a
-  cryptographic protection: someone with root on a site could bypass it.
-* **New sites start offline** (project decision): the tunnels of a joined
-  site come up only when a user takes it online, after checking that it is
-  set up correctly; the state is part of the shared configuration.
-* **Native = VLAN 1 between the sites**: untagged traffic travels as VLAN 1
-  in the tunnels, like the default native VLAN of most switches. An empty
-  VLAN list means all VLANs plus native, like a plain trunk.
-* **Joining with invitation codes**: a site joins with the address of any
-  member and a one-time code created there; the member adds it with the
-  source address of the request (no address has to be typed) and answers
-  with the configuration. Codes do not expire; they are used up or deleted.
-  The code protects the layer-2 access a new site gets; it travels in clear
-  text through the (trusted) transport network.
-* **Path MTU probes use UDP** between the daemons (DF set via
-  `IP_PMTUDISC_PROBE`) instead of ICMP: no `CAP_NET_RAW`, and the same probes
-  carry reachability, RTT and the sync announcements.
-* **MSS clamping on entering and leaving SYNs** per tunnel port: clamping
-  only on the egress port would give each direction the other side's value.
-* **netlink everywhere except nftables**: links, bridge, VLANs, GRETAP and tc
-  use rtnetlink (raw attributes where `netlink-packet-route` lacks them:
-  `IFLA_GRE_IGNORE_DF`, the tc `vlan` and `gact` actions); nftables uses its
-  JSON interface through the `nftables` crate (which runs `nft -j`, hence the
-  dependency on the `nftables` package). The crate's 0.6.3 release swaps the
-  `<`/`>` operators; wanderlan works around it and a test guards the JSON.
-* Interface names `br0` and `gt-<site>` are fixed; site names are limited to
-  12 characters so that `gt-<site>` fits into 15 characters.
-* Debian 13 is the target; the build and test images are Debian 13.
+* **No VPN inside wanderlan.** Transport and encryption belong to the existing
+  VPN; wanderlan only does layer 2 and VLANs. Sites are identified by their
+  transport address, and GRE runs unencrypted on top of that trusted network.
+* **Servers and clients, like plugging switches together.** Roles are not
+  configured up front: a site that joins is a client of the site that invited
+  it and only has to reach it; servers form a mesh with split horizon. There
+  are no tunnels between clients; the VLANs decide who meets whom.
+* **Clients only know their part.** A client's configuration contains its
+  server and its own clients only; servers merge the changes of their clients.
+* **Who may change a site**: its manager (the inviting site), the site itself
+  only if released. The daemons enforce this among themselves; someone with
+  root on a site could bypass it.
+* **New sites start offline**, so a site is checked before its traffic flows.
+* **Native = VLAN 1 between the sites**, like the default native VLAN of
+  switches; an empty VLAN list means all VLANs plus native.
+* **Joining with invitation codes**: the inviting site adds the new site with
+  the address the request came from, so no address has to be typed. Codes
+  work once and do not expire; they travel in clear text through the trusted
+  transport network.
+* **Changes must be confirmed**, so nobody locks themselves out through the
+  tunnel they are changing.
+* **UDP probes instead of ICMP** for reachability and path MTU (DF set via
+  `IP_PMTUDISC_PROBE`): no `CAP_NET_RAW`, and the same probes carry the sync
+  announcements.
+* **MSS clamping on entering and leaving SYNs** per tunnel port, so both
+  directions get the smaller value.
+* **netlink everywhere except nftables**: links, bridges, VLANs, GRETAP and tc
+  use rtnetlink; nftables is driven through its JSON interface (the
+  `nftables` crate, hence the dependency on the `nftables` package; a test
+  guards a workaround for swapped `<`/`>` in its 0.6.3 release).
+* **Fixed interface names** `br0`, `wl-<interface>` and `gt-<site>`; site
+  names have at most 12 characters so that `gt-<site>` fits.
 
 Open questions are collected in [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md).
 
@@ -565,67 +549,56 @@ Everything builds and runs in Docker; nothing else is needed on the
 development machine.
 
 ```sh
-scripts/check.sh              # cargo fmt --check, clippy -D warnings, tests
+scripts/check.sh              # cargo fmt --check, clippy -D warnings, unit and snapshot tests
 scripts/cargo.sh test         # any cargo command in the build container
 scripts/build.sh amd64        # static binaries and .deb into dist/ (also arm64)
-scripts/integration.sh        # .deb in Debian 13 containers, full integration tests
+scripts/integration.sh        # the .deb in Debian 13 containers: five sites, a router, clients
 scripts/systemd-test.sh       # the daemon under systemd with the hardened unit
 ```
 
+`scripts/integration.sh` loads the needed kernel modules into the host kernel
+through a privileged helper container and runs the scenarios in
+`tests/integration/cases` (see `tests/integration/README.md`).
 `scripts/systemd-test.sh` boots two Debian 13 containers with systemd as
-PID 1 and the package installed, and goes through what users do: a new
-network, an invitation, a join, `wanderland` typed by mistake, a deleted
-socket, a reset (under `ProtectSystem=strict`), a new network while the old
-one still lists the site, a crash, restart and stop. After every step both
-services must be active and their journals free of internal errors.
-
-`scripts/integration.sh` loads the required kernel modules into the host
-kernel through a privileged helper container (on GitHub runners with sudo)
-and runs the scenarios in `tests/integration/cases` on a topology of five
-sites, a router standing in for the transport network and one client per
-site (see `tests/integration/README.md`).
+PID 1 and goes through what users do: a new network, an invitation, a join, a
+mistyped `wanderland`, a deleted socket, a reset, a new network while the old
+one still lists the site, a crash, restart and stop.
 
 The workspace has three crates: `wanderlan-core` (configuration, topology,
-desired state, reconciliation, system access behind traits with a netlink
-and an in-memory implementation), `wanderland` (daemon) and `wanderlan`
-(TUI and CLI).
+views, rights, desired state, reconciliation, system access behind traits
+with a netlink and an in-memory implementation), `wanderland` (the daemon)
+and `wanderlan` (TUI and CLI).
 
 ## Maintainers: releases and the APT repository
 
-Publishing is automatic: every push to `main` whose CI run is green
-(`ci.yml`: fmt, clippy, tests, packages for amd64 and arm64 with a smoke
-test, integration tests) is published by `publish.yml`:
+Publishing is automatic: every push to `main` whose CI run is green (fmt,
+clippy, tests, packages for amd64 and arm64 with a smoke test, integration
+tests, systemd test) is published by `publish.yml`:
 
-* version `<Cargo.toml version>+<CI run number>.g<commit>`, package version
-  with `-1`; the run number makes every build newer than the one before,
-* the packages go into the signed repository on the branch `gh-pages`
-  (one commit without history, so the branch does not grow), suite `stable`;
-  the newest 20 commit builds per architecture stay, tagged releases forever,
-* `verify-apt.yml` then waits until GitHub Pages serves the version,
-  installs it with the commands above on fresh Debian 13, Debian 12 and
-  Ubuntu 24.04, installs exactly this version and downgrades to the previous
-  one, and runs two hosts with the example configuration.
+* as version `<Cargo.toml version>+<CI run>.g<commit>`, package version with
+  `-1`, so every build is newer than the one before;
+* into the signed repository on the branch `gh-pages` (one commit without
+  history), suite `stable`; the newest 20 builds per architecture stay,
+  tagged releases forever;
+* `verify-apt.yml` then installs it from GitHub Pages with the commands above
+  on Debian 13, Debian 12 and Ubuntu 24.04, also exactly this version and a
+  downgrade, and runs two hosts with an invitation.
 
-Tags are optional: the tag `v<version>` (equal to the version in
-`Cargo.toml`) makes `release.yml` build the same way, create a GitHub release
-with binaries, packages and `SHA256SUMS`, and add `<version>-1` to the
-repository, where it is kept forever. Later commit builds
-(`<version>+<build>…`) count as newer. To start a new version line, raise
-the version in `Cargo.toml`.
+A tag `v<version>` (equal to the version in `Cargo.toml`) additionally makes
+`release.yml` create a GitHub release with binaries, packages and
+`SHA256SUMS` and keeps `<version>-1` in the repository forever. To start a
+new version line, raise the version in `Cargo.toml`.
 
 One-time setup (done for this repository):
 
-1. Create the signing key (RSA 4096) outside the repository:
-   `scripts/gen-apt-key.sh ~/wanderlan-apt-key`, and commit its public part
-   as `key.gpg` in the repository root (every publication puts it on GitHub
-   Pages as well). Current key fingerprint:
+1. Create the signing key (RSA 4096) outside the repository with
+   `scripts/gen-apt-key.sh ~/wanderlan-apt-key` and commit its public part
+   as `key.gpg`. Current fingerprint:
    `F6C4 00CF 318B FD47 E3A6  B8A7 7BC2 D7AE 6699 82D4`.
-2. Store `private.asc` as the repository secret `APT_GPG_PRIVATE_KEY`
-   (Settings → Secrets and variables → Actions) and keep a backup offline.
-   Without it a publication stops with an error and changes nothing.
-3. Set GitHub Pages to "Deploy from a branch", branch `gh-pages`, folder `/`.
+2. Store `private.asc` as the repository secret `APT_GPG_PRIVATE_KEY` and
+   keep a backup offline; without it a publication stops and changes nothing.
+3. GitHub Pages: "Deploy from a branch", branch `gh-pages`, folder `/`.
 
 Locally: `scripts/build.sh` (with `WANDERLAN_VERSION=…` for a specific
 version), `scripts/smoke-test.sh dist <package version>`,
-`scripts/test-apt-repo.sh` (retention, indices and signatures of the
-repository script with a throwaway key).
+`scripts/test-apt-repo.sh` (the repository script with a throwaway key).

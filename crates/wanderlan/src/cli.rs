@@ -82,7 +82,7 @@ pub enum Command {
         #[arg(long)]
         force: bool,
     },
-    /// Print the running mesh.toml (e.g. to copy it to a new site).
+    /// Print the running mesh.toml (on a client: its part of the network).
     Export,
     /// Re-enable a tunnel port shut down by the loop guard.
     Unblock {
