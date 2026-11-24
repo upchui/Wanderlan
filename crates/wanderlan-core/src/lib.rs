@@ -5,6 +5,7 @@
 //! and deriving the desired system state. System access is abstracted behind
 //! traits so that all logic can be tested without root privileges.
 
+pub mod api;
 pub mod config;
 pub mod desired;
 pub mod mtu;

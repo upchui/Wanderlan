@@ -1,0 +1,447 @@
+//! API between the TUI/CLI and the daemon.
+//!
+//! Transport: Unix socket `/run/wanderlan/wanderlan.sock`, one JSON object
+//! per line in both directions. A request is `{"id":1,"method":"status"}`
+//! (plus `"params":{...}` for methods with parameters); the daemon answers
+//! with `{"id":1,"result":...}` or `{"id":1,"error":{...}}`. After a
+//! `subscribe` request the daemon also sends `{"event":{...}}` lines on that
+//! connection.
+
+use serde::{Deserialize, Serialize};
+
+use crate::config::Diagnostic;
+
+/// Default socket path.
+pub const SOCKET_PATH: &str = "/run/wanderlan/wanderlan.sock";
+/// Environment variable that overrides the socket path.
+pub const SOCKET_ENV: &str = "WANDERLAN_SOCKET";
+
+/// Returns the socket path, honouring [`SOCKET_ENV`].
+pub fn socket_path() -> std::path::PathBuf {
+    std::env::var_os(SOCKET_ENV).map_or_else(|| SOCKET_PATH.into(), Into::into)
+}
+
+/// A request with its id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RequestEnvelope {
+    /// Echoed in the response.
+    pub id: u64,
+    /// The request.
+    #[serde(flatten)]
+    pub request: Request,
+}
+
+/// Requests understood by the daemon.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "method", content = "params", rename_all = "snake_case")]
+pub enum Request {
+    /// Current status → [`Status`].
+    Status,
+    /// Event history, then live events on this connection → [`Vec<Event>`].
+    Subscribe,
+    /// Running configuration → [`ConfigTexts`].
+    GetConfig,
+    /// Validates a configuration without applying it → [`Validation`].
+    Validate(ConfigInput),
+    /// Applies a configuration; it must be confirmed in time → [`Applied`].
+    Apply(ApplyParams),
+    /// Applies the files in `/etc/wanderlan` as they are → [`Applied`].
+    ApplyFiles(ApplyFilesParams),
+    /// Makes the pending change permanent → [`Confirmed`].
+    Confirm,
+    /// Reverts the pending change → [`Done`].
+    Rollback,
+    /// Network interfaces of the host (setup wizard) → [`Vec<Interface>`].
+    Interfaces,
+    /// Learned MAC addresses → [`Vec<MacEntry>`].
+    MacTable,
+    /// Re-enables a port shut down by the loop guard → [`Done`].
+    Unblock(UnblockParams),
+    /// Measures the path MTU to all peers again → [`Done`].
+    ProbeNow,
+}
+
+/// A configuration given as TOML texts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigInput {
+    /// Contents of `mesh.toml`.
+    pub mesh: String,
+    /// Contents of `local.toml`.
+    pub local: String,
+}
+
+/// Parameters of [`Request::Apply`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyParams {
+    /// The new configuration.
+    #[serde(flatten)]
+    pub config: ConfigInput,
+    /// Revision the change is based on; the daemon refuses the change if it
+    /// knows a newer revision (from this site or a peer).
+    #[serde(default)]
+    pub base_revision: Option<u64>,
+    /// Confirmation timeout in seconds; defaults to `commit_timeout`.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Parameters of [`Request::ApplyFiles`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyFilesParams {
+    /// Confirmation timeout in seconds; defaults to `commit_timeout`.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+/// Parameters of [`Request::Unblock`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnblockParams {
+    /// Tunnel interface, e.g. `gt-haus2`.
+    pub port: String,
+}
+
+/// A response with its id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResponseEnvelope {
+    /// Id of the request.
+    pub id: u64,
+    /// Result on success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    /// Error otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ApiError>,
+}
+
+/// An error answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
+#[error("{message}")]
+pub struct ApiError {
+    /// Human-readable message.
+    pub message: String,
+    /// Validation problems, if the error is about an invalid configuration.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Diagnostic>,
+}
+
+impl ApiError {
+    /// An error with a message only.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+/// A line sent by the daemon: a response or an event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ServerMessage {
+    /// An asynchronous event (after `subscribe`).
+    Event {
+        /// The event.
+        event: Event,
+    },
+    /// The answer to a request.
+    Response(ResponseEnvelope),
+}
+
+/// Empty result.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Done {}
+
+/// Result of [`Request::Validate`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Validation {
+    /// True if there are no errors.
+    pub valid: bool,
+    /// Errors and warnings with line numbers.
+    pub diagnostics: Vec<Diagnostic>,
+    /// Unified diff against the running configuration (canonical form).
+    pub diff: String,
+}
+
+/// Result of [`Request::Apply`] and [`Request::ApplyFiles`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Applied {
+    /// Seconds left to confirm.
+    pub confirm_within_secs: u64,
+    /// Unified diff against the previous configuration.
+    pub diff: String,
+    /// Changes made to the system, in plain language.
+    pub changes: Vec<String>,
+    /// Warnings from the validation.
+    pub warnings: Vec<Diagnostic>,
+}
+
+/// Result of [`Request::Confirm`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Confirmed {
+    /// The mesh revision now in effect.
+    pub revision: u64,
+}
+
+/// Result of [`Request::GetConfig`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigTexts {
+    /// True if the site has a configuration.
+    pub configured: bool,
+    /// Running `mesh.toml` in canonical form (empty if none).
+    pub mesh: String,
+    /// Running `local.toml` in canonical form.
+    pub local: String,
+    /// Mesh revision.
+    pub revision: u64,
+    /// Mesh fingerprint (hex SHA-256).
+    pub fingerprint: String,
+}
+
+/// Overall state of the site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SiteState {
+    /// No configuration yet (setup wizard).
+    Unconfigured,
+    /// Configuration applied.
+    Running,
+    /// The configuration could not be applied.
+    Error,
+}
+
+/// Who started a pending change.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ChangeSource {
+    /// A user on this site (TUI/CLI).
+    Local,
+    /// The configuration sync, received from a peer.
+    Sync {
+        /// Peer the configuration came from.
+        peer: String,
+    },
+}
+
+/// A change waiting for confirmation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingChange {
+    /// Seconds until the automatic rollback.
+    pub remaining_secs: u64,
+    /// Where the change came from.
+    pub source: ChangeSource,
+}
+
+/// State of a tunnel port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PortState {
+    /// Up.
+    Up,
+    /// Down.
+    Down,
+    /// Shut down by the loop guard.
+    Blocked,
+    /// Not created (yet).
+    Missing,
+}
+
+/// Status of one direct peer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PeerStatus {
+    /// Site name.
+    pub name: String,
+    /// Role of the peer.
+    pub role: crate::config::Role,
+    /// Transport address.
+    pub address: String,
+    /// Tunnel interface.
+    pub port: String,
+    /// Tunnel port state.
+    pub port_state: PortState,
+    /// The peer answers control probes.
+    pub reachable: bool,
+    /// Seconds since the last answered probe.
+    pub last_reply_secs: Option<u64>,
+    /// Round-trip time in milliseconds.
+    pub rtt_ms: Option<f64>,
+    /// Measured path MTU.
+    pub pmtu: Option<u16>,
+    /// TCP MSS clamped on this port.
+    pub mss: Option<u16>,
+    /// Learned MAC addresses behind this port.
+    pub macs: usize,
+    /// Receive rate in bit/s.
+    pub rx_bps: u64,
+    /// Transmit rate in bit/s.
+    pub tx_bps: u64,
+    /// Mesh revision announced by the peer.
+    pub revision: Option<u64>,
+    /// Whether the peer runs the same mesh configuration.
+    pub in_sync: Option<bool>,
+}
+
+/// One site of the mesh (for the overview).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteSummary {
+    /// Name.
+    pub name: String,
+    /// Role.
+    pub role: crate::config::Role,
+    /// Hub of a spoke.
+    pub hub: Option<String>,
+    /// Transport address.
+    pub address: String,
+    /// True for this site.
+    pub is_self: bool,
+    /// True if there is a tunnel to this site.
+    pub direct: bool,
+}
+
+/// Result of [`Request::Status`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Status {
+    /// Daemon version.
+    pub version: String,
+    /// Overall state.
+    pub state: SiteState,
+    /// Name of this site.
+    pub site: Option<String>,
+    /// Role of this site.
+    pub role: Option<crate::config::Role>,
+    /// Transport address of this site.
+    pub address: Option<String>,
+    /// Trunk interface.
+    pub trunk: Option<String>,
+    /// Shared VLANs.
+    pub vlans: Option<String>,
+    /// Mesh revision in effect.
+    pub revision: u64,
+    /// Mesh fingerprint.
+    pub fingerprint: String,
+    /// A change waiting for confirmation.
+    pub pending: Option<PendingChange>,
+    /// Last error applying the configuration.
+    pub last_error: Option<String>,
+    /// Direct peers with live data.
+    pub peers: Vec<PeerStatus>,
+    /// All sites of the mesh.
+    pub sites: Vec<SiteSummary>,
+    /// Ports shut down by the loop guard.
+    pub blocked: Vec<String>,
+}
+
+/// Severity of an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Level {
+    /// Informational.
+    Info,
+    /// Something needs attention.
+    Warn,
+    /// Something failed.
+    Error,
+}
+
+/// An entry of the event log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Event {
+    /// Unix time in milliseconds.
+    pub time_ms: u64,
+    /// Severity.
+    pub level: Level,
+    /// Peer the event is about, if any.
+    pub peer: Option<String>,
+    /// Message in plain language.
+    pub message: String,
+}
+
+/// A network interface of the host.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Interface {
+    /// Name.
+    pub name: String,
+    /// Kernel kind ("" for physical interfaces).
+    pub kind: String,
+    /// Administratively up.
+    pub up: bool,
+    /// Master device, if attached to a bridge or bond.
+    pub master: Option<String>,
+    /// MTU.
+    pub mtu: u32,
+    /// True if the interface was created by wanderlan.
+    pub managed: bool,
+}
+
+/// A learned MAC address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MacEntry {
+    /// MAC address (lowercase, colon separated).
+    pub mac: String,
+    /// VLAN.
+    pub vlan: Option<u16>,
+    /// Bridge port.
+    pub port: String,
+    /// Seconds since the entry was last updated.
+    pub age_secs: Option<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_json_shape() {
+        let req = RequestEnvelope {
+            id: 1,
+            request: Request::Status,
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"id":1,"method":"status"}"#
+        );
+        let req: RequestEnvelope =
+            serde_json::from_str(r#"{"id":2,"method":"unblock","params":{"port":"gt-a"}}"#)
+                .unwrap();
+        assert_eq!(
+            req.request,
+            Request::Unblock(UnblockParams {
+                port: "gt-a".into()
+            })
+        );
+        let req: RequestEnvelope = serde_json::from_str(
+            r#"{"id":3,"method":"apply","params":{"mesh":"m","local":"l","timeout_secs":10}}"#,
+        )
+        .unwrap();
+        match req.request {
+            Request::Apply(p) => {
+                assert_eq!(p.config.mesh, "m");
+                assert_eq!(p.timeout_secs, Some(10));
+                assert_eq!(p.base_revision, None);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_messages_are_distinguishable() {
+        let ev = ServerMessage::Event {
+            event: Event {
+                time_ms: 1,
+                level: Level::Warn,
+                peer: Some("a".into()),
+                message: "m".into(),
+            },
+        };
+        let text = serde_json::to_string(&ev).unwrap();
+        assert!(text.starts_with(r#"{"event":"#));
+        assert_eq!(serde_json::from_str::<ServerMessage>(&text).unwrap(), ev);
+        let resp = ServerMessage::Response(ResponseEnvelope {
+            id: 4,
+            result: None,
+            error: Some(ApiError::new("nope")),
+        });
+        let text = serde_json::to_string(&resp).unwrap();
+        assert_eq!(text, r#"{"id":4,"error":{"message":"nope"}}"#);
+        assert_eq!(serde_json::from_str::<ServerMessage>(&text).unwrap(), resp);
+    }
+}
