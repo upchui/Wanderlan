@@ -12,7 +12,7 @@ use wanderlan_core::config::{VlanSet, parse_network, render_network};
 
 use super::draw;
 use crate::client::ClientError;
-use crate::tui::app::{App, Msg, Reply};
+use crate::tui::app::{App, MessageKind, Msg, Reply};
 use crate::tui::fixtures;
 
 fn render(app: &App) -> String {
@@ -332,4 +332,57 @@ fn peer_details_limited() {
     reply(&mut app, Request::GetConfig, Reply::Config(texts));
     key(&mut app, KeyCode::Enter);
     insta::assert_snapshot!(render(&app));
+}
+
+fn render_size(app: &App, width: u16, height: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    terminal.draw(|f| draw(f, app)).expect("draw");
+    terminal.backend().to_string()
+}
+
+#[test]
+fn the_help_bar_always_offers_help_and_quit() {
+    let mut app = connected();
+    if let Some(d) = &mut app.draft {
+        // A modified draft adds a and x to every bar.
+        d.network.sites[2].uplink = Some("heim".into());
+        d.revalidate();
+    }
+    for view in ['1', '2', '3', '4', '5', '6', '7'] {
+        key(&mut app, KeyCode::Char(view));
+        let screen = render(&app);
+        let bar = screen.lines().last().unwrap_or_default();
+        assert!(
+            bar.contains("?  help") && bar.contains("q  quit"),
+            "view {view}: {bar}"
+        );
+        if view != '6' {
+            assert!(bar.contains("a  apply"), "view {view}: {bar}");
+        }
+    }
+}
+
+#[test]
+fn a_long_message_gets_two_lines() {
+    let mut app = connected();
+    app.say(
+        MessageKind::Error,
+        "this site (\"haus5\") may not change site \"buero\": its VLANs, mappings and online state are managed by only \"heim\"; make the change there",
+    );
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
+fn messages_window() {
+    let mut app = connected();
+    app.say(MessageKind::Info, "first message");
+    app.say(MessageKind::Success, "second message");
+    app.say(MessageKind::Error, "third message");
+    key(&mut app, KeyCode::Char('M'));
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
+fn terminal_too_small() {
+    insta::assert_snapshot!(render_size(&connected(), 60, 20));
 }

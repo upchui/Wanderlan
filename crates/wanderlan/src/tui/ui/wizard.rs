@@ -143,7 +143,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             );
             page.blank();
             page.text(
-                "After confirming, an invitation for the next site is created and shown in the overview.",
+                "After confirming, the form for inviting the next site opens (Sites, i).",
                 Style::new(),
             );
         }

@@ -135,7 +135,7 @@ fn footer_texts(app: &App, review: &Review) -> Vec<(String, Style)> {
                 .map_or(applied.confirm_within_secs, |p| p.remaining_secs);
             out.push((
                 format!(
-                    "Check that everything still works (Esc shows the overview), then press c to keep the change. Without confirmation it is rolled back in {secs} s; r rolls back now."
+                    "Check that everything still works (Esc closes this window), then press c to keep the change. Without confirmation it is rolled back in {secs} s; r rolls back now."
                 ),
                 theme::warn(),
             ));

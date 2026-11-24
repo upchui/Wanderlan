@@ -1,6 +1,5 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 100
 expression: render(&app)
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
@@ -25,5 +24,5 @@ expression: render(&app)
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-"                                                     draft: no changes  heim r7 "
-" /  filter   s  sort   o  order   1-7  views   ?  help   q  quit                "
+"                                  1 blocked (see 1)  draft: no changes  heim r7 "
+" /  filter   s  sort   o  order   PgUp/PgDn  page   ?  help   q  quit           "

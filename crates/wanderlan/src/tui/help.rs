@@ -29,6 +29,7 @@ pub const SECTIONS: &[Section] = &[
             ("c", "confirm a pending change"),
             ("r", "roll a pending change back now"),
             ("?", "this help"),
+            ("M", "the last messages of the status line"),
             ("q", "quit (asks if the draft has unapplied changes)"),
             ("Ctrl-C", "quit immediately"),
         ],
@@ -79,7 +80,8 @@ pub const SECTIONS: &[Section] = &[
             ("d, Del", "delete the mapping"),
             ("t", "tunnels: what each carries (Enter: limit it)"),
         ],
-        text: "",
+        text: "In the tunnel list (t): Enter limits what a tunnel carries, d lifts \
+               the limit; below it says which VLANs this site passes on.",
     },
     Section {
         title: "4 MAC table",
@@ -114,11 +116,6 @@ pub const SECTIONS: &[Section] = &[
         text: "Problems are marked at the field as you type.",
     },
     Section {
-        title: "7 Settings",
-        keys: &[("Up/Down", "choose a setting"), ("Enter", "change it")],
-        text: "Every setting of the network and of this host, with an explanation.",
-    },
-    Section {
         title: "6 Setup",
         keys: &[
             ("Enter", "next step"),
@@ -128,6 +125,20 @@ pub const SECTIONS: &[Section] = &[
         ],
         text: "Unconfigured: start a new network, or join one with an invitation \
                (address of the inviting site and the code).",
+    },
+    Section {
+        title: "7 Settings",
+        keys: &[("Up/Down", "choose a setting"), ("Enter", "change it")],
+        text: "Every setting of the network and of this host, with an explanation.",
+    },
+    Section {
+        title: "Windows",
+        keys: &[
+            ("Esc", "close the window"),
+            ("n, d", "open invitations: new, delete"),
+            ("Enter, q", "also close the peer details"),
+        ],
+        text: "",
     },
     Section {
         title: "How changes work",
@@ -180,13 +191,26 @@ pub fn max_scroll() -> u16 {
     u16::try_from(lines().len().saturating_sub(1)).unwrap_or(u16::MAX)
 }
 
+/// How much a key of the help bar matters: lower is shown first when the
+/// bar is too narrow for all keys. Help, quit and close always fit; the
+/// draft keys come right after the most important key of the view.
+pub fn priority(index: usize, key: &str) -> usize {
+    match key {
+        "?" | "q" | "Esc" | "Ctrl-C" => 0,
+        "a" | "x" => 3,
+        _ if index == 0 => 2,
+        _ => 2 * index + 2,
+    }
+}
+
 /// Keys shown in the help bar for the current context, most important
-/// first.
+/// first (see [`priority`]).
 pub fn bar(app: &App) -> Vec<Binding> {
     if let Some(modal) = &app.modal {
         return match modal {
             Modal::Help { .. } => vec![("Up/Down", "scroll"), ("Esc", "close")],
-            Modal::Ask(_) => vec![("y", "yes"), ("n", "no")],
+            Modal::Ask(_) => vec![("y/Enter", "yes"), ("n/Esc", "no")],
+            Modal::Messages { .. } => vec![("Up/Down", "scroll"), ("Esc", "close")],
             Modal::Invites { .. } => vec![
                 ("Up/Down", "choose"),
                 ("n", "new"),
@@ -219,37 +243,53 @@ pub fn bar(app: &App) -> Vec<Binding> {
         vec![("1-7", "views")]
     } else {
         match app.view {
-            View::Overview => vec![("Enter", "details"), ("u", "unblock"), ("p", "probe MTU")],
-            View::Sites => vec![
-                ("i", "invite"),
-                ("I", "invites"),
-                ("o", "online"),
-                ("e", "edit"),
-                ("d", "delete"),
+            View::Overview => vec![
+                ("Enter", "details"),
+                ("u", "unblock"),
+                ("p", "probe MTU"),
+                ("Up/Down", "choose"),
             ],
-            View::Settings => vec![("Up/Down", "choose"), ("Enter", "change")],
+            View::Sites => vec![
+                ("Enter", "edit"),
+                ("i", "invite"),
+                ("o", "on/off"),
+                ("n", "new"),
+                ("d", "delete"),
+                ("I", "invites"),
+                ("m", "network"),
+                ("l", "this host"),
+            ],
+            View::Settings => vec![("Enter", "change"), ("Up/Down", "choose")],
             View::Vlans if app.vlans_tunnels => vec![
-                ("v", "VLANs"),
-                ("e", "limit"),
+                ("Enter", "limit"),
                 ("d", "no limit"),
                 ("t", "mappings"),
+                ("v", "VLANs"),
+                ("o", "own VLANs"),
             ],
             View::Vlans => vec![
-                ("v", "VLANs"),
                 ("n", "new"),
-                ("e", "edit"),
-                ("d", "del"),
+                ("Enter", "edit"),
+                ("d", "delete"),
                 ("t", "tunnels"),
+                ("v", "VLANs"),
+                ("o", "own VLANs"),
             ],
             View::Macs if app.macs.editing => {
                 return vec![("Enter", "keep filter"), ("Esc", "clear filter")];
             }
-            View::Macs => vec![("/", "filter"), ("s", "sort"), ("o", "order")],
+            View::Macs => vec![
+                ("/", "filter"),
+                ("s", "sort"),
+                ("o", "order"),
+                ("PgUp/PgDn", "page"),
+            ],
             View::Log => vec![
                 ("l", "level"),
                 ("p", "peer"),
-                ("Up/Down", "scroll"),
                 ("End", "follow"),
+                ("PgUp/PgDn", "page"),
+                ("Home", "oldest"),
             ],
             View::Setup if app.wizard.captures_text(&app.interfaces) => {
                 // Letters and digits go into the field: only special keys.

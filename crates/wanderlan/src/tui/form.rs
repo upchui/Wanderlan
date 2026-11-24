@@ -404,7 +404,6 @@ impl Form {
         )
     }
 
-    /// Form for the shared VLANs only.
     /// Form for the own VLANs of the site `site` (index in the network).
     pub fn own_vlans(draft: &Draft, site: usize) -> Self {
         let s = draft.network.sites.get(site);
@@ -453,6 +452,7 @@ impl Form {
         )
     }
 
+    /// Form for the shared VLANs only.
     pub fn vlans(draft: &Draft) -> Self {
         let fields = vec![vlans_field(&draft.network.vlans)];
         Self::new(FormKind::Vlans, "VLANs of the network", fields, draft)

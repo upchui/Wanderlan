@@ -208,6 +208,61 @@ impl Draft {
         }
     }
 
+    /// How many things the draft changes against `running`: settings,
+    /// sites, mappings, tunnel limits and local settings (an edited mapping
+    /// or limit counts once).
+    pub fn changes(&self, running: Option<&Running>) -> usize {
+        let Some(old) = running.and_then(|r| r.network.as_ref()) else {
+            return 0;
+        };
+        let new = &self.network;
+        let settings = [
+            old.vlans != new.vlans,
+            old.control_port != new.control_port,
+            old.mtu_probe_interval != new.mtu_probe_interval,
+            old.mss != new.mss,
+            old.commit_timeout != new.commit_timeout,
+        ]
+        .iter()
+        .filter(|c| **c)
+        .count();
+        let sites = new
+            .sites
+            .iter()
+            .filter(|s| old.site(&s.name) != Some(*s))
+            .count()
+            + old
+                .sites
+                .iter()
+                .filter(|s| new.site(&s.name).is_none())
+                .count();
+        let added = new.maps.iter().filter(|m| !old.maps.contains(m)).count();
+        let removed = old.maps.iter().filter(|m| !new.maps.contains(m)).count();
+        let maps = added.max(removed);
+        let limits = old
+            .tunnels
+            .iter()
+            .chain(new.tunnels.iter())
+            .map(|t| &t.sites)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|[a, b]| old.tunnel_limit(a, b) != new.tunnel_limit(a, b))
+            .count();
+        let old_local = running.map(|r| &r.local);
+        let local = old_local.map_or(0, |l| {
+            usize::from(l.self_name != self.local.self_name)
+                + usize::from(l.trunk != self.local.trunk)
+                + l.tunnel_trunks
+                    .keys()
+                    .chain(self.local.tunnel_trunks.keys())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .filter(|k| l.tunnel_trunks.get(*k) != self.local.tunnel_trunks.get(*k))
+                    .count()
+        });
+        settings + sites + maps + limits + local
+    }
+
     /// The rows of the tunnel table: every tunnel of the network, then the
     /// limits of site pairs without a tunnel (so they can be removed).
     pub fn tunnel_rows(&self) -> Vec<TunnelRow> {

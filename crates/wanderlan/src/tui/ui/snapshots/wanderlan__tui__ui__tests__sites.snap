@@ -24,5 +24,5 @@ expression: render(&app)
 "│ Commit timeout  1m                   ││ Only on this host (local.toml).      │"
 "│ MSS             from path MTU        ││                                      │"
 "└──────────────────────────────────────┘└──────────────────────────────────────┘"
-"                                                     draft: no changes  heim r7 "
-" i  invite   I  invites   o  online   e  edit   d  delete   1-7  views          "
+"                                  1 blocked (see 1)  draft: no changes  heim r7 "
+" Enter  edit   i  invite   o  on/off   n  new   d  delete   ?  help   q  quit   "

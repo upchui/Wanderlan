@@ -20,26 +20,35 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
-use wanderlan_core::api::{PeerStatus, PortState};
+use wanderlan_core::api::{PeerStatus, PortState, SiteState};
 use wanderlan_core::config::{Diagnostic, Severity};
 
 use super::app::{
     App, BRAND, Busy, Conn, MessageKind, Modal, URGENT_SECS, View, banner_text, tab_layout,
 };
-use super::{help, theme};
+use super::{format, help, theme};
 use overview::{Health, health};
+
+/// Smallest terminal the views are made for.
+pub const MIN_SIZE: (u16, u16) = (80, 24);
 
 /// Draws the whole screen.
 pub fn draw(frame: &mut Frame, app: &App) {
+    let area = frame.area();
+    if area.width < MIN_SIZE.0 || area.height < MIN_SIZE.1 {
+        draw_too_small(frame, area);
+        return;
+    }
     let pending = app.pending();
+    let status_height = status_height(app, area.width);
     let [tabs, banner, body, status, keys] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(u16::from(pending.is_some())),
         Constraint::Min(0),
-        Constraint::Length(1),
+        Constraint::Length(status_height),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(area);
     draw_tabs(frame, app, tabs);
     if let Some(p) = pending {
         let urgent = p.remaining_secs <= URGENT_SECS;
@@ -57,6 +66,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Modal::Form(f) => popup::form(frame, f, body),
             Modal::Ask(a) => popup::ask(frame, a, body),
             Modal::Help { scroll } => popup::help(frame, *scroll, body),
+            Modal::Messages { scroll } => popup::messages(frame, app, *scroll, body),
             Modal::Invites { selected } => details::invites(frame, app, *selected, body),
             Modal::Peer { name } => details::peer(frame, app, name, body),
         }
@@ -151,12 +161,75 @@ fn offline(frame: &mut Frame, app: &App, error: &str, retry_in: Option<u32>, are
     );
 }
 
+fn draw_too_small(frame: &mut Frame, area: Rect) {
+    let (w, h) = MIN_SIZE;
+    let text = vec![
+        Line::styled(
+            format!(" Terminal too small: {}×{}", area.width, area.height),
+            theme::warn(),
+        ),
+        Line::raw(format!(" wanderlan needs at least {w}×{h}.")),
+        Line::styled(" q quits, Ctrl-C too.", theme::dim()),
+    ];
+    frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), area);
+}
+
+/// Two lines for a message that does not fit into one.
+fn status_height(app: &App, width: u16) -> u16 {
+    let badge = status_badge(app).width();
+    let text = status_text(app).map_or(0, |l| l.width());
+    if text + badge > usize::from(width) {
+        2
+    } else {
+        1
+    }
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let right = status_badge(app);
     let width = u16::try_from(right.width()).unwrap_or_default();
+    let [first, second] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     let [left_area, right_area] =
-        Layout::horizontal([Constraint::Min(0), Constraint::Length(width)]).areas(area);
-    let left = match (&app.busy, &app.message) {
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(width)]).areas(first);
+    frame.render_widget(Paragraph::new(right), right_area);
+    let Some(left) = status_text(app) else {
+        return;
+    };
+    let style = left.style;
+    let text: String = left.spans.iter().map(|s| s.content.as_ref()).collect();
+    if second.height == 0 {
+        frame.render_widget(Paragraph::new(Line::styled(text, style)), left_area);
+        return;
+    }
+    // The first line next to the badge, the rest over the full width below.
+    let lines = format::wrap(
+        text.trim_start(),
+        usize::from(left_area.width.saturating_sub(3)),
+    );
+    let head = lines.first().cloned().unwrap_or_default();
+    let rest = text
+        .trim_start()
+        .get(head.len()..)
+        .unwrap_or_default()
+        .trim_start();
+    let room = usize::from(second.width.saturating_sub(1));
+    let tail = if rest.chars().count() > room {
+        let cut: String = rest.chars().take(room.saturating_sub(14)).collect();
+        format!(" {cut}… M shows all")
+    } else {
+        format!(" {rest}")
+    };
+    frame.render_widget(
+        Paragraph::new(Line::styled(format!(" {head}"), style)),
+        left_area,
+    );
+    frame.render_widget(Paragraph::new(Line::styled(tail, style)), second);
+}
+
+/// The left part of the status line: what is running, the last message,
+/// or a hint.
+fn status_text(app: &App) -> Option<Line<'static>> {
+    Some(match (&app.busy, &app.message) {
         (Some(busy), _) => Line::styled(
             match busy {
                 Busy::Applying => " Applying ...",
@@ -174,23 +247,64 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             },
         ),
         (None, None) if app.draft_stale() && app.draft_dirty() => Line::styled(
-            " The running configuration changed since the draft was made; x discards the draft.",
+            " The running configuration changed; x discards the draft.",
             theme::warn(),
         ),
-        (None, None) => Line::raw(""),
+        (None, None) => return None,
+    })
+}
+
+/// Problems of this site in a few words, for the status line of every view.
+fn problems(app: &App) -> Option<(String, Style)> {
+    // The overview shows them in full.
+    if app.view == View::Overview && app.modal.is_none() {
+        return None;
+    }
+    let s = app.status.as_ref()?;
+    let mut bad = Vec::new();
+    let mut warn = Vec::new();
+    if s.state == SiteState::Error || s.last_error.is_some() {
+        bad.push("error".to_string());
+    }
+    if !s.blocked.is_empty() {
+        bad.push(format!("{} blocked", s.blocked.len()));
+    }
+    if s.sync_problem.is_some() {
+        warn.push("not taken over".to_string());
+    }
+    let refused = s.peers.iter().filter(|p| p.refused.is_some()).count();
+    if refused > 0 {
+        warn.push(format!("{refused} refused"));
+    }
+    if bad.is_empty() && warn.is_empty() {
+        return None;
+    }
+    let style = if bad.is_empty() {
+        theme::warn()
+    } else {
+        theme::bad()
     };
-    frame.render_widget(Paragraph::new(left), left_area);
-    frame.render_widget(Paragraph::new(right), right_area);
+    bad.extend(warn);
+    Some((format!("{} (see 1)", bad.join(", ")), style))
 }
 
 /// Draft and connection state for the right end of the status line.
 fn status_badge(app: &App) -> Line<'static> {
     let mut spans = Vec::new();
+    if let Some((text, style)) = problems(app) {
+        spans.push(Span::styled(text, style));
+        spans.push(Span::raw("  "));
+    }
     if let Some(draft) = &app.draft {
+        let changes = draft.changes(app.running.as_ref());
         let (text, style) = if !app.draft_dirty() {
             ("draft: no changes".to_string(), theme::dim())
         } else if draft.errors() > 0 {
             (format!("draft: {} error(s)", draft.errors()), theme::bad())
+        } else if changes == 1 {
+            ("draft: 1 change".to_string(), theme::warn())
+        } else if changes > 1 {
+            (format!("draft: {changes} changes"), theme::warn())
         } else {
             ("draft: modified".to_string(), theme::warn())
         };
@@ -211,18 +325,26 @@ fn status_badge(app: &App) -> Line<'static> {
 }
 
 fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
-    let mut spans = Vec::new();
+    let keys = help::bar(app);
+    let width = |(key, what): &(&str, &str)| key.chars().count() + what.chars().count() + 5;
+    // The most important keys that fit, shown in their own order.
+    let mut order: Vec<usize> = (0..keys.len()).collect();
+    order.sort_by_key(|&i| (help::priority(i, keys[i].0), i));
+    let mut shown = vec![false; keys.len()];
     let mut used = 0usize;
-    for (key, what) in help::bar(app) {
-        let key = format!(" {key} ");
-        let what = format!(" {what}  ");
-        let width = key.chars().count() + what.chars().count();
-        if used + width > usize::from(area.width) {
-            break;
+    for i in order {
+        let w = width(&keys[i]);
+        if used + w <= usize::from(area.width) {
+            used += w;
+            shown[i] = true;
         }
-        used += width;
-        spans.push(Span::styled(key, theme::key()));
-        spans.push(Span::raw(what));
+    }
+    let mut spans = Vec::new();
+    for (i, (key, what)) in keys.iter().enumerate() {
+        if shown[i] {
+            spans.push(Span::styled(format!(" {key} "), theme::key()));
+            spans.push(Span::raw(format!(" {what}  ")));
+        }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }

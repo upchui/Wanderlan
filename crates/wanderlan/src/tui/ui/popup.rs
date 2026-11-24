@@ -7,7 +7,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph, Wrap};
 
 use super::{diagnostic_line, titled};
-use crate::tui::app::Ask;
+use crate::tui::app::{App, Ask, MessageKind};
 use crate::tui::form::{Field, Form, Input};
 use crate::tui::help::{self, HelpLine};
 use crate::tui::{format, theme};
@@ -51,7 +51,7 @@ pub fn form(frame: &mut Frame, form: &Form, area: Rect) {
         lines.push(Line::from(spans));
         let pad = " ".repeat(usize::from(LABEL_WIDTH + 1));
         let below = match (field.visible_error(form.submitted), &field.warning) {
-            _ if !field.enabled => Line::styled(format!("{pad}only for spokes"), theme::dim()),
+            _ if !field.enabled => Line::styled(format!("{pad}not used here"), theme::dim()),
             (Some(e), _) => Line::styled(format!("{pad}{e}"), theme::bad()),
             (None, Some(w)) => Line::styled(format!("{pad}{w}"), theme::warn()),
             (None, None) => Line::styled(format!("{pad}{}", field.hint), theme::dim()),
@@ -139,6 +139,35 @@ pub fn ask(frame: &mut Frame, ask: &Ask, area: Rect) {
     frame.render_widget(
         Paragraph::new(text).block(titled(format!(" {} ", ask.title)).border_style(theme::warn())),
         popup,
+    );
+}
+
+/// The last messages of the status line, newest first.
+pub fn messages(frame: &mut Frame, app: &App, scroll: u16, area: Rect) {
+    frame.render_widget(Clear, area);
+    let lines: Vec<Line> = if app.messages.is_empty() {
+        vec![Line::styled(" No messages yet.", theme::dim())]
+    } else {
+        app.messages
+            .iter()
+            .map(|m| {
+                Line::styled(
+                    format!(" {}", m.text),
+                    match m.kind {
+                        MessageKind::Info => Style::new(),
+                        MessageKind::Success => theme::ok(),
+                        MessageKind::Error => theme::bad(),
+                    },
+                )
+            })
+            .collect()
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(titled(" Messages, newest first (Esc closes) "))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        area,
     );
 }
 

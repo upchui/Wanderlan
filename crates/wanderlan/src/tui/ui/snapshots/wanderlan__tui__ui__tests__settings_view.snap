@@ -24,5 +24,5 @@ expression: render(&app)
 " Changes go into the draft; a reviews and applies them, c confirms.             "
 "                                                                                "
 "                                                                                "
-"                                                     draft: no changes  heim r7 "
-" Up/Down  choose   Enter  change   1-7  views   ?  help   q  quit               "
+"                                  1 blocked (see 1)  draft: no changes  heim r7 "
+" Enter  change   Up/Down  choose   1-7  views   ?  help   q  quit               "

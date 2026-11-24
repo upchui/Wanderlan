@@ -24,5 +24,5 @@ expression: render(&app)
 " wl-<interface>): only that network reaches haus2.                              "
 " Changes go into the draft; a reviews and applies them, c confirms.             "
 "                                                                                "
-"                                                       draft: modified  heim r7 "
-" Up/Down  choose   Enter  change   a  apply   x  discard   ?  help   q  quit    "
+"                                    1 blocked (see 1)  draft: 1 change  heim r7 "
+" Enter  change   Up/Down  choose   a  apply   x  discard   ?  help   q  quit    "

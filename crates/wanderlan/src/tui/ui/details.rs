@@ -241,18 +241,14 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, area: Rect) {
 /// The open invitations with their rules.
 pub fn invites(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
     let rows = app.invitations.len().max(1);
-    let height = u16::try_from(rows + 7).unwrap_or(u16::MAX);
+    let height = u16::try_from(rows + 6).unwrap_or(u16::MAX);
     let popup = area.centered(Constraint::Max(80), Constraint::Max(height));
     frame.render_widget(Clear, popup);
     let block = titled(" Open invitations ");
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    let [list, command, keys] = Layout::vertical([
-        Constraint::Min(2),
-        Constraint::Length(2),
-        Constraint::Length(1),
-    ])
-    .areas(inner);
+    let [list, command] =
+        Layout::vertical([Constraint::Min(2), Constraint::Length(2)]).areas(inner);
     let table_rows: Vec<Row> = if app.invitations.is_empty() {
         vec![Row::new(vec![Cell::from("no open invitations")]).style(theme::dim())]
     } else {
@@ -293,16 +289,5 @@ pub fn invites(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
             Line::styled(format!(" {cmd}"), theme::bold()),
         ]),
         command,
-    );
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" n ", theme::key()),
-            Span::raw(" new  "),
-            Span::styled(" d ", theme::key()),
-            Span::raw(" delete  "),
-            Span::styled(" Esc ", theme::key()),
-            Span::raw(" close"),
-        ])),
-        keys,
     );
 }

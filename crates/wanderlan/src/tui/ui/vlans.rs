@@ -132,7 +132,8 @@ fn vlans_text(vlans: &VlanSet) -> String {
 fn draw_tunnels(frame: &mut Frame, app: &App, draft: &Draft, area: Rect, detail: Rect) {
     let rows = draft.tunnel_rows();
     let selected = app.tunnels_selected.min(rows.len().saturating_sub(1));
-    let header = Row::new(vec!["TUNNEL", "KIND", "CARRIES", "LIMIT"]).style(theme::header());
+    let header = Row::new(vec!["", "TUNNEL", "KIND", "CARRIES", "LIMIT"]).style(theme::header());
+    let running = app.running.as_ref().and_then(|r| r.network.as_ref());
     let table_rows: Vec<Row> = rows
         .iter()
         .map(|r| {
@@ -151,7 +152,15 @@ fn draw_tunnels(frame: &mut Frame, app: &App, draft: &Draft, area: Rect, detail:
                 r.entry
                     .and_then(|i| draft.worst_within(&FieldPath::tunnel(i))),
             );
+            let before = running.and_then(|n| n.tunnel_limit(a, b));
+            let marker = match (before, r.limit.as_ref()) {
+                (None, Some(_)) => Span::styled("+", theme::ok()),
+                (Some(x), Some(y)) if x != y => Span::styled("*", theme::warn()),
+                (Some(_), None) => Span::styled("*", theme::warn()),
+                _ => Span::raw(" "),
+            };
             Row::new(vec![
+                Cell::from(marker),
                 Cell::from(format!("{a} – {b}")),
                 Cell::from(kind),
                 Cell::from(carries),
@@ -171,6 +180,7 @@ fn draw_tunnels(frame: &mut Frame, app: &App, draft: &Draft, area: Rect, detail:
         );
     } else {
         let widths = [
+            Constraint::Length(1),
             Constraint::Length(27),
             Constraint::Length(8),
             Constraint::Min(10),
@@ -224,7 +234,9 @@ fn draw_tunnels(frame: &mut Frame, app: &App, draft: &Draft, area: Rect, detail:
 }
 
 fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
-    let header = Row::new(vec!["#", "SITE", "LOCAL", "SHARED", "MEANING"]).style(theme::header());
+    let header =
+        Row::new(vec!["", "#", "SITE", "LOCAL", "SHARED", "MEANING"]).style(theme::header());
+    let running = app.running.as_ref().and_then(|r| r.network.as_ref());
     let rows: Vec<Row> = draft
         .network
         .maps
@@ -232,7 +244,21 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         .enumerate()
         .map(|(i, map)| {
             let at = |key: &str| draft.worst_at(&FieldPath::map_field(i, key));
+            let marker = match running {
+                Some(old) if old.maps.contains(map) => Span::raw(" "),
+                Some(old)
+                    if old
+                        .maps
+                        .iter()
+                        .any(|m| m.site == map.site && m.local == map.local) =>
+                {
+                    Span::styled("*", theme::warn())
+                }
+                Some(_) => Span::styled("+", theme::ok()),
+                None => Span::raw(" "),
+            };
             Row::new(vec![
+                Cell::from(marker),
                 Cell::from(format!("{}", i + 1)),
                 marked(
                     draft
@@ -250,6 +276,7 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         .collect();
     let empty = rows.is_empty();
     let widths = [
+        Constraint::Length(1),
         Constraint::Length(3),
         Constraint::Length(21),
         Constraint::Length(8),

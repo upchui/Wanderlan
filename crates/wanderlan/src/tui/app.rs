@@ -145,6 +145,9 @@ pub enum MessageKind {
     Error,
 }
 
+/// How many messages [`App::messages`] keeps.
+pub const MESSAGE_HISTORY: usize = 20;
+
 /// A message in the status line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
@@ -279,6 +282,11 @@ pub enum Modal {
     Invites {
         /// Selected row.
         selected: usize,
+    },
+    /// The last messages of the status line.
+    Messages {
+        /// First visible line.
+        scroll: u16,
     },
     /// Traffic and details of one peer.
     Peer {
@@ -447,6 +455,8 @@ pub struct App {
     pub modal: Option<Modal>,
     /// Status line message.
     pub message: Option<Message>,
+    /// The last messages, newest first (`M`).
+    pub messages: VecDeque<Message>,
     /// A running confirm/rollback/apply.
     pub busy: Option<Busy>,
     wizard_offered: bool,
@@ -487,6 +497,7 @@ impl App {
             settings_selected: 0,
             modal: None,
             message: None,
+            messages: VecDeque::new(),
             busy: None,
             wizard_offered: false,
             in_flight: InFlight::default(),
@@ -564,12 +575,17 @@ impl App {
             .and_then(|s| s.peers.get(self.overview_selected))
     }
 
-    fn say(&mut self, kind: MessageKind, text: impl Into<String>) {
-        self.message = Some(Message {
+    pub(crate) fn say(&mut self, kind: MessageKind, text: impl Into<String>) {
+        let message = Message {
             kind,
             text: text.into(),
             ttl: MESSAGE_TICKS,
-        });
+        };
+        if self.messages.front().map(|m| &m.text) != Some(&message.text) {
+            self.messages.push_front(message.clone());
+            self.messages.truncate(MESSAGE_HISTORY);
+        }
+        self.message = Some(message);
     }
 
     // ----- connection -------------------------------------------------
@@ -948,7 +964,6 @@ impl App {
         self.request_config(fx);
     }
 
-    /// The new network is confirmed: invite the next site right away.
     /// The new network is confirmed: the invitation form for the next site
     /// opens as soon as the running configuration arrived (it needs it).
     fn setup_done(&mut self, fx: &mut Vec<Effect>) {
@@ -1281,6 +1296,7 @@ impl App {
                 }
             }
             KeyCode::Char('?') => self.modal = Some(Modal::Help { scroll: 0 }),
+            KeyCode::Char('M') => self.modal = Some(Modal::Messages { scroll: 0 }),
             KeyCode::Char('q') => self.request_quit(fx),
             KeyCode::Char('a') => self.open_review(),
             KeyCode::Char('x') => self.ask_discard(),
@@ -1442,6 +1458,16 @@ impl App {
             },
             Modal::Form(form) => self.on_form_key(form, key, fx),
             Modal::Invites { selected } => self.on_invites_key(selected, key, fx),
+            Modal::Messages { scroll } => match key.code {
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'M') => None,
+                KeyCode::Up | KeyCode::Char('k') => Some(Modal::Messages {
+                    scroll: scroll.saturating_sub(1),
+                }),
+                KeyCode::Down | KeyCode::Char('j') => Some(Modal::Messages {
+                    scroll: scroll.saturating_add(1),
+                }),
+                _ => Some(Modal::Messages { scroll }),
+            },
             Modal::Peer { name } => match key.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
                 _ => Some(Modal::Peer { name }),
