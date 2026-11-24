@@ -24,6 +24,10 @@ fail() {
   printf '    \033[31mFAIL\033[0m %s\n' "$*"
   FAILURES=$((FAILURES + 1))
   echo "$CASE: $*" >>"$RUN_DIR/failures"
+  # GitHub Actions annotations are visible without access to the job logs.
+  if [ "${GITHUB_ACTIONS:-}" = true ]; then
+    printf '::error title=%s::%s\n' "${CASE//,/;}" "$(printf '%s' "$*" | tr '\n' ' ' | cut -c1-900)"
+  fi
 }
 
 # Runs a shell command in a container.
