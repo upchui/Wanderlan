@@ -58,8 +58,14 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
     match &status.site {
         Some(site) => {
             let value = |v: &Option<String>| v.clone().unwrap_or_else(|| "?".into());
+            let role = status
+                .sites
+                .iter()
+                .find(|s| s.is_self)
+                .map_or_else(String::new, |s| format::role(s.uplink.as_deref()));
             lines.push(Line::from(vec![
                 Span::styled(format!(" {site}"), theme::bold()),
+                Span::styled(format!("  {role}"), theme::title()),
                 Span::styled("  address ", theme::dim()),
                 Span::raw(value(&status.address)),
                 Span::styled("  trunk ", theme::dim()),
@@ -235,11 +241,14 @@ fn link(status: &Status, site: &SiteSummary) -> (String, Style) {
     if site.direct {
         return ("tunnel".into(), Style::new());
     }
-    ("-".into(), theme::dim())
+    match &site.via {
+        Some(hop) => (format!("via {hop}"), theme::dim()),
+        None => ("-".into(), theme::dim()),
+    }
 }
 
 fn draw_sites(frame: &mut Frame, status: &Status, area: Rect) {
-    let header = Row::new(vec!["SITE", "ADDRESS", "VLANS", "LINK"]).style(theme::header());
+    let header = Row::new(vec!["SITE", "ADDRESS", "VLANS", "ROLE", "LINK"]).style(theme::header());
     let rows: Vec<Row> = status
         .sites
         .iter()
@@ -249,6 +258,7 @@ fn draw_sites(frame: &mut Frame, status: &Status, area: Rect) {
                 Cell::from(site.name.clone()),
                 Cell::from(site.address.clone()),
                 Cell::from(site.vlans.clone()),
+                Cell::from(format::role(site.uplink.as_deref())),
                 Cell::from(link).style(style),
             ])
         })
@@ -256,7 +266,8 @@ fn draw_sites(frame: &mut Frame, status: &Status, area: Rect) {
     let widths = [
         Constraint::Length(12),
         Constraint::Length(15),
-        Constraint::Length(20),
+        Constraint::Length(12),
+        Constraint::Length(17),
         Constraint::Min(10),
     ];
     let title = format!(" Network: {} sites ", status.sites.len());
@@ -279,5 +290,18 @@ mod tests {
         assert_eq!(health(by_name("haus2")), Health::Bad);
         assert_eq!(health(by_name("haus5")), Health::Degraded);
         assert_eq!(health(by_name("haus6")), Health::Bad);
+    }
+
+    #[test]
+    fn sites_without_a_tunnel_show_the_next_hop() {
+        let mut status = fixtures::status();
+        let mut far = status.sites[1].clone();
+        far.name = "far".into();
+        far.direct = false;
+        far.uplink = Some("buero".into());
+        far.via = Some("buero".into());
+        status.sites.push(far.clone());
+        assert_eq!(link(&status, &far).0, "via buero");
+        assert_eq!(format::role(far.uplink.as_deref()), "client of buero");
     }
 }

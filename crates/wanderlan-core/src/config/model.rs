@@ -111,6 +111,9 @@ pub struct Site {
     pub managed_by: Option<String>,
     /// The site may also change its own rules.
     pub self_managed: bool,
+    /// The site this one is plugged into (a client of it): its only tunnel
+    /// leads there. `None`: a server, connected with all other servers.
+    pub uplink: Option<String>,
 }
 
 /// The local side of a VLAN mapping.
@@ -184,6 +187,7 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
+            uplink: None,
         });
         mesh.sites.push(Site {
             name: "b".into(),
@@ -192,6 +196,7 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
+            uplink: None,
         });
         assert!(mesh.site("c").is_none());
         let a = mesh.site("a").unwrap();

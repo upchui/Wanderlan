@@ -30,6 +30,7 @@ struct Rules<'a> {
     online: bool,
     managed_by: Option<&'a str>,
     self_managed: bool,
+    uplink: Option<&'a str>,
     maps: Vec<&'a VlanMap>,
 }
 
@@ -42,6 +43,7 @@ fn rules<'a>(mesh: &'a Mesh, site: &'a Site) -> Rules<'a> {
         online: site.online,
         managed_by: site.managed_by.as_deref(),
         self_managed: site.self_managed,
+        uplink: site.uplink.as_deref(),
         maps,
     }
 }
@@ -163,6 +165,7 @@ mod tests {
             online: true,
             managed_by: managed_by.map(Into::into),
             self_managed,
+            uplink: None,
         }
     }
 
@@ -219,6 +222,11 @@ mod tests {
         let mut taken = old.clone();
         taken.sites[2].managed_by = Some("b".into());
         assert!(check_edit(&old, &taken, "b").is_err());
+        // Which site it is plugged into is a rule too.
+        let mut moved = old.clone();
+        moved.sites[2].uplink = Some("b".into());
+        assert!(check_edit(&old, &moved, "b").is_err());
+        assert!(check_edit(&old, &moved, "a").is_ok());
     }
 
     #[test]

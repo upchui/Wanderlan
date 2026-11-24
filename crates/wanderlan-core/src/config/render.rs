@@ -67,6 +67,15 @@ fn render_mesh_inner(mesh: &Mesh, with_revision: bool) -> String {
         if site.self_managed {
             out.push_str("self_managed = true\n");
         }
+        match &site.uplink {
+            Some(up) => {
+                let _ = writeln!(out, "uplink = {}", quote(up));
+            }
+            // A server with a manager says so, otherwise it would be read
+            // as a client of its manager (configurations before uplinks).
+            None if site.managed_by.is_some() => out.push_str("uplink = \"\"\n"),
+            None => {}
+        }
     }
     for map in &mesh.maps {
         out.push_str("\n[[map]]\n");

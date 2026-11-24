@@ -7,7 +7,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use wanderlan_core::config::FieldPath;
-use wanderlan_core::desired::{GRETAP_MTU, bridge_for};
+use wanderlan_core::desired::bridge_for;
 use wanderlan_core::policy;
 
 use super::{not_configured, severity_style, titled};
@@ -69,7 +69,7 @@ pub const ROWS: [SettingRow; 7] = [
         key: "trunk",
         label: "Trunk",
         local: true,
-        help: "The local interface that carries the VLANs to the switch or hypervisor; it is a port of the bridge br0. Never the interface that leads to the other sites.",
+        help: "The local interface that carries the VLANs to the switch or hypervisor (a port of br0); never the one that leads to the other sites. Tunnel MTU: fixed 1500, GRE fragments if the path is smaller.",
     },
 ];
 
@@ -95,30 +95,54 @@ fn value(draft: &Draft, key: &str) -> String {
     }
 }
 
-/// Who manages this site and which sites it manages.
-fn permissions(draft: &Draft) -> [(&'static str, String); 2] {
+/// The role of this site, who manages it, which sites it manages and which
+/// sites are its clients.
+fn permissions(draft: &Draft) -> [(&'static str, String); 4] {
     let mesh = &draft.mesh;
     let me = draft.local.self_name.as_deref().unwrap_or_default();
-    let this = match (mesh.site(me), policy::restricted_by(mesh, me)) {
-        (_, Some(m)) => format!("managed by {m}: no VLAN changes here"),
+    let site = mesh.site(me);
+    let role = site.map_or_else(
+        || "-".to_string(),
+        |s| match s.uplink.as_deref() {
+            Some(up) => format!("client of {up} (its only tunnel leads there)"),
+            None => "server (connected with the other servers)".to_string(),
+        },
+    );
+    let managed = match (site, policy::restricted_by(mesh, me)) {
+        (_, Some(m)) => format!("{m}: no VLAN changes here"),
         (Some(site), None) => match policy::manager(mesh, site) {
-            Some(m) => format!("managed by {m}, may change its own VLANs"),
-            None => "not managed by another site".to_string(),
+            Some(m) => format!("{m}, may change its own VLANs"),
+            None => "- (not managed by another site)".to_string(),
         },
         (None, None) => "-".to_string(),
     };
-    let managed: Vec<&str> = mesh
-        .sites
-        .iter()
-        .filter(|s| s.name != me && policy::manager(mesh, s) == Some(me))
-        .map(|s| s.name.as_str())
-        .collect();
-    let manages = if managed.is_empty() {
-        "-".to_string()
-    } else {
-        managed.join(", ")
+    let list = |names: Vec<&str>| {
+        if names.is_empty() {
+            "-".to_string()
+        } else {
+            names.join(", ")
+        }
     };
-    [("This site", this), ("Manages", manages)]
+    let manages = list(
+        mesh.sites
+            .iter()
+            .filter(|s| s.name != me && policy::manager(mesh, s) == Some(me))
+            .map(|s| s.name.as_str())
+            .collect(),
+    );
+    let clients = list(
+        mesh.sites
+            .iter()
+            .filter(|s| s.uplink.as_deref() == Some(me))
+            .map(|s| s.name.as_str())
+            .collect(),
+    );
+    [
+        ("Role", role),
+        ("Clients", clients),
+        ("Managed by", managed),
+        ("Manages", manages),
+    ]
 }
 
 /// A row of the settings list that can be selected.
@@ -206,14 +230,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         );
     }
     rows.push(Row::new(vec![
-        Cell::from(Span::styled("  Tunnel MTU", theme::dim())),
-        Cell::from(Span::styled(
-            format!("{GRETAP_MTU} (fixed; GRE fragments if the path is smaller)"),
-            theme::dim(),
-        )),
-    ]));
-    rows.push(Row::new(vec![
-        Cell::from(Span::styled("Permissions", theme::header())),
+        Cell::from(Span::styled("Role and rights", theme::header())),
         Cell::from(Span::styled(
             "who may change VLANs: Sites (2), Enter, Changes",
             theme::dim(),

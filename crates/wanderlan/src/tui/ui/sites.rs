@@ -6,7 +6,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use wanderlan_core::config::{FieldPath, Severity};
-use wanderlan_core::policy;
+use wanderlan_core::{policy, topology};
 
 use super::{diagnostic_line, health_style, not_configured, port_state, severity_style, titled};
 use crate::tui::app::App;
@@ -36,8 +36,16 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
     let running = app.running.as_ref().and_then(|r| r.mesh.as_ref());
     let own = draft.local.self_name.as_deref();
-    let header = Row::new(vec!["", "NAME", "ADDRESS", "VLANS", "MANAGED BY", "TUNNEL"])
-        .style(theme::header());
+    let header = Row::new(vec![
+        "",
+        "NAME",
+        "ADDRESS",
+        "VLANS",
+        "ROLE",
+        "MANAGED BY",
+        "TUNNEL",
+    ])
+    .style(theme::header());
     let rows: Vec<Row> = draft
         .mesh
         .sites
@@ -56,7 +64,10 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
             } else {
                 match app.peer(&site.name) {
                     Some(peer) => (port_state(peer.port_state).to_string(), health_style(peer)),
-                    None => ("-".to_string(), theme::dim()),
+                    None => match own.and_then(|me| topology::via(&draft.mesh, me, &site.name)) {
+                        Some(hop) => (format!("via {hop}"), theme::dim()),
+                        None => ("-".to_string(), theme::dim()),
+                    },
                 }
             };
             let style = severity_style(draft.worst_within(&FieldPath::site(i)));
@@ -68,6 +79,7 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
                     Some(v) => Cell::from(v.to_string()),
                     None => Cell::from(Span::styled(draft.mesh.vlans.to_string(), theme::dim())),
                 },
+                Cell::from(format::role(site.uplink.as_deref())),
                 Cell::from(policy::managed_label(&draft.mesh, site)),
                 Cell::from(tunnel).style(tunnel_style),
             ])
@@ -88,9 +100,10 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         Constraint::Length(1),
         Constraint::Length(12),
         Constraint::Length(15),
-        Constraint::Length(14),
-        Constraint::Length(13),
-        Constraint::Min(8),
+        Constraint::Length(9),
+        Constraint::Length(15),
+        Constraint::Length(10),
+        Constraint::Min(9),
     ];
     let table = Table::new(rows, widths)
         .header(header)
@@ -120,17 +133,12 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
         lines.push(line);
     }
     if let Some(site) = draft.mesh.sites.get(app.sites_selected) {
-        let text = match policy::manager(&draft.mesh, site) {
-            Some(_) => format!(
-                " {}: VLANs, mappings and online state are changed by {} (Enter: Changes).",
-                site.name,
-                policy::managers(&draft.mesh, site)
-            ),
-            None => format!(
-                " {}: every site that is not managed by another may change it (Enter: Changes).",
-                site.name
-            ),
-        };
+        let text = format!(
+            " {}: {}; VLANs and online state changed by {} (Enter: edit).",
+            site.name,
+            format::role(site.uplink.as_deref()),
+            policy::managed_label(&draft.mesh, site)
+        );
         lines.push(Line::styled(text, theme::dim()));
         if let Some(trunk) = draft.local.tunnel_trunks.get(&site.name) {
             lines.push(Line::styled(

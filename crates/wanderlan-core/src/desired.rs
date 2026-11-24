@@ -165,7 +165,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
                     ignore_df: true,
                     pmtudisc: false,
                 },
-                isolated: true,
+                isolated: t.isolated(),
                 vlans: own
                     .iter()
                     .filter(|v| theirs.contains(*v))
@@ -597,5 +597,45 @@ mod tests {
             let expected = if t.peer == "haus2" { "wl-ens20" } else { "br0" };
             assert_eq!(t.bridge, expected, "{}", t.peer);
         }
+    }
+
+    #[test]
+    fn the_ports_of_clients_are_not_isolated() {
+        let mesh = MESH.replace(
+            "name = \"haus2\"\n",
+            "name = \"haus2\"\nuplink = \"heim\"\n",
+        );
+        let cfg = match load(&mesh, "self = \"heim\"\ntrunk = \"ens19\"\n")
+            .unwrap()
+            .loaded
+        {
+            Loaded::Configured(cfg) => cfg,
+            Loaded::Unconfigured { .. } => panic!("configured"),
+        };
+        let d = derive(&cfg, &Runtime::default());
+        let haus2 = d.tunnels.iter().find(|t| t.peer == "haus2").unwrap();
+        assert!(!haus2.isolated, "a client of heim");
+        assert!(
+            d.tunnels
+                .iter()
+                .filter(|t| t.peer != "haus2")
+                .all(|t| t.isolated)
+        );
+        // haus2 has only its tunnel to heim.
+        let cfg2 = match load(&mesh, "self = \"haus2\"\ntrunk = \"ens19\"\n")
+            .unwrap()
+            .loaded
+        {
+            Loaded::Configured(cfg) => cfg,
+            Loaded::Unconfigured { .. } => panic!("configured"),
+        };
+        let d2 = derive(&cfg2, &Runtime::default());
+        assert_eq!(
+            d2.tunnels
+                .iter()
+                .map(|t| t.peer.as_str())
+                .collect::<Vec<_>>(),
+            ["heim"]
+        );
     }
 }

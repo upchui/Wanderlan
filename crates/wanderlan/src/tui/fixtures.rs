@@ -41,6 +41,7 @@ name = "haus6"
 address = "10.8.0.16"
 online = false
 managed_by = "buero"
+uplink = "heim"
 
 [[map]]
 site = "haus3"
@@ -125,6 +126,8 @@ fn summary(name: &str, address: &str, vlans: &str) -> SiteSummary {
         online: true,
         is_self: name == "heim",
         direct: name != "heim",
+        uplink: (name == "haus6").then(|| "heim".to_string()),
+        via: None,
     }
 }
 

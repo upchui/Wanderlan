@@ -104,8 +104,42 @@ pub struct Admission {
     /// Final name of the joining site.
     pub name: String,
     /// False if the site was already a member (same name and address): it
-    /// joins again, e.g. after a reset, and the mesh is unchanged.
+    /// joins again, e.g. after a reset.
     pub added: bool,
+    /// The mesh changed (revision + 1) and must be applied: a new site, or
+    /// a member that joined again through another site and now hangs off it.
+    pub changed: bool,
+}
+
+/// A client that joins again through another site now hangs off that site
+/// (it reached it, maybe not its old uplink). Servers stay servers, and a
+/// site never hangs off one of its own clients.
+fn rejoin(mesh: &Mesh, inviter: &str, name: &str) -> Option<Admission> {
+    let site = mesh.site(name)?;
+    let current = site.uplink.as_deref()?;
+    if current == inviter || name == inviter {
+        return None;
+    }
+    // The inviter must not hang (indirectly) off the joining site.
+    let mut up = mesh.site(inviter)?.uplink.as_deref();
+    let mut steps = 0;
+    while let Some(u) = up {
+        if u == name || steps > mesh.sites.len() {
+            return None;
+        }
+        up = mesh.site(u).and_then(|s| s.uplink.as_deref());
+        steps += 1;
+    }
+    let mut new = mesh.clone();
+    new.revision = mesh.revision + 1;
+    let entry = new.sites.iter_mut().find(|s| s.name == name)?;
+    entry.uplink = Some(inviter.to_string());
+    Some(Admission {
+        mesh: new,
+        name: name.to_string(),
+        added: false,
+        changed: true,
+    })
 }
 
 /// Adds the site `name` at `address` to `mesh` (revision + 1), with the
@@ -114,7 +148,9 @@ pub struct Admission {
 ///
 /// * The name in the rules wins over the requested name.
 /// * A site with the same name and address is already a member: the mesh
-///   stays as it is (rules are not applied again).
+///   stays as it is (rules are not applied again), except that a client
+///   joining through another site now hangs off that site.
+/// * The new site is a client of the inviting site (`uplink`).
 /// * A default name (the host name) that is taken gets a suffix `-2`, `-3`,
 ///   ...; a default name whose address already belongs to a site joins as
 ///   that site.
@@ -135,13 +171,16 @@ pub fn add_site(
         mesh: mesh.clone(),
         name: name.to_string(),
         added: false,
+        changed: false,
     };
     if let Some(msg) = site_name_error(name) {
         return Err(JoinError::InvalidName(msg));
     }
     if let Some(existing) = mesh.sites.iter().find(|s| s.address == address) {
         if existing.name == name || name_is_default {
-            return Ok(unchanged(&existing.name));
+            return Ok(
+                rejoin(mesh, inviter, &existing.name).unwrap_or_else(|| unchanged(&existing.name))
+            );
         }
         return Err(JoinError::AddressTaken {
             address,
@@ -174,6 +213,8 @@ pub fn add_site(
         online: false,
         managed_by: Some(inviter.to_string()),
         self_managed: rules.allow_self,
+        // Plugged into the inviting site: its only tunnel leads there.
+        uplink: Some(inviter.to_string()),
     });
     if let Some(shared) = rules.native {
         new.maps.push(VlanMap {
@@ -202,6 +243,7 @@ pub fn add_site(
         mesh: new,
         name,
         added: true,
+        changed: true,
     })
 }
 
@@ -300,6 +342,7 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
+            uplink: None,
         });
         mesh
     }
@@ -322,6 +365,12 @@ mod tests {
             !a.mesh.site("site2").unwrap().online,
             "new sites start offline"
         );
+        assert_eq!(
+            a.mesh.site("site2").unwrap().uplink.as_deref(),
+            Some("site1"),
+            "a client of the inviting site"
+        );
+        assert!(a.changed);
     }
 
     #[test]
@@ -392,7 +441,66 @@ mod tests {
         // With its host name it joins as the site that has its address.
         let by_host = add_site(&first.mesh, "site1", "wanderlan", true, NEW, &none()).unwrap();
         assert!(!by_host.added);
+        assert!(!by_host.changed);
         assert_eq!(by_host.name, "site2");
+    }
+
+    #[test]
+    fn a_client_joining_again_through_another_site_hangs_off_that_site() {
+        // site1 and site3 are servers, site2 a client of site1.
+        let mut base = add_site(&mesh(), "site1", "site2", false, NEW, &none())
+            .unwrap()
+            .mesh;
+        base.sites.push(Site {
+            name: "site3".into(),
+            address: Ipv4Addr::new(10, 13, 0, 105),
+            vlans: None,
+            online: true,
+            managed_by: None,
+            self_managed: false,
+            uplink: None,
+        });
+        let moved = add_site(&base, "site3", "site2", false, NEW, &none()).unwrap();
+        assert!(!moved.added && moved.changed);
+        assert_eq!(moved.mesh.revision, base.revision + 1);
+        let site2 = moved.mesh.site("site2").unwrap();
+        assert_eq!(site2.uplink.as_deref(), Some("site3"));
+        assert_eq!(
+            site2.managed_by.as_deref(),
+            Some("site1"),
+            "the manager stays"
+        );
+
+        // A server joining again stays a server.
+        let server = add_site(
+            &base,
+            "site3",
+            "site1",
+            false,
+            Ipv4Addr::new(10, 13, 0, 103),
+            &none(),
+        )
+        .unwrap();
+        assert!(!server.changed);
+        assert_eq!(server.mesh.site("site1").unwrap().uplink, None);
+
+        // Never off one of its own clients.
+        let mut chain = base.clone();
+        chain.sites.push(Site {
+            name: "site4".into(),
+            address: Ipv4Addr::new(10, 13, 0, 106),
+            vlans: None,
+            online: true,
+            managed_by: None,
+            self_managed: false,
+            uplink: Some("site2".into()),
+        });
+        let no_loop = add_site(&chain, "site4", "site2", false, NEW, &none()).unwrap();
+        assert!(!no_loop.changed);
+        assert_eq!(
+            no_loop.mesh.site("site2").unwrap().uplink.as_deref(),
+            Some("site1")
+        );
     }
 
     #[test]

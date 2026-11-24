@@ -144,6 +144,22 @@ pub enum Command {
         #[arg(long)]
         confirm: bool,
     },
+    /// Make a site a server (connected with the other servers) or a client
+    /// of another site (its only tunnel leads there).
+    ///
+    /// Examples: `wanderlan role marcel client alex`, `wanderlan role dc server`.
+    Role {
+        /// The site.
+        site: String,
+        /// "server" or "client".
+        #[arg(value_parser = ["server", "client"])]
+        role: String,
+        /// For "client": the site it is plugged into.
+        uplink: Option<String>,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Bridge the tunnel to a site with a trunk of its own (a segment of its
     /// own on this site), or with the default trunk again ("default").
     Trunk {
@@ -299,6 +315,37 @@ pub async fn run(args: Args) -> Result<ExitCode> {
         Some(Command::Online { site, confirm }) => set_online(&socket, &site, true, confirm).await,
         Some(Command::Offline { site, confirm }) => {
             set_online(&socket, &site, false, confirm).await
+        }
+        Some(Command::Role {
+            site,
+            role,
+            uplink,
+            confirm,
+        }) => {
+            let uplink = match (role.as_str(), uplink) {
+                ("server", None) => None,
+                ("server", Some(_)) => bail!("a server has no uplink"),
+                (_, Some(up)) => Some(up),
+                (_, None) => {
+                    bail!("name the site it is a client of: wanderlan role {site} client <site>")
+                }
+            };
+            edit_site(&socket, &site, confirm, |entry, _| {
+                if entry.uplink == uplink {
+                    return Err(format!(
+                        "{} is already a {}.",
+                        entry.name,
+                        role_text(uplink.as_deref())
+                    ));
+                }
+                entry.uplink.clone_from(&uplink);
+                Ok(format!(
+                    "{} is a {}",
+                    entry.name,
+                    role_text(uplink.as_deref())
+                ))
+            })
+            .await
         }
         Some(Command::Trunk {
             site,
@@ -804,9 +851,15 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
         println!("{}", serde_json::to_string_pretty(&st)?);
         return Ok(ExitCode::SUCCESS);
     }
+    let own_uplink = st
+        .sites
+        .iter()
+        .find(|s| s.is_self)
+        .and_then(|s| s.uplink.as_deref());
     match &st.site {
         Some(site) => println!(
-            "Site {site}{}, address {}, trunk {}, VLANs {}",
+            "Site {site} ({}){}, address {}, trunk {}, VLANs {}",
+            role_text(own_uplink),
             if st.online { "" } else { " (OFFLINE)" },
             st.address.as_deref().unwrap_or("?"),
             st.trunk.as_deref().unwrap_or("?"),
@@ -832,6 +885,26 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
             st.invites
         );
     }
+    if !st.sites.is_empty() {
+        println!("\n{:<12} {:<15} {:<18} LINK", "SITE", "ADDRESS", "ROLE");
+        for s in &st.sites {
+            let link = if s.is_self {
+                "this site".to_string()
+            } else if let Some(hop) = &s.via {
+                format!("via {hop}")
+            } else if s.direct {
+                "tunnel".to_string()
+            } else {
+                "-".to_string()
+            };
+            println!(
+                "{:<12} {:<15} {:<18} {link}",
+                s.name,
+                s.address,
+                role_text(s.uplink.as_deref())
+            );
+        }
+    }
     if st.peers.is_empty() {
         return Ok(ExitCode::SUCCESS);
     }
@@ -856,6 +929,11 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `server`, or `client of <uplink>`.
+fn role_text(uplink: Option<&str>) -> String {
+    uplink.map_or_else(|| "server".to_string(), |u| format!("client of {u}"))
 }
 
 fn short(fingerprint: &str) -> &str {

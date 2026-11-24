@@ -236,6 +236,16 @@ impl Form {
                 choices,
                 &current,
             ),
+            Field::choice(
+                "uplink",
+                "Connected to",
+                "a client has one tunnel, to its server; servers connect with each other",
+                connection_choices(draft, existing.map(|s| s.name.as_str())),
+                &match existing {
+                    Some(s) => connection_value(s.uplink.as_deref()),
+                    None => connection_value(Some(&me)),
+                },
+            ),
         ];
         Self::new(FormKind::Site(index), title, fields, draft)
     }
@@ -270,7 +280,11 @@ impl Form {
                 "only this site",
             ),
         ];
-        Self::new(FormKind::Invite, "Invite a new site", fields, draft)
+        let title = match draft.local.self_name.as_deref() {
+            Some(me) => format!("Invite a new site (it becomes a client of {me})"),
+            None => "Invite a new site".to_string(),
+        };
+        Self::new(FormKind::Invite, title, fields, draft)
     }
 
     /// The rules of an invitation form.
@@ -622,12 +636,14 @@ impl Form {
             FormKind::Site(index) => {
                 let site = self.parse_site()?;
                 let (managed_by, self_managed) = parse_changes(&self.value("changes"));
+                let uplink = parse_connection(&self.value("uplink"));
                 match index.and_then(|i| candidate.mesh.sites.get_mut(i)) {
                     Some(slot) => {
                         let mut site = site;
                         site.online = slot.online;
                         site.managed_by = managed_by;
                         site.self_managed = self_managed;
+                        site.uplink = uplink;
                         let old = std::mem::replace(slot, site.clone());
                         if old.name != site.name {
                             candidate.rename_references(&old.name, &site.name);
@@ -636,6 +652,7 @@ impl Form {
                     None => candidate.mesh.sites.push(Site {
                         managed_by,
                         self_managed,
+                        uplink,
                         ..site
                     }),
                 }
@@ -758,6 +775,7 @@ impl Form {
             vlans,
             online: false,
             managed_by: candidate.local.self_name.clone(),
+            uplink: candidate.local.self_name.clone(),
             self_managed: false,
         });
         if let Some(shared) = native {
@@ -820,6 +838,7 @@ impl Form {
             online: true,
             managed_by: None,
             self_managed: false,
+            uplink: None,
         })
     }
 
@@ -965,6 +984,32 @@ pub fn trunk_candidates(interfaces: &[Interface]) -> Vec<&Interface> {
     list
 }
 
+/// The "Connected to" choice of a server.
+const SERVER: &str = "server (with the other servers)";
+
+/// Choices of the "Connected to" field: server, or client of another site.
+fn connection_choices(draft: &Draft, site: Option<&str>) -> Vec<String> {
+    let mut choices = vec![SERVER.to_string()];
+    choices.extend(
+        draft
+            .mesh
+            .sites
+            .iter()
+            .filter(|s| Some(s.name.as_str()) != site)
+            .map(|s| format!("client of {}", s.name)),
+    );
+    choices
+}
+
+fn connection_value(uplink: Option<&str>) -> String {
+    uplink.map_or_else(|| SERVER.to_string(), |u| format!("client of {u}"))
+}
+
+/// The uplink from a "Connected to" choice.
+fn parse_connection(value: &str) -> Option<String> {
+    value.strip_prefix("client of ").map(str::to_string)
+}
+
 /// The "Changes" choice that lets every site change a site.
 const ANY_SITE: &str = "any site";
 
@@ -1050,7 +1095,7 @@ mod tests {
         let form = Form::site(&d, None);
         assert_eq!(
             form.fields.iter().map(|f| f.key).collect::<Vec<_>>(),
-            ["name", "address", "vlans", "changes"]
+            ["name", "address", "vlans", "changes", "uplink"]
         );
         assert_eq!(form.value("changes"), "only heim", "managed by this site");
         // Empty required fields are errors, but hidden until touched.
@@ -1092,6 +1137,33 @@ mod tests {
         let neu = candidate.mesh.site("neu").unwrap();
         assert_eq!(neu.managed_by.as_deref(), Some("heim"));
         assert!(!neu.self_managed);
+    }
+
+    #[test]
+    fn the_connected_to_field_makes_servers_and_clients() {
+        let d = draft();
+        let haus6 = d.mesh.sites.iter().position(|s| s.name == "haus6").unwrap();
+        let form = Form::site(&d, Some(haus6));
+        assert_eq!(form.value("uplink"), "client of heim");
+        let buero = Form::site(&d, Some(1));
+        assert_eq!(buero.value("uplink"), SERVER);
+        assert!(
+            !connection_choices(&d, Some("buero")).contains(&"client of buero".to_string()),
+            "never a client of itself"
+        );
+        assert_eq!(parse_connection(SERVER), None);
+        assert_eq!(parse_connection("client of heim"), Some("heim".into()));
+        // A new site is a client of this site unless chosen otherwise.
+        let mut form = Form::site(&d, None);
+        assert_eq!(form.value("uplink"), "client of heim");
+        type_text(&mut form, &d, "neu");
+        press(&mut form, &d, KeyCode::Tab);
+        type_text(&mut form, &d, "10.8.0.99");
+        let candidate = form.submit(&d).unwrap();
+        assert_eq!(
+            candidate.mesh.site("neu").unwrap().uplink.as_deref(),
+            Some("heim")
+        );
     }
 
     #[test]

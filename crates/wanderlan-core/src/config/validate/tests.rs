@@ -436,6 +436,77 @@ fn mesh_model_validation_without_text() {
     assert_eq!(diags[0].line, None);
 }
 
+const CLIENTS: &str = r#"
+[mesh]
+
+[[site]]
+name = "alex"
+address = "10.13.0.103"
+
+[[site]]
+name = "marcel"
+address = "10.0.10.5"
+managed_by = "alex"
+
+[[site]]
+name = "site2"
+address = "10.13.0.104"
+uplink = "alex"
+"#;
+
+#[test]
+fn uplinks_make_clients_and_old_configurations_are_migrated() {
+    let mesh = parse_mesh(CLIENTS).unwrap().mesh.unwrap();
+    // No `uplink`, but invited by alex: a client of alex.
+    assert_eq!(mesh.site("marcel").unwrap().uplink.as_deref(), Some("alex"));
+    assert_eq!(mesh.site("site2").unwrap().uplink.as_deref(), Some("alex"));
+    assert_eq!(mesh.site("alex").unwrap().uplink, None);
+    // Written explicitly from now on; the canonical form reads back the same.
+    let text = render_mesh(&mesh);
+    assert_eq!(text.matches("uplink = \"alex\"").count(), 2, "{text}");
+    assert_eq!(parse_mesh(&text).unwrap().mesh.unwrap(), mesh);
+    // A server with a manager stays a server: `uplink = ""`.
+    let mut server = mesh.clone();
+    server.sites[1].uplink = None;
+    let text = render_mesh(&server);
+    assert!(text.contains("uplink = \"\""), "{text}");
+    assert_eq!(parse_mesh(&text).unwrap().mesh.unwrap(), server);
+}
+
+#[test]
+fn uplinks_must_lead_to_a_server() {
+    let local = "self = \"alex\"\ntrunk = \"ens19\"\n";
+    let unknown = CLIENTS.replace("uplink = \"alex\"", "uplink = \"nowhere\"");
+    let err = single_error(&unknown, local);
+    assert!(
+        err.message.contains("uplink \"nowhere\" is not a site"),
+        "{err}"
+    );
+    assert_eq!(
+        err.line,
+        Some(line_of(&unknown, "name = \"site2\"", "uplink"))
+    );
+    let itself = CLIENTS.replace("uplink = \"alex\"", "uplink = \"site2\"");
+    assert!(
+        single_error(&itself, local)
+            .message
+            .contains("uplink is the site itself")
+    );
+    let looped = CLIENTS
+        .replace("uplink = \"alex\"", "uplink = \"marcel\"")
+        .replace(
+            "managed_by = \"alex\"",
+            "managed_by = \"alex\"\nuplink = \"site2\"",
+        );
+    let errs = errors(&looped, local);
+    assert!(
+        errs.iter().any(|e| e
+            .message
+            .contains("uplinks form a loop: marcel -> site2 -> marcel")),
+        "{errs:#?}"
+    );
+}
+
 #[test]
 fn a_tunnel_can_have_its_own_trunk() {
     let local = "self = \"haus2\"\ntrunk = \"ens19\"\n\n[tunnels.heim]\ntrunk = \"ens20\"\n";

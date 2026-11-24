@@ -15,15 +15,17 @@ Clients ─ trunk ─ br0 ─┬─ gt-<peer1> ─┐
                        └─ gt-<peer2> ─┴─ existing VPN / transport network
 ```
 
-* one GRETAP tunnel `gt-<peer>` to every other site, between the site
-  addresses,
+* servers and clients: the servers are connected with each other, every
+  other site is a client plugged into the site that invited it (one GRETAP
+  tunnel `gt-<peer>` per connection, between the site addresses),
 * a Linux bridge `br0` with VLAN filtering (STP off) with the local trunk and
   all tunnels as ports,
 * VLANs per site (like the allowed VLANs of a switch port) and VLAN mappings
   per site (untagged → VLAN, VLAN → VLAN),
 * joining with an invitation code: `wanderlan join <address> <code>`,
 * TCP MSS clamping from measured path MTUs, GRE fragmentation as safety net,
-* loop protection (split horizon plus a loop guard),
+* loop protection (split horizon between servers, a tree below them, plus a
+  loop guard),
 * changes with automatic rollback unless confirmed,
 * automatic synchronisation of the shared configuration between all sites,
 * an interactive terminal UI (`wanderlan`) and a daemon (`wanderland`).
@@ -62,9 +64,26 @@ routers; wanderlan neither assigns addresses in the VLANs nor routes.
   `act_gact`, `nf_tables` (all part of the standard kernels; the package loads
   them at boot).
 
-All sites are equal: every site has a tunnel to every other site, so **every
-site must reach every other site** in the transport network (with a VPN
-server in the middle: routing between the VPN clients must be allowed).
+**Servers and clients.** The first site is a **server**. A site that joins
+with an invitation is a **client** of the site that invited it, like a cable
+plugged into a switch: its only tunnel leads there, so **a client only has to
+reach that site** in the transport network. Servers are connected with each
+other, so servers must reach each other. Whether two sites exchange traffic
+is decided by the VLANs alone: every tunnel carries the VLANs both of its
+ends take part in, so two clients meet only in a VLAN that they and their
+server all have; there is no tunnel between clients.
+
+```
+        alex (server, VLANs all)
+       /                        \
+  marcel (client of alex)     site2 (client of alex)
+  VLAN 15                     VLAN 13
+```
+
+A site can be made a server or the client of another site later (TUI: Sites,
+`Enter`, "Connected to"; CLI: `wanderlan role <site> server|client <site>`;
+`mesh.toml`: `uplink = "<site>"`). Every view shows the role (`server`,
+`client of alex`); sites without a tunnel from here show `via alex`.
 
 ## Installation
 
@@ -126,9 +145,11 @@ sudo wanderlan join 10.8.0.1 K7F3Q-9QX2M
 The new site gets its name from the host name (`--name` to choose one),
 picks the trunk automatically (`--trunk` if there is more than one
 candidate), and receives the configuration of the network; the inviting site
-adds it with the address the request came from. Both sides confirm
-automatically as soon as they reach each other, and all other sites build
-their tunnel to the new site through the configuration sync. In the TUI the
+adds it with the address the request came from, as its client. Both sides
+confirm automatically as soon as they reach each other; the other sites
+learn about the new site through the configuration sync (they need no tunnel
+to it). A client that joins again through another site (e.g. after a reset)
+becomes a client of that site. In the TUI the
 wizard offers the same as **Join an existing network**.
 
 A new site starts **offline**: its tunnels exist but stay down, while the
@@ -395,6 +416,7 @@ discards the draft, `?` shows all keys, `q` quits.
 | `wanderlan join <address>[:port] <code> [--name N] [--trunk IF]` | Join a network (on an unconfigured site) |
 | `wanderlan online <site> [--confirm]` / `wanderlan offline <site> [--confirm]` | Take a site online (its tunnels come up) or offline |
 | `wanderlan manage <site> [--by S \| --anyone] [--self-managed yes\|no] [--confirm]` | Who may change a site's VLANs, mappings and online state |
+| `wanderlan role <site> server\|client <site> [--confirm]` | Make a site a server or the client of another site |
 | `wanderlan trunk <site> <interface\|default> [--confirm]` | Give the tunnel to a site a trunk of its own (a segment of its own here), or the default trunk again |
 | `wanderlan reset [--yes]` | Remove everything wanderlan set up on this site; unconfigured again |
 
@@ -406,11 +428,12 @@ On each site the daemon creates, and removes again when it stops:
 
 * `br0`: bridge, `vlan_filtering 1`, STP off, no default VLAN, no
   netfilter calls; marked with the interface alias `wanderlan`;
-* `gt-<peer>` for every other site: GRETAP from the own to the peer's
-  address, `ignore-df`, `nopmtudisc`, MTU 1500, marked with the alias
-  `wanderlan`; all tunnel ports are `isolated` (split horizon: isolated ports
-  do not forward to each other, so a frame from one site only reaches the
-  trunk of the other sites and never circles);
+* `gt-<peer>` to its uplink, its clients and, on a server, every other
+  server: GRETAP from the own to the peer's address, `ignore-df`,
+  `nopmtudisc`, MTU 1500, marked with the alias `wanderlan`; the ports
+  between servers are `isolated` (split horizon: a frame from one server is
+  never forwarded to another server), the ports of clients and uplinks are
+  ordinary ports (a tree, loop-free by itself);
 * the VLANs of the site on the trunk; on each tunnel the VLANs both sites
   take part in;
 * tc `clsact` filters on the trunk for translations (recognised by their
@@ -488,12 +511,13 @@ Deviations from the original specification, and why:
 * **Automatic configuration sync** (also a project decision), see above.
   Every site may change the mesh; trust between the sites is implied by the
   shared layer 2.
-* **No hubs and spokes** (since 0.2, a project decision: "like a switch you
-  plug a cable into"). Every site has a tunnel to every other site and all
-  tunnel ports are isolated (split horizon). This needs every site to reach
-  every other site in the transport network, but there is nothing to decide
-  per site except its VLANs. The loop guard also watches trunk-to-tunnel
-  moves, the typical sign of a loop through two sites' LANs.
+* **Servers and clients instead of hubs and spokes** (project decision: "like
+  a switch you plug a cable into"). Roles are not configured up front: a
+  site that joins is a client of the site that invited it and only has to
+  reach that site; servers form a mesh with split horizon. Clients never get
+  a tunnel to each other; the VLANs decide who meets whom. The loop guard
+  also watches trunk-to-tunnel moves, the typical sign of a loop through two
+  sites' LANs.
 * **Who may change a site** (project decision): the inviting site manages
   the sites it invited (`managed_by`), unless it allows them to manage
   themselves. Every wanderland enforces this for changes made on it (TUI,

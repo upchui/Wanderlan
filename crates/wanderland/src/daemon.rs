@@ -955,7 +955,7 @@ impl Controller {
             }
         };
         let via = confirmed.self_name().to_string();
-        if !admission.added {
+        if !admission.changed {
             if let Err(e) = self.invites.remove(&invite.code) {
                 warn!("{e:#}");
             }
@@ -975,6 +975,13 @@ impl Controller {
         }
         let mesh = render_mesh(&admission.mesh);
         let site = admission.name;
+        if !admission.added {
+            self.events.emit(
+                Level::Info,
+                Some(&site),
+                format!("Site \"{site}\" joins again through this site and becomes a client of it"),
+            );
+        }
         let cfg = Config {
             mesh: admission.mesh,
             local: confirmed.local.clone(),
@@ -1717,6 +1724,8 @@ impl Controller {
                 online: s.online,
                 is_self: s.name == cfg.self_name(),
                 direct: direct.contains(s.name.as_str()),
+                uplink: s.uplink.clone(),
+                via: topology::via(&cfg.mesh, cfg.self_name(), &s.name).map(str::to_string),
             })
             .collect();
         let trunks: Vec<PortTraffic> = desired

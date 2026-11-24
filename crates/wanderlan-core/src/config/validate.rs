@@ -28,6 +28,7 @@ pub fn validate(mesh: &Mesh, local: Option<&Local>) -> Vec<Diagnostic> {
     let mut v = Validator::default();
     v.mesh_settings(mesh);
     v.sites(mesh);
+    v.uplinks(mesh);
     v.maps(mesh);
     if let Some(local) = local.filter(|l| l.is_configured()) {
         v.local(mesh, local);
@@ -181,6 +182,51 @@ impl Validator {
                     FieldPath::site_field(i, "vlans"),
                     format!("site \"{name}\": vlans must contain at least one VLAN"),
                 );
+            }
+        }
+    }
+
+    /// Every uplink names another site, and following the uplinks always
+    /// ends at a server (no loop).
+    fn uplinks(&mut self, mesh: &Mesh) {
+        for (i, site) in mesh.sites.iter().enumerate() {
+            let Some(up) = site.uplink.as_deref() else {
+                continue;
+            };
+            let path = FieldPath::site_field(i, "uplink");
+            if up == site.name {
+                self.error(
+                    path,
+                    format!("site \"{}\": uplink is the site itself", site.name),
+                );
+                continue;
+            }
+            if mesh.site(up).is_none() {
+                self.error(
+                    path,
+                    format!(
+                        "site \"{}\": uplink \"{up}\" is not a site of the network",
+                        site.name
+                    ),
+                );
+                continue;
+            }
+            // Follow the chain; a loop is reported at each of its sites.
+            let mut chain = vec![site.name.as_str()];
+            let mut current = up;
+            loop {
+                if chain.contains(&current) {
+                    if chain.first() == Some(&current) {
+                        chain.push(current);
+                        self.error(path, format!("uplinks form a loop: {}", chain.join(" -> ")));
+                    }
+                    break;
+                }
+                chain.push(current);
+                match mesh.site(current).and_then(|s| s.uplink.as_deref()) {
+                    Some(next) => current = next,
+                    None => break,
+                }
             }
         }
     }

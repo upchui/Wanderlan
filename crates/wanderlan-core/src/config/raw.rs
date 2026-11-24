@@ -62,6 +62,7 @@ struct RawSite {
     online: Option<Spanned<bool>>,
     managed_by: Option<Spanned<String>>,
     self_managed: Option<Spanned<bool>>,
+    uplink: Option<Spanned<String>>,
     /// Since 0.2 there are no roles; read and ignored with a warning.
     role: Option<Spanned<String>>,
     /// Since 0.2 there are no hubs; read and ignored with a warning.
@@ -227,13 +228,29 @@ pub fn parse_mesh(text: &str) -> Result<ParsedMesh, Vec<Diagnostic>> {
         Some(section) => lower_section(&mut lw, section, &mut mesh),
     }
 
+    let mut uplink_missing = Vec::new();
     for (i, raw_site) in raw.site.into_iter().enumerate() {
         let path = FieldPath::site(i);
-        if let Some(site) = lw
+        if let Some((site, given)) = lw
             .take(&path, Some(raw_site))
             .and_then(|s| lower_site(&mut lw, i, s))
         {
+            if !given {
+                uplink_missing.push(mesh.sites.len());
+            }
             mesh.sites.push(site);
+        }
+    }
+    // Configurations from before uplinks: a site that joined with an
+    // invitation (it has a manager) hangs off that site.
+    for i in uplink_missing {
+        let manager = mesh.sites.get(i).and_then(|s| s.managed_by.clone());
+        if let Some(m) = manager
+            && mesh.site(&m).is_some()
+            && mesh.sites.get(i).is_some_and(|s| s.name != m)
+            && let Some(site) = mesh.sites.get_mut(i)
+        {
+            site.uplink = Some(m);
         }
     }
     for (i, raw_map) in raw.map.into_iter().enumerate() {
@@ -328,7 +345,8 @@ fn parse_vlans(vlans: RawVlans) -> Result<VlanSet, super::vlan::VlanSetError> {
     }
 }
 
-fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<Site> {
+/// Lowers one site; the flag tells whether `uplink` was given at all.
+fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
     let name_path = FieldPath::site_field(i, "name");
     let name = lw.take(&name_path, s.name);
     let addr_path = FieldPath::site_field(i, "address");
@@ -342,6 +360,12 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<Site> {
     let self_managed = lw
         .take(&FieldPath::site_field(i, "self_managed"), s.self_managed)
         .unwrap_or(false);
+    // `uplink = ""` marks a server explicitly.
+    let uplink_given = s.uplink.is_some();
+    let uplink = lw
+        .take(&FieldPath::site_field(i, "uplink"), s.uplink)
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty());
 
     let label = name
         .as_deref()
@@ -352,7 +376,7 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<Site> {
             lw.warning(
                 path,
                 format!(
-                    "{label}: `{field}` is no longer used and is ignored; every site now connects to every other site"
+                    "{label}: `{field}` is no longer used and is ignored; use `uplink` to make a site a client of another"
                 ),
             );
         }
@@ -382,14 +406,18 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<Site> {
             }
         });
 
-    Some(Site {
-        name: name?,
-        address: address?,
-        vlans,
-        online,
-        managed_by,
-        self_managed,
-    })
+    Some((
+        Site {
+            name: name?,
+            address: address?,
+            vlans,
+            online,
+            managed_by,
+            self_managed,
+            uplink,
+        },
+        uplink_given,
+    ))
 }
 
 fn lower_map(lw: &mut Lowering, i: usize, m: RawMap) -> Option<VlanMap> {

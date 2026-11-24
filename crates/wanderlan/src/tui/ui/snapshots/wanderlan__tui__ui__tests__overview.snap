@@ -1,10 +1,9 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 59
 expression: render(&connected())
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
-" heim  address 10.8.0.1  trunk ens19  VLANs 10-50                               "
+" heim  server  address 10.8.0.1  trunk ens19  VLANs 10-50                       "
 " state running  mesh revision 7 (3f2a9c1b04de)  daemon 0.1.0                    "
 " tunnels in 1.4Mbit/s  out 394.6kbit/s  (Enter: details)                        "
 " 1 open invitation(s)  (Sites: I)                                               "
@@ -18,12 +17,12 @@ expression: render(&connected())
 "│haus6        down    lost  -      -    -       0      0      0 -              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "┌ Network: 6 sites ────────────────────────────────────────────────────────────┐"
-"│SITE         ADDRESS         VLANS                LINK                        │"
-"│heim         10.8.0.1        10-50                this site                   │"
-"│buero        10.8.0.2        10-50                tunnel up                   │"
-"│haus2        10.8.0.11       20,30                tunnel BLOCKED              │"
-"│haus3        10.8.0.12       10-50                tunnel up                   │"
-"│haus5        10.8.0.15       10-50                tunnel up                   │"
+"│SITE         ADDRESS         VLANS        ROLE              LINK              │"
+"│heim         10.8.0.1        10-50        server            this site         │"
+"│buero        10.8.0.2        10-50        server            tunnel up         │"
+"│haus2        10.8.0.11       20,30        server            tunnel BLOCKED    │"
+"│haus3        10.8.0.12       10-50        server            tunnel up         │"
+"│haus5        10.8.0.15       10-50        server            tunnel up         │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "                                                     draft: no changes  heim r7 "
 " Enter  details   u  unblock   p  probe MTU   1-7  views   ?  help   q  quit    "

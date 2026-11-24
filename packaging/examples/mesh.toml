@@ -8,9 +8,11 @@
 #
 # wanderlan does not build a VPN. Every site must already be reachable at its
 # `address` through an existing transport network, usually a VPN set up
-# beforehand (WireGuard, IPsec, a provider network, ...), and all sites must
-# reach each other there. Together the sites act as one virtual switch with a
-# GRETAP tunnel between every two sites.
+# beforehand (WireGuard, IPsec, a provider network, ...). Sites without
+# `uplink` are servers: they are connected with each other and must reach
+# each other there. A site with `uplink` is a client of that site: its only
+# GRETAP tunnel leads there (sites that join with an invitation become
+# clients of the inviting site).
 
 [mesh]
 vlans = "10-50"               # VLANs of every site that does not list its own
@@ -34,6 +36,7 @@ vlans = "20,30"               # haus2 only takes part in VLANs 20 and 30
 [[site]]
 name = "haus3"
 address = "10.8.0.12"
+# uplink = "heim"             # would make haus3 a client of heim
 
 # Untagged traffic on the trunk of haus3 belongs to shared VLAN 20.
 [[map]]

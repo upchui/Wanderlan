@@ -444,6 +444,7 @@ impl Wizard {
             online: true,
             managed_by: None,
             self_managed: false,
+            uplink: None,
         });
         let local = Local {
             self_name: Some(name),

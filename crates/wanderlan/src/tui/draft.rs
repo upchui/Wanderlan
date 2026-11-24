@@ -184,6 +184,9 @@ impl Draft {
             if site.managed_by.as_deref() == Some(old) {
                 site.managed_by = Some(new.to_string());
             }
+            if site.uplink.as_deref() == Some(old) {
+                site.uplink = Some(new.to_string());
+            }
         }
         if self.local.self_name.as_deref() == Some(old) {
             self.local.self_name = Some(new.to_string());

@@ -89,8 +89,16 @@ check "site5 has its address from the connection" \
   test "$(jqs site2 '.sites[] | select(.name == "site5") | .address')" = 10.100.13.10
 check "the invitation is used up" x site2 "! wanderlan invite list | grep -q '$code1'"
 check "site2's log tells who joined" x site2 "wanderlan log | grep -q 'Site \"site5\" joined the network'"
-wait_for 30 "site5 has tunnels to all four other sites" \
-  x site5 "[ \"\$(ip -j link show master br0 | jq '[.[].ifname | select(startswith(\"gt-\"))] | length')\" = 4 ]"
+wait_for 30 "site5 is a client of site2: its only tunnel leads there" \
+  x site5 "[ \"\$(ip -j link show master br0 | jq -r '[.[].ifname | select(startswith(\"gt-\"))] | join(\" \")')\" = gt-site2 ]"
+check "the mesh says so (uplink)" \
+  test "$(x site2 "grep -A8 'name = \"site5\"' /etc/wanderlan/mesh.toml | grep -c 'uplink = \"site2\"'")" = 1
+check "site1 shows site5 as a client of site2, reached via site2" \
+  test "$(jqs site1 '.sites[] | select(.name == "site5") | "\(.uplink) \(.via) \(.direct)"')" = "site2 site2 false"
+check "site1 and site3 have no tunnel to site5" \
+  x site1 "! ip link show gt-site5 2>/dev/null" && x site3 "! ip link show gt-site5 2>/dev/null"
+check "the client port at site2 is not isolated, the server ports are" \
+  x site2 "bridge -d link show dev gt-site5 | grep -q 'isolated off' && bridge -d link show dev gt-site1 | grep -q 'isolated on'"
 check "site5 got the rules of the invitation (untagged is VLAN 20)" \
   test "$(vlan_summary site5 trunk0)" = "10-19,20:pu,21-50"
 check "site5 is managed by site2" \
@@ -114,18 +122,35 @@ else
   fail "unexpected output when site1 changes site5: $out"
 fi
 check "site2 takes site5 online" x site2 "wanderlan online site5 --confirm"
-wait_for 30 "the tunnel to site5 is up at site1" \
-  x site1 "ip -j link show gt-site5 | jq -e '.[0].flags | index(\"UP\")'"
-expect_ping c-site5 10.20.0.1 "VLAN 20: the new site reaches site1's client"
-expect_ping c-site3 10.20.0.13 "VLAN 20: site3's client reaches the new site"
+wait_for 30 "the tunnel to site5 is up at site2" \
+  x site2 "ip -j link show gt-site5 | jq -e '.[0].flags | index(\"UP\")'"
+expect_ping c-site5 10.20.0.1 "VLAN 20: the new site reaches site1's client (through site2)"
+expect_ping c-site3 10.20.0.13 "VLAN 20: site3's client reaches the new site (through site2)"
+
+# Only VLANs: a VLAN that site2 does not take part in does not pass it,
+# even if site1 and site5 have it.
+client_vlan c-site1 45 10.45.0.1/24
+client_vlan c-site5 45 10.45.0.13/24
+expect_ping c-site5 10.45.0.1 "VLAN 45: site5 reaches site1 while site2 has VLAN 45"
+x site2 "sed '/^name = \"site2\"\$/a vlans = \"10-40\"' /etc/wanderlan/mesh.toml > /tmp/site2-vlans.toml"
+check "site2 limits itself to VLANs 10-40" \
+  x site2 "wanderlan apply --mesh /tmp/site2-vlans.toml >/dev/null && wanderlan confirm >/dev/null"
+wait_eq 30 "the tunnel site2-site5 no longer carries VLAN 45" "10-40" vlan_summary site2 gt-site5
+expect_no_ping c-site5 10.45.0.1 "VLAN 45: no way from site5 to site1 without site2"
+x site2 "sed '/^name = \"site2\"\$/{n;/^vlans = \"10-40\"\$/d;}' /etc/wanderlan/mesh.toml > /tmp/site2-all.toml"
+check "site2 takes part in all VLANs again" \
+  x site2 "wanderlan apply --mesh /tmp/site2-all.toml >/dev/null && wanderlan confirm >/dev/null"
+expect_ping c-site5 10.45.0.1 "VLAN 45: site5 reaches site1 again"
+client_vlan_del c-site1 45
+client_vlan_del c-site5 45
 x site2 "wl-daemon stop; wl-daemon start"
 wait_for 30 "site2 is running again" x site2 "wanderlan status --json | jq -e '.state == \"running\"'"
 check "site5 stays online across a restart" \
   test "$(jqs site2 '.sites[] | select(.name == "site5") | .online')" = true
 expect_ping c-site5 10.20.0.2 "VLAN 20: site5 reaches site2's client after the restart"
 check "site2 takes site5 offline again" x site2 "wanderlan offline site5 --confirm"
-wait_for 30 "the tunnel to site5 is down at site3" \
-  x site3 "ip -j link show gt-site5 | jq -e '.[0].flags | index(\"UP\") | not'"
+wait_for 30 "the tunnel to site5 is down at site2" \
+  x site2 "ip -j link show gt-site5 | jq -e '.[0].flags | index(\"UP\") | not'"
 check "and online again" x site2 "wanderlan online site5 --confirm"
 expect_ping c-site5 10.20.0.1 "VLAN 20: traffic flows again"
 
@@ -162,8 +187,8 @@ fi
 rev=$(jqs site2 .revision)
 wait_eq 60 "site5 has revision $rev" "$rev" jqs site5 .revision
 check "now site5 takes itself offline" x site5 "wanderlan offline site5 --confirm"
-wait_for 30 "the tunnel to site5 is down at site1" \
-  x site1 "ip -j link show gt-site5 | jq -e '.[0].flags | index(\"UP\") | not'"
+wait_for 30 "the tunnel to site5 is down at site2" \
+  x site2 "ip -j link show gt-site5 | jq -e '.[0].flags | index(\"UP\") | not'"
 check "and online again" x site5 "wanderlan online site5 --confirm"
 expect_ping c-site5 10.20.0.1 "VLAN 20: traffic flows again"
 rev=$(jqs site5 .revision)
@@ -202,7 +227,11 @@ if grep -q 'Done: "site5" is part of the network' <<<"$out"; then
 else
   fail "unexpected join output: $out"
 fi
-check "the mesh is unchanged (site5 was still listed)" test "$(jqs site1 .revision)" = "$rev"
+check "site5 is a client of site1 now (it joined through site1)" \
+  test "$(jqs site1 '"\(.revision) \(.sites[] | select(.name == "site5") | .uplink)"')" = "$((rev + 1)) site1"
+wait_for 30 "site5's only tunnel leads to site1" \
+  x site5 "[ \"\$(ip -j link show master br0 | jq -r '[.[].ifname | select(startswith(\"gt-\"))] | join(\" \")')\" = gt-site1 ]"
+wait_for 30 "site2 has no tunnel to site5 any more" x site2 "! ip link show gt-site5 2>/dev/null"
 check "site1's invitation is used up" x site1 "wanderlan invite list | grep -q 'No open invitations'"
 check "site5 is still online (the state is kept)" \
   test "$(jqs site1 '.sites[] | select(.name == "site5") | .online')" = true

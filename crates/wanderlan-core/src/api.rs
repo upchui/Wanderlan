@@ -506,6 +506,13 @@ pub struct SiteSummary {
     pub is_self: bool,
     /// True if there is a tunnel to this site.
     pub direct: bool,
+    /// The site it is a client of; `None` for a server.
+    #[serde(default)]
+    pub uplink: Option<String>,
+    /// For sites without a tunnel from here: the neighbour traffic to it
+    /// passes ("via alex").
+    #[serde(default)]
+    pub via: Option<String>,
 }
 
 /// Result of [`Request::Status`].

@@ -111,6 +111,11 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// The role of a site: `server`, or `client of <uplink>`.
+pub fn role(uplink: Option<&str>) -> String {
+    uplink.map_or_else(|| "server".to_string(), |u| format!("client of {u}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

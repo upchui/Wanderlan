@@ -118,6 +118,25 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
 - Sites added by hand are managed by the site that added them (field
   "Changes").
 
+### Servers and clients
+
+- A site that joins with an invitation is a client of the site that invited
+  it (`[[site]] uplink = "alex"`): its only tunnel leads there, so it only
+  has to reach that site. Sites without uplink are servers, connected with
+  each other as before (split horizon). Clients have no tunnel to each other;
+  every tunnel carries the VLANs both ends take part in, so two clients meet
+  only in a VLAN they and their server share.
+- Configurations without `uplink`: a site with a manager (`managed_by`)
+  becomes a client of it. Update all sites: older 0.2 builds refuse the new
+  key.
+- Visible everywhere: column ROLE (`server`, `client of alex`) in Sites and
+  in the overview, the own role in the overview header and in Settings
+  (with its clients), `via alex` for sites without a tunnel from here, also
+  in `wanderlan status`. Change it in the site form ("Connected to") or with
+  `wanderlan role <site> server|client <site>`.
+- A client that joins again through another site becomes a client of that
+  site.
+
 ### Trunk per tunnel
 
 - A tunnel can have a trunk of its own (`local.toml`: `[tunnels.<site>]
