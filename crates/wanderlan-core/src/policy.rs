@@ -56,13 +56,14 @@ pub fn manager<'a>(mesh: &Mesh, site: &'a Site) -> Option<&'a str> {
 }
 
 /// The site that manages `editor` if `editor` is restricted (joined with an
-/// invitation and not allowed to manage itself).
+/// invitation and not allowed to manage itself). A site that is managed by
+/// itself ("only alex may change alex") is never restricted.
 pub fn restricted_by<'a>(mesh: &'a Mesh, editor: &str) -> Option<&'a str> {
     let site = mesh.site(editor)?;
     if site.self_managed {
         return None;
     }
-    manager(mesh, site)
+    manager(mesh, site).filter(|m| *m != editor)
 }
 
 /// True if `editor` may change the rules of `site` in `mesh`.
@@ -393,5 +394,25 @@ mod tests {
             err.contains("may not change the own VLANs of site \"c\""),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_site_managed_by_itself_is_not_restricted() {
+        let mut old = mesh();
+        old.sites[0].managed_by = Some("a".into());
+        assert_eq!(restricted_by(&old, "a"), None);
+        assert!(may_change_network_vlans(&old, "a"));
+        let mut new = old.clone();
+        new.vlans = VlanSet::from_range(10, 20);
+        new.sites[0].vlans = Some(VlanSet::from_range(10, 10));
+        new.sites[2].online = false;
+        assert!(
+            check_edit(&old, &new, "a").is_ok(),
+            "network, itself, its clients"
+        );
+        // Others still may not change it.
+        let mut other = old.clone();
+        other.sites[0].online = false;
+        assert!(check_edit(&old, &other, "b").is_err());
     }
 }

@@ -117,6 +117,9 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
   who may change them) instead of creating an invitation without rules.
 - Sites added by hand are managed by the site that added them (field
   "Changes").
+- A site managed by itself ("only alex may change alex") is not
+  restricted: it changes the network's VLANs and its mappings as before
+  (it was shown read-only and its edits were refused).
 
 ### Servers and clients
 

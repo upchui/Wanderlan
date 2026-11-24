@@ -568,3 +568,41 @@ fn a_restricted_site_sets_its_own_vlans() {
         app.message
     );
 }
+
+/// The fixture app on a server that is managed by itself ("only heim").
+fn managed_by_itself() -> App {
+    let mut app = connected();
+    let mut texts = fixtures::config_texts();
+    let heim = "name = \"heim\"\naddress = \"10.8.0.1\"\n";
+    texts.mesh = texts
+        .mesh
+        .replace(heim, &format!("{heim}managed_by = \"heim\"\n"));
+    app.update(reply(Request::GetConfig, Reply::Config(texts)));
+    app
+}
+
+#[test]
+fn a_server_managed_by_itself_edits_vlans_and_mappings() {
+    let mut app = managed_by_itself();
+    assert_eq!(app.restricted_by(), None);
+    app.update(ch('3'));
+    app.update(ch('v'));
+    assert!(matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::Vlans));
+    app.update(key(KeyCode::Esc));
+    app.update(ch('n'));
+    assert!(matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::Map(None)));
+    // Site heim, local "native" (prefilled), shared VLAN 30.
+    app.update(key(KeyCode::Tab));
+    app.update(key(KeyCode::Tab));
+    for c in "30".chars() {
+        app.update(ch(c));
+    }
+    app.update(key(KeyCode::Enter));
+    assert!(app.modal.is_none(), "saved: {:?}", app.message);
+    app.update(ch('a'));
+    assert!(
+        matches!(app.modal, Some(Modal::Review(_))),
+        "{:?}",
+        app.message
+    );
+}
