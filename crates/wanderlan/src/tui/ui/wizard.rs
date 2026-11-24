@@ -6,13 +6,12 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use wanderlan_core::api::{Interface, SiteState};
-use wanderlan_core::config::Role;
 
 use super::titled;
 use crate::tui::app::App;
 use crate::tui::form::trunk_candidates;
 use crate::tui::input::TextInput;
-use crate::tui::wizard::{Step, Wizard};
+use crate::tui::wizard::{Mode, Step};
 use crate::tui::{format, theme};
 
 /// Column where input fields start.
@@ -72,9 +71,17 @@ impl Page {
 
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let w = &app.wizard;
-    let title = match w.step.number() {
-        Some(n) => format!(" Setup - step {n} of {}: {} ", Step::COUNT, w.step.title()),
-        None => format!(" Setup: {} ", w.step.title()),
+    let configured = app
+        .status
+        .as_ref()
+        .is_some_and(|s| s.state != SiteState::Unconfigured);
+    let title = if configured && w.step == Step::Welcome {
+        " Setup ".to_string()
+    } else {
+        match w.number() {
+            Some(n) => format!(" Setup - step {n} of {}: {} ", Step::COUNT, w.step.title()),
+            None => format!(" Setup: {} ", w.step.title()),
+        }
     };
     let block = titled(title);
     let inner = block.inner(area);
@@ -85,20 +92,36 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     };
     page.blank();
     match w.step {
+        Step::Welcome if configured => configured_page(&mut page, app),
         Step::Welcome => welcome(&mut page, app),
+        Step::Target => {
+            page.text(
+                "The address of the site that created the invitation, in the transport network (as shown by `wanderlan invite` there, e.g. 10.8.0.1).",
+                Style::new(),
+            );
+            page.blank();
+            page.input("Address", &w.target, true);
+        }
+        Step::Code => {
+            page.text(
+                "The invitation code, e.g. K7F3Q-9QX2M. Case and dashes do not matter.",
+                Style::new(),
+            );
+            page.blank();
+            page.input("Code", &w.code, true);
+        }
         Step::Name => {
             page.text(
-                "The name identifies this site in the mesh. It becomes part of the tunnel interface names on the other sites (gt-<name>): a-z, 0-9 and '-', at most 12 characters.",
+                "The name identifies this site in the network. It becomes part of the tunnel interface names on the other sites (gt-<name>): a-z, 0-9 and '-', at most 12 characters.",
                 Style::new(),
             );
             page.blank();
             page.input("Site name", &w.name, true);
         }
-        Step::Role => role(&mut page, w),
         Step::Trunk => trunk(&mut page, app),
         Step::Address => {
             page.text(
-                "The IPv4 address of this host in the existing transport network, e.g. its VPN address. The other sites build their GRETAP tunnels to this address.",
+                "The IPv4 address of this host in the existing transport network, e.g. its VPN address. Every other site builds its tunnel to this address.",
                 Style::new(),
             );
             page.blank();
@@ -106,30 +129,30 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         }
         Step::Vlans => {
             page.text(
-                "The VLAN IDs stretched across all sites, e.g. 10-50 or 10-50,60. When this site joins an existing mesh, the value of the mesh replaces this one with the first sync.",
+                "The VLAN IDs the network carries, e.g. 10-50 or 10-50,60. Later every site can be limited to some of them, and VLANs can be mapped per site (VLANs, 3).",
                 Style::new(),
             );
             page.blank();
-            page.input("Shared VLANs", &w.vlans, true);
-        }
-        Step::Peer => {
-            page.text(
-                "The first peer is a site that already runs wanderlan. A spoke's first peer is its hub; a hub's first peer is another hub.",
-                Style::new(),
-            );
-            page.blank();
-            page.input("Peer name", &w.peer_name, w.peer_focus == 0);
-            page.input("Peer address", &w.peer_address, w.peer_focus == 1);
-            page.value("Peer role", w.peer_role().as_str().to_string());
+            page.input("VLANs", &w.vlans, true);
         }
         Step::Summary => summary(&mut page, app),
         Step::Applied => {
             page.text(
-                "The configuration is applied and waits for confirmation. Check in the overview (1) that the peer is reachable, then press c to keep it. Without confirmation it is rolled back automatically (see the countdown); r rolls back now.",
+                "The configuration is applied and waits for confirmation. Press c to keep it; without confirmation it is rolled back automatically (see the countdown), r rolls back now.",
                 theme::warn(),
             );
             page.blank();
-            sync_hint(&mut page, w);
+            page.text(
+                "After confirming, an invitation for the next site is created and shown in the overview.",
+                Style::new(),
+            );
+        }
+        Step::Joining => {
+            let target = w.target.value().trim().to_string();
+            page.text(
+                &format!("Asking {target} to let this site join ..."),
+                theme::bold(),
+            );
         }
     }
     page.error(w.error.as_ref());
@@ -146,43 +169,19 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 
 fn welcome(page: &mut Page, app: &App) {
     page.text(
-        "wanderlan stretches VLANs across sites on layer 2. It does not build a VPN: the sites must already reach each other through an existing transport network (usually a VPN), and every site has an address in it.",
+        "wanderlan connects sites on layer 2 like one big switch: VLANs pass between all sites, and per site you choose which VLANs take part, map VLAN IDs and put untagged traffic into a VLAN. It does not build a VPN: the sites must already reach each other through an existing transport network (usually a VPN).",
         Style::new(),
     );
     page.blank();
-    page.text(
-        "This wizard creates a minimal configuration: this site and one peer that already runs wanderlan. The full mesh configuration then arrives automatically from that peer as soon as the peer lists this site.",
-        Style::new(),
-    );
-    let configured = app
-        .status
-        .as_ref()
-        .is_some_and(|s| s.state != SiteState::Unconfigured);
-    if configured {
-        page.blank();
-        page.text(
-            "This site is already configured. Finishing the wizard replaces its configuration; to change single settings use Sites (2) and VLANs (3) instead.",
-            theme::warn(),
-        );
-    }
-    page.blank();
-    page.text(
-        "Press Enter to start, Esc to leave the setup.",
-        theme::bold(),
-    );
-}
-
-fn role(page: &mut Page, w: &Wizard) {
-    page.text(
-        "Hubs are fully meshed with each other; a spoke has exactly one tunnel, to its hub. Most branch sites are spokes.",
-        Style::new(),
-    );
-    page.blank();
-    for (role, what) in [
-        (Role::Hub, "tunnels to all other hubs and to its own spokes"),
-        (Role::Spoke, "exactly one tunnel, to its hub"),
+    for (mode, label, what) in [
+        (Mode::New, "Start a new network", "this is the first site"),
+        (
+            Mode::Join,
+            "Join an existing network",
+            "with an invitation code from any site",
+        ),
     ] {
-        let chosen = w.role == role;
+        let chosen = app.wizard.mode == mode;
         let marker = if chosen { ">" } else { " " };
         let style = if chosen {
             theme::focused()
@@ -191,31 +190,61 @@ fn role(page: &mut Page, w: &Wizard) {
         };
         page.lines.push(Line::from(vec![
             Span::raw(format!("   {marker} ")),
-            Span::styled(format!("{:<6}", role.as_str()), style),
+            Span::styled(format!("{label:<26}"), style),
             Span::styled(format!("  {what}"), theme::dim()),
         ]));
     }
+    page.blank();
+    page.text(
+        "Up/Down to choose, Enter to start, Esc to leave the setup.",
+        theme::bold(),
+    );
 }
 
-fn interface_line(i: &Interface) -> String {
+/// The Setup view of a site that is already part of a network.
+fn configured_page(page: &mut Page, app: &App) {
+    let site = app
+        .status
+        .as_ref()
+        .and_then(|s| s.site.clone())
+        .unwrap_or_default();
+    page.text(
+        &format!("This site (\"{site}\") is part of a network."),
+        theme::bold(),
+    );
+    page.blank();
+    page.text(
+        "i   invite a new site: creates a code and shows the command to run on the new site (also in Sites, 2).",
+        Style::new(),
+    );
+    page.text(
+        "R   reset this site: removes the bridge, the tunnels, all rules, the configuration and the invitations. Afterwards the site is unconfigured, like after the installation.",
+        Style::new(),
+    );
+}
+
+fn interface_line(i: &Interface, transport: bool) -> String {
     let kind = if i.kind.is_empty() {
         "physical"
     } else {
         &i.kind
     };
     let state = if i.up { "up" } else { "down" };
-    let master = i
-        .master
-        .as_ref()
-        .map(|m| format!("  (in {m})"))
-        .unwrap_or_default();
-    format!("{:<16}{kind:<10}{state:<6}mtu {}{master}", i.name, i.mtu)
+    let note = if transport {
+        "  (transport, not the trunk)".to_string()
+    } else {
+        i.master
+            .as_ref()
+            .map(|m| format!("  (in {m})"))
+            .unwrap_or_default()
+    };
+    format!("{:<16}{kind:<10}{state:<6}mtu {}{note}", i.name, i.mtu)
 }
 
 fn trunk(page: &mut Page, app: &App) {
     let w = &app.wizard;
     page.text(
-        "The trunk is the local interface that carries the VLANs (tagged) to the switch or hypervisor. It is added to the bridge br0. Loopback and interfaces created by wanderlan are not listed.",
+        "The trunk is the local interface that carries the VLANs (tagged) to the switch or hypervisor; it is added to the bridge br0. It must not be the interface that leads to the other sites.",
         Style::new(),
     );
     page.blank();
@@ -225,18 +254,20 @@ fn trunk(page: &mut Page, app: &App) {
             None => page.text("Loading the interface list ...", theme::dim()),
         }
     }
+    let selected = w.trunk_index(&app.interfaces);
     let candidates = trunk_candidates(&app.interfaces);
     for (i, iface) in candidates.iter().enumerate() {
-        let chosen = i == w.trunk_selected;
+        let chosen = i == selected;
         let marker = if chosen { ">" } else { " " };
         let style = if chosen {
             theme::focused()
         } else {
             Style::new()
         };
+        let transport = w.transport.as_deref() == Some(iface.name.as_str());
         page.lines.push(Line::from(vec![
             Span::raw(format!("   {marker} ")),
-            Span::styled(interface_line(iface), style),
+            Span::styled(interface_line(iface, transport), style),
         ]));
     }
     if w.trunk_is_manual(&app.interfaces) {
@@ -247,53 +278,35 @@ fn trunk(page: &mut Page, app: &App) {
     }
 }
 
-/// What the peer has to add so that the mesh configuration arrives here.
-fn sync_hint(page: &mut Page, w: &Wizard) {
-    let name = w.name.value().trim();
-    let peer = w.peer_name.value().trim();
-    let address = w.address.value().trim();
-    let entry = match w.role {
-        Role::Spoke => format!("name {name}, role spoke, hub {peer}, address {address}"),
-        Role::Hub => format!("name {name}, role hub, address {address}"),
-    };
-    page.text(
-        &format!(
-            "Important: the full mesh configuration arrives automatically via sync once {peer} lists this site. The peer has to add this site first: on {peer} open wanderlan, go to Sites (2), press n and enter"
-        ),
-        theme::bold(),
-    );
-    page.lines
-        .push(Line::styled(format!("     {entry}"), theme::ok()));
-    page.text(
-        "then apply and confirm it there. Until then only the tunnel to the peer exists.",
-        theme::bold(),
-    );
-}
-
 fn summary(page: &mut Page, app: &App) {
     let w = &app.wizard;
-    let peer = w.peer_name.value().trim().to_string();
-    let own = match w.role {
-        Role::Spoke => format!("{}, spoke of {peer}", w.name.value().trim()),
-        Role::Hub => format!("{}, hub", w.name.value().trim()),
-    };
-    page.value("This site", own);
-    page.value("Address", w.address.value().trim().to_string());
-    page.value("Trunk", w.trunk(&app.interfaces));
-    page.value("Shared VLANs", w.vlans.value().trim().to_string());
-    page.value(
-        "First peer",
-        format!(
-            "{peer} ({}) at {}",
-            w.peer_role(),
-            w.peer_address.value().trim()
-        ),
-    );
-    page.blank();
-    sync_hint(page, w);
-    page.blank();
-    page.text(
-        "Enter shows the configuration files and applies them.",
-        theme::dim(),
-    );
+    match w.mode {
+        Mode::New => {
+            page.text(
+                "A new network with this site as its first site:",
+                theme::bold(),
+            );
+            page.blank();
+            page.value("This site", w.name.value().trim().to_string());
+            page.value("Address", w.address.value().trim().to_string());
+            page.value("Trunk", w.trunk(&app.interfaces));
+            page.value("VLANs", w.vlans.value().trim().to_string());
+            page.blank();
+            page.text(
+                "Enter shows the configuration files and applies them. Afterwards add more sites with an invitation.",
+                theme::dim(),
+            );
+        }
+        Mode::Join => {
+            page.value("Join via", w.target.value().trim().to_string());
+            page.value("Invitation", w.code.value().trim().to_string());
+            page.value("This site", w.name.value().trim().to_string());
+            page.value("Trunk", w.trunk(&app.interfaces));
+            page.blank();
+            page.text(
+                "Enter asks the inviting site to add this site. It answers with the configuration of the network; this site applies it and confirms it automatically as soon as the inviting site answers.",
+                theme::dim(),
+            );
+        }
+    }
 }

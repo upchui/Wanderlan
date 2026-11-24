@@ -13,7 +13,7 @@ use std::time::Duration;
 use crossterm::event::{KeyCode, KeyEvent};
 use wanderlan_core::api::Interface;
 use wanderlan_core::config::{
-    Diagnostic, FieldPath, LocalVid, Role, Severity, Site, VID_MAX, VID_MIN, VlanMap, VlanSet,
+    Diagnostic, FieldPath, LocalVid, Severity, Site, VID_MAX, VID_MIN, VlanMap, VlanSet,
     ifname_error, site_name_error,
 };
 
@@ -172,30 +172,17 @@ impl Form {
     /// Form for a new site (`None`) or an existing one.
     pub fn site(draft: &Draft, index: Option<usize>) -> Self {
         let existing = index.and_then(|i| draft.mesh.sites.get(i));
-        let own_name = existing.map(|s| s.name.as_str());
-        let mut hubs: Vec<String> = draft
-            .mesh
-            .hubs()
-            .filter(|h| Some(h.name.as_str()) != own_name)
-            .map(|h| h.name.clone())
-            .collect();
-        let (name, role, hub, address) = match existing {
+        let (name, address, vlans) = match existing {
             Some(s) => (
                 s.name.clone(),
-                s.role,
-                s.hub.clone().unwrap_or_default(),
                 s.address.to_string(),
+                s.vlans
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
             ),
-            None => (
-                String::new(),
-                Role::Spoke,
-                default_hub(draft),
-                String::new(),
-            ),
+            None => (String::new(), String::new(), String::new()),
         };
-        if !hub.is_empty() && !hubs.contains(&hub) {
-            hubs.push(hub.clone());
-        }
         let title = match existing {
             Some(s) => format!("Edit site {}", s.name),
             None => "New site".to_string(),
@@ -207,19 +194,20 @@ impl Form {
                 "a-z, 0-9 and '-', at most 12 characters",
                 name,
             ),
-            Field::choice(
-                "role",
-                "Role",
-                "hub: meshed with all hubs; spoke: one tunnel to its hub",
-                vec!["hub".into(), "spoke".into()],
-                role.as_str(),
-            ),
-            Field::choice("hub", "Hub", "the hub this spoke connects to", hubs, &hub),
             Field::text(
                 "address",
                 "Address",
                 "IPv4 address in the transport network (e.g. the VPN)",
                 address,
+            ),
+            Field::text(
+                "vlans",
+                "VLANs",
+                format!(
+                    "VLANs this site takes part in; empty: all VLANs of the network ({})",
+                    draft.mesh.vlans
+                ),
+                vlans,
             ),
         ];
         Self::new(FormKind::Site(index), title, fields, draft)
@@ -411,14 +399,7 @@ impl Form {
         }
     }
 
-    fn update_enabled(&mut self) {
-        if matches!(self.kind, FormKind::Site(_)) {
-            let spoke = self.value("role") == Role::Spoke.as_str();
-            if let Some(hub) = self.field_mut("hub") {
-                hub.enabled = spoke;
-            }
-        }
-    }
+    fn update_enabled(&mut self) {}
 
     /// Parses the fields and validates the draft with the edit applied.
     pub fn revalidate(&mut self, draft: &Draft) {
@@ -574,14 +555,18 @@ impl Form {
             }
             None => true,
         };
-        let role = if self.value("role") == Role::Spoke.as_str() {
-            Role::Spoke
+        let vlans_text = self.value("vlans");
+        let vlans = if vlans_text.trim().is_empty() {
+            Some(None)
         } else {
-            Role::Hub
+            match VlanSet::from_str(&vlans_text) {
+                Ok(set) => Some(Some(set)),
+                Err(e) => {
+                    self.set_error("vlans", format!("{e} (e.g. 10-50,60; empty for all)"));
+                    None
+                }
+            }
         };
-        let hub = (role == Role::Spoke)
-            .then(|| self.value("hub"))
-            .filter(|h| !h.is_empty());
         let address = self.value("address");
         let address = match address.parse::<Ipv4Addr>() {
             Ok(ip) => Some(ip),
@@ -596,11 +581,11 @@ impl Form {
             }
         };
         let address = address?;
+        let vlans = vlans?;
         name_ok.then_some(Site {
             name,
-            role,
-            hub,
             address,
+            vlans,
         })
     }
 
@@ -700,26 +685,6 @@ fn parse_vid(text: &str) -> Result<u16, String> {
         .ok_or_else(|| format!("a VLAN ID between {VID_MIN} and {VID_MAX}"))
 }
 
-/// Hub suggested for a new spoke: this site if it is a hub, otherwise its
-/// hub, otherwise the first hub.
-fn default_hub(draft: &Draft) -> String {
-    let own = draft
-        .local
-        .self_name
-        .as_deref()
-        .and_then(|n| draft.mesh.site(n));
-    match own {
-        Some(s) if s.role == Role::Hub => s.name.clone(),
-        Some(s) if s.hub.is_some() => s.hub.clone().unwrap_or_default(),
-        _ => draft
-            .mesh
-            .hubs()
-            .next()
-            .map(|h| h.name.clone())
-            .unwrap_or_default(),
-    }
-}
-
 /// Interfaces that can serve as trunk: no loopback, nothing wanderlan
 /// created; sorted by name.
 pub fn trunk_candidates(interfaces: &[Interface]) -> Vec<&Interface> {
@@ -774,15 +739,21 @@ mod tests {
     }
 
     #[test]
-    fn new_site_defaults_to_spoke_of_this_hub() {
+    fn a_new_site_starts_empty() {
         let d = draft();
         let form = Form::site(&d, None);
-        assert_eq!(form.field("role").unwrap().value(), "spoke");
-        assert_eq!(form.field("hub").unwrap().value(), "heim");
+        assert_eq!(
+            form.fields.iter().map(|f| f.key).collect::<Vec<_>>(),
+            ["name", "address", "vlans"]
+        );
         // Empty required fields are errors, but hidden until touched.
         let name = form.field("name").unwrap();
         assert!(name.error.is_some());
         assert_eq!(name.visible_error(false), None);
+        assert!(
+            form.field("vlans").unwrap().error.is_none(),
+            "empty: all VLANs"
+        );
         assert!(!form.is_valid());
     }
 
@@ -791,8 +762,6 @@ mod tests {
         let d = draft();
         let mut form = Form::site(&d, None);
         type_text(&mut form, &d, "buero");
-        press(&mut form, &d, KeyCode::Tab);
-        press(&mut form, &d, KeyCode::Tab);
         press(&mut form, &d, KeyCode::Tab);
         type_text(&mut form, &d, "10.8.0.20");
         let name = form.field("name").unwrap();
@@ -805,33 +774,41 @@ mod tests {
     }
 
     #[test]
-    fn adding_a_valid_spoke() {
+    fn adding_a_valid_site() {
         let d = draft();
         let mut form = Form::site(&d, None);
         type_text(&mut form, &d, "haus4");
-        form.focus = 3;
+        form.focus = 1;
         type_text(&mut form, &d, "10.8.0.14");
         let new = form.submit(&d).expect("valid");
         let site = new.mesh.site("haus4").unwrap();
-        assert_eq!(site.role, Role::Spoke);
-        assert_eq!(site.hub.as_deref(), Some("heim"));
+        assert_eq!(site.vlans, None);
         assert_eq!(new.errors(), 0);
     }
 
     #[test]
-    fn hub_field_follows_role() {
+    fn site_vlans_are_parsed_and_checked_against_mappings() {
         let d = draft();
-        let mut form = Form::site(&d, Some(0));
-        assert!(!form.field("hub").unwrap().enabled);
-        form.focus = 1;
-        assert_eq!(press(&mut form, &d, KeyCode::Right), FormEvent::Changed);
-        assert_eq!(form.field("role").unwrap().value(), "spoke");
-        assert!(form.field("hub").unwrap().enabled);
-        // heim becoming a spoke breaks its spokes: shown as notes.
+        // haus3 maps native traffic to VLAN 20 and local 130 to 30.
+        let index = d.mesh.sites.iter().position(|s| s.name == "haus3");
+        let mut form = Form::site(&d, index);
+        form.focus = 2;
+        type_text(&mut form, &d, "x");
+        assert!(
+            form.field("vlans")
+                .unwrap()
+                .visible_error(false)
+                .is_some_and(|e| e.contains("not a VLAN ID")),
+            "{:?}",
+            form.field("vlans")
+        );
+        press(&mut form, &d, KeyCode::Backspace);
+        type_text(&mut form, &d, "30");
+        assert!(form.field("vlans").unwrap().error.is_none());
         assert!(
             form.notes
                 .iter()
-                .any(|n| n.message.contains("is a spoke, not a hub")),
+                .any(|n| n.message.contains("shared VLAN 20 is not one of the VLANs")),
             "{:?}",
             form.notes
         );
@@ -841,7 +818,7 @@ mod tests {
     fn invalid_address_and_vlan_mapping_conflict() {
         let d = draft();
         let mut form = Form::site(&d, Some(1));
-        form.focus = 3;
+        form.focus = 1;
         press(&mut form, &d, KeyCode::Backspace);
         type_text(&mut form, &d, "x");
         assert!(
@@ -899,7 +876,7 @@ mod tests {
         assert!(
             form.notes
                 .iter()
-                .any(|n| n.message.contains("shared VLAN 30 is not in mesh.vlans")),
+                .any(|n| n.message.contains("shared VLAN 30 is not one of the VLANs")),
             "{:?}",
             form.notes
         );

@@ -7,15 +7,16 @@ and executes the cases in `cases/` in order.
 
 Topology:
 
-| Container  | Underlay (transport)  | Trunk network  |
-|------------|-----------------------|----------------|
-| router     | .254 in every underlay | –             |
-| hub1       | 10.100.1.10           | 10.200.1.0/24  |
-| hub2       | 10.100.2.10           | 10.200.2.0/24  |
-| spoke1     | 10.100.11.10          | 10.200.11.0/24 |
-| spoke2     | 10.100.12.10          | 10.200.12.0/24 |
-| spoke3     | 10.100.13.10 (MTU 1400) | 10.200.13.0/24 |
-| c-<site>   | –                     | client on the trunk of <site> |
+| Container | Underlay (transport)    | Trunk network                 |
+|-----------|-------------------------|-------------------------------|
+| router    | .254 in every underlay  | –                             |
+| site1     | 10.100.1.10             | 10.200.1.0/24                 |
+| site2     | 10.100.2.10             | 10.200.2.0/24                 |
+| site3     | 10.100.11.10            | 10.200.11.0/24                |
+| site4     | 10.100.12.10            | 10.200.12.0/24                |
+| site5     | 10.100.13.10 (MTU 1400) | 10.200.13.0/24                |
+| c-<site>  | –                       | client on the trunk of <site> |
+| looper    | –                       | bridges the trunks of site3 and site4 on request (loop guard) |
 
 The underlay networks stand in for the transport network (usually a VPN)
 that wanderlan expects to exist; the router connects them. On every site the

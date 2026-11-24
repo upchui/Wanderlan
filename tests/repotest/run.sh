@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Acceptance test: two hosts install wanderlan from the APT repository with
-# the README commands and run the example configuration (its two hubs
-# "heim" and "buero"); a client at each site pings the other in VLAN 20.
+# the README commands. "heim" starts a new network, "buero" joins it with an
+# invitation (`wanderlan invite` / `wanderlan join`); a client at each site
+# pings the other in VLAN 20.
 #   REPO_URL  repository (default https://upchui.github.io/Wanderlan)
 #   KEEP=1    keep the containers
 set -uo pipefail
@@ -22,16 +23,23 @@ for s in heim buero c-heim c-buero; do
   for _ in $(seq 1 30); do x "$s" "test -f /run/node-ready" && break; sleep 1; done
 done
 
-# The example mesh.toml, reduced to its two hubs (everything from the first
-# spoke on is cut), and a local.toml per host.
-example="$(x heim "cat /usr/share/doc/wanderlan/examples/mesh.toml 2>/dev/null || wanderlan init | sed -n '/^# ---- mesh.toml/,/^# ---- local.toml/p'")"
-mesh="$(awk '/^\[\[site\]\]/ { block = $0; next } block != "" { if ($0 ~ /^name = "haus2"/) exit; print block; block = "" } { print }' <<<"$example")"
-for s in heim buero; do
-  printf '%s\n' "$mesh" | "${COMPOSE[@]}" exec -T "$s" sh -c 'cat > /etc/wanderlan/mesh.toml'
-  printf 'self = "%s"\ntrunk = "trunk0"\n' "$s" | "${COMPOSE[@]}" exec -T "$s" sh -c 'cat > /etc/wanderlan/local.toml'
-  x "$s" "wanderlan validate /etc/wanderlan/mesh.toml --local /etc/wanderlan/local.toml" || exit 1
-  x "$s" "wl-daemon start"
+# heim starts a new network, with the files the setup wizard writes.
+printf '[mesh]\nvlans = "10-50"\n\n[[site]]\nname = "heim"\naddress = "10.8.0.1"\n' |
+  "${COMPOSE[@]}" exec -T heim sh -c 'cat > /etc/wanderlan/mesh.toml'
+printf 'self = "heim"\ntrunk = "trunk0"\n' |
+  "${COMPOSE[@]}" exec -T heim sh -c 'cat > /etc/wanderlan/local.toml'
+x heim "wanderlan validate /etc/wanderlan/mesh.toml --local /etc/wanderlan/local.toml" || exit 1
+x heim "wl-daemon start"
+for _ in $(seq 1 30); do
+  x heim "wanderlan status --json | jq -e '.state == \"running\"'" >/dev/null 2>&1 && break
+  sleep 1
 done
+
+# buero joins with nothing but the address of heim and an invitation code.
+code=$(x heim "wanderlan invite" | awk '$1 == "wanderlan" && $2 == "join" {print $4; exit}')
+echo "invitation: $code"
+x buero "wl-daemon start"
+x buero "wanderlan join 10.8.0.1 $code" || exit 1
 
 ok=1
 for _ in $(seq 1 30); do
@@ -46,7 +54,7 @@ for _ in $(seq 1 20); do
 done
 x heim "wanderlan status"
 if [ "$ok" = 0 ]; then
-  echo "OK: the example configuration connects heim and buero; VLAN 20 works."
+  echo "OK: buero joined heim's network with an invitation; VLAN 20 works."
 else
   echo "FAILED: no ping in VLAN 20 between heim and buero" >&2
   x heim "tail -n 40 /var/log/wanderland.log"

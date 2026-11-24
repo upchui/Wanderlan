@@ -8,6 +8,12 @@
 
 use std::path::{Path, PathBuf};
 
+/// The `mesh.toml` shipped by the package (written back on reset, so that
+/// dpkg sees the conffile unchanged).
+const TEMPLATE_MESH: &str = include_str!("../../../packaging/etc/mesh.toml");
+/// The `local.toml` shipped by the package.
+const TEMPLATE_LOCAL: &str = include_str!("../../../packaging/etc/local.toml");
+
 use anyhow::{Context as _, Result};
 use wanderlan_core::config::{Config, render_local, render_mesh};
 
@@ -102,6 +108,35 @@ impl Paths {
     pub fn marker_exists(&self) -> bool {
         self.marker().exists()
     }
+
+    /// Open invitations of this site.
+    pub fn invites(&self) -> PathBuf {
+        self.state_dir.join("invites.json")
+    }
+
+    /// Back to the state after installation: the configuration files become
+    /// the package templates again; the state directory (confirmed copies,
+    /// marker, invitations) and rejected files are removed.
+    pub fn reset(&self) -> Result<()> {
+        write_atomic(&self.mesh(), TEMPLATE_MESH)?;
+        write_atomic(&self.local(), TEMPLATE_LOCAL)?;
+        for name in ["mesh.toml.rejected", "local.toml.rejected"] {
+            remove_optional(&self.config_dir.join(name))?;
+        }
+        match std::fs::remove_dir_all(&self.state_dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| format!("cannot remove {}", self.state_dir.display())),
+        }
+    }
+}
+
+fn remove_optional(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("cannot remove {}", path.display())),
+    }
 }
 
 /// Reads a file, treating a missing file as empty.
@@ -114,7 +149,7 @@ pub fn read_optional(path: &Path) -> Result<String> {
 }
 
 /// Writes a file via a temporary file and rename.
-fn write_atomic(path: &Path, content: &str) -> Result<()> {
+pub fn write_atomic(path: &Path, content: &str) -> Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     let name = path
@@ -151,6 +186,35 @@ mod tests {
             "bad"
         );
         assert!(!paths.marker_exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn reset_restores_the_templates_and_clears_the_state() {
+        let base = std::env::temp_dir().join(format!("wl-reset-{}", std::process::id()));
+        let paths = Paths {
+            config_dir: base.join("etc"),
+            state_dir: base.join("state"),
+        };
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        std::fs::write(paths.mesh(), "configured").unwrap();
+        std::fs::write(paths.local(), "self = \"a\"").unwrap();
+        std::fs::write(paths.config_dir.join("mesh.toml.rejected"), "x").unwrap();
+        paths.save_copy().unwrap();
+        paths.set_marker().unwrap();
+        std::fs::write(paths.invites(), "[]").unwrap();
+        paths.reset().unwrap();
+        assert_eq!(
+            std::fs::read_to_string(paths.mesh()).unwrap(),
+            TEMPLATE_MESH
+        );
+        assert_eq!(
+            std::fs::read_to_string(paths.local()).unwrap(),
+            TEMPLATE_LOCAL
+        );
+        assert!(!paths.config_dir.join("mesh.toml.rejected").exists());
+        assert!(!paths.state_dir.exists());
+        paths.reset().unwrap();
         std::fs::remove_dir_all(base).unwrap();
     }
 }

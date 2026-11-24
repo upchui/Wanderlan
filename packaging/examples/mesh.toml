@@ -1,39 +1,38 @@
 # wanderlan example mesh configuration.
 #
-# Copy this file to /etc/wanderlan/mesh.toml on one site, adjust it and run
-# `wanderlan apply`. The daemon distributes it to all other sites.
+# Usually nobody writes this file by hand: set up the first site with
+# `wanderlan` ("Start a new network"), then add every further site with an
+# invitation: `wanderlan invite` on any site that is already part of the
+# network, `wanderlan join <address> <code>` on the new one. The daemons keep
+# this file identical on all sites.
 #
 # wanderlan does not build a VPN. Every site must already be reachable at its
 # `address` through an existing transport network, usually a VPN set up
-# beforehand (WireGuard, IPsec, a provider network, ...). wanderlan builds the
-# layer-2 part (GRETAP tunnels, bridge, VLANs) on top of it.
+# beforehand (WireGuard, IPsec, a provider network, ...), and all sites must
+# reach each other there. Together the sites act as one virtual switch with a
+# GRETAP tunnel between every two sites.
 
 [mesh]
-vlans = "10-50"               # VLANs stretched across all sites
+vlans = "10-50"               # VLANs of every site that does not list its own
 mtu_probe_interval = "5m"     # how often the path MTU to each peer is measured
 # mss = 1300                  # optional: fixed TCP MSS instead of measuring
 commit_timeout = "60s"        # changes are rolled back unless confirmed in time
 
 [[site]]
 name = "heim"
-role = "hub"
 address = "10.8.0.1"
 
 [[site]]
 name = "buero"
-role = "hub"
 address = "10.8.0.2"
 
 [[site]]
 name = "haus2"
-role = "spoke"
-hub = "heim"
 address = "10.8.0.11"
+vlans = "20,30"               # haus2 only takes part in VLANs 20 and 30
 
 [[site]]
 name = "haus3"
-role = "spoke"
-hub = "buero"
 address = "10.8.0.12"
 
 # Untagged traffic on the trunk of haus3 belongs to shared VLAN 20.

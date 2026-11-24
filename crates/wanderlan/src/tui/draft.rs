@@ -173,13 +173,8 @@ impl Draft {
         true
     }
 
-    /// Updates all references to a renamed site (spokes, mappings, `self`).
+    /// Updates all references to a renamed site (mappings, `self`).
     pub fn rename_references(&mut self, old: &str, new: &str) {
-        for site in &mut self.mesh.sites {
-            if site.hub.as_deref() == Some(old) {
-                site.hub = Some(new.to_string());
-            }
-        }
         for map in &mut self.mesh.maps {
             if map.site == old {
                 map.site = new.to_string();
@@ -254,13 +249,16 @@ mod tests {
         // A revision bump alone is not a change.
         draft.mesh.revision += 1;
         assert!(!draft.differs_from(&running));
-        // Removing the hub of haus2 makes haus2's `hub` invalid.
+        // Removing heim leaves "self" pointing at a site that is gone.
         let removed = draft.remove_site(0).unwrap();
         assert_eq!(removed.name, "heim");
         assert!(draft.differs_from(&running));
         assert!(draft.errors() > 0);
-        let hub_path = FieldPath::site_field(1, "hub");
-        assert_eq!(draft.worst_at(&hub_path), Some(Severity::Error));
+        let self_path = FieldPath::local("self");
+        assert_eq!(draft.worst_at(&self_path), Some(Severity::Error));
+        // An empty VLAN list of a site is marked on the site.
+        draft.mesh.sites[1].vlans = Some(wanderlan_core::config::VlanSet::new());
+        draft.revalidate();
         assert_eq!(
             draft.worst_within(&FieldPath::site(1)),
             Some(Severity::Error)
@@ -286,12 +284,20 @@ mod tests {
     fn rename_updates_references() {
         let running = Running::parse(&fixtures::config_texts()).unwrap();
         let mut draft = Draft::from_running(&running).unwrap();
+        let haus3 = draft
+            .mesh
+            .sites
+            .iter()
+            .position(|s| s.name == "haus3")
+            .unwrap();
+        draft.mesh.sites[haus3].name = "haus33".into();
+        draft.rename_references("haus3", "haus33");
         draft.mesh.sites[0].name = "home".into();
         draft.rename_references("heim", "home");
         draft.revalidate();
         assert_eq!(draft.errors(), 0, "{:?}", draft.diagnostics);
         assert_eq!(draft.local.self_name.as_deref(), Some("home"));
-        assert_eq!(draft.mesh.sites[2].hub.as_deref(), Some("home"));
+        assert!(draft.mesh.maps.iter().all(|m| m.site == "haus33"));
     }
 
     #[test]

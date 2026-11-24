@@ -2,6 +2,7 @@
 
 mod cli;
 mod client;
+mod hostinfo;
 mod tui;
 
 use std::process::ExitCode;

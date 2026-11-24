@@ -8,6 +8,7 @@
 pub mod api;
 pub mod config;
 pub mod desired;
+pub mod join;
 pub mod loopguard;
 pub mod mtu;
 pub mod reconcile;

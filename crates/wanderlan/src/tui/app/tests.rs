@@ -191,7 +191,7 @@ fn review_shows_the_diff_and_applies_with_the_base_revision() {
 fn invalid_draft_is_not_applied() {
     let mut app = connected();
     if let Some(d) = &mut app.draft {
-        d.mesh.sites[2].hub = Some("nowhere".into());
+        d.mesh.sites[2].vlans = Some(wanderlan_core::config::VlanSet::new());
         d.revalidate();
         assert!(d.errors() > 0);
     }

@@ -6,14 +6,13 @@
 //!
 //! wanderlan does not build a VPN. Every site is reachable at its `address`
 //! through a transport network that already exists (usually a VPN set up
-//! beforehand); wanderlan only builds the layer-2 part on top of it.
+//! beforehand); wanderlan only builds the layer-2 part on top of it. All
+//! sites together act as one virtual switch: every site has a tunnel to
+//! every other site.
 
 use std::fmt;
 use std::net::Ipv4Addr;
-use std::str::FromStr;
 use std::time::Duration;
-
-use serde::{Deserialize, Serialize};
 
 use super::vlan::VlanSet;
 
@@ -33,7 +32,7 @@ pub struct Mesh {
     pub revision: u64,
     /// Daemon control port (UDP probes, TCP config sync) on the site addresses.
     pub control_port: u16,
-    /// VLANs that are stretched across all sites.
+    /// VLANs of every site that does not list its own (`[[site]] vlans`).
     pub vlans: VlanSet,
     /// Interval between path MTU measurements.
     pub mtu_probe_interval: Duration,
@@ -67,16 +66,9 @@ impl Mesh {
         self.sites.iter().find(|s| s.name == name)
     }
 
-    /// Returns all hub sites.
-    pub fn hubs(&self) -> impl Iterator<Item = &Site> {
-        self.sites.iter().filter(|s| s.role == Role::Hub)
-    }
-
-    /// Returns the spokes attached to the given hub.
-    pub fn spokes_of<'a>(&'a self, hub: &'a str) -> impl Iterator<Item = &'a Site> + 'a {
-        self.sites
-            .iter()
-            .filter(move |s| s.role == Role::Spoke && s.hub.as_deref() == Some(hub))
+    /// Shared VLANs a site takes part in: its own list, or the mesh default.
+    pub fn vlans_of<'a>(&'a self, site: &'a Site) -> &'a VlanSet {
+        site.vlans.as_ref().unwrap_or(&self.vlans)
     }
 
     /// Returns the VLAN mappings of one site.
@@ -85,58 +77,17 @@ impl Mesh {
     }
 }
 
-/// Role of a site in the layer-2 topology.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Role {
-    /// Tunnels to all other hubs and to its own spokes.
-    Hub,
-    /// Exactly one tunnel, to its hub.
-    Spoke,
-}
-
-impl Role {
-    /// Lowercase name as used in the configuration file.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Hub => "hub",
-            Self::Spoke => "spoke",
-        }
-    }
-}
-
-impl fmt::Display for Role {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Role {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "hub" => Ok(Self::Hub),
-            "spoke" => Ok(Self::Spoke),
-            other => Err(format!(
-                "unknown role \"{other}\" (expected \"hub\" or \"spoke\")"
-            )),
-        }
-    }
-}
-
 /// One site of the mesh.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Site {
     /// Unique name, also used in interface names (`gt-<name>`).
     pub name: String,
-    /// Hub or spoke.
-    pub role: Role,
-    /// Name of the hub this spoke connects to (spokes only).
-    pub hub: Option<String>,
     /// Address of the site in the existing transport network (e.g. its VPN
     /// address). GRETAP tunnels run between these addresses.
     pub address: Ipv4Addr,
+    /// Shared VLANs this site takes part in, like the allowed VLANs of a
+    /// switch port; `None` means the mesh default (`mesh.vlans`).
+    pub vlans: Option<VlanSet>,
 }
 
 /// The local side of a VLAN mapping.
@@ -189,34 +140,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn role_parsing() {
-        assert_eq!("hub".parse::<Role>(), Ok(Role::Hub));
-        assert_eq!("spoke".parse::<Role>(), Ok(Role::Spoke));
-        assert!("router".parse::<Role>().is_err());
-    }
-
-    #[test]
-    fn mesh_lookups() {
+    fn mesh_lookups_and_site_vlans() {
         let mut mesh = Mesh::new(VlanSet::from_range(10, 20));
         mesh.sites.push(Site {
             name: "a".into(),
-            role: Role::Hub,
-            hub: None,
             address: Ipv4Addr::new(10, 0, 0, 1),
+            vlans: None,
         });
         mesh.sites.push(Site {
             name: "b".into(),
-            role: Role::Spoke,
-            hub: Some("a".into()),
             address: Ipv4Addr::new(10, 0, 0, 2),
+            vlans: Some(VlanSet::from_range(14, 14)),
         });
-        assert_eq!(mesh.hubs().count(), 1);
-        assert_eq!(
-            mesh.spokes_of("a")
-                .map(|s| s.name.as_str())
-                .collect::<Vec<_>>(),
-            ["b"]
-        );
         assert!(mesh.site("c").is_none());
+        let a = mesh.site("a").unwrap();
+        let b = mesh.site("b").unwrap();
+        assert_eq!(mesh.vlans_of(a).len(), 11);
+        assert_eq!(mesh.vlans_of(b).iter().collect::<Vec<_>>(), [14]);
     }
 }

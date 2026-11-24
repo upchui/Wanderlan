@@ -1,11 +1,11 @@
-//! Test data: a hub `heim` with a second hub, four spokes and a few peers in
+//! Test data: site `heim` in a network of six sites, with peers in
 //! different states.
 
 use wanderlan_core::api::{
     ConfigTexts, Event, Interface, Level, MacEntry, PeerStatus, PortState, SiteState, SiteSummary,
     Status,
 };
-use wanderlan_core::config::{Local, Role, fingerprint, parse_mesh, render_local, render_mesh};
+use wanderlan_core::config::{Local, fingerprint, parse_mesh, render_local, render_mesh};
 
 /// `mesh.toml` of the fixture mesh (revision 7).
 pub const MESH: &str = r#"
@@ -17,36 +17,27 @@ commit_timeout = "60s"
 
 [[site]]
 name = "heim"
-role = "hub"
 address = "10.8.0.1"
 
 [[site]]
 name = "buero"
-role = "hub"
 address = "10.8.0.2"
 
 [[site]]
 name = "haus2"
-role = "spoke"
-hub = "heim"
 address = "10.8.0.11"
+vlans = "20,30"
 
 [[site]]
 name = "haus3"
-role = "spoke"
-hub = "buero"
 address = "10.8.0.12"
 
 [[site]]
 name = "haus5"
-role = "spoke"
-hub = "heim"
 address = "10.8.0.15"
 
 [[site]]
 name = "haus6"
-role = "spoke"
-hub = "heim"
 address = "10.8.0.16"
 
 [[map]]
@@ -87,13 +78,13 @@ pub fn unconfigured_texts() -> ConfigTexts {
     }
 }
 
-fn peer(name: &str, role: Role, address: &str) -> PeerStatus {
+fn peer(name: &str, address: &str) -> PeerStatus {
     PeerStatus {
         name: name.into(),
-        role,
         address: address.into(),
         port: format!("gt-{name}"),
         port_state: PortState::Up,
+        vlans: "10-50".into(),
         reachable: true,
         last_reply_secs: Some(1),
         rtt_ms: Some(12.4),
@@ -107,25 +98,23 @@ fn peer(name: &str, role: Role, address: &str) -> PeerStatus {
     }
 }
 
-fn summary(name: &str, role: Role, hub: Option<&str>, address: &str, direct: bool) -> SiteSummary {
+fn summary(name: &str, address: &str, vlans: &str) -> SiteSummary {
     SiteSummary {
         name: name.into(),
-        role,
-        hub: hub.map(str::to_string),
         address: address.into(),
+        vlans: vlans.into(),
         is_self: name == "heim",
-        direct,
+        direct: name != "heim",
     }
 }
 
-/// Status of `heim`: buero fine, haus2 blocked by the loop guard, haus5 on an
-/// older configuration, haus6 unreachable.
+/// Status of `heim`: buero and haus3 fine, haus2 blocked by the loop guard,
+/// haus5 on an older configuration, haus6 unreachable.
 pub fn status() -> Status {
     Status {
         version: "0.1.0".into(),
         state: SiteState::Running,
         site: Some("heim".into()),
-        role: Some(Role::Hub),
         address: Some("10.8.0.1".into()),
         trunk: Some("ens19".into()),
         vlans: Some("10-50".into()),
@@ -138,13 +127,21 @@ pub fn status() -> Status {
                 macs: 12,
                 rx_bps: 1_234_000,
                 tx_bps: 345_600,
-                ..peer("buero", Role::Hub, "10.8.0.2")
+                ..peer("buero", "10.8.0.2")
             },
             PeerStatus {
                 port_state: PortState::Blocked,
                 last_reply_secs: Some(2),
                 rtt_ms: Some(3.1),
-                ..peer("haus2", Role::Spoke, "10.8.0.11")
+                vlans: "20,30".into(),
+                ..peer("haus2", "10.8.0.11")
+            },
+            PeerStatus {
+                rtt_ms: Some(8.7),
+                macs: 4,
+                rx_bps: 96_000,
+                tx_bps: 31_000,
+                ..peer("haus3", "10.8.0.12")
             },
             PeerStatus {
                 last_reply_secs: Some(3),
@@ -156,7 +153,7 @@ pub fn status() -> Status {
                 tx_bps: 18_000,
                 revision: Some(6),
                 in_sync: Some(false),
-                ..peer("haus5", Role::Spoke, "10.8.0.15")
+                ..peer("haus5", "10.8.0.15")
             },
             PeerStatus {
                 port_state: PortState::Down,
@@ -167,18 +164,19 @@ pub fn status() -> Status {
                 mss: None,
                 revision: None,
                 in_sync: None,
-                ..peer("haus6", Role::Spoke, "10.8.0.16")
+                ..peer("haus6", "10.8.0.16")
             },
         ],
         sites: vec![
-            summary("heim", Role::Hub, None, "10.8.0.1", false),
-            summary("buero", Role::Hub, None, "10.8.0.2", true),
-            summary("haus2", Role::Spoke, Some("heim"), "10.8.0.11", true),
-            summary("haus3", Role::Spoke, Some("buero"), "10.8.0.12", false),
-            summary("haus5", Role::Spoke, Some("heim"), "10.8.0.15", true),
-            summary("haus6", Role::Spoke, Some("heim"), "10.8.0.16", true),
+            summary("heim", "10.8.0.1", "10-50"),
+            summary("buero", "10.8.0.2", "10-50"),
+            summary("haus2", "10.8.0.11", "20,30"),
+            summary("haus3", "10.8.0.12", "10-50"),
+            summary("haus5", "10.8.0.15", "10-50"),
+            summary("haus6", "10.8.0.16", "10-50"),
         ],
         blocked: vec!["gt-haus2".into()],
+        invites: 1,
     }
 }
 
@@ -188,7 +186,6 @@ pub fn unconfigured_status() -> Status {
         version: "0.1.0".into(),
         state: SiteState::Unconfigured,
         site: None,
-        role: None,
         address: None,
         trunk: None,
         vlans: None,
@@ -199,6 +196,7 @@ pub fn unconfigured_status() -> Status {
         peers: Vec::new(),
         sites: Vec::new(),
         blocked: Vec::new(),
+        invites: 0,
     }
 }
 

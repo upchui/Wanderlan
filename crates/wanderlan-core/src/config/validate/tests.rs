@@ -111,7 +111,7 @@ fn unconfigured_local_with_mesh_still_validates_mesh() {
         outcome.loaded,
         Loaded::Unconfigured { mesh: Some(_), .. }
     ));
-    let bad = EXAMPLE_MESH.replace("hub = \"heim\"", "hub = \"nope\"");
+    let bad = EXAMPLE_MESH.replace("address = \"10.8.0.2\"", "address = \"nope\"");
     assert!(load(&bad, "").is_err());
 }
 
@@ -171,59 +171,71 @@ fn invalid_address() {
 }
 
 #[test]
-fn spoke_hub_must_exist() {
-    let mesh = EXAMPLE_MESH.replace("hub = \"buero\"", "hub = \"buero2\"");
-    let line = line_of(&mesh, "", "hub = \"buero2\"");
+fn old_role_and_hub_keys_are_ignored_with_a_warning() {
+    let mesh = EXAMPLE_MESH.replace(
+        "name = \"haus2\"\n",
+        "name = \"haus2\"\nrole = \"spoke\"\nhub = \"heim\"\n",
+    );
+    let outcome = load(&mesh, LOCAL).expect("old keys do not make the file invalid");
+    let warnings: Vec<_> = outcome
+        .warnings
+        .iter()
+        .filter(|w| w.message.contains("no longer used"))
+        .collect();
+    assert_eq!(warnings.len(), 2, "{:?}", outcome.warnings);
+    assert_eq!(
+        warnings[0].line,
+        Some(line_of(&mesh, "name = \"haus2\"", "role"))
+    );
+    let Loaded::Configured(cfg) = outcome.loaded else {
+        panic!("configured");
+    };
+    assert_eq!(cfg.mesh.sites.len(), 4);
+    assert!(!render_mesh(&cfg.mesh).contains("role"));
+}
+
+#[test]
+fn a_single_site_is_a_valid_network() {
+    let mesh = "[mesh]\nvlans = \"10\"\n\n[[site]]\nname = \"a\"\naddress = \"10.0.0.1\"\n";
+    let outcome = load(mesh, "self = \"a\"\ntrunk = \"eth0\"\n").expect("valid");
+    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+}
+
+#[test]
+fn site_vlans_are_parsed_and_rendered() {
+    let outcome = load(EXAMPLE_MESH, LOCAL).expect("example loads");
+    let Loaded::Configured(cfg) = outcome.loaded else {
+        panic!("configured");
+    };
+    let haus2 = cfg.mesh.site("haus2").expect("haus2");
+    assert_eq!(cfg.mesh.vlans_of(haus2).to_string(), "20,30");
+    let heim = cfg.mesh.site("heim").expect("heim");
+    assert_eq!(cfg.mesh.vlans_of(heim).to_string(), "10-50");
+    assert!(render_mesh(&cfg.mesh).contains("vlans = \"20,30\""));
+}
+
+#[test]
+fn invalid_site_vlans_have_a_line() {
+    let mesh = EXAMPLE_MESH.replace("vlans = \"20,30\"", "vlans = \"20,5000\"");
+    let line = line_of(&mesh, "name = \"haus2\"", "vlans");
     assert_error(
         &mesh,
         line,
-        "spoke \"haus3\": hub \"buero2\" does not exist",
+        "site \"haus2\": vlans: VLAN ID 5000 is outside 1-4094",
     );
 }
 
 #[test]
-fn spoke_hub_must_be_a_hub() {
-    let mesh = EXAMPLE_MESH.replace("hub = \"buero\"", "hub = \"haus2\"");
-    let line = line_of(&mesh, "", "hub = \"haus2\"");
-    assert_error(&mesh, line, "\"haus2\" is a spoke, not a hub");
-}
-
-#[test]
-fn spoke_needs_hub() {
-    let mesh = EXAMPLE_MESH.replace("hub = \"buero\"\n", "");
-    let line = line_of(&mesh, "name = \"haus2\"", "[[site]]");
-    assert_error(&mesh, line, "spoke \"haus3\" needs `hub");
-}
-
-#[test]
-fn hub_must_not_have_hub() {
+fn map_target_must_be_a_vlan_of_the_site() {
     let mesh = EXAMPLE_MESH.replace(
-        "name = \"buero\"\nrole = \"hub\"\n",
-        "name = \"buero\"\nrole = \"hub\"\nhub = \"heim\"\n",
+        "name = \"haus3\"\naddress = \"10.8.0.12\"\n",
+        "name = \"haus3\"\naddress = \"10.8.0.12\"\nvlans = \"30\"\n",
     );
-    let line = line_of(&mesh, "name = \"buero\"", "hub = \"heim\"");
-    assert_error(&mesh, line, "hub \"buero\" must not have a `hub` entry");
-}
-
-#[test]
-fn mesh_needs_a_hub() {
-    let mesh = "[mesh]\nvlans = \"10\"\n\n[[site]]\nname = \"a\"\nrole = \"spoke\"\nhub = \"a\"\naddress = \"10.0.0.1\"\n";
-    let errs = errors(mesh, "self = \"a\"\ntrunk = \"eth0\"\n");
-    assert!(errs.iter().any(|e| e.message.contains("at least one hub")));
-    assert!(
-        errs.iter()
-            .any(|e| e.message.contains("cannot be its own hub"))
-    );
-}
-
-#[test]
-fn invalid_role() {
-    let mesh = EXAMPLE_MESH.replacen("role = \"hub\"", "role = \"router\"", 1);
-    let errs = errors(&mesh, LOCAL);
-    assert!(
-        errs.iter()
-            .any(|e| e.message.contains("unknown role \"router\"")
-                && e.line == Some(line_of(&mesh, "", "role = \"router\"")))
+    let line = line_of(&mesh, "local = \"native\"", "shared");
+    assert_error(
+        &mesh,
+        line,
+        "shared VLAN 20 is not one of the VLANs of site \"haus3\" (30)",
     );
 }
 
@@ -246,7 +258,11 @@ fn invalid_site_name() {
 fn shared_vid_must_be_in_range() {
     let mesh = EXAMPLE_MESH.replace("shared = 30", "shared = 60");
     let line = line_of(&mesh, "", "shared = 60");
-    assert_error(&mesh, line, "shared VLAN 60 is not in mesh.vlans (10-50)");
+    assert_error(
+        &mesh,
+        line,
+        "shared VLAN 60 is not one of the VLANs of site \"haus3\" (10-50)",
+    );
 }
 
 #[test]
@@ -369,7 +385,7 @@ fn local_unknown_key() {
 #[test]
 fn check_without_local() {
     assert!(!has_errors(&check(EXAMPLE_MESH, None)));
-    let bad = EXAMPLE_MESH.replace("hub = \"heim\"", "hub = \"nope\"");
+    let bad = EXAMPLE_MESH.replace("site = \"haus3\"", "site = \"nope\"");
     let diags = check(&bad, None);
     assert!(has_errors(&diags));
     assert!(diags[0].line.is_some());
@@ -379,7 +395,7 @@ fn check_without_local() {
 #[test]
 fn reports_multiple_errors_at_once() {
     let mesh = EXAMPLE_MESH
-        .replace("hub = \"buero\"", "hub = \"buero2\"")
+        .replace("address = \"10.8.0.12\"", "address = \"10.8.0.11\"")
         .replace("shared = 30", "shared = 60");
     assert_eq!(errors(&mesh, LOCAL).len(), 2);
 }
@@ -388,9 +404,9 @@ fn reports_multiple_errors_at_once() {
 fn mesh_model_validation_without_text() {
     // The TUI validates the model directly; paths identify the field.
     let mut mesh: Mesh = parse_mesh(EXAMPLE_MESH).unwrap().mesh.unwrap();
-    mesh.sites[3].hub = Some("x".into());
+    mesh.sites[0].vlans = Some(crate::config::VlanSet::new());
     let diags = crate::config::validate(&mesh, None);
     assert_eq!(diags.len(), 1);
-    assert_eq!(diags[0].path.as_str(), "site[3].hub");
+    assert_eq!(diags[0].path.as_str(), "site[0].vlans");
     assert_eq!(diags[0].line, None);
 }

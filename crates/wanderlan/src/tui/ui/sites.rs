@@ -35,8 +35,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
     let running = app.running.as_ref().and_then(|r| r.mesh.as_ref());
     let own = draft.local.self_name.as_deref();
-    let header =
-        Row::new(vec!["", "NAME", "ROLE", "HUB", "ADDRESS", "TUNNEL"]).style(theme::header());
+    let header = Row::new(vec!["", "NAME", "ADDRESS", "VLANS", "TUNNEL"]).style(theme::header());
     let rows: Vec<Row> = draft
         .mesh
         .sites
@@ -60,9 +59,11 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
             Row::new(vec![
                 Cell::from(marker),
                 Cell::from(site.name.clone()),
-                Cell::from(site.role.as_str()),
-                Cell::from(site.hub.clone().unwrap_or_else(|| "-".into())),
                 Cell::from(site.address.to_string()),
+                match &site.vlans {
+                    Some(v) => Cell::from(v.to_string()),
+                    None => Cell::from(Span::styled(draft.mesh.vlans.to_string(), theme::dim())),
+                },
                 Cell::from(tunnel).style(tunnel_style),
             ])
             .style(style)
@@ -81,9 +82,8 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
     let widths = [
         Constraint::Length(1),
         Constraint::Length(12),
-        Constraint::Length(5),
-        Constraint::Length(12),
         Constraint::Length(15),
+        Constraint::Length(20),
         Constraint::Min(8),
     ];
     let table = Table::new(rows, widths)
@@ -137,7 +137,7 @@ fn draw_mesh(frame: &mut Frame, draft: &Draft, area: Rect) {
     let at = |key: &str| draft.worst_at(&FieldPath::mesh(key));
     let lines = vec![
         setting(
-            "VLANs",
+            "Default VLANs",
             format!("{} ({} VLANs)", m.vlans, m.vlans.len()),
             at("vlans"),
         ),
@@ -164,7 +164,7 @@ fn draw_mesh(frame: &mut Frame, draft: &Draft, area: Rect) {
         ),
     ];
     frame.render_widget(
-        Paragraph::new(lines).block(titled(" Mesh settings (m) ")),
+        Paragraph::new(lines).block(titled(" Network settings (m) ")),
         area,
     );
 }

@@ -59,6 +59,18 @@ pub enum Request {
     Unblock(UnblockParams),
     /// Measures the path MTU to all peers again → [`Done`].
     ProbeNow,
+    /// Creates an invitation for a new site → [`Invitation`].
+    Invite,
+    /// Lists the open invitations of this site → [`Vec<Invitation>`].
+    Invites,
+    /// Deletes an open invitation → [`Done`].
+    DeleteInvite(InviteParams),
+    /// Joins an existing network with an invitation (unconfigured sites
+    /// only) → [`Joined`].
+    Join(JoinParams),
+    /// Removes the bridge, the tunnels, all rules, the configuration and the
+    /// invitations: the site is unconfigured again → [`Done`].
+    Reset,
 }
 
 /// A configuration given as TOML texts.
@@ -98,6 +110,57 @@ pub struct ApplyFilesParams {
 pub struct UnblockParams {
     /// Tunnel interface, e.g. `gt-haus2`.
     pub port: String,
+}
+
+/// Parameters of [`Request::DeleteInvite`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteParams {
+    /// The invitation code.
+    pub code: String,
+}
+
+/// Parameters of [`Request::Join`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinParams {
+    /// Site that created the invitation: `<address>` or `<address>:<port>`.
+    pub target: String,
+    /// The invitation code.
+    pub code: String,
+    /// Name of this site.
+    pub name: String,
+    /// True if the name was not chosen by the user (the host name); the
+    /// inviting site then appends `-2`, `-3`, ... if it is taken.
+    #[serde(default)]
+    pub name_is_default: bool,
+    /// Local trunk interface.
+    pub trunk: String,
+}
+
+/// An open invitation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Invitation {
+    /// The code, e.g. `K7F3Q-9QX2M`.
+    pub code: String,
+    /// The command to run on the new site.
+    pub command: String,
+    /// Unix time the invitation was created.
+    pub created_secs: u64,
+    /// True while a site is joining with it (not used up yet).
+    #[serde(default)]
+    pub in_use: bool,
+}
+
+/// Result of [`Request::Join`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Joined {
+    /// Name this site got in the network.
+    pub site: String,
+    /// The site that let it join.
+    pub via: String,
+    /// Number of sites in the network.
+    pub sites: usize,
+    /// Mesh revision received.
+    pub revision: u64,
 }
 
 /// A response with its id.
@@ -220,6 +283,11 @@ pub enum ChangeSource {
         /// Peer the configuration came from.
         peer: String,
     },
+    /// A new site joined with an invitation of this site.
+    Join {
+        /// Name of the new site.
+        site: String,
+    },
 }
 
 /// A change waiting for confirmation.
@@ -250,14 +318,15 @@ pub enum PortState {
 pub struct PeerStatus {
     /// Site name.
     pub name: String,
-    /// Role of the peer.
-    pub role: crate::config::Role,
     /// Transport address.
     pub address: String,
     /// Tunnel interface.
     pub port: String,
     /// Tunnel port state.
     pub port_state: PortState,
+    /// VLANs carried by the tunnel (both sites take part in them).
+    #[serde(default)]
+    pub vlans: String,
     /// The peer answers control probes.
     pub reachable: bool,
     /// Seconds since the last answered probe.
@@ -285,12 +354,11 @@ pub struct PeerStatus {
 pub struct SiteSummary {
     /// Name.
     pub name: String,
-    /// Role.
-    pub role: crate::config::Role,
-    /// Hub of a spoke.
-    pub hub: Option<String>,
     /// Transport address.
     pub address: String,
+    /// Shared VLANs the site takes part in.
+    #[serde(default)]
+    pub vlans: String,
     /// True for this site.
     pub is_self: bool,
     /// True if there is a tunnel to this site.
@@ -306,8 +374,6 @@ pub struct Status {
     pub state: SiteState,
     /// Name of this site.
     pub site: Option<String>,
-    /// Role of this site.
-    pub role: Option<crate::config::Role>,
     /// Transport address of this site.
     pub address: Option<String>,
     /// Trunk interface.
@@ -328,6 +394,9 @@ pub struct Status {
     pub sites: Vec<SiteSummary>,
     /// Ports shut down by the loop guard.
     pub blocked: Vec<String>,
+    /// Open invitations of this site.
+    #[serde(default)]
+    pub invites: usize,
 }
 
 /// Severity of an event.
@@ -370,6 +439,20 @@ pub struct Interface {
     pub mtu: u32,
     /// True if the interface was created by wanderlan.
     pub managed: bool,
+}
+
+impl Interface {
+    /// True for an interface that can be the trunk: physical or a VLAN,
+    /// bond or veth device, not created by wanderlan, not attached to another
+    /// bridge or bond (attached to wanderlan's own bridge is fine).
+    pub fn is_trunk_candidate(&self) -> bool {
+        let kind_ok = matches!(self.kind.as_str(), "" | "vlan" | "bond" | "veth");
+        let master_ok = self
+            .master
+            .as_deref()
+            .is_none_or(|m| m == crate::BRIDGE_NAME);
+        self.name != "lo" && kind_ok && master_ok && !self.managed
+    }
 }
 
 /// A learned MAC address.

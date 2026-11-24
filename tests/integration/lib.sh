@@ -7,8 +7,8 @@ FAILURES=0
 CASE=""
 
 # Site name -> transport address and VLAN host number.
-declare -A ADDR=([hub1]=10.100.1.10 [hub2]=10.100.2.10 [spoke1]=10.100.11.10 [spoke2]=10.100.12.10 [spoke3]=10.100.13.10)
-declare -A HOSTNUM=([hub1]=1 [hub2]=2 [spoke1]=11 [spoke2]=12 [spoke3]=13)
+declare -A ADDR=([site1]=10.100.1.10 [site2]=10.100.2.10 [site3]=10.100.11.10 [site4]=10.100.12.10 [site5]=10.100.13.10)
+declare -A HOSTNUM=([site1]=1 [site2]=2 [site3]=11 [site4]=12 [site5]=13)
 
 log() { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
 info() { printf '    %s\n' "$*"; }
@@ -107,19 +107,23 @@ check_not() {
 # revision so the sync between the daemons never prefers an older one.
 MESH_REVISION=${MESH_REVISION:-100}
 
-# mesh_toml <vlans> <site:role[:hub]>... prints a mesh.toml.
+# mesh_toml <vlans> <site[=vlans]>... prints a mesh.toml; `site=20,30`
+# limits a site to some of the VLANs.
 mesh_toml() {
   local vlans="$1"
   shift
   MESH_REVISION=$((MESH_REVISION + 1))
   printf '[mesh]\nrevision = %s\nvlans = "%s"\nmtu_probe_interval = "%s"\ncommit_timeout = "%s"\n' \
     "${REVISION:-$MESH_REVISION}" "$vlans" "${PROBE_INTERVAL:-15s}" "${COMMIT_TIMEOUT:-60s}"
-  local spec name role hub
+  local spec name site_vlans
   for spec in "$@"; do
-    IFS=: read -r name role hub <<<"$spec"
-    printf '\n[[site]]\nname = "%s"\nrole = "%s"\n' "$name" "$role"
-    [ -n "$hub" ] && printf 'hub = "%s"\n' "$hub"
-    printf 'address = "%s"\n' "${ADDR[$name]}"
+    name="${spec%%=*}"
+    site_vlans=""
+    [[ "$spec" == *=* ]] && site_vlans="${spec#*=}"
+    printf '\n[[site]]\nname = "%s"\naddress = "%s"\n' "$name" "${ADDR[$name]}"
+    if [ -n "$site_vlans" ]; then
+      printf 'vlans = "%s"\n' "$site_vlans"
+    fi
   done
   if [ -n "${MESH_EXTRA:-}" ]; then
     printf '\n%s\n' "$MESH_EXTRA"

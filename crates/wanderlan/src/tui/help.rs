@@ -48,22 +48,27 @@ pub const SECTIONS: &[Section] = &[
         title: "2 Sites",
         keys: &[
             ("Up/Down", "select a site"),
-            ("n", "new site"),
+            ("i", "invite a new site (shows the command to run there)"),
+            ("n", "new site by hand"),
             (
                 "e, Enter",
                 "edit the site (renaming updates all references)",
             ),
             ("d, Del", "delete the site and its VLAN mappings"),
-            ("m", "mesh settings (VLANs, port, MTU probe, timeout, MSS)"),
+            (
+                "m",
+                "network settings (VLANs, port, MTU probe, timeout, MSS)",
+            ),
             ("l", "local settings of this host: self, trunk"),
             ("u", "unblock the tunnel port to the site"),
         ],
-        text: "",
+        text: "Every site has a tunnel to every other site. Edit a site to limit it \
+               to some VLANs (like the allowed VLANs of a switch port).",
     },
     Section {
         title: "3 VLANs",
         keys: &[
-            ("v", "edit the shared VLANs (e.g. 10-50,60)"),
+            ("v", "edit the default VLANs of the network (e.g. 10-50,60)"),
             ("n", "new mapping (native or local VLAN -> shared VLAN)"),
             ("e, Enter", "edit the mapping"),
             ("d, Del", "delete the mapping"),
@@ -107,8 +112,11 @@ pub const SECTIONS: &[Section] = &[
         keys: &[
             ("Enter", "next step"),
             ("Esc", "previous step; leave on the first"),
+            ("i", "on a configured site: invite a new site"),
+            ("R", "on a configured site: reset it (removes everything)"),
         ],
-        text: "",
+        text: "Unconfigured: start a new network, or join one with an invitation \
+               (address of the inviting site and the code).",
     },
     Section {
         title: "How changes work",
@@ -195,12 +203,12 @@ pub fn bar(app: &App) -> Vec<Binding> {
         match app.view {
             View::Overview => vec![("Up/Down", "peer"), ("u", "unblock"), ("p", "probe MTU")],
             View::Sites => vec![
+                ("i", "invite"),
                 ("n", "new"),
                 ("e", "edit"),
                 ("d", "delete"),
-                ("m", "mesh"),
+                ("m", "network"),
                 ("l", "local"),
-                ("u", "unblock"),
             ],
             View::Vlans => vec![
                 ("v", "VLANs"),
@@ -221,18 +229,27 @@ pub fn bar(app: &App) -> Vec<Binding> {
             View::Setup if app.wizard.captures_text(&app.interfaces) => {
                 // Letters and digits go into the field: only special keys.
                 let mut keys = vec![("Enter", "next"), ("Esc", "back")];
-                match app.wizard.step {
-                    Step::Peer => keys.insert(0, ("Tab", "field")),
-                    Step::Trunk => keys.insert(0, ("Up/Down", "choose")),
-                    _ => {}
+                if app.wizard.step == Step::Trunk {
+                    keys.insert(0, ("Up/Down", "choose"));
                 }
                 keys.push(("Ctrl-C", "quit"));
                 return keys;
             }
+            View::Setup
+                if app.status.as_ref().is_some_and(|s| s.site.is_some())
+                    && app.wizard.step == Step::Welcome =>
+            {
+                vec![("i", "invite a site"), ("R", "reset this site")]
+            }
             View::Setup => match app.wizard.step {
-                Step::Welcome => vec![("Enter", "start"), ("Esc", "leave setup")],
-                Step::Summary => vec![("Enter", "review and apply"), ("Esc", "back")],
+                Step::Welcome => vec![
+                    ("Up/Down", "choose"),
+                    ("Enter", "start"),
+                    ("Esc", "leave setup"),
+                ],
+                Step::Summary => vec![("Enter", "apply / join"), ("Esc", "back")],
                 Step::Applied => vec![("c", "confirm"), ("r", "roll back")],
+                Step::Joining => vec![],
                 _ => vec![("Up/Down", "choose"), ("Enter", "next"), ("Esc", "back")],
             },
         }

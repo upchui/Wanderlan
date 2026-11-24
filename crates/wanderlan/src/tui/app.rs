@@ -12,8 +12,8 @@ use crossterm::event::{
 };
 use wanderlan_core::api::{
     ApiError, Applied, ApplyParams, ChangeSource, ConfigInput, ConfigTexts, Confirmed, Event,
-    Interface, MacEntry, PeerStatus, PendingChange, PortState, Request, SiteState, Status,
-    UnblockParams,
+    Interface, Invitation, Joined, MacEntry, PeerStatus, PendingChange, PortState, Request,
+    SiteState, Status, UnblockParams,
 };
 use wanderlan_core::config::{Diagnostic, has_errors, render_local, render_mesh};
 use wanderlan_core::topology::gretap_name;
@@ -23,8 +23,9 @@ use super::draft::{Draft, Running};
 use super::form::{Form, FormEvent, FormKind, trunk_hint};
 use super::log::LogState;
 use super::macs::MacState;
-use super::wizard::{self, Step, Wizard};
+use super::wizard::{self, Mode, Step, Wizard};
 use crate::client::ClientError;
+use crate::hostinfo;
 
 /// Ticks (seconds) between connection attempts while the daemon is down.
 pub const RETRY_TICKS: u32 = 2;
@@ -170,6 +171,8 @@ pub enum AskAction {
     DeleteMap(usize),
     /// Re-enable a port blocked by the loop guard.
     Unblock(String),
+    /// Remove everything wanderlan set up on this site.
+    Reset,
 }
 
 /// A yes/no question.
@@ -283,6 +286,10 @@ pub enum Reply {
     Interfaces(Vec<Interface>),
     /// Answer to `mac_table`.
     Macs(Vec<MacEntry>),
+    /// Answer to `invite`.
+    Invitation(Invitation),
+    /// Answer to `join`.
+    Joined(Joined),
     /// An empty answer.
     Done,
 }
@@ -371,6 +378,8 @@ pub struct App {
     pub maps_selected: usize,
     /// The setup wizard.
     pub wizard: Wizard,
+    /// The invitation created last (shown in the overview while open).
+    pub invitation: Option<Invitation>,
     /// Popup, if any.
     pub modal: Option<Modal>,
     /// Status line message.
@@ -404,6 +413,7 @@ impl App {
             sites_selected: 0,
             maps_selected: 0,
             wizard: Wizard::new(),
+            invitation: None,
             modal: None,
             message: None,
             busy: None,
@@ -612,6 +622,9 @@ impl App {
                 MessageKind::Info,
                 "Measuring the path MTU to all peers; the overview updates shortly.",
             ),
+            (Request::Invite, Ok(Reply::Invitation(inv))) => self.on_invitation(inv, fx),
+            (Request::Join(_), Ok(Reply::Joined(joined))) => self.on_joined(&joined, fx),
+            (Request::Reset, Ok(_)) => self.on_reset(fx),
             (request, Err(e)) => self.on_request_failed(&request, &e),
             (_, Ok(_)) => {}
         }
@@ -649,6 +662,19 @@ impl App {
             Request::Unblock(_) => "unblock",
             Request::ProbeNow => "MTU probe",
             Request::Validate(_) | Request::Apply(_) | Request::ApplyFiles(_) => "apply",
+            Request::Invite | Request::Invites | Request::DeleteInvite(_) => "invitation",
+            Request::Join(_) => {
+                self.wizard.step = Step::Summary;
+                self.wizard.error = Some(match error {
+                    ClientError::Api(e) => e.message.clone(),
+                    other => other.to_string(),
+                });
+                return;
+            }
+            Request::Reset => {
+                self.busy = None;
+                "reset"
+            }
         };
         self.say(MessageKind::Error, format!("{what} failed: {error}"));
     }
@@ -669,12 +695,17 @@ impl App {
         }
         let had_pending = self.pending().is_some();
         if had_pending && status.pending.is_none() && self.busy.is_none() {
-            self.on_pending_ended(status.state);
+            self.on_pending_ended(status.state, fx);
+        }
+        if status.invites == 0 {
+            self.invitation = None;
         }
         if !self.wizard_offered {
             self.wizard_offered = true;
             if status.state == SiteState::Unconfigured {
                 self.view = View::Setup;
+                self.wizard
+                    .prefill(&hostinfo::hostname(), hostinfo::default_address());
                 self.request_interfaces(fx);
             }
         }
@@ -686,7 +717,7 @@ impl App {
 
     /// The pending change disappeared without a confirm/rollback from here:
     /// the timer ran out or someone else decided.
-    fn on_pending_ended(&mut self, state: SiteState) {
+    fn on_pending_ended(&mut self, state: SiteState, fx: &mut Vec<Effect>) {
         if let Some(Modal::Review(review)) = &self.modal
             && matches!(review.state, ReviewState::Applied(_))
         {
@@ -700,9 +731,7 @@ impl App {
                     "The setup was rolled back because it was not confirmed in time.",
                 );
             } else {
-                self.wizard = Wizard::new();
-                self.view = View::Overview;
-                self.say(MessageKind::Success, "The setup was confirmed.");
+                self.setup_done(fx);
             }
             return;
         }
@@ -787,12 +816,7 @@ impl App {
         self.busy = None;
         self.clear_pending();
         if self.wizard.step == Step::Applied {
-            self.wizard = Wizard::new();
-            self.view = View::Overview;
-            self.say(
-                MessageKind::Success,
-                "Setup complete. The rest of the mesh arrives once the peer lists this site.",
-            );
+            self.setup_done(fx);
         } else {
             self.say(
                 MessageKind::Success,
@@ -804,6 +828,90 @@ impl App {
         }
         self.request_status(fx);
         self.request_config(fx);
+    }
+
+    /// The new network is confirmed: invite the next site right away.
+    fn setup_done(&mut self, fx: &mut Vec<Effect>) {
+        self.wizard = Wizard::new();
+        self.view = View::Overview;
+        self.say(
+            MessageKind::Success,
+            "Setup complete. Creating an invitation for the next site ...",
+        );
+        fx.push(Effect::Request(Request::Invite));
+    }
+
+    fn on_invitation(&mut self, invitation: Invitation, fx: &mut Vec<Effect>) {
+        self.say(
+            MessageKind::Success,
+            format!("On the new site run: {}", invitation.command),
+        );
+        self.invitation = Some(invitation);
+        self.request_status(fx);
+    }
+
+    fn invite(&mut self, fx: &mut Vec<Effect>) {
+        if !self.is_connected() {
+            self.say(MessageKind::Error, "Not connected to the daemon.");
+            return;
+        }
+        fx.push(Effect::Request(Request::Invite));
+    }
+
+    fn start_join(&mut self, fx: &mut Vec<Effect>) {
+        match self.wizard.join_params(&self.interfaces) {
+            Ok(params) => fx.push(Effect::Request(Request::Join(params))),
+            Err(e) => {
+                self.wizard.step = Step::Summary;
+                self.wizard.error = Some(e);
+            }
+        }
+    }
+
+    fn on_joined(&mut self, joined: &Joined, fx: &mut Vec<Effect>) {
+        self.wizard = Wizard::new();
+        self.view = View::Overview;
+        self.say(
+            MessageKind::Success,
+            format!(
+                "Joined via {} as {} ({} sites); confirmed automatically as soon as {} answers.",
+                joined.via, joined.site, joined.sites, joined.via
+            ),
+        );
+        self.request_status(fx);
+        self.request_config(fx);
+    }
+
+    fn ask_reset(&mut self) {
+        self.modal = Some(Modal::Ask(Ask {
+            title: "Reset this site".into(),
+            text: "Remove the bridge, all tunnels and rules, the configuration and the invitations of this site? It becomes unconfigured, like after the installation. Other sites keep listing it until it is removed there.".into(),
+            action: AskAction::Reset,
+        }));
+    }
+
+    fn on_reset(&mut self, fx: &mut Vec<Effect>) {
+        self.busy = None;
+        self.wizard = Wizard::new();
+        self.wizard
+            .prefill(&hostinfo::hostname(), hostinfo::default_address());
+        self.invitation = None;
+        self.view = View::Setup;
+        self.say(
+            MessageKind::Success,
+            "Reset done: this site is unconfigured again.",
+        );
+        self.request_status(fx);
+        self.request_config(fx);
+        self.request_interfaces(fx);
+    }
+
+    fn on_setup_key(&mut self, key: &KeyEvent, fx: &mut Vec<Effect>) {
+        match key.code {
+            KeyCode::Char('i') => self.invite(fx),
+            KeyCode::Char('R') => self.ask_reset(),
+            _ => {}
+        }
     }
 
     fn on_rolled_back(&mut self, fx: &mut Vec<Effect>) {
@@ -843,9 +951,14 @@ impl App {
             self.modal = self.on_modal_key(modal, key, fx);
             return;
         }
+        let unconfigured = self
+            .status
+            .as_ref()
+            .is_some_and(|s| s.state == SiteState::Unconfigured);
         if self.view == View::Setup
             && self.is_connected()
             && self.status.is_some()
+            && (unconfigured || self.wizard.step != Step::Welcome)
             && let Some(action) = self.wizard.handle_key(key, &self.interfaces)
         {
             self.on_wizard_action(action, fx);
@@ -866,7 +979,7 @@ impl App {
                 self.macs.handle_key(key);
             }
             View::Log => self.on_log_key(key),
-            View::Setup => {}
+            View::Setup => self.on_setup_key(key, fx),
         }
     }
 
@@ -1173,6 +1286,7 @@ impl App {
             AskAction::Unblock(port) => {
                 fx.push(Effect::Request(Request::Unblock(UnblockParams { port })));
             }
+            AskAction::Reset => fx.push(Effect::Request(Request::Reset)),
         }
     }
 
@@ -1183,8 +1297,18 @@ impl App {
                 self.view = View::Overview;
                 self.say(MessageKind::Info, "Setup left. Press 6 to return to it.");
             }
-            wizard::Action::LoadInterfaces => self.request_interfaces(fx),
+            wizard::Action::LoadInterfaces => {
+                self.wizard.transport = match self.wizard.mode {
+                    Mode::Join => self
+                        .wizard
+                        .target_address()
+                        .and_then(hostinfo::route_interface),
+                    Mode::New => hostinfo::default_interface(),
+                };
+                self.request_interfaces(fx);
+            }
             wizard::Action::Review => self.open_wizard_review(),
+            wizard::Action::Join => self.start_join(fx),
         }
     }
 
@@ -1289,6 +1413,7 @@ impl App {
                 self.modal = Some(Modal::Form(Form::site(draft, Some(selected))));
             }
             KeyCode::Char('m') => self.modal = Some(Modal::Form(Form::mesh(draft))),
+            KeyCode::Char('i') => self.invite(fx),
             KeyCode::Char('l') => {
                 self.modal = Some(Modal::Form(Form::local(draft, &self.interfaces)));
                 self.request_interfaces(fx);
@@ -1389,6 +1514,7 @@ pub fn banner_text(pending: &PendingChange) -> String {
     let what = match &pending.source {
         ChangeSource::Local => "UNCONFIRMED CHANGE".to_string(),
         ChangeSource::Sync { peer } => format!("CHANGE FROM {peer}"),
+        ChangeSource::Join { site } => format!("SITE {site} JOINING"),
     };
     format!(
         " {what}: rollback in {} s  |  c confirm  |  r roll back now ",

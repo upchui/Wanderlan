@@ -14,7 +14,7 @@ use serde_spanned::Spanned;
 use super::diag::{ConfigFile, Diagnostic, FieldPath, SpanMap};
 use super::model::{
     DEFAULT_COMMIT_TIMEOUT, DEFAULT_CONTROL_PORT, DEFAULT_MTU_PROBE_INTERVAL, Local, LocalVid,
-    Mesh, Role, Site, VlanMap,
+    Mesh, Site, VlanMap,
 };
 use super::vlan::{VID_MAX, VID_MIN, VlanSet};
 
@@ -57,9 +57,12 @@ enum RawVlanItem {
 #[serde(deny_unknown_fields)]
 struct RawSite {
     name: Option<Spanned<String>>,
-    role: Option<Spanned<String>>,
-    hub: Option<Spanned<String>>,
     address: Option<Spanned<String>>,
+    vlans: Option<Spanned<RawVlans>>,
+    /// Since 0.2 there are no roles; read and ignored with a warning.
+    role: Option<Spanned<String>>,
+    /// Since 0.2 there are no hubs; read and ignored with a warning.
+    hub: Option<Spanned<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +96,8 @@ pub struct ParsedMesh {
     pub mesh: Option<Mesh>,
     /// Source positions for line numbers in later diagnostics.
     pub spans: SpanMap,
+    /// Warnings found while reading (e.g. keys that are no longer used).
+    pub warnings: Vec<Diagnostic>,
 }
 
 /// Result of parsing `local.toml`.
@@ -122,6 +127,12 @@ impl Lowering {
 
     fn span(&mut self, path: &FieldPath, span: Range<usize>) {
         self.spans.insert(path.clone(), span);
+    }
+
+    fn warning(&mut self, path: FieldPath, message: impl Into<String>) {
+        let mut diag = Diagnostic::warning(self.file, path, message);
+        diag.line = self.spans.line(&diag.path);
+        self.diags.push(diag);
     }
 
     fn error(&mut self, path: FieldPath, message: impl Into<String>) {
@@ -190,6 +201,7 @@ pub fn parse_mesh(text: &str) -> Result<ParsedMesh, Vec<Diagnostic>> {
         return Ok(ParsedMesh {
             mesh: None,
             spans: lw.spans,
+            warnings: Vec::new(),
         });
     }
 
@@ -223,13 +235,14 @@ pub fn parse_mesh(text: &str) -> Result<ParsedMesh, Vec<Diagnostic>> {
         }
     }
 
-    if lw.diags.is_empty() {
+    if lw.diags.iter().any(Diagnostic::is_error) {
+        Err(lw.diags)
+    } else {
         Ok(ParsedMesh {
             mesh: Some(mesh),
             spans: lw.spans,
+            warnings: lw.diags,
         })
-    } else {
-        Err(lw.diags)
     }
 }
 
@@ -251,26 +264,7 @@ fn lower_section(lw: &mut Lowering, s: RawMeshSection, mesh: &mut Mesh) {
     let path = FieldPath::mesh("vlans");
     let vlans = lw.take(&path, s.vlans);
     if let Some(vlans) = lw.required(path.clone(), vlans, "mesh.vlans (e.g. \"10-50\")") {
-        let parsed = match vlans {
-            RawVlans::Text(text) => text.parse::<VlanSet>(),
-            RawVlans::List(items) => {
-                let mut set = VlanSet::new();
-                items
-                    .iter()
-                    .try_for_each(|item| match item {
-                        RawVlanItem::Num(n) => set.insert_checked(*n),
-                        RawVlanItem::Text(t) => set.insert_item(t),
-                    })
-                    .and_then(|()| {
-                        if set.is_empty() {
-                            Err(super::vlan::VlanSetError::Empty)
-                        } else {
-                            Ok(set)
-                        }
-                    })
-            }
-        };
-        match parsed {
+        match parse_vlans(vlans) {
             Ok(set) => mesh.vlans = set,
             Err(e) => lw.error(path, format!("mesh.vlans: {e}")),
         }
@@ -298,33 +292,55 @@ fn lower_section(lw: &mut Lowering, s: RawMeshSection, mesh: &mut Mesh) {
     }
 }
 
+/// Parses `"10-50"`, `"10,20,30-40"` or a list `[10, "20-30"]`.
+fn parse_vlans(vlans: RawVlans) -> Result<VlanSet, super::vlan::VlanSetError> {
+    match vlans {
+        RawVlans::Text(text) => text.parse::<VlanSet>(),
+        RawVlans::List(items) => {
+            let mut set = VlanSet::new();
+            items.iter().try_for_each(|item| match item {
+                RawVlanItem::Num(n) => set.insert_checked(*n),
+                RawVlanItem::Text(t) => set.insert_item(t),
+            })?;
+            if set.is_empty() {
+                Err(super::vlan::VlanSetError::Empty)
+            } else {
+                Ok(set)
+            }
+        }
+    }
+}
+
 fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<Site> {
     let name_path = FieldPath::site_field(i, "name");
     let name = lw.take(&name_path, s.name);
-    let role_path = FieldPath::site_field(i, "role");
-    let role = lw.take(&role_path, s.role);
-    let hub_path = FieldPath::site_field(i, "hub");
-    let hub = lw.take(&hub_path, s.hub);
     let addr_path = FieldPath::site_field(i, "address");
     let address = lw.take(&addr_path, s.address);
+    let vlans_path = FieldPath::site_field(i, "vlans");
+    let vlans = lw.take(&vlans_path, s.vlans);
 
     let label = name
         .as_deref()
         .map_or_else(|| format!("site #{}", i + 1), |n| format!("site \"{n}\""));
+    for (field, value) in [("role", s.role), ("hub", s.hub)] {
+        let path = FieldPath::site_field(i, field);
+        if lw.take(&path, value).is_some() {
+            lw.warning(
+                path,
+                format!(
+                    "{label}: `{field}` is no longer used and is ignored; every site now connects to every other site"
+                ),
+            );
+        }
+    }
     let name = lw.required(name_path, name, &format!("{label}: name"));
-    let role = lw
-        .required(
-            role_path.clone(),
-            role,
-            &format!("{label}: role (\"hub\" or \"spoke\")"),
-        )
-        .and_then(|r| match r.parse::<Role>() {
-            Ok(role) => Some(role),
-            Err(e) => {
-                lw.error(role_path, format!("{label}: {e}"));
-                None
-            }
-        });
+    let vlans = vlans.and_then(|v| match parse_vlans(v) {
+        Ok(set) => Some(set),
+        Err(e) => {
+            lw.error(vlans_path, format!("{label}: vlans: {e}"));
+            None
+        }
+    });
     let address = lw
         .required(addr_path.clone(), address, &format!("{label}: address"))
         .and_then(|a| match a.trim().parse::<Ipv4Addr>() {
@@ -340,9 +356,8 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<Site> {
 
     Some(Site {
         name: name?,
-        role: role?,
-        hub,
         address: address?,
+        vlans,
     })
 }
 

@@ -4,8 +4,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use super::diag::{ConfigFile, Diagnostic, FieldPath};
-use super::model::{Local, LocalVid, MAX_SITE_NAME_LEN, Mesh, Role};
-use crate::topology::{self, GRETAP_PREFIX};
+use super::model::{Local, LocalVid, MAX_SITE_NAME_LEN, Mesh};
+use crate::topology::GRETAP_PREFIX;
 
 /// Smallest accepted fixed MSS.
 pub const MSS_MIN: u16 = 536;
@@ -28,7 +28,6 @@ pub fn validate(mesh: &Mesh, local: Option<&Local>) -> Vec<Diagnostic> {
     v.mesh_settings(mesh);
     v.sites(mesh);
     v.maps(mesh);
-    v.diags.extend(topology::check(mesh));
     if let Some(local) = local.filter(|l| l.is_configured()) {
         v.local(mesh, local);
     }
@@ -178,40 +177,16 @@ impl Validator {
                 );
             }
 
-            match site.role {
-                Role::Hub => {
-                    if site.hub.is_some() {
-                        self.error(
-                            FieldPath::site_field(i, "hub"),
-                            format!("hub \"{name}\" must not have a `hub` entry"),
-                        );
-                    }
-                }
-                Role::Spoke => match site.hub.as_deref() {
-                    None => self.error(
-                        FieldPath::site_field(i, "hub"),
-                        format!("spoke \"{name}\" needs `hub = \"<name of its hub>\"`"),
-                    ),
-                    Some(hub) if hub == name => self.error(
-                        FieldPath::site_field(i, "hub"),
-                        format!("spoke \"{name}\" cannot be its own hub"),
-                    ),
-                    Some(hub) => match mesh.site(hub) {
-                        None => self.error(
-                            FieldPath::site_field(i, "hub"),
-                            format!("spoke \"{name}\": hub \"{hub}\" does not exist"),
-                        ),
-                        Some(h) if h.role != Role::Hub => self.error(
-                            FieldPath::site_field(i, "hub"),
-                            format!("spoke \"{name}\": \"{hub}\" is a spoke, not a hub"),
-                        ),
-                        Some(_) => {}
-                    },
-                },
+            if site
+                .vlans
+                .as_ref()
+                .is_some_and(super::vlan::VlanSet::is_empty)
+            {
+                self.error(
+                    FieldPath::site_field(i, "vlans"),
+                    format!("site \"{name}\": vlans must contain at least one VLAN"),
+                );
             }
-        }
-        if mesh.hubs().next().is_none() {
-            self.error(FieldPath::root(), "the mesh needs at least one hub");
         }
     }
 
@@ -221,22 +196,21 @@ impl Validator {
         let mut shareds: BTreeMap<(&str, u16), usize> = BTreeMap::new();
         for (i, map) in mesh.maps.iter().enumerate() {
             let site = map.site.as_str();
-            if mesh.site(site).is_none() {
-                self.error(
+            let site_vlans = mesh.site(site).map(|s| mesh.vlans_of(s));
+            match site_vlans {
+                None => self.error(
                     FieldPath::map_field(i, "site"),
                     format!("map #{}: site \"{site}\" does not exist", i + 1),
-                );
-            }
-            if !mesh.vlans.contains(map.shared) {
-                self.error(
+                ),
+                Some(vlans) if !vlans.contains(map.shared) => self.error(
                     FieldPath::map_field(i, "shared"),
                     format!(
-                        "map #{}: shared VLAN {} is not in mesh.vlans ({})",
+                        "map #{}: shared VLAN {} is not one of the VLANs of site \"{site}\" ({vlans})",
                         i + 1,
                         map.shared,
-                        mesh.vlans
                     ),
-                );
+                ),
+                Some(_) => {}
             }
             if map.local == LocalVid::Vid(map.shared) {
                 self.error(
@@ -266,7 +240,7 @@ impl Validator {
                 );
             }
             if let LocalVid::Vid(local) = map.local
-                && mesh.vlans.contains(local)
+                && site_vlans.is_some_and(|v| v.contains(local))
             {
                 self.warning(
                     FieldPath::map_field(i, "local"),

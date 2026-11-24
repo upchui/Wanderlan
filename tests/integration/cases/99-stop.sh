@@ -3,7 +3,7 @@
 
 begin "Stopping the daemon removes all interfaces it created"
 
-for s in hub1 hub2 spoke1 spoke2 spoke3; do
+for s in site1 site2 site3 site4 site5; do
   x "$s" "wl-daemon status" >/dev/null 2>&1 || continue
   x "$s" "wl-daemon stop"
   check "$s: no br0 and no gt-* interfaces left" \

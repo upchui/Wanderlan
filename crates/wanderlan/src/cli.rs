@@ -1,18 +1,22 @@
 //! Non-interactive subcommands for scripts.
 
+use std::io::{BufRead as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use wanderlan_core::api::{
     self, Applied, ApplyFilesParams, ApplyParams, ConfigInput, ConfigTexts, Confirmed, Done, Event,
-    Level, PortState, Request, Status, UnblockParams,
+    Interface, Invitation, InviteParams, JoinParams, Joined, Level, PortState, Request, SiteState,
+    Status, UnblockParams,
 };
 use wanderlan_core::config::{self, ConfigFile, Severity};
+use wanderlan_core::join;
 
 use crate::client::Client;
+use crate::hostinfo;
 use crate::tui::{self, TuiOptions};
 
 const EXAMPLE_MESH: &str = include_str!("../../../packaging/examples/mesh.toml");
@@ -92,6 +96,50 @@ pub enum Command {
     },
     /// Measure the path MTU to all peers now.
     Probe,
+    /// Invite a new site: prints the command to run there.
+    ///
+    /// Works on every site of the network. The code can be used once and
+    /// stays valid until it is used or deleted.
+    Invite {
+        #[command(subcommand)]
+        action: Option<InviteAction>,
+    },
+    /// Join an existing network with an invitation.
+    ///
+    /// Run on a new site: `wanderlan join <address> <code>` as printed by
+    /// `wanderlan invite` on any site of the network.
+    Join {
+        /// Address of the site that created the invitation (`ip` or `ip:port`).
+        target: String,
+        /// The invitation code.
+        code: String,
+        /// Name of this site (default: the host name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Interface carrying the VLANs (default: the only interface that
+        /// does not lead to the inviting site).
+        #[arg(long)]
+        trunk: Option<String>,
+    },
+    /// Remove everything wanderlan set up on this site: bridge, tunnels,
+    /// rules, configuration and invitations. The site is unconfigured again.
+    Reset {
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+/// What `wanderlan invite` does.
+#[derive(Debug, Subcommand)]
+pub enum InviteAction {
+    /// List the open invitations of this site.
+    List,
+    /// Delete an open invitation.
+    Delete {
+        /// The code.
+        code: String,
+    },
 }
 
 /// Runs the selected subcommand.
@@ -146,7 +194,143 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             println!("Measuring the path MTU to all peers; see `wanderlan status`.");
             Ok(ExitCode::SUCCESS)
         }
+        Some(Command::Invite { action }) => invite(&socket, action).await,
+        Some(Command::Join {
+            target,
+            code,
+            name,
+            trunk,
+        }) => join_network(&socket, &target, &code, name, trunk).await,
+        Some(Command::Reset { yes }) => reset(&socket, yes).await,
     }
+}
+
+async fn invite(socket: &Path, action: Option<InviteAction>) -> Result<ExitCode> {
+    let client = connect(socket).await?;
+    match action {
+        None => {
+            let inv: Invitation = client.call(Request::Invite).await?;
+            println!("Invitation {} created. On the new site run:\n", inv.code);
+            println!("    {}\n", inv.command);
+            println!("The code works once and stays valid until it is used or deleted");
+            println!("(`wanderlan invite delete {}`).", inv.code);
+        }
+        Some(InviteAction::List) => {
+            let list: Vec<Invitation> = client.call(Request::Invites).await?;
+            if list.is_empty() {
+                println!("No open invitations.");
+            }
+            for inv in &list {
+                let created = humantime::format_rfc3339_seconds(
+                    std::time::UNIX_EPOCH + Duration::from_secs(inv.created_secs),
+                );
+                let state = if inv.in_use {
+                    "  (a site is joining with it)"
+                } else {
+                    ""
+                };
+                println!("{}  created {created}  {}{state}", inv.code, inv.command);
+            }
+        }
+        Some(InviteAction::Delete { code }) => {
+            let _: Done = client
+                .call(Request::DeleteInvite(InviteParams { code: code.clone() }))
+                .await?;
+            println!("Invitation {code} deleted.");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn join_network(
+    socket: &Path,
+    target: &str,
+    code: &str,
+    name: Option<String>,
+    trunk: Option<String>,
+) -> Result<ExitCode> {
+    let client = connect(socket).await?;
+    let (address, _) =
+        join::parse_target(target, config::DEFAULT_CONTROL_PORT).map_err(|e| anyhow!(e))?;
+    let (name, name_is_default) = match name {
+        Some(n) => (n, false),
+        None => (join::site_name_from_hostname(&hostinfo::hostname()), true),
+    };
+    let trunk = match trunk {
+        Some(t) => t,
+        None => {
+            let interfaces: Vec<Interface> = client.call(Request::Interfaces).await?;
+            let transport = hostinfo::route_interface(address);
+            hostinfo::choose_trunk(&interfaces, transport.as_deref()).map_err(|candidates| {
+                let via = transport.map_or_else(String::new, |t| format!(" ({t} leads to {address})"));
+                if candidates.is_empty() {
+                    anyhow!("no interface is left for the trunk{via}; give it with --trunk <interface>")
+                } else {
+                    anyhow!(
+                        "more than one interface could be the trunk: {}{via}; choose one with --trunk <interface>",
+                        candidates.join(", ")
+                    )
+                }
+            })?
+        }
+    };
+    println!("Joining via {target} as \"{name}\", trunk {trunk} ...");
+    let joined: Joined = client
+        .call(Request::Join(JoinParams {
+            target: target.to_string(),
+            code: code.to_string(),
+            name,
+            name_is_default,
+            trunk,
+        }))
+        .await?;
+    println!(
+        "Received the network configuration from \"{}\": this site is \"{}\", {} sites.",
+        joined.via, joined.site, joined.sites
+    );
+    println!("Waiting until \"{}\" answers ...", joined.via);
+    for _ in 0..120 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let st: Status = client.call(Request::Status).await?;
+        if st.state == SiteState::Unconfigured {
+            bail!(
+                "\"{}\" did not answer in time; the change was rolled back. Check that both sites reach each other (GRE and UDP/TCP {} in the transport network) and join again with a new invitation.",
+                joined.via,
+                config::DEFAULT_CONTROL_PORT
+            );
+        }
+        if st.pending.is_none() {
+            println!(
+                "Done: \"{}\" is part of the network (mesh revision {}). See `wanderlan status`.",
+                joined.site, st.revision
+            );
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+    bail!("no confirmation after two minutes; see `wanderlan status` and `wanderlan log`")
+}
+
+async fn reset(socket: &Path, yes: bool) -> Result<ExitCode> {
+    let client = connect(socket).await?;
+    if !yes {
+        println!(
+            "This removes everything wanderlan set up on this site: the bridge {}, all tunnels,\n\
+             the VLAN and MSS rules, the configuration and the open invitations.",
+            wanderlan_core::BRIDGE_NAME
+        );
+        print!("Type \"reset\" to continue: ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().lock().read_line(&mut answer)?;
+        if answer.trim() != "reset" {
+            println!("Nothing was changed.");
+            return Ok(ExitCode::FAILURE);
+        }
+    }
+    let _: Done = client.call(Request::Reset).await?;
+    println!("Reset done: this site is unconfigured again.");
+    println!("Other sites still list it until it is removed there (`wanderlan`, Sites, d).");
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn connect(socket: &Path) -> Result<Client> {
@@ -272,13 +456,14 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
     }
     match &st.site {
         Some(site) => println!(
-            "Site {site} ({}), address {}, trunk {}, VLANs {}",
-            st.role.map_or("?", |r| r.as_str()),
+            "Site {site}, address {}, trunk {}, VLANs {}",
             st.address.as_deref().unwrap_or("?"),
             st.trunk.as_deref().unwrap_or("?"),
             st.vlans.as_deref().unwrap_or("?"),
         ),
-        None => println!("This site is not configured yet; run `wanderlan` to set it up."),
+        None => println!(
+            "This site is not configured yet: run `wanderlan` to start a new network, or `wanderlan join <address> <code>` with an invitation."
+        ),
     }
     println!("Mesh revision {} ({})", st.revision, short(&st.fingerprint));
     if let Some(p) = &st.pending {
@@ -290,18 +475,23 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
     if let Some(e) = &st.last_error {
         println!("ERROR: {e}");
     }
+    if st.invites > 0 {
+        println!(
+            "{} open invitation(s) (`wanderlan invite list`)",
+            st.invites
+        );
+    }
     if st.peers.is_empty() {
         return Ok(ExitCode::SUCCESS);
     }
     println!(
-        "\n{:<12} {:<5} {:<15} {:<8} {:>7} {:>8} {:>5} {:>5} {:>5} {:>10} {:>10}",
-        "PEER", "ROLE", "ADDRESS", "PORT", "REPLY", "RTT", "PMTU", "MSS", "MACS", "RX", "TX"
+        "\n{:<12} {:<15} {:<8} {:>7} {:>8} {:>5} {:>5} {:>5} {:>10} {:>10}  VLANS",
+        "PEER", "ADDRESS", "PORT", "REPLY", "RTT", "PMTU", "MSS", "MACS", "RX", "TX"
     );
     for p in &st.peers {
         println!(
-            "{:<12} {:<5} {:<15} {:<8} {:>7} {:>8} {:>5} {:>5} {:>5} {:>10} {:>10}",
+            "{:<12} {:<15} {:<8} {:>7} {:>8} {:>5} {:>5} {:>5} {:>10} {:>10}  {}",
             p.name,
-            p.role.as_str(),
             p.address,
             port_state(p.port_state),
             p.last_reply_secs.map_or("-".into(), |s| format!("{s}s")),
@@ -311,6 +501,7 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
             p.macs,
             rate(p.rx_bps),
             rate(p.tx_bps),
+            p.vlans,
         );
     }
     Ok(ExitCode::SUCCESS)

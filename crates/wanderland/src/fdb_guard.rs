@@ -96,8 +96,8 @@ async fn handle(
     let Some(detected) = detected else {
         return true;
     };
-    let isolated = |p: u32| map.tunnels.get(&p).is_some_and(|(_, iso)| *iso);
-    let Some(port) = loopguard::choose_port(&detected, isolated)
+    let is_tunnel = |p: u32| map.tunnels.contains_key(&p);
+    let Some(port) = loopguard::choose_port(&detected, is_tunnel)
         .and_then(|p| map.tunnels.get(&p).map(|(n, _)| n.clone()))
     else {
         return true;
@@ -106,7 +106,11 @@ async fn handle(
         .moves
         .iter()
         .flat_map(|m| [m.from, m.to])
-        .filter_map(|p| map.tunnels.get(&p).map(|(n, _)| n.clone()))
+        .map(|p| {
+            map.tunnels
+                .get(&p)
+                .map_or_else(|| "the trunk".to_string(), |(n, _)| n.clone())
+        })
         .collect();
     involved.sort();
     involved.dedup();

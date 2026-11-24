@@ -5,10 +5,10 @@
 //! loop guard reports, fetched configurations and timers arrive as [`Input`]s
 //! or timer ticks in one select loop.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::sync::{Arc, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use tokio::signal::unix::{SignalKind, signal};
@@ -16,14 +16,15 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 use wanderlan_core::api::{
-    ApiError, Applied, ChangeSource, ConfigInput, ConfigTexts, Confirmed, Done, Interface, Level,
-    MacEntry, PeerStatus, PendingChange, PortState, Request, SiteState, SiteSummary, Status,
-    Validation,
+    ApiError, Applied, ChangeSource, ConfigInput, ConfigTexts, Confirmed, Done, Interface,
+    Invitation, JoinParams, Joined, Level, MacEntry, PeerStatus, PendingChange, PortState, Request,
+    SiteState, SiteSummary, Status, Validation,
 };
 use wanderlan_core::config::{
     self, Config, ConfigFile, Diagnostic, Loaded, render_local, render_mesh, unified_diff,
 };
 use wanderlan_core::desired::{self, OWNER_ALIAS, Runtime};
+use wanderlan_core::join::{self, JoinReply, JoinRequest};
 use wanderlan_core::loopguard::format_mac;
 use wanderlan_core::mtu::wire::Announce;
 use wanderlan_core::reconcile::{self, Change};
@@ -40,6 +41,7 @@ use crate::api_server;
 use crate::events::EventLog;
 use crate::fdb_guard::{self, LoopReport, PortMap};
 use crate::files::Paths;
+use crate::invites::{Invite, Invites};
 use crate::probe::{self, ProbeConfig, ProbeEvent, ProbeTable};
 use crate::stats::{self, Rates};
 use crate::sync_net::{self, Offer};
@@ -76,7 +78,32 @@ pub enum Input {
     },
     /// The loop guard detected a loop.
     Loop(LoopReport),
+    /// A site asks to join with an invitation of this site.
+    JoinRequest {
+        /// Source address of the connection: the new site's address.
+        from: Ipv4Addr,
+        /// The request.
+        request: JoinRequest,
+        /// Where to send the answer.
+        reply: oneshot::Sender<JoinReply>,
+    },
+    /// The inviting site answered our join request.
+    JoinAnswer {
+        /// What the user asked for.
+        params: JoinParams,
+        /// The answer, or why there is none.
+        result: Result<JoinReply, String>,
+        /// Where to send the API result.
+        reply: oneshot::Sender<Result<serde_json::Value, ApiError>>,
+    },
 }
+
+/// How long a joining site retries while the inviting site is busy.
+const JOIN_BUSY_RETRY: Duration = Duration::from_secs(60);
+/// Wrong invitation codes allowed per address within [`JOIN_FAILURE_WINDOW`].
+const JOIN_MAX_FAILURES: usize = 5;
+/// Window for counting wrong invitation codes.
+const JOIN_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 
 /// A change waiting for confirmation.
 #[derive(Debug)]
@@ -114,6 +141,9 @@ struct Controller {
     fetch_backoff: BTreeMap<String, Instant>,
     grace: BTreeMap<String, (Ipv4Addr, Instant)>,
     generation: u64,
+    invites: Invites,
+    join_failures: BTreeMap<Ipv4Addr, VecDeque<Instant>>,
+    joining: bool,
 }
 
 /// Runs the daemon until SIGTERM or SIGINT.
@@ -135,7 +165,7 @@ pub async fn run(args: Args) -> Result<()> {
 
     let mut tasks = vec![
         probe::spawn(probe_rx, probes.clone(), probe_event_tx),
-        sync_net::spawn(offer_rx),
+        sync_net::spawn(offer_rx, inputs_tx.clone()),
         stats::spawn(sys.clone(), rates.clone()),
         api_server::spawn(args.socket.clone(), events.clone(), inputs_tx.clone())
             .context("cannot start the API")?,
@@ -146,6 +176,7 @@ pub async fn run(args: Args) -> Result<()> {
         config_dir: args.config_dir.clone(),
         state_dir: args.state_dir.clone(),
     };
+    let invites = Invites::load(paths.invites());
     let mut ctl = Controller {
         sys,
         paths,
@@ -168,6 +199,9 @@ pub async fn run(args: Args) -> Result<()> {
         fetch_backoff: BTreeMap::new(),
         grace: BTreeMap::new(),
         generation: 0,
+        invites,
+        join_failures: BTreeMap::new(),
+        joining: false,
     };
     ctl.startup();
     ctl.seed_measurements().await;
@@ -225,6 +259,13 @@ async fn sleep_until_opt(at: Option<Instant>) {
         Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
     }
+}
+
+/// Seconds since the Unix epoch.
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// A hex fingerprint as raw bytes.
@@ -457,8 +498,28 @@ impl Controller {
 
     async fn handle(&mut self, input: Input) {
         match input {
+            Input::Api {
+                request: Request::Join(params),
+                reply,
+            } => self.start_join(params, reply),
             Input::Api { request, reply } => {
                 let result = self.api(request).await;
+                let _ = reply.send(result);
+            }
+            Input::JoinRequest {
+                from,
+                request,
+                reply,
+            } => {
+                let answer = self.admit(from, request).await;
+                let _ = reply.send(answer);
+            }
+            Input::JoinAnswer {
+                params,
+                result,
+                reply,
+            } => {
+                let result = self.finish_join(params, result).await;
                 let _ = reply.send(result);
             }
             Input::Probe(ProbeEvent::Pmtu { peer, pmtu }) => {
@@ -510,6 +571,30 @@ impl Controller {
                         Some(&source),
                         format!(
                             "Configuration from \"{source}\" confirmed automatically (peer \"{via}\" is reachable); mesh revision {}",
+                            c.revision
+                        ),
+                    ),
+                    Err(e) => self.events.error(e.message),
+                }
+            }
+        }
+        if let Some(p) = &self.pending
+            && let ChangeSource::Join { site } = &p.source
+        {
+            let since = p.applied_at;
+            let site = site.clone();
+            let up = self.probes.read().ok().is_some_and(|t| {
+                t.get(&site)
+                    .and_then(|pp| pp.last_reply)
+                    .is_some_and(|r| r > since)
+            });
+            if up {
+                match self.confirm(false) {
+                    Ok(c) => self.events.emit(
+                        Level::Info,
+                        Some(&site),
+                        format!(
+                            "Site \"{site}\" joined the network; mesh revision {}",
                             c.revision
                         ),
                     ),
@@ -697,7 +782,321 @@ impl Controller {
                 self.publish();
                 to_value(&Done {})
             }
+            Request::Invite => {
+                if self.confirmed.is_none() {
+                    return Err(ApiError::new(
+                        "this site is not part of a network yet; set it up first (wanderlan)",
+                    ));
+                }
+                let invite = self.invites.create(now_secs()).map_err(api_err)?;
+                let invitation = self.invitation(&invite);
+                self.events.info(format!(
+                    "Invitation {} created; on the new site run: {}",
+                    invite.code, invitation.command
+                ));
+                to_value(&invitation)
+            }
+            Request::Invites => {
+                let list: Vec<Invitation> = self
+                    .invites
+                    .list()
+                    .iter()
+                    .map(|i| self.invitation(i))
+                    .collect();
+                to_value(&list)
+            }
+            Request::DeleteInvite(params) => {
+                match self.invites.remove(&params.code).map_err(api_err)? {
+                    Some(code) => {
+                        self.events.info(format!("Invitation {code} was deleted"));
+                        to_value(&Done {})
+                    }
+                    None => Err(ApiError::new(format!(
+                        "there is no open invitation {}",
+                        params.code
+                    ))),
+                }
+            }
+            Request::Join(_) => Err(ApiError::new("join requests are handled separately")),
+            Request::Reset => to_value(&self.reset().await?),
         }
+    }
+
+    /// An invitation as shown to the user.
+    fn invitation(&self, invite: &Invite) -> Invitation {
+        let command = self
+            .confirmed
+            .as_ref()
+            .and_then(|c| c.self_site().map(|s| (s.address, c.mesh.control_port)))
+            .map(|(address, port)| {
+                if port == config::DEFAULT_CONTROL_PORT {
+                    format!("wanderlan join {address} {}", invite.code)
+                } else {
+                    format!("wanderlan join {address}:{port} {}", invite.code)
+                }
+            })
+            .unwrap_or_default();
+        Invitation {
+            code: invite.code.clone(),
+            command,
+            created_secs: invite.created_secs,
+            in_use: self.invites.is_reserved(&invite.code),
+        }
+    }
+
+    // ---- joining -------------------------------------------------------------
+
+    /// A site asks to join with an invitation of this site: check the code,
+    /// add the site (its address is the source of the connection) and answer
+    /// with the new mesh. The change is confirmed as soon as the new site
+    /// answers probes, or rolled back after `commit_timeout`.
+    async fn admit(&mut self, from: Ipv4Addr, request: JoinRequest) -> JoinReply {
+        let error = |message: String| JoinReply::Error { message };
+        let now = Instant::now();
+        let failures = self.join_failures.entry(from).or_default();
+        while failures
+            .front()
+            .is_some_and(|t| now.duration_since(*t) > JOIN_FAILURE_WINDOW)
+        {
+            failures.pop_front();
+        }
+        if failures.len() >= JOIN_MAX_FAILURES {
+            return error(
+                "too many wrong invitation codes from this address; wait a minute".into(),
+            );
+        }
+        if request.protocol != join::PROTOCOL {
+            return error(format!(
+                "this site (wanderland {}) speaks join protocol {}, not {}; update both sites",
+                wanderlan_core::VERSION,
+                join::PROTOCOL,
+                request.protocol
+            ));
+        }
+        let Some(confirmed) = self.confirmed.clone() else {
+            return error("this site is not part of a network".into());
+        };
+        let Some(invite) = self.invites.find_free(&request.code).cloned() else {
+            failures.push_back(now);
+            self.events.warn(format!(
+                "Join attempt from {from} with an unknown or used invitation code"
+            ));
+            return error("unknown or already used invitation code".into());
+        };
+        if self.pending.is_some() {
+            return JoinReply::Busy;
+        }
+        let admission = match join::add_site(
+            &confirmed.mesh,
+            &request.name,
+            request.name_is_default,
+            from,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                self.events
+                    .warn(format!("The site at {from} cannot join: {e}"));
+                return error(e.to_string());
+            }
+        };
+        let via = confirmed.self_name().to_string();
+        if !admission.added {
+            if let Err(e) = self.invites.remove(&invite.code) {
+                warn!("{e:#}");
+            }
+            self.events.emit(
+                Level::Info,
+                Some(&admission.name),
+                format!(
+                    "Site \"{}\" at {from} joined again with invitation {}",
+                    admission.name, invite.code
+                ),
+            );
+            return JoinReply::Ok {
+                site: admission.name,
+                via,
+                mesh: render_mesh(&confirmed.mesh),
+            };
+        }
+        let mesh = render_mesh(&admission.mesh);
+        let site = admission.name;
+        let cfg = Config {
+            mesh: admission.mesh,
+            local: confirmed.local.clone(),
+        };
+        let source = ChangeSource::Join { site: site.clone() };
+        match self.apply(cfg, source, None, None, false).await {
+            Ok(_) => {
+                self.invites.reserve(&invite.code);
+                self.events.emit(
+                    Level::Info,
+                    Some(&site),
+                    format!(
+                        "Site \"{site}\" at {from} is joining with invitation {}; waiting for it to come up",
+                        invite.code
+                    ),
+                );
+                JoinReply::Ok { site, via, mesh }
+            }
+            Err(e) => error(format!("cannot add the site here: {}", e.message)),
+        }
+    }
+
+    /// Starts joining a network. The connection to the inviting site runs in
+    /// the background; its answer comes back as [`Input::JoinAnswer`].
+    fn start_join(
+        &mut self,
+        params: JoinParams,
+        reply: oneshot::Sender<Result<serde_json::Value, ApiError>>,
+    ) {
+        let checked = if self.config.is_some() || self.pending.is_some() {
+            Err("this site is already part of a network; reset it first to join another one (wanderlan reset)".to_string())
+        } else if self.joining {
+            Err("a join is already in progress".to_string())
+        } else if let Some(msg) = config::site_name_error(&params.name) {
+            Err(msg)
+        } else if let Some(msg) = config::ifname_error(&params.trunk) {
+            Err(format!("trunk: {msg}"))
+        } else {
+            join::parse_target(&params.target, config::DEFAULT_CONTROL_PORT)
+        };
+        let (address, port) = match checked {
+            Ok(t) => t,
+            Err(message) => {
+                let _ = reply.send(Err(ApiError::new(message)));
+                return;
+            }
+        };
+        let target = SocketAddrV4::new(address, port);
+        self.joining = true;
+        self.events.info(format!(
+            "Asking {target} to let this site join as \"{}\"",
+            params.name
+        ));
+        let request = JoinRequest {
+            protocol: join::PROTOCOL,
+            code: params.code.clone(),
+            name: params.name.clone(),
+            name_is_default: params.name_is_default,
+            version: wanderlan_core::VERSION.into(),
+        };
+        let inputs = self.inputs.clone();
+        tokio::spawn(async move {
+            let give_up = Instant::now() + JOIN_BUSY_RETRY;
+            let result = loop {
+                match sync_net::join(target, &request).await {
+                    Ok(JoinReply::Busy) if Instant::now() < give_up => {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                    Ok(answer) => break Ok(answer),
+                    Err(e) => break Err(format!("{e:#}")),
+                }
+            };
+            let _ = inputs
+                .send(Input::JoinAnswer {
+                    params,
+                    result,
+                    reply,
+                })
+                .await;
+        });
+    }
+
+    /// Applies the configuration received from the inviting site. It is
+    /// confirmed automatically as soon as that site answers probes.
+    async fn finish_join(
+        &mut self,
+        params: JoinParams,
+        result: Result<JoinReply, String>,
+    ) -> Result<serde_json::Value, ApiError> {
+        self.joining = false;
+        let answer = result.map_err(|e| {
+            self.events.warn(format!("Joining failed: {e}"));
+            ApiError::new(format!("cannot join: {e}"))
+        })?;
+        let (site, via, text) = match answer {
+            JoinReply::Ok { site, via, mesh } => (site, via, mesh),
+            JoinReply::Busy => {
+                return Err(ApiError::new(
+                    "the inviting site is busy with another change; try again in a minute",
+                ));
+            }
+            JoinReply::Error { message } => {
+                self.events.warn(format!("Joining was refused: {message}"));
+                return Err(ApiError::new(format!(
+                    "the inviting site refused: {message}"
+                )));
+            }
+        };
+        if self.config.is_some() || self.pending.is_some() {
+            return Err(ApiError::new("this site was configured meanwhile"));
+        }
+        let mesh = match config::parse_mesh(&text) {
+            Ok(parsed) => parsed.mesh,
+            Err(diags) => {
+                let msg = diags.first().map_or_else(String::new, ToString::to_string);
+                return Err(ApiError::new(format!(
+                    "the configuration from \"{via}\" cannot be read: {msg}"
+                )));
+            }
+        }
+        .ok_or_else(|| ApiError::new(format!("\"{via}\" sent an empty configuration")))?;
+        let local = config::Local {
+            self_name: Some(site.clone()),
+            trunk: Some(params.trunk.clone()),
+        };
+        let cfg = sync::accept(mesh, &local).map_err(|e| {
+            ApiError::new(format!(
+                "the configuration from \"{via}\" cannot be used: {e}"
+            ))
+        })?;
+        let revision = cfg.mesh.revision;
+        let sites = cfg.mesh.sites.len();
+        let source = ChangeSource::Sync { peer: via.clone() };
+        self.apply(cfg, source, None, None, false).await?;
+        self.events.info(format!(
+            "Joining the network via \"{via}\" as \"{site}\" ({sites} sites); confirmed automatically as soon as \"{via}\" answers"
+        ));
+        to_value(&Joined {
+            site,
+            via,
+            sites,
+            revision,
+        })
+    }
+
+    /// Back to the state after installation: everything wanderlan created is
+    /// removed, the configuration files become the templates again and the
+    /// state (confirmed copies, invitations) is deleted.
+    async fn reset(&mut self) -> Result<Done, ApiError> {
+        if self.joining {
+            return Err(ApiError::new(
+                "a join is in progress; wait until it has finished",
+            ));
+        }
+        self.pending = None;
+        self.confirmed = None;
+        self.set_config(None);
+        self.runtime = Runtime::default();
+        self.applied_key = None;
+        self.last_error = None;
+        self.rejected.clear();
+        self.fetch_backoff.clear();
+        self.grace.clear();
+        self.flushes.clear();
+        self.invites.clear();
+        self.publish();
+        let removed = reconcile::teardown(&self.sys, |c| info!("{c}"))
+            .await
+            .map_err(|e| ApiError::new(format!("cannot remove the interfaces: {e}")))?;
+        self.paths
+            .reset()
+            .map_err(|e| ApiError::new(format!("{e:#}")))?;
+        self.events.warn(format!(
+            "Reset: the bridge, the tunnels and all rules were removed ({} changes), the configuration and the invitations deleted; this site is unconfigured again. Other sites still list it until it is removed there (Sites, d).",
+            removed.len()
+        ));
+        Ok(Done {})
     }
 
     fn config_texts(&self) -> ConfigTexts {
@@ -817,6 +1216,7 @@ impl Controller {
                 format!("The configuration from \"{peer}\""),
                 Some(peer.clone()),
             ),
+            ChangeSource::Join { site } => (format!("The new site \"{site}\""), Some(site.clone())),
         };
         self.pending = Some(Pending {
             previous,
@@ -894,6 +1294,13 @@ impl Controller {
             )));
         }
         self.paths.clear_marker();
+        if matches!(pending.source, ChangeSource::Join { .. }) {
+            match self.invites.consume_reserved() {
+                Ok(Some(code)) => self.events.info(format!("Invitation {code} is used up")),
+                Ok(None) => {}
+                Err(e) => self.events.error(format!("{e:#}")),
+            }
+        }
         self.confirmed = Some(cfg.clone());
         self.set_config(Some(cfg.clone()));
         self.runtime.blocked.clear();
@@ -917,6 +1324,17 @@ impl Controller {
             ChangeSource::Sync { peer } => {
                 self.rejected.insert(pending.fingerprint.clone());
                 Some(peer.clone())
+            }
+            ChangeSource::Join { site } => {
+                self.invites.release();
+                self.events.emit(
+                    Level::Warn,
+                    Some(site),
+                    format!(
+                        "The new site \"{site}\" did not come up in time; it was removed again and its invitation can be used again"
+                    ),
+                );
+                Some(site.clone())
             }
             ChangeSource::Local => None,
         };
@@ -1090,7 +1508,6 @@ impl Controller {
                 version: wanderlan_core::VERSION.into(),
                 state: SiteState::Unconfigured,
                 site: None,
-                role: None,
                 address: None,
                 trunk: None,
                 vlans: None,
@@ -1101,6 +1518,7 @@ impl Controller {
                 peers: Vec::new(),
                 sites: Vec::new(),
                 blocked,
+                invites: 0,
             };
         };
         let desired = desired::derive(cfg, &self.runtime);
@@ -1134,12 +1552,24 @@ impl Controller {
                     .map(|r| r.mss);
                 let (rx_bps, tx_bps) = rates.get(&port).copied().unwrap_or_default();
                 let announce = probe.and_then(|p| p.announce);
+                let vlans = desired
+                    .tunnels
+                    .iter()
+                    .find(|d| d.name == port)
+                    .map(|d| {
+                        d.vlans
+                            .keys()
+                            .copied()
+                            .collect::<config::VlanSet>()
+                            .to_string()
+                    })
+                    .unwrap_or_default();
                 PeerStatus {
                     name: t.peer.name.clone(),
-                    role: t.peer.role,
                     address: t.peer.address.to_string(),
                     port,
                     port_state,
+                    vlans,
                     reachable: probe.is_some_and(|p| p.reachable),
                     last_reply_secs: probe
                         .and_then(|p| p.last_reply)
@@ -1162,9 +1592,8 @@ impl Controller {
             .iter()
             .map(|s| SiteSummary {
                 name: s.name.clone(),
-                role: s.role,
-                hub: s.hub.clone(),
                 address: s.address.to_string(),
+                vlans: cfg.mesh.vlans_of(s).to_string(),
                 is_self: s.name == cfg.self_name(),
                 direct: direct.contains(s.name.as_str()),
             })
@@ -1177,10 +1606,9 @@ impl Controller {
                 SiteState::Running
             },
             site: Some(cfg.self_name().to_string()),
-            role: me.map(|s| s.role),
             address: me.map(|s| s.address.to_string()),
             trunk: Some(cfg.trunk().to_string()),
-            vlans: Some(cfg.mesh.vlans.to_string()),
+            vlans: me.map(|s| cfg.mesh.vlans_of(s).to_string()),
             revision: cfg.mesh.revision,
             fingerprint: config::fingerprint(&cfg.mesh),
             pending,
@@ -1188,6 +1616,7 @@ impl Controller {
             peers,
             sites,
             blocked,
+            invites: self.invites.list().len(),
         }
     }
 }

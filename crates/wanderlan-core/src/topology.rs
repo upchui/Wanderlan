@@ -1,46 +1,30 @@
-//! Layer-2 tunnel topology: which sites get a GRETAP tunnel to which.
+//! Layer-2 tunnel topology: every site has a GRETAP tunnel to every other
+//! site.
 //!
-//! Hubs are fully meshed, every spoke has exactly one tunnel to its hub.
-//! Loop freedom comes from split horizon: on a hub, tunnels to other hubs are
-//! marked `isolated`, so frames received from one hub are never forwarded to
-//! another hub. Frames from spokes may go anywhere.
+//! All sites together act as one virtual switch; every tunnel is a port of
+//! it. Loop freedom comes from split horizon: all tunnel ports are marked
+//! `isolated`, so a frame received from one tunnel is only forwarded to the
+//! local trunk, never into another tunnel. This needs every site to reach
+//! every other site in the transport network.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 
-use crate::config::{ConfigFile, Diagnostic, FieldPath, Mesh, Role, Site};
+use crate::config::{Mesh, Site};
 
 /// Prefix of the GRETAP interfaces created by wanderlan.
 pub const GRETAP_PREFIX: &str = "gt-";
-
-/// Kind of a tunnel, seen from the local site.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum TunnelKind {
-    /// Local hub to another hub.
-    HubToHub,
-    /// Local hub to one of its spokes.
-    HubToSpoke,
-    /// Local spoke to its hub.
-    SpokeToHub,
-}
 
 /// A tunnel from the local site to a peer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Tunnel<'a> {
     /// The remote site.
     pub peer: &'a Site,
-    /// Kind of the tunnel.
-    pub kind: TunnelKind,
 }
 
 impl Tunnel<'_> {
     /// Name of the GRETAP interface for this tunnel.
     pub fn ifname(&self) -> String {
         gretap_name(&self.peer.name)
-    }
-
-    /// Whether the bridge port must be isolated (split horizon).
-    pub fn isolated(&self) -> bool {
-        self.kind == TunnelKind::HubToHub
     }
 }
 
@@ -49,43 +33,18 @@ pub fn gretap_name(peer: &str) -> String {
     format!("{GRETAP_PREFIX}{peer}")
 }
 
-/// Returns the tunnels the given site has to build, sorted by peer name.
-///
-/// Sites with invalid references (e.g. a spoke naming a missing hub) are
-/// skipped; [`check`] reports them.
+/// Returns the tunnels the given site has to build (one to every other
+/// site), sorted by peer name. A site that is not part of the mesh has none.
 pub fn tunnels_for<'a>(mesh: &'a Mesh, local: &str) -> Vec<Tunnel<'a>> {
-    let Some(me) = mesh.site(local) else {
+    if mesh.site(local).is_none() {
         return Vec::new();
-    };
-    let mut out: Vec<Tunnel<'a>> = match me.role {
-        Role::Hub => mesh
-            .sites
-            .iter()
-            .filter(|s| s.name != me.name)
-            .filter_map(|s| match s.role {
-                Role::Hub => Some(Tunnel {
-                    peer: s,
-                    kind: TunnelKind::HubToHub,
-                }),
-                Role::Spoke if s.hub.as_deref() == Some(me.name.as_str()) => Some(Tunnel {
-                    peer: s,
-                    kind: TunnelKind::HubToSpoke,
-                }),
-                Role::Spoke => None,
-            })
-            .collect(),
-        Role::Spoke => me
-            .hub
-            .as_deref()
-            .and_then(|h| mesh.site(h))
-            .filter(|h| h.role == Role::Hub && h.name != me.name)
-            .map(|h| Tunnel {
-                peer: h,
-                kind: TunnelKind::SpokeToHub,
-            })
-            .into_iter()
-            .collect(),
-    };
+    }
+    let mut out: Vec<Tunnel<'a>> = mesh
+        .sites
+        .iter()
+        .filter(|s| s.name != local)
+        .map(|peer| Tunnel { peer })
+        .collect();
     out.sort_by(|a, b| a.peer.name.cmp(&b.peer.name));
     out
 }
@@ -106,134 +65,18 @@ pub fn edges(mesh: &Mesh) -> BTreeSet<(String, String)> {
     out
 }
 
-/// Everything about the mesh that determines how frames are forwarded:
-/// the tunnels and the role of every site. Two meshes with the same key have
-/// the same layer-2 paths.
+/// Everything about the mesh that determines over which ports frames
+/// travel: the tunnels. Two meshes with the same key have the same layer-2
+/// paths, so learned MAC addresses stay valid; VLAN changes do not move
+/// addresses between ports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardingKey {
     edges: BTreeSet<(String, String)>,
-    roles: BTreeSet<(String, Role)>,
 }
 
 /// Computes the [`ForwardingKey`] of a mesh.
 pub fn forwarding_key(mesh: &Mesh) -> ForwardingKey {
-    let roles = mesh
-        .sites
-        .iter()
-        .map(|s| (s.name.clone(), s.role))
-        .collect();
-    ForwardingKey {
-        edges: edges(mesh),
-        roles,
-    }
-}
-
-/// Checks the topology invariants that make split horizon loop-free:
-/// hubs are fully meshed, every spoke has exactly one tunnel and it leads to a
-/// hub, there are no spoke-to-spoke tunnels and the mesh is connected.
-///
-/// Errors about the referenced hub itself (missing, not a hub) are reported
-/// by the configuration validator; this function only reports what remains.
-pub fn check(mesh: &Mesh) -> Vec<Diagnostic> {
-    let mut diags = Vec::new();
-    let index: BTreeMap<&str, usize> = mesh
-        .sites
-        .iter()
-        .enumerate()
-        .map(|(i, s)| (s.name.as_str(), i))
-        .collect();
-    let role_of = |name: &str| {
-        index
-            .get(name)
-            .and_then(|i| mesh.sites.get(*i))
-            .map(|s| s.role)
-    };
-
-    let edges = edges(mesh);
-    let mut adjacency: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for (a, b) in &edges {
-        adjacency.entry(a).or_default().insert(b);
-        adjacency.entry(b).or_default().insert(a);
-    }
-
-    let hubs: Vec<&Site> = mesh.hubs().collect();
-    for (i, a) in hubs.iter().enumerate() {
-        for b in hubs.iter().skip(i + 1) {
-            let linked = adjacency
-                .get(a.name.as_str())
-                .is_some_and(|n| n.contains(b.name.as_str()));
-            if !linked {
-                diags.push(Diagnostic::error(
-                    ConfigFile::Mesh,
-                    FieldPath::root(),
-                    format!(
-                        "hubs \"{}\" and \"{}\" are not connected; hubs must form a full mesh",
-                        a.name, b.name
-                    ),
-                ));
-            }
-        }
-    }
-
-    for (i, site) in mesh.sites.iter().enumerate() {
-        if site.role != Role::Spoke {
-            continue;
-        }
-        let neighbours = adjacency.get(site.name.as_str());
-        let count = neighbours.map_or(0, BTreeSet::len);
-        if count > 1 {
-            diags.push(Diagnostic::error(
-                ConfigFile::Mesh,
-                FieldPath::site(i),
-                format!(
-                    "spoke \"{}\" would have {count} tunnels; a spoke must be connected to exactly one hub",
-                    site.name
-                ),
-            ));
-        }
-        for n in neighbours.into_iter().flatten() {
-            if role_of(n) == Some(Role::Spoke) {
-                diags.push(Diagnostic::error(
-                    ConfigFile::Mesh,
-                    FieldPath::site(i),
-                    format!(
-                        "spokes \"{}\" and \"{n}\" must not be connected directly",
-                        site.name
-                    ),
-                ));
-            }
-        }
-    }
-
-    // Connectivity: every site must be reachable from the first hub. Spokes
-    // with a broken hub reference are already reported by the validator.
-    if let Some(start) = hubs.first() {
-        let mut seen: BTreeSet<&str> = BTreeSet::new();
-        let mut queue = VecDeque::from([start.name.as_str()]);
-        while let Some(n) = queue.pop_front() {
-            if seen.insert(n) {
-                queue.extend(adjacency.get(n).into_iter().flatten().copied());
-            }
-        }
-        for (i, site) in mesh.sites.iter().enumerate() {
-            let hub_ok = site.role == Role::Hub
-                || site
-                    .hub
-                    .as_deref()
-                    .is_some_and(|h| role_of(h) == Some(Role::Hub));
-            if hub_ok && !seen.contains(site.name.as_str()) {
-                diags.push(Diagnostic::error(
-                    ConfigFile::Mesh,
-                    FieldPath::site(i),
-                    format!(
-                        "site \"{}\" is not connected to the rest of the mesh",
-                        site.name
-                    ),
-                ));
-            }
-        }
-    }
-    diags
+    ForwardingKey { edges: edges(mesh) }
 }
 
 #[cfg(test)]
@@ -243,84 +86,57 @@ mod tests {
     use super::*;
     use crate::config::VlanSet;
 
-    fn site(name: &str, role: Role, hub: Option<&str>, last: u8) -> Site {
+    fn site(name: &str, last: u8) -> Site {
         Site {
             name: name.into(),
-            role,
-            hub: hub.map(Into::into),
             address: Ipv4Addr::new(10, 0, 0, last),
+            vlans: None,
         }
     }
 
     fn example() -> Mesh {
         let mut mesh = Mesh::new(VlanSet::from_range(10, 50));
-        mesh.sites = vec![
-            site("heim", Role::Hub, None, 1),
-            site("buero", Role::Hub, None, 2),
-            site("haus2", Role::Spoke, Some("heim"), 11),
-            site("haus3", Role::Spoke, Some("buero"), 12),
-            site("haus4", Role::Spoke, Some("heim"), 13),
-        ];
+        mesh.sites = vec![site("heim", 1), site("buero", 2), site("haus2", 11)];
         mesh
     }
 
-    fn names(tunnels: &[Tunnel<'_>]) -> Vec<(String, TunnelKind, bool)> {
-        tunnels
+    #[test]
+    fn every_site_has_a_tunnel_to_every_other_site() {
+        let mesh = example();
+        let names: Vec<String> = tunnels_for(&mesh, "heim")
             .iter()
-            .map(|t| (t.ifname(), t.kind, t.isolated()))
-            .collect()
-    }
-
-    #[test]
-    fn hub_tunnels_and_isolation() {
-        let mesh = example();
-        assert_eq!(
-            names(&tunnels_for(&mesh, "heim")),
-            vec![
-                ("gt-buero".into(), TunnelKind::HubToHub, true),
-                ("gt-haus2".into(), TunnelKind::HubToSpoke, false),
-                ("gt-haus4".into(), TunnelKind::HubToSpoke, false),
-            ]
-        );
-    }
-
-    #[test]
-    fn spoke_has_exactly_its_hub() {
-        let mesh = example();
-        assert_eq!(
-            names(&tunnels_for(&mesh, "haus3")),
-            vec![("gt-buero".into(), TunnelKind::SpokeToHub, false)]
-        );
+            .map(Tunnel::ifname)
+            .collect();
+        assert_eq!(names, vec!["gt-buero", "gt-haus2"]);
+        assert_eq!(tunnels_for(&mesh, "haus2").len(), 2);
         assert!(tunnels_for(&mesh, "unknown").is_empty());
     }
 
     #[test]
-    fn edges_are_symmetric() {
-        let mesh = example();
-        let e = edges(&mesh);
-        assert_eq!(e.len(), 4);
+    fn edges_are_symmetric_and_complete() {
+        let e = edges(&example());
+        assert_eq!(e.len(), 3);
         assert!(e.contains(&("buero".to_string(), "heim".to_string())));
+        assert!(e.contains(&("buero".to_string(), "haus2".to_string())));
         assert!(e.contains(&("haus2".to_string(), "heim".to_string())));
     }
 
     #[test]
-    fn valid_topology_has_no_findings() {
-        assert!(check(&example()).is_empty());
-    }
-
-    #[test]
-    fn spoke_with_missing_hub_is_left_to_validator() {
-        let mut mesh = example();
-        mesh.sites[2].hub = Some("nowhere".into());
-        assert!(check(&mesh).is_empty());
-        assert!(tunnels_for(&mesh, "haus2").is_empty());
-    }
-
-    #[test]
-    fn two_hubs_only_is_the_simple_case() {
+    fn a_single_site_has_no_tunnels() {
         let mut mesh = Mesh::new(VlanSet::from_range(10, 50));
-        mesh.sites = vec![site("a", Role::Hub, None, 1), site("b", Role::Hub, None, 2)];
-        assert!(check(&mesh).is_empty());
-        assert_eq!(edges(&mesh).len(), 1);
+        mesh.sites = vec![site("first", 1)];
+        assert!(tunnels_for(&mesh, "first").is_empty());
+        assert!(edges(&mesh).is_empty());
+    }
+
+    #[test]
+    fn forwarding_key_follows_the_tunnels_only() {
+        let a = example();
+        let mut b = example();
+        b.sites[0].address = Ipv4Addr::new(10, 0, 0, 99);
+        b.sites[1].vlans = Some(VlanSet::from_range(10, 20));
+        assert_eq!(forwarding_key(&a), forwarding_key(&b));
+        b.sites.pop();
+        assert_ne!(forwarding_key(&a), forwarding_key(&b));
     }
 }

@@ -1,10 +1,11 @@
 //! Loop detection from bridge FDB updates.
 //!
-//! Split horizon makes the mesh itself loop-free, but a loop can still form
-//! outside wanderlan's control (e.g. two sites bridged together by another
-//! path). The symptom is a MAC address that keeps moving between tunnel
-//! ports. [`LoopGuard`] counts such moves per MAC/VLAN within a time window
-//! and reports a loop once a threshold is reached.
+//! Split horizon makes the network itself loop-free, but a loop can still
+//! form outside wanderlan's control, e.g. when the LANs of two sites are also
+//! connected by another path. The symptom is a MAC address that keeps moving
+//! between the trunk and a tunnel, or between two tunnels. [`LoopGuard`]
+//! counts such moves per MAC/VLAN within a time window and reports a loop
+//! once a threshold is reached.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -45,7 +46,7 @@ struct Track {
     moves: VecDeque<Move>,
 }
 
-/// Detects MAC flapping between tunnel ports.
+/// Detects MAC flapping that involves tunnel ports.
 #[derive(Debug)]
 pub struct LoopGuard {
     window: Duration,
@@ -72,8 +73,9 @@ impl LoopGuard {
     }
 
     /// Records that `mac` in `vlan` is now learned on `port`. `is_tunnel`
-    /// tells whether a port is a GRETAP tunnel; only moves between two
-    /// tunnel ports count. Returns a detection when the threshold is hit.
+    /// tells whether a port is a GRETAP tunnel; moves count if at least one
+    /// of the two ports is a tunnel (trunk to tunnel, tunnel to tunnel).
+    /// Returns a detection when the threshold is hit.
     pub fn learned(
         &mut self,
         now: Instant,
@@ -99,7 +101,7 @@ impl LoopGuard {
         }
         let from = track.port;
         track.port = port;
-        if !(is_tunnel(from) && is_tunnel(port)) {
+        if !(is_tunnel(from) || is_tunnel(port)) {
             return None;
         }
         track.moves.push_back(Move {
@@ -129,21 +131,21 @@ impl LoopGuard {
     }
 }
 
-/// Chooses the port to shut down for a detected loop: among the tunnel
-/// ports involved, prefer ports that are not isolated (spoke ports on a hub),
-/// then the port the address moved to most recently.
-pub fn choose_port(detected: &LoopDetected, isolated: impl Fn(u32) -> bool) -> Option<u32> {
-    let mut candidates: Vec<(bool, usize, u32)> = Vec::new();
+/// Chooses the port to shut down for a detected loop: the tunnel port
+/// involved that the address moved to most recently. The trunk is never
+/// chosen; cutting the tunnel ends a loop between two sites' LANs.
+pub fn choose_port(detected: &LoopDetected, is_tunnel: impl Fn(u32) -> bool) -> Option<u32> {
+    let mut candidates: Vec<(usize, u32)> = Vec::new();
     for (i, m) in detected.moves.iter().enumerate() {
-        for port in [m.from, m.to] {
+        for port in [m.from, m.to].into_iter().filter(|p| is_tunnel(*p)) {
             let recency = if port == m.to { 2 * i + 1 } else { 2 * i };
-            match candidates.iter_mut().find(|c| c.2 == port) {
-                Some(c) => c.1 = c.1.max(recency),
-                None => candidates.push((!isolated(port), recency, port)),
+            match candidates.iter_mut().find(|c| c.1 == port) {
+                Some(c) => c.0 = c.0.max(recency),
+                None => candidates.push((recency, port)),
             }
         }
     }
-    candidates.into_iter().max().map(|c| c.2)
+    candidates.into_iter().max().map(|c| c.1)
 }
 
 /// Formats a MAC address.
@@ -214,11 +216,26 @@ mod tests {
     }
 
     #[test]
-    fn moves_to_the_trunk_do_not_count() {
+    fn flapping_between_trunk_and_tunnel_is_detected() {
+        // The LANs of two sites are connected by another path: a local MAC
+        // comes back through the tunnel again and again.
+        let mut g = LoopGuard::new(Duration::from_secs(10), 3);
+        let t = Instant::now();
+        let mut found = None;
+        for i in 0..4u64 {
+            let port = if i % 2 == 0 { TRUNK } else { GT_A };
+            found = found.or(g.learned(t, MAC, None, port, tunnel));
+        }
+        let found = found.expect("loop detected");
+        assert_eq!(choose_port(&found, tunnel), Some(GT_A));
+    }
+
+    #[test]
+    fn moves_between_non_tunnel_ports_do_not_count() {
         let mut g = LoopGuard::new(Duration::from_secs(10), 2);
         let t = Instant::now();
         for i in 0..10u64 {
-            let port = if i % 2 == 0 { GT_A } else { TRUNK };
+            let port = if i % 2 == 0 { TRUNK } else { 2 };
             assert!(g.learned(t, MAC, None, port, tunnel).is_none());
         }
     }
@@ -235,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn prefers_non_isolated_and_most_recent_port() {
+    fn chooses_the_most_recent_tunnel_never_the_trunk() {
         let t = Instant::now();
         let det = LoopDetected {
             mac: MAC,
@@ -253,9 +270,19 @@ mod tests {
                 },
             ],
         };
-        // Both isolated: the port moved to last.
-        assert_eq!(choose_port(&det, |_| true), Some(GT_A));
-        // GT_B is a spoke port (not isolated): preferred.
-        assert_eq!(choose_port(&det, |p| p == GT_A), Some(GT_B));
+        // The port the address moved to last.
+        assert_eq!(choose_port(&det, tunnel), Some(GT_A));
+        // Only GT_B is a tunnel: GT_B, even though GT_A is more recent.
+        assert_eq!(choose_port(&det, |p| p == GT_B), Some(GT_B));
+        let trunk_only = LoopDetected {
+            mac: MAC,
+            vlan: None,
+            moves: vec![Move {
+                at: t,
+                from: TRUNK,
+                to: TRUNK,
+            }],
+        };
+        assert_eq!(choose_port(&trunk_only, tunnel), None);
     }
 }

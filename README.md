@@ -1,7 +1,9 @@
 # wanderlan
 
 wanderlan connects several sites on layer 2, so that the same VLANs, subnets
-and DHCP servers are available at every site as if it were one network.
+and DHCP servers are available at every site as if it were one network. All
+sites together behave like one big switch: plug a site in, choose which VLANs
+it takes part in, map VLAN IDs or put untagged traffic into a VLAN.
 
 wanderlan does **not** build a VPN. The sites must already reach each other
 through an existing transport network, usually a VPN set up beforehand
@@ -13,10 +15,13 @@ Clients ─ trunk ─ br0 ─┬─ gt-<peer1> ─┐
                        └─ gt-<peer2> ─┴─ existing VPN / transport network
 ```
 
-* one GRETAP tunnel `gt-<peer>` per peer site, between the site addresses,
+* one GRETAP tunnel `gt-<peer>` to every other site, between the site
+  addresses,
 * a Linux bridge `br0` with VLAN filtering (STP off) with the local trunk and
   all tunnels as ports,
-* VLAN mappings per site (untagged → VLAN, VLAN → VLAN),
+* VLANs per site (like the allowed VLANs of a switch port) and VLAN mappings
+  per site (untagged → VLAN, VLAN → VLAN),
+* joining with an invitation code: `wanderlan join <address> <code>`,
 * TCP MSS clamping from measured path MTUs, GRE fragmentation as safety net,
 * loop protection (split horizon plus a loop guard),
 * changes with automatic rollback unless confirmed,
@@ -57,16 +62,9 @@ routers; wanderlan neither assigns addresses in the VLANs nor routes.
   `act_gact`, `nf_tables` (all part of the standard kernels; the package loads
   them at boot).
 
-Sites have one of two roles:
-
-| Role  | Tunnels |
-|-------|---------|
-| hub   | to all other hubs and to its own spokes |
-| spoke | exactly one, to its hub |
-
-Two hubs without spokes are the simple two-site case; only hubs give a full
-mesh. Spokes are for sites that only reach a hub through the transport
-network, e.g. behind CGNAT with a VPN to that hub.
+All sites are equal: every site has a tunnel to every other site, so **every
+site must reach every other site** in the transport network (with a VPN
+server in the middle: routing between the VPN clients must be allowed).
 
 ## Installation
 
@@ -108,23 +106,40 @@ sudo usermod -aG wanderlan $USER    # then log in again
 
 ## Quick start
 
-On the **first site** (say a hub `heim` at transport address `10.8.0.1`):
+On the **first site** (say `heim` at transport address `10.8.0.1`):
 
-1. Run `wanderlan`. On a site without configuration the setup wizard opens:
-   site name, role, trunk interface (chosen from the host's interfaces),
-   the site's transport address, the shared VLANs (e.g. `10-50`) and a first
-   peer (name, role and address, e.g. hub `buero` at `10.8.0.2`).
-2. Review the change and apply it; then confirm it with `c` within the
+1. Run `wanderlan`. On a site without configuration the setup wizard opens;
+   choose **Start a new network**. The name (from the host name), the trunk
+   (the interface that does not lead to the transport network) and the
+   address are suggested; add the VLANs of the network (e.g. `10-50`).
+2. Review the change and apply it, then confirm it with `c` within the
    commit timeout (60 s by default), otherwise it is rolled back.
+3. The wizard creates an invitation right away and shows the command for the
+   next site, e.g. `wanderlan join 10.8.0.1 K7F3Q-9QX2M`.
 
-On the **second site** run the wizard the same way (site `buero`, peer
-`heim`). Once both sites list each other, the tunnel comes up.
+On **every further site** install the package and run that command:
 
-To add further sites, add them in the TUI of any existing site (view 2,
-`n`) and confirm. The configuration is distributed to all sites
-automatically. On the new site the wizard only needs its own name, trunk,
-address and the hub it connects to; the full mesh configuration then
-arrives from that hub.
+```
+sudo wanderlan join 10.8.0.1 K7F3Q-9QX2M
+```
+
+That is all: the new site gets its name from the host name (`--name` to
+choose one), picks the trunk automatically (`--trunk` if there is more than
+one candidate), and receives the configuration of the network; the inviting
+site adds it with the address the request came from. Both sides confirm
+automatically as soon as they reach each other, and all other sites build
+their tunnel to the new site through the configuration sync. In the TUI the
+wizard offers the same as **Join an existing network**.
+
+Invitations can be created on **any** site of the network (`wanderlan
+invite`, or `i` in the TUI); the command contains that site's address. A code
+works once and stays valid until it is used or deleted (`wanderlan invite
+list`, `wanderlan invite delete <code>`).
+
+To start over on a site: `sudo wanderlan reset` removes the bridge, the
+tunnels, all rules, the configuration and the invitations; the site is
+unconfigured again, like after the installation. Remove it on another site
+too (TUI, Sites, `d`) if it leaves the network for good.
 
 Without the TUI: write `/etc/wanderlan/mesh.toml` and `local.toml` (see
 `wanderlan init` or the examples), check them with `wanderlan validate`,
@@ -147,33 +162,28 @@ trunk = "ens19"    # local interface carrying the VLANs
 
 ```toml
 [mesh]
-vlans = "10-50"               # VLANs stretched across all sites
+vlans = "10-50"               # VLANs of every site that does not list its own
 mtu_probe_interval = "5m"     # how often the path MTU to each peer is measured
 # mss = 1300                  # optional: fixed TCP MSS instead of measuring
 commit_timeout = "60s"        # changes are rolled back unless confirmed in time
-# control_port = 51821        # UDP/TCP port for probes and sync on the site addresses
+# control_port = 51821        # UDP/TCP port for probes, sync and joining
 # revision = 12               # maintained by wanderlan, do not edit by hand
 
 [[site]]
 name = "heim"
-role = "hub"
 address = "10.8.0.1"          # address of the site in the transport network
 
 [[site]]
 name = "buero"
-role = "hub"
 address = "10.8.0.2"
 
 [[site]]
 name = "haus2"
-role = "spoke"
-hub = "heim"
 address = "10.8.0.11"
+vlans = "20,30"               # haus2 only takes part in VLANs 20 and 30
 
 [[site]]
 name = "haus3"
-role = "spoke"
-hub = "buero"
 address = "10.8.0.12"
 
 [[map]]                       # untagged traffic on the trunk of haus3 is VLAN 20
@@ -191,34 +201,32 @@ shared = 30
 
 | Key | Default | Meaning |
 |-----|---------|---------|
-| `mesh.vlans` | – (required) | Shared VLANs: `"10-50"`, `"10,20,30-40"` or a list `[10, "20-30"]`. Only these VLANs are bridged; VLAN 1 and untagged traffic are not, unless a site maps them. |
+| `mesh.vlans` | – (required) | VLANs of the network, used by every site without its own `vlans`: `"10-50"`, `"10,20,30-40"` or a list `[10, "20-30"]`. Only these VLANs are bridged; VLAN 1 and untagged traffic are not, unless a site maps them. |
 | `mesh.mtu_probe_interval` | `5m` | Interval of the path MTU measurement (at least 10 s). |
 | `mesh.mss` | unset | Fixed TCP MSS (536–1460) instead of measuring. |
 | `mesh.commit_timeout` | `60s` | Time to confirm a change (10 s–1 h). |
 | `mesh.control_port` | `51821` | Port of the daemon-to-daemon control channel. |
 | `mesh.revision` | `0` | Revision counter used by the sync; raised automatically. |
 | `site.name` | – | Unique, `a-z`, `0-9`, `-`, at most 12 characters (it becomes part of the interface name `gt-<name>`). |
-| `site.role` | – | `hub` or `spoke`. |
-| `site.hub` | – | For spokes: the name of their hub. |
 | `site.address` | – | Unique IPv4 address of the site in the transport network. |
+| `site.vlans` | `mesh.vlans` | VLANs this site takes part in, like the allowed VLANs of a switch port. A tunnel carries the VLANs both of its sites take part in. |
 | `map.site` | – | Site the mapping applies to. |
 | `map.local` | – | `"native"` (untagged) or a local VLAN ID. |
-| `map.shared` | – | The VLAN ID in the shared network; must be in `vlans`. |
+| `map.shared` | – | The VLAN ID in the shared network; must be one of the VLANs of the site. |
 
 The configuration is checked when it is loaded; every problem is reported
 with file and line, e.g.
 
 ```
-mesh.toml:36: error: spoke "haus3": hub "buero2" does not exist
-mesh.toml:49: error: map #2: shared VLAN 60 is not in mesh.vlans (10-50)
+mesh.toml:24: error: site "haus2": vlans: VLAN ID 5000 is outside 1-4094
+mesh.toml:42: error: map #2: shared VLAN 60 is not one of the VLANs of site "haus3" (10-50)
 ```
 
-Rules: names and addresses are unique; every spoke names an existing hub;
-hubs have no `hub`; there is at least one hub; shared VLANs of mappings are
-in `vlans`; per site at most one native mapping, no local VLAN mapped twice
+Rules: names and addresses are unique; shared VLANs of mappings are VLANs of
+their site; per site at most one native mapping, no local VLAN mapped twice
 and no two local VLANs onto the same shared VLAN; `self` exists in the mesh;
-unknown keys are errors (typos). Hubs are always fully meshed and every
-spoke has exactly one tunnel, so the topology is loop-free by construction.
+unknown keys are errors (typos). Configurations of wanderlan 0.1 with `role`
+and `hub` still load; these keys are ignored with a warning.
 
 ### VLAN mappings
 
@@ -267,9 +275,11 @@ so non-TCP traffic larger than the path still arrives.
 
 ### Loop guard
 
-Besides the topology check, the daemon watches the bridge's forwarding
-database. If the same MAC address keeps moving between tunnel ports (5 times
-within 10 s), it shuts the offending port down (spoke ports first), logs it
+Split horizon keeps the network itself loop-free, but the LANs of two sites
+may also be connected by another path. The daemon watches the bridge's
+forwarding database: if the same MAC address keeps moving between the trunk
+and a tunnel, or between two tunnels (5 times within 10 s), it shuts the
+tunnel port down (never the trunk), logs it
 and shows it in the TUI. The port stays down until it is re-enabled with
 `wanderlan unblock gt-<site>` (or `u` in the TUI) or the configuration
 changes.
@@ -307,6 +317,10 @@ discards the draft, `?` shows all keys, `q` quits.
 | `wanderlan unblock <port>` | Re-enable a port shut down by the loop guard |
 | `wanderlan log [-f]` | Event log |
 | `wanderlan probe` | Measure the path MTU to all peers now |
+| `wanderlan invite` | Create an invitation; prints `wanderlan join <address> <code>` for the new site |
+| `wanderlan invite list` / `wanderlan invite delete <code>` | Open invitations of this site |
+| `wanderlan join <address>[:port] <code> [--name N] [--trunk IF]` | Join a network (on an unconfigured site) |
+| `wanderlan reset [--yes]` | Remove everything wanderlan set up on this site; unconfigured again |
 
 The socket can be changed with `--socket` or `WANDERLAN_SOCKET`.
 
@@ -316,12 +330,13 @@ On each site the daemon creates, and removes again when it stops:
 
 * `br0`: bridge, `vlan_filtering 1`, STP off, no default VLAN, no
   netfilter calls; marked with the interface alias `wanderlan`;
-* `gt-<peer>`: GRETAP from the own to the peer's address, `ignore-df`,
-  `nopmtudisc`, MTU 1500, marked with the alias `wanderlan`; on hubs, ports
-  to other hubs are `isolated` (split horizon: isolated ports do not forward
-  to each other, so spokes reach each other through their hub and everything
-  else through the mesh, and no frame can circle);
-* the configured VLANs on the trunk and the tunnels;
+* `gt-<peer>` for every other site: GRETAP from the own to the peer's
+  address, `ignore-df`, `nopmtudisc`, MTU 1500, marked with the alias
+  `wanderlan`; all tunnel ports are `isolated` (split horizon: isolated ports
+  do not forward to each other, so a frame from one site only reaches the
+  trunk of the other sites and never circles);
+* the VLANs of the site on the trunk; on each tunnel the VLANs both sites
+  take part in;
 * tc `clsact` filters on the trunk for translations (recognised by their
   action cookie `wl:…`);
 * the nftables table `bridge wanderlan` for MSS clamping.
@@ -350,7 +365,17 @@ hardened systemd unit. Logs go to the journal: `journalctl -u wanderland`.
 * **Tunnel up but no traffic**: check that GRE (IP protocol 47) passes between
   the site addresses in both directions (firewalls on the hosts, the VPN's
   allowed IPs/policies); `tcpdump -ni any proto gre`. Check that the VLAN is
-  in `vlans` and that the switch port is a trunk with that VLAN.
+  one of the site's VLANs and that the switch port is a trunk with that VLAN.
+* **Nothing from a client arrives (TX 0 towards all peers)**: the client
+  probably sends untagged; untagged traffic is only bridged with a native
+  mapping for that site (VLANs, 3, `n`), otherwise tag it (on Proxmox: VLAN
+  tag on the VM's network device). On Proxmox also switch off the firewall
+  (or its MAC filter) on the trunk NIC of the wanderlan VM: it drops frames
+  with foreign source MACs, which is all bridged traffic.
+* **`wanderlan join` fails**: the code is used up or wrong (create a new one
+  with `wanderlan invite`), or TCP on the control port of the inviting site
+  is not reachable. A site that does not answer within `commit_timeout` after
+  joining is removed again on the inviting site; its code can be used again.
 * **Peer "does not answer control probes" / no path MTU / no sync**: allow UDP
   and TCP on the control port (51821) between the site addresses; check that
   the peer lists this site in its configuration (`wanderlan status` on both).
@@ -381,6 +406,18 @@ Deviations from the original specification, and why:
 * **Automatic configuration sync** (also a project decision), see above.
   Every site may change the mesh; trust between the sites is implied by the
   shared layer 2.
+* **No hubs and spokes** (since 0.2, a project decision: "like a switch you
+  plug a cable into"). Every site has a tunnel to every other site and all
+  tunnel ports are isolated (split horizon). This needs every site to reach
+  every other site in the transport network, but there is nothing to decide
+  per site except its VLANs. The loop guard also watches trunk-to-tunnel
+  moves, the typical sign of a loop through two sites' LANs.
+* **Joining with invitation codes**: a site joins with the address of any
+  member and a one-time code created there; the member adds it with the
+  source address of the request (no address has to be typed) and answers
+  with the configuration. Codes do not expire; they are used up or deleted.
+  The code protects the layer-2 access a new site gets; it travels in clear
+  text through the (trusted) transport network.
 * **Path MTU probes use UDP** between the daemons (DF set via
   `IP_PMTUDISC_PROBE`) instead of ICMP: no `CAP_NET_RAW`, and the same probes
   carry reachability, RTT and the sync announcements.
@@ -412,9 +449,9 @@ scripts/integration.sh        # .deb in Debian 13 containers, full integration t
 
 `scripts/integration.sh` loads the required kernel modules into the host
 kernel through a privileged helper container (on GitHub runners with sudo)
-and runs the scenarios in `tests/integration/cases` on a topology of two
-hubs, three spokes, a router standing in for the transport network and one
-client per site (see `tests/integration/README.md`).
+and runs the scenarios in `tests/integration/cases` on a topology of five
+sites, a router standing in for the transport network and one client per
+site (see `tests/integration/README.md`).
 
 The workspace has three crates: `wanderlan-core` (configuration, topology,
 desired state, reconciliation, system access behind traits with a netlink

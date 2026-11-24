@@ -6,7 +6,6 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, TableState};
 use wanderlan_core::api::{PeerStatus, PortState, SiteState, SiteSummary, Status};
-use wanderlan_core::config::Role;
 
 use super::{health_style, port_state, titled};
 use crate::tui::app::App;
@@ -41,7 +40,7 @@ pub fn health(peer: &PeerStatus) -> Health {
 }
 
 pub fn draw(frame: &mut Frame, app: &App, status: &Status, area: Rect) {
-    let header = header_lines(status);
+    let header = header_lines(app, status);
     let peer_rows = u16::try_from(status.peers.len().max(1)).unwrap_or(u16::MAX);
     let [head, peers, sites] = Layout::vertical([
         Constraint::Length(u16::try_from(header.len()).unwrap_or_default()),
@@ -54,14 +53,13 @@ pub fn draw(frame: &mut Frame, app: &App, status: &Status, area: Rect) {
     draw_sites(frame, status, sites);
 }
 
-fn header_lines(status: &Status) -> Vec<Line<'static>> {
+fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     match &status.site {
         Some(site) => {
             let value = |v: &Option<String>| v.clone().unwrap_or_else(|| "?".into());
             lines.push(Line::from(vec![
                 Span::styled(format!(" {site}"), theme::bold()),
-                Span::raw(format!(" ({})", status.role.map_or("?", Role::as_str))),
                 Span::styled("  address ", theme::dim()),
                 Span::raw(value(&status.address)),
                 Span::styled("  trunk ", theme::dim()),
@@ -71,7 +69,7 @@ fn header_lines(status: &Status) -> Vec<Line<'static>> {
             ]));
         }
         None => lines.push(Line::styled(
-            " This site is not configured yet. Press 6 to run the setup wizard.",
+            " This site is not configured yet. Press 6 to start a new network or join one.",
             theme::warn(),
         )),
     }
@@ -92,6 +90,17 @@ fn header_lines(status: &Status) -> Vec<Line<'static>> {
         Span::styled("  daemon ", theme::dim()),
         Span::raw(status.version.clone()),
     ]));
+    match (&app.invitation, status.invites) {
+        (_, 0) => {}
+        (Some(inv), _) => lines.push(Line::from(vec![
+            Span::styled(" Invitation: ", theme::warn()),
+            Span::styled(inv.command.clone(), theme::bold()),
+        ])),
+        (None, n) => lines.push(Line::from(vec![
+            Span::styled(format!(" {n} open invitation(s)"), theme::warn()),
+            Span::styled("  (wanderlan invite list)", theme::dim()),
+        ])),
+    }
     if !status.blocked.is_empty() {
         lines.push(Line::from(vec![
             Span::styled(" Blocked by the loop guard: ", theme::bad()),
@@ -123,7 +132,6 @@ fn peer_row(peer: &PeerStatus) -> Row<'static> {
     };
     Row::new(vec![
         Cell::from(peer.name.clone()),
-        Cell::from(peer.role.as_str()),
         Cell::from(port_state(peer.port_state)),
         Cell::from(reply),
         Cell::from(opt(peer.rtt_ms.map(format::rtt))),
@@ -139,7 +147,7 @@ fn peer_row(peer: &PeerStatus) -> Row<'static> {
 
 fn draw_peers(frame: &mut Frame, app: &App, status: &Status, area: Rect) {
     let header = Row::new(vec![
-        "PEER", "ROLE", "PORT", "REPLY", "RTT", "PMTU", "MSS", "MACS", "RX b/s", "TX b/s", "CONFIG",
+        "PEER", "PORT", "REPLY", "RTT", "PMTU", "MSS", "MACS", "RX b/s", "TX b/s", "CONFIG",
     ])
     .style(theme::header());
     let rows: Vec<Row> = if status.peers.is_empty() {
@@ -149,7 +157,6 @@ fn draw_peers(frame: &mut Frame, app: &App, status: &Status, area: Rect) {
     };
     let widths = [
         Constraint::Length(12),
-        Constraint::Length(5),
         Constraint::Length(7),
         Constraint::Length(5),
         Constraint::Length(6),
@@ -185,22 +192,11 @@ fn link(status: &Status, site: &SiteSummary) -> (String, Style) {
     if site.direct {
         return ("tunnel".into(), Style::new());
     }
-    let via = match status.role {
-        Some(Role::Spoke) => status
-            .sites
-            .iter()
-            .find(|s| s.is_self)
-            .and_then(|s| s.hub.clone()),
-        _ => site.hub.clone(),
-    };
-    match via {
-        Some(hub) => (format!("via {hub}"), theme::dim()),
-        None => ("-".into(), theme::dim()),
-    }
+    ("-".into(), theme::dim())
 }
 
 fn draw_sites(frame: &mut Frame, status: &Status, area: Rect) {
-    let header = Row::new(vec!["SITE", "ROLE", "HUB", "ADDRESS", "LINK"]).style(theme::header());
+    let header = Row::new(vec!["SITE", "ADDRESS", "VLANS", "LINK"]).style(theme::header());
     let rows: Vec<Row> = status
         .sites
         .iter()
@@ -208,21 +204,19 @@ fn draw_sites(frame: &mut Frame, status: &Status, area: Rect) {
             let (link, style) = link(status, site);
             Row::new(vec![
                 Cell::from(site.name.clone()),
-                Cell::from(site.role.as_str()),
-                Cell::from(site.hub.clone().unwrap_or_else(|| "-".into())),
                 Cell::from(site.address.clone()),
+                Cell::from(site.vlans.clone()),
                 Cell::from(link).style(style),
             ])
         })
         .collect();
     let widths = [
         Constraint::Length(12),
-        Constraint::Length(5),
-        Constraint::Length(12),
         Constraint::Length(15),
+        Constraint::Length(20),
         Constraint::Min(10),
     ];
-    let title = format!(" Mesh: {} sites ", status.sites.len());
+    let title = format!(" Network: {} sites ", status.sites.len());
     frame.render_widget(
         Table::new(rows, widths).header(header).block(titled(title)),
         area,

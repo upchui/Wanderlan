@@ -1,79 +1,80 @@
 //! The setup wizard for a site without configuration.
 //!
-//! It asks for the minimum a site needs to join a mesh: its own name, role,
-//! trunk interface, transport address, the shared VLANs and one peer. The
-//! result is a mesh with two sites and a `local.toml`; the rest of the mesh
-//! arrives through the configuration sync once the peer lists this site.
+//! Two ways to start: a new network, with this site as its first site, or
+//! joining an existing network with an invitation from any of its sites
+//! (`wanderlan invite` there). Joining only needs the address of the
+//! inviting site, the code and the local trunk; everything else comes from
+//! the network.
 
 use std::net::Ipv4Addr;
 use std::str::FromStr as _;
 
 use crossterm::event::{KeyCode, KeyEvent};
-use wanderlan_core::api::Interface;
+use wanderlan_core::api::{Interface, JoinParams};
 use wanderlan_core::config::{
-    Local, Mesh, Role, Site, VlanSet, has_errors, ifname_error, site_name_error, validate,
+    DEFAULT_CONTROL_PORT, Local, Mesh, Site, VlanSet, has_errors, ifname_error, site_name_error,
+    validate,
 };
+use wanderlan_core::join;
 use wanderlan_core::{BRIDGE_NAME, topology::GRETAP_PREFIX};
 
 use super::form::trunk_candidates;
 use super::input::{Outcome, TextInput};
 
-/// Default shared VLANs offered by the wizard.
+/// Default VLANs offered for a new network.
 pub const DEFAULT_VLANS: &str = "10-50";
+
+/// What the wizard sets up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// A new network; this site is its first site.
+    New,
+    /// Join an existing network with an invitation.
+    Join,
+}
 
 /// Steps of the wizard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
-    /// Explanation.
+    /// Explanation and choice of the mode.
     Welcome,
-    /// Name of this site.
-    Name,
-    /// Hub or spoke.
-    Role,
+    /// Address of the site that created the invitation (join).
+    Target,
+    /// The invitation code (join).
+    Code,
     /// Trunk interface.
     Trunk,
-    /// Transport address of this site.
+    /// Name of this site.
+    Name,
+    /// Transport address of this site (new network).
     Address,
-    /// Shared VLANs.
+    /// VLANs of the network (new network).
     Vlans,
-    /// The first peer.
-    Peer,
-    /// Summary before applying.
+    /// Summary before applying or joining.
     Summary,
-    /// Applied, waiting for confirmation.
+    /// Applied, waiting for confirmation (new network).
     Applied,
+    /// Waiting for the inviting site (join).
+    Joining,
 }
 
 impl Step {
-    /// Number of numbered steps.
-    pub const COUNT: usize = 7;
-
-    /// Position in "step n of 7", if numbered.
-    pub fn number(self) -> Option<usize> {
-        match self {
-            Self::Welcome | Self::Applied => None,
-            Self::Name => Some(1),
-            Self::Role => Some(2),
-            Self::Trunk => Some(3),
-            Self::Address => Some(4),
-            Self::Vlans => Some(5),
-            Self::Peer => Some(6),
-            Self::Summary => Some(7),
-        }
-    }
+    /// Number of numbered steps (both modes have five).
+    pub const COUNT: usize = 5;
 
     /// Heading of the step.
     pub fn title(self) -> &'static str {
         match self {
             Self::Welcome => "Welcome",
-            Self::Name => "Name of this site",
-            Self::Role => "Role of this site",
+            Self::Target => "Site that invited you",
+            Self::Code => "Invitation code",
             Self::Trunk => "Trunk interface",
-            Self::Address => "Transport address",
-            Self::Vlans => "Shared VLANs",
-            Self::Peer => "First peer",
+            Self::Name => "Name of this site",
+            Self::Address => "Address in the transport network",
+            Self::Vlans => "VLANs",
             Self::Summary => "Summary",
             Self::Applied => "Waiting for confirmation",
+            Self::Joining => "Joining",
         }
     }
 }
@@ -85,36 +86,43 @@ pub enum Action {
     None,
     /// Leave the wizard.
     Leave,
-    /// Show the diff of the built configuration and apply it.
+    /// Show the configuration of the new network and apply it.
     Review,
     /// The trunk step needs the interface list.
     LoadInterfaces,
+    /// Ask the inviting site to let this site join.
+    Join,
 }
 
 /// State of the wizard.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Wizard {
+    /// New network or join.
+    pub mode: Mode,
     /// Current step.
     pub step: Step,
     /// Name of this site.
     pub name: TextInput,
-    /// Role of this site.
-    pub role: Role,
+    /// The suggested name (from the host name); a name equal to it may get a
+    /// suffix when joining if it is taken.
+    pub default_name: String,
     /// Selected entry of the interface list; one past the last entry means
     /// "type a name".
     pub trunk_selected: usize,
+    /// The user moved the selection (otherwise the suggestion is used).
+    pub trunk_touched: bool,
+    /// Interface that carries the transport traffic; not suggested as trunk.
+    pub transport: Option<String>,
     /// Manually entered trunk name.
     pub trunk_manual: TextInput,
     /// Transport address of this site.
     pub address: TextInput,
-    /// Shared VLANs.
+    /// VLANs of the network.
     pub vlans: TextInput,
-    /// Name of the first peer.
-    pub peer_name: TextInput,
-    /// Address of the first peer.
-    pub peer_address: TextInput,
-    /// Focused peer field: 0 name, 1 address.
-    pub peer_focus: usize,
+    /// Address of the inviting site.
+    pub target: TextInput,
+    /// Invitation code.
+    pub code: TextInput,
     /// Problem with the current step.
     pub error: Option<String>,
 }
@@ -129,44 +137,89 @@ impl Wizard {
     /// A wizard at the welcome step.
     pub fn new() -> Self {
         Self {
+            mode: Mode::New,
             step: Step::Welcome,
             name: TextInput::default(),
-            role: Role::Spoke,
+            default_name: String::new(),
             trunk_selected: 0,
+            trunk_touched: false,
+            transport: None,
             trunk_manual: TextInput::default(),
             address: TextInput::default(),
             vlans: TextInput::new(DEFAULT_VLANS),
-            peer_name: TextInput::default(),
-            peer_address: TextInput::default(),
-            peer_focus: 0,
+            target: TextInput::default(),
+            code: TextInput::default(),
             error: None,
         }
     }
 
-    /// Role of the first peer: a spoke's first peer is its hub, a hub's
-    /// first peer is another hub.
-    pub fn peer_role(&self) -> Role {
-        Role::Hub
+    /// Fills in suggestions: the name from the host name, the address of
+    /// the default route. Fields the user already filled are kept.
+    pub fn prefill(&mut self, hostname: &str, address: Option<Ipv4Addr>) {
+        if self.name.value().is_empty() && !hostname.is_empty() {
+            self.default_name = join::site_name_from_hostname(hostname);
+            self.name = TextInput::new(self.default_name.clone());
+        }
+        if self.address.value().is_empty()
+            && let Some(a) = address
+        {
+            self.address = TextInput::new(a.to_string());
+        }
+    }
+
+    /// Position in "step n of 5", if numbered.
+    pub fn number(&self) -> Option<usize> {
+        match (self.mode, self.step) {
+            (_, Step::Welcome | Step::Applied | Step::Joining) => None,
+            (Mode::New, Step::Name) | (Mode::Join, Step::Target) => Some(1),
+            (Mode::New, Step::Trunk) | (Mode::Join, Step::Code) => Some(2),
+            (Mode::New, Step::Address) | (Mode::Join, Step::Trunk) => Some(3),
+            (Mode::New, Step::Vlans) | (Mode::Join, Step::Name) => Some(4),
+            (_, Step::Summary) => Some(5),
+            _ => None,
+        }
+    }
+
+    /// The address of the inviting site, if it can be parsed.
+    pub fn target_address(&self) -> Option<Ipv4Addr> {
+        join::parse_target(self.target.value(), DEFAULT_CONTROL_PORT)
+            .ok()
+            .map(|(a, _)| a)
+    }
+
+    /// Index of the selected trunk entry: the user's choice, or the first
+    /// interface that can be a trunk (physical, VLAN, bond, not in another
+    /// bridge) and does not carry the transport traffic.
+    pub fn trunk_index(&self, interfaces: &[Interface]) -> usize {
+        if self.trunk_touched {
+            return self.trunk_selected;
+        }
+        let list = trunk_candidates(interfaces);
+        let usable = |i: &&Interface| Some(i.name.as_str()) != self.transport.as_deref();
+        list.iter()
+            .position(|i| usable(i) && i.is_trunk_candidate())
+            .or_else(|| list.iter().position(usable))
+            .unwrap_or(0)
     }
 
     /// True if the "type a name" entry of the trunk list is selected.
     pub fn trunk_is_manual(&self, interfaces: &[Interface]) -> bool {
-        self.trunk_selected >= trunk_candidates(interfaces).len()
+        self.trunk_index(interfaces) >= trunk_candidates(interfaces).len()
     }
 
     /// True while printable keys go into a text field.
     pub fn captures_text(&self, interfaces: &[Interface]) -> bool {
         match self.step {
-            Step::Name | Step::Address | Step::Vlans | Step::Peer => true,
+            Step::Name | Step::Address | Step::Vlans | Step::Target | Step::Code => true,
             Step::Trunk => self.trunk_is_manual(interfaces),
-            Step::Welcome | Step::Role | Step::Summary | Step::Applied => false,
+            Step::Welcome | Step::Summary | Step::Applied | Step::Joining => false,
         }
     }
 
     /// The chosen trunk interface.
     pub fn trunk(&self, interfaces: &[Interface]) -> String {
         trunk_candidates(interfaces)
-            .get(self.trunk_selected)
+            .get(self.trunk_index(interfaces))
             .map_or_else(
                 || self.trunk_manual.value().trim().to_string(),
                 |i| i.name.clone(),
@@ -183,72 +236,103 @@ impl Wizard {
         }
     }
 
+    fn previous(&self) -> Option<Step> {
+        match (self.mode, self.step) {
+            (_, Step::Welcome | Step::Applied | Step::Joining) => None,
+            (Mode::New, Step::Name) | (Mode::Join, Step::Target) => Some(Step::Welcome),
+            (Mode::New, Step::Trunk) => Some(Step::Name),
+            (Mode::New, Step::Address) => Some(Step::Trunk),
+            (Mode::New, Step::Vlans) => Some(Step::Address),
+            (Mode::New, Step::Summary) => Some(Step::Vlans),
+            (Mode::Join, Step::Code) => Some(Step::Target),
+            (Mode::Join, Step::Trunk) => Some(Step::Code),
+            (Mode::Join, Step::Name) => Some(Step::Trunk),
+            (Mode::Join, Step::Summary) => Some(Step::Name),
+            _ => Some(Step::Welcome),
+        }
+    }
+
+    fn next(&self) -> Step {
+        match (self.mode, self.step) {
+            (Mode::New, Step::Name) => Step::Trunk,
+            (Mode::New, Step::Trunk) => Step::Address,
+            (Mode::New, Step::Address) => Step::Vlans,
+            (Mode::Join, Step::Target) => Step::Code,
+            (Mode::Join, Step::Code) => Step::Trunk,
+            (Mode::Join, Step::Trunk) => Step::Name,
+            _ => Step::Summary,
+        }
+    }
+
     /// Handles a key. Returns `None` if the key is not for the wizard (so
     /// global keys such as view switching still work).
     pub fn handle_key(&mut self, key: &KeyEvent, interfaces: &[Interface]) -> Option<Action> {
-        let back = |step| match step {
-            Step::Welcome => None,
-            Step::Name => Some(Step::Welcome),
-            Step::Role => Some(Step::Name),
-            Step::Trunk => Some(Step::Role),
-            Step::Address => Some(Step::Trunk),
-            Step::Vlans => Some(Step::Address),
-            Step::Peer => Some(Step::Vlans),
-            Step::Summary => Some(Step::Peer),
-            Step::Applied => None,
-        };
         if key.code == KeyCode::Esc {
-            return match back(self.step) {
+            return match self.previous() {
                 Some(step) => Some(self.go(step)),
                 None if self.step == Step::Welcome => Some(Action::Leave),
                 None => None,
             };
         }
         match self.step {
-            Step::Welcome => (key.code == KeyCode::Enter).then(|| self.go(Step::Name)),
-            Step::Name => self.text_step(key, Step::Role),
-            Step::Role => match key.code {
-                KeyCode::Up
-                | KeyCode::Down
-                | KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Char(' ') => {
-                    self.role = match self.role {
-                        Role::Hub => Role::Spoke,
-                        Role::Spoke => Role::Hub,
-                    };
-                    Some(Action::None)
-                }
-                KeyCode::Char('h') => {
-                    self.role = Role::Hub;
-                    Some(Action::None)
-                }
-                KeyCode::Char('s') => {
-                    self.role = Role::Spoke;
-                    Some(Action::None)
-                }
-                KeyCode::Enter => Some(self.go(Step::Trunk)),
-                _ => None,
-            },
+            Step::Welcome => self.welcome_key(key),
             Step::Trunk => self.trunk_key(key, interfaces),
-            Step::Address => self.text_step(key, Step::Vlans),
-            Step::Vlans => self.text_step(key, Step::Peer),
-            Step::Peer => self.peer_key(key),
-            Step::Summary => (key.code == KeyCode::Enter).then(|| match self.build(interfaces) {
-                Ok(_) => Action::Review,
-                Err(e) => {
-                    self.error = Some(e);
-                    Action::None
-                }
+            Step::Name | Step::Address | Step::Vlans | Step::Target | Step::Code => {
+                self.text_step(key)
+            }
+            Step::Summary => (key.code == KeyCode::Enter).then(|| match self.mode {
+                Mode::New => match self.build(interfaces) {
+                    Ok(_) => Action::Review,
+                    Err(e) => {
+                        self.error = Some(e);
+                        Action::None
+                    }
+                },
+                Mode::Join => match self.join_params(interfaces) {
+                    Ok(_) => {
+                        self.step = Step::Joining;
+                        self.error = None;
+                        Action::Join
+                    }
+                    Err(e) => {
+                        self.error = Some(e);
+                        Action::None
+                    }
+                },
             }),
-            Step::Applied => None,
+            Step::Applied | Step::Joining => None,
         }
     }
 
-    fn text_step(&mut self, key: &KeyEvent, next: Step) -> Option<Action> {
+    fn welcome_key(&mut self, key: &KeyEvent) -> Option<Action> {
+        match key.code {
+            KeyCode::Up | KeyCode::Down | KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') => {
+                self.mode = match self.mode {
+                    Mode::New => Mode::Join,
+                    Mode::Join => Mode::New,
+                };
+                Some(Action::None)
+            }
+            KeyCode::Char('n') => {
+                self.mode = Mode::New;
+                Some(Action::None)
+            }
+            KeyCode::Char('j') => {
+                self.mode = Mode::Join;
+                Some(Action::None)
+            }
+            KeyCode::Enter => Some(self.go(match self.mode {
+                Mode::New => Step::Name,
+                Mode::Join => Step::Target,
+            })),
+            _ => None,
+        }
+    }
+
+    fn text_step(&mut self, key: &KeyEvent) -> Option<Action> {
         if key.code == KeyCode::Enter {
             return Some(match self.check_step() {
-                Ok(()) => self.go(next),
+                Ok(()) => self.go(self.next()),
                 Err(e) => {
                     self.error = Some(e);
                     Action::None
@@ -261,6 +345,8 @@ impl Wizard {
         let input = match self.step {
             Step::Name => &mut self.name,
             Step::Address => &mut self.address,
+            Step::Target => &mut self.target,
+            Step::Code => &mut self.code,
             _ => &mut self.vlans,
         };
         if input.handle(key) == Outcome::Edited {
@@ -271,19 +357,22 @@ impl Wizard {
 
     fn trunk_key(&mut self, key: &KeyEvent, interfaces: &[Interface]) -> Option<Action> {
         let entries = trunk_candidates(interfaces).len() + 1;
+        let current = self.trunk_index(interfaces);
         match key.code {
             KeyCode::Up => {
-                self.trunk_selected = self.trunk_selected.min(entries - 1).saturating_sub(1);
+                self.trunk_selected = current.min(entries - 1).saturating_sub(1);
+                self.trunk_touched = true;
                 self.error = None;
                 Some(Action::None)
             }
             KeyCode::Down => {
-                self.trunk_selected = (self.trunk_selected + 1).min(entries - 1);
+                self.trunk_selected = (current + 1).min(entries - 1);
+                self.trunk_touched = true;
                 self.error = None;
                 Some(Action::None)
             }
             KeyCode::Enter => Some(match self.check_trunk(interfaces) {
-                Ok(()) => self.go(Step::Address),
+                Ok(()) => self.go(self.next()),
                 Err(e) => {
                     self.error = Some(e);
                     Action::None
@@ -302,45 +391,6 @@ impl Wizard {
         }
     }
 
-    fn peer_key(&mut self, key: &KeyEvent) -> Option<Action> {
-        match key.code {
-            KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                self.peer_focus = 1 - self.peer_focus.min(1);
-                Some(Action::None)
-            }
-            KeyCode::Enter => {
-                if self.peer_focus == 0 {
-                    match self.check_peer_name() {
-                        Ok(()) => {
-                            self.peer_focus = 1;
-                            self.error = None;
-                        }
-                        Err(e) => self.error = Some(e),
-                    }
-                    return Some(Action::None);
-                }
-                Some(match self.check_step() {
-                    Ok(()) => self.go(Step::Summary),
-                    Err(e) => {
-                        self.error = Some(e);
-                        Action::None
-                    }
-                })
-            }
-            _ => {
-                let input = if self.peer_focus == 0 {
-                    &mut self.peer_name
-                } else {
-                    &mut self.peer_address
-                };
-                if input.handle(key) == Outcome::Edited {
-                    self.error = None;
-                }
-                Some(Action::None)
-            }
-        }
-    }
-
     fn check_step(&self) -> Result<(), String> {
         match self.step {
             Step::Name => site_name_error(self.name.value().trim()).map_or(Ok(()), Err),
@@ -348,28 +398,22 @@ impl Wizard {
             Step::Vlans => VlanSet::from_str(self.vlans.value())
                 .map(|_| ())
                 .map_err(|e| format!("{e} (e.g. 10-50 or 10-50,60)")),
-            Step::Peer => {
-                self.check_peer_name()?;
-                let own = parse_address(self.address.value())?;
-                let peer = parse_address(self.peer_address.value())?;
-                if own == peer {
-                    return Err(format!("{peer} is the address of this site"));
+            Step::Target => {
+                join::parse_target(self.target.value(), DEFAULT_CONTROL_PORT).map(|_| ())
+            }
+            Step::Code => {
+                let code = join::normalize_code(self.code.value());
+                if code.len() == join::CODE_LEN {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "an invitation code has {} characters, e.g. K7F3Q-9QX2M",
+                        join::CODE_LEN
+                    ))
                 }
-                Ok(())
             }
             _ => Ok(()),
         }
-    }
-
-    fn check_peer_name(&self) -> Result<(), String> {
-        let peer = self.peer_name.value().trim();
-        if let Some(e) = site_name_error(peer) {
-            return Err(e);
-        }
-        if peer == self.name.value().trim() {
-            return Err(format!("\"{peer}\" is the name of this site"));
-        }
-        Ok(())
     }
 
     fn check_trunk(&self, interfaces: &[Interface]) -> Result<(), String> {
@@ -380,28 +424,24 @@ impl Wizard {
         if trunk.starts_with(GRETAP_PREFIX) || trunk == BRIDGE_NAME {
             return Err(format!("\"{trunk}\" is an interface managed by wanderlan"));
         }
+        if self.transport.as_deref() == Some(trunk.as_str()) {
+            return Err(format!(
+                "{trunk} carries the traffic to the other sites; as trunk it would cut this host off. Choose the interface that carries the VLANs."
+            ));
+        }
         Ok(())
     }
 
-    /// Builds the minimal mesh (this site and the first peer) and the local
-    /// configuration.
+    /// Builds the configuration of a new network: this site alone.
     pub fn build(&self, interfaces: &[Interface]) -> Result<(Mesh, Local), String> {
         let name = self.name.value().trim().to_string();
-        let peer = self.peer_name.value().trim().to_string();
         let vlans = VlanSet::from_str(self.vlans.value()).map_err(|e| e.to_string())?;
         self.check_trunk(interfaces)?;
         let mut mesh = Mesh::new(vlans);
         mesh.sites.push(Site {
             name: name.clone(),
-            role: self.role,
-            hub: (self.role == Role::Spoke).then(|| peer.clone()),
             address: parse_address(self.address.value())?,
-        });
-        mesh.sites.push(Site {
-            name: peer,
-            role: self.peer_role(),
-            hub: None,
-            address: parse_address(self.peer_address.value())?,
+            vlans: None,
         });
         let local = Local {
             self_name: Some(name),
@@ -417,6 +457,23 @@ impl Wizard {
             return Err(first);
         }
         Ok((mesh, local))
+    }
+
+    /// The join request.
+    pub fn join_params(&self, interfaces: &[Interface]) -> Result<JoinParams, String> {
+        join::parse_target(self.target.value(), DEFAULT_CONTROL_PORT)?;
+        self.check_trunk(interfaces)?;
+        let name = self.name.value().trim().to_string();
+        if let Some(e) = site_name_error(&name) {
+            return Err(e);
+        }
+        Ok(JoinParams {
+            target: self.target.value().trim().to_string(),
+            code: self.code.value().trim().to_string(),
+            name_is_default: !self.default_name.is_empty() && name == self.default_name,
+            name,
+            trunk: self.trunk(interfaces),
+        })
     }
 }
 
@@ -452,121 +509,149 @@ mod tests {
         }
     }
 
-    /// Runs through all steps as a spoke `haus4` of hub `heim`.
-    fn completed() -> Wizard {
+    /// Runs through a new network `heim` (trunk ens19, ens18 carries the
+    /// transport traffic).
+    fn new_network() -> Wizard {
         let mut w = Wizard::new();
+        w.prefill("heim.example.org", Some(Ipv4Addr::new(10, 8, 0, 1)));
+        w.transport = Some("ens18".into());
         press(&mut w, KeyCode::Enter);
-        type_text(&mut w, "haus4");
-        press(&mut w, KeyCode::Enter);
-        assert_eq!(w.step, Step::Role);
+        assert_eq!(w.step, Step::Name);
+        assert_eq!(w.name.value(), "heim", "name from the host name");
         press(&mut w, KeyCode::Enter);
         assert_eq!(w.step, Step::Trunk);
-        press(&mut w, KeyCode::Down);
-        press(&mut w, KeyCode::Down);
+        assert_eq!(
+            w.trunk(&fixtures::interfaces()),
+            "ens19",
+            "ens18 is skipped"
+        );
         press(&mut w, KeyCode::Enter);
         assert_eq!(w.step, Step::Address);
-        type_text(&mut w, "10.8.0.14");
+        assert_eq!(w.address.value(), "10.8.0.1");
         press(&mut w, KeyCode::Enter);
         assert_eq!(w.step, Step::Vlans);
-        press(&mut w, KeyCode::Enter);
-        assert_eq!(w.step, Step::Peer);
-        type_text(&mut w, "heim");
-        press(&mut w, KeyCode::Enter);
-        type_text(&mut w, "10.8.0.1");
         press(&mut w, KeyCode::Enter);
         assert_eq!(w.step, Step::Summary, "{:?}", w.error);
         w
     }
 
     #[test]
-    fn builds_minimal_spoke_configuration() {
-        let mut w = completed();
+    fn a_new_network_has_this_site_only() {
+        let mut w = new_network();
         assert_eq!(press(&mut w, KeyCode::Enter), Some(Action::Review));
         let (mesh, local) = w.build(&fixtures::interfaces()).unwrap();
-        insta::assert_snapshot!("wizard_spoke_mesh", render_mesh(&mesh));
+        insta::assert_snapshot!("wizard_new_network_mesh", render_mesh(&mesh));
         assert_eq!(
             render_local(&local),
-            "# wanderlan site-local configuration (never synchronised).\n\nself = \"haus4\"\ntrunk = \"ens19\"\n"
+            "# wanderlan site-local configuration (never synchronised).\n\nself = \"heim\"\ntrunk = \"ens19\"\n"
         );
     }
 
     #[test]
-    fn hub_peers_with_another_hub() {
-        let mut w = completed();
-        w.role = Role::Hub;
-        let (mesh, _) = w.build(&fixtures::interfaces()).unwrap();
-        assert!(mesh.sites.iter().all(|s| s.role == Role::Hub));
-        assert!(mesh.sites.iter().all(|s| s.hub.is_none()));
-    }
-
-    #[test]
-    fn rejects_invalid_input_per_step() {
+    fn joining_needs_address_code_trunk_and_name() {
         let mut w = Wizard::new();
+        w.prefill("wanderlan", None);
+        press(&mut w, KeyCode::Down);
+        assert_eq!(w.mode, Mode::Join);
         press(&mut w, KeyCode::Enter);
-        type_text(&mut w, "Bad Name");
+        assert_eq!(w.step, Step::Target);
+        assert_eq!(w.number(), Some(1));
+        type_text(&mut w, "10.13.0.");
+        press(&mut w, KeyCode::Enter);
+        assert!(w.error.is_some(), "incomplete address");
+        type_text(&mut w, "103");
+        press(&mut w, KeyCode::Enter);
+        assert_eq!(w.step, Step::Code);
+        type_text(&mut w, "k7f3q");
+        press(&mut w, KeyCode::Enter);
+        assert!(
+            w.error
+                .as_deref()
+                .is_some_and(|e| e.contains("10 characters"))
+        );
+        type_text(&mut w, "-9qx2m");
+        press(&mut w, KeyCode::Enter);
+        assert_eq!(w.step, Step::Trunk);
+        w.transport = Some("ens18".into());
         press(&mut w, KeyCode::Enter);
         assert_eq!(w.step, Step::Name);
-        assert!(w.error.as_deref().unwrap().contains("may only contain"));
-        // Editing clears the error.
-        press(&mut w, KeyCode::Backspace);
-        assert_eq!(w.error, None);
-
-        let mut w = completed();
-        w.step = Step::Peer;
-        w.peer_focus = 0;
-        w.peer_name.set("haus4");
         press(&mut w, KeyCode::Enter);
-        assert!(w.error.as_deref().unwrap().contains("name of this site"));
-        w.peer_name.set("heim");
-        w.peer_address.set("10.8.0.14");
-        w.peer_focus = 1;
-        press(&mut w, KeyCode::Enter);
-        assert!(w.error.as_deref().unwrap().contains("address of this site"));
-
-        w.step = Step::Address;
-        w.address.set("127.0.0.1");
-        press(&mut w, KeyCode::Enter);
-        assert!(w.error.as_deref().unwrap().contains("not a usable"));
-
-        w.step = Step::Vlans;
-        w.vlans.set("10-5000");
-        press(&mut w, KeyCode::Enter);
-        assert_eq!(w.step, Step::Vlans);
+        assert_eq!(w.step, Step::Summary);
+        assert_eq!(press(&mut w, KeyCode::Enter), Some(Action::Join));
+        assert_eq!(w.step, Step::Joining);
+        let params = w.join_params(&fixtures::interfaces()).unwrap();
+        assert_eq!(params.target, "10.13.0.103");
+        assert_eq!(params.code, "k7f3q-9qx2m");
+        assert_eq!(params.name, "wanderlan");
+        assert!(params.name_is_default);
+        assert_eq!(params.trunk, "ens19");
     }
 
     #[test]
-    fn trunk_list_hides_loopback_and_managed_and_allows_manual_entry() {
-        let interfaces = fixtures::interfaces();
-        let names: Vec<&str> = trunk_candidates(&interfaces)
-            .iter()
-            .map(|i| i.name.as_str())
-            .collect();
-        assert_eq!(names, ["br-lan", "ens18", "ens19", "eth1"]);
+    fn a_chosen_name_is_not_the_default() {
         let mut w = Wizard::new();
+        w.prefill("wanderlan", None);
+        w.mode = Mode::Join;
+        w.step = Step::Name;
+        type_text(&mut w, "2");
+        w.target = TextInput::new("10.13.0.103");
+        w.code = TextInput::new("K7F3Q-9QX2M");
+        let params = w.join_params(&fixtures::interfaces()).unwrap();
+        assert_eq!(params.name, "wanderlan2");
+        assert!(!params.name_is_default);
+    }
+
+    #[test]
+    fn the_transport_interface_is_not_accepted_as_trunk() {
+        let mut w = new_network();
         w.step = Step::Trunk;
-        for _ in 0..10 {
+        w.trunk_touched = true;
+        w.trunk_selected = trunk_candidates(&fixtures::interfaces())
+            .iter()
+            .position(|i| i.name == "ens18")
+            .unwrap();
+        assert_eq!(w.trunk(&fixtures::interfaces()), "ens18");
+        press(&mut w, KeyCode::Enter);
+        assert_eq!(w.step, Step::Trunk);
+        assert!(
+            w.error
+                .as_deref()
+                .is_some_and(|e| e.contains("cut this host off"))
+        );
+    }
+
+    #[test]
+    fn esc_goes_back_and_leaves_from_the_start() {
+        let mut w = new_network();
+        for step in [
+            Step::Vlans,
+            Step::Address,
+            Step::Trunk,
+            Step::Name,
+            Step::Welcome,
+        ] {
+            press(&mut w, KeyCode::Esc);
+            assert_eq!(w.step, step);
+        }
+        assert_eq!(press(&mut w, KeyCode::Esc), Some(Action::Leave));
+    }
+
+    #[test]
+    fn manual_trunk_name_is_validated() {
+        let mut w = new_network();
+        w.step = Step::Trunk;
+        let manual = trunk_candidates(&fixtures::interfaces()).len();
+        for _ in 0..manual + 2 {
             press(&mut w, KeyCode::Down);
         }
-        assert!(w.trunk_is_manual(&interfaces));
-        assert!(w.captures_text(&interfaces));
-        type_text(&mut w, "gt-x");
+        assert!(w.trunk_is_manual(&fixtures::interfaces()));
+        assert!(w.captures_text(&fixtures::interfaces()));
+        type_text(&mut w, "br0");
         press(&mut w, KeyCode::Enter);
-        assert!(w.error.as_deref().unwrap().contains("managed by wanderlan"));
-        w.trunk_manual.set("bond0");
-        press(&mut w, KeyCode::Enter);
-        assert_eq!(w.step, Step::Address);
-        assert_eq!(w.trunk(&interfaces), "bond0");
-    }
-
-    #[test]
-    fn escape_goes_back_and_leaves_on_the_first_step() {
-        let mut w = Wizard::new();
-        press(&mut w, KeyCode::Enter);
-        assert_eq!(w.step, Step::Name);
-        assert_eq!(press(&mut w, KeyCode::Esc), Some(Action::None));
-        assert_eq!(w.step, Step::Welcome);
-        assert_eq!(press(&mut w, KeyCode::Esc), Some(Action::Leave));
-        // Digits on the welcome step are not for the wizard (view keys).
-        assert_eq!(press(&mut w, KeyCode::Char('1')), None);
+        assert!(
+            w.error
+                .as_deref()
+                .is_some_and(|e| e.contains("managed by wanderlan"))
+        );
     }
 }

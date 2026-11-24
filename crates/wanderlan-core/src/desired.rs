@@ -9,7 +9,7 @@ use crate::mtu;
 use crate::sys::nft::{MssRule, PortDir};
 use crate::sys::tc::{Direction, TcAction, TcRule};
 use crate::sys::{BridgeOptions, GretapParams, PortVlans, VlanFlags};
-use crate::topology::{self, TunnelKind};
+use crate::topology;
 
 /// Alias that marks interfaces created by wanderlan.
 pub const OWNER_ALIAS: &str = "wanderlan";
@@ -43,15 +43,14 @@ pub struct TunnelSpec {
     pub name: String,
     /// Remote site name.
     pub peer: String,
-    /// Kind of the tunnel.
-    pub kind: TunnelKind,
     /// GRETAP parameters.
     pub params: GretapParams,
-    /// Split horizon: isolated ports do not forward to each other.
+    /// Split horizon: isolated ports do not forward to each other. Every
+    /// tunnel port is isolated, so frames from one tunnel never enter another.
     pub isolated: bool,
     /// Whether the port should be up (false if blocked by the loop guard).
     pub enabled: bool,
-    /// VLAN membership.
+    /// VLAN membership: the VLANs both ends take part in.
     pub vlans: PortVlans,
 }
 
@@ -89,26 +88,34 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
     let me = cfg.self_name();
     let local_address = cfg.self_site().map_or(Ipv4Addr::UNSPECIFIED, |s| s.address);
 
-    let shared: PortVlans = mesh.vlans.iter().map(|v| (v, VlanFlags::TAGGED)).collect();
+    let own = cfg
+        .self_site()
+        .map(|s| mesh.vlans_of(s).clone())
+        .unwrap_or_default();
+    let shared: PortVlans = own.iter().map(|v| (v, VlanFlags::TAGGED)).collect();
     let (trunk_vlans, tc) = trunk_mapping(cfg, &shared);
 
     let tunnels: Vec<TunnelSpec> = topology::tunnels_for(mesh, me)
         .into_iter()
         .map(|t| {
             let name = t.ifname();
+            let theirs = mesh.vlans_of(t.peer);
             TunnelSpec {
                 enabled: !blocked.contains(&name),
                 name,
                 peer: t.peer.name.clone(),
-                kind: t.kind,
                 params: GretapParams {
                     local: local_address,
                     remote: t.peer.address,
                     ignore_df: true,
                     pmtudisc: false,
                 },
-                isolated: t.isolated(),
-                vlans: shared.clone(),
+                isolated: true,
+                vlans: own
+                    .iter()
+                    .filter(|v| theirs.contains(*v))
+                    .map(|v| (v, VlanFlags::TAGGED))
+                    .collect(),
             }
         })
         .collect();
@@ -237,7 +244,7 @@ mod tests {
     }
 
     #[test]
-    fn hub_has_isolated_hub_ports_and_open_spoke_ports() {
+    fn every_site_gets_an_isolated_tunnel_to_every_other_site() {
         let d = derive(&config("heim"), &Runtime::default());
         assert_eq!(d.bridge, "br0");
         assert_eq!(d.local_address, Ipv4Addr::new(10, 8, 0, 1));
@@ -250,11 +257,11 @@ mod tests {
             summary,
             vec![
                 ("gt-buero", true, Ipv4Addr::new(10, 8, 0, 2)),
-                ("gt-haus2", false, Ipv4Addr::new(10, 8, 0, 11)),
+                ("gt-haus2", true, Ipv4Addr::new(10, 8, 0, 11)),
+                ("gt-haus3", true, Ipv4Addr::new(10, 8, 0, 12)),
             ]
         );
         for t in &d.tunnels {
-            assert_eq!(t.vlans.len(), 41);
             assert!(t.params.ignore_df && !t.params.pmtudisc);
             assert_eq!(t.params.local, d.local_address);
         }
@@ -264,14 +271,33 @@ mod tests {
     }
 
     #[test]
+    fn a_tunnel_carries_the_vlans_both_sites_take_part_in() {
+        let heim = derive(&config("heim"), &Runtime::default());
+        let vids = |d: &Desired, port: &str| -> Vec<u16> {
+            d.tunnels
+                .iter()
+                .find(|t| t.name == port)
+                .map(|t| t.vlans.keys().copied().collect())
+                .unwrap_or_default()
+        };
+        assert_eq!(vids(&heim, "gt-buero").len(), 41);
+        assert_eq!(vids(&heim, "gt-haus2"), vec![20, 30]);
+        let haus2 = derive(&config("haus2"), &Runtime::default());
+        assert_eq!(
+            haus2.trunk.vlans.keys().copied().collect::<Vec<_>>(),
+            vec![20, 30]
+        );
+        assert_eq!(vids(&haus2, "gt-heim"), vec![20, 30]);
+    }
+
+    #[test]
     fn native_mapping_and_translation_shape_the_trunk() {
         let d = derive(&config("haus3"), &Runtime::default());
         assert_eq!(d.trunk.vlans.get(&20), Some(&VlanFlags::NATIVE));
         assert_eq!(d.trunk.vlans.get(&30), Some(&VlanFlags::TAGGED));
         assert!(!d.trunk.vlans.contains_key(&130));
-        assert_eq!(d.tunnels.len(), 1);
-        assert_eq!(d.tunnels[0].name, "gt-buero");
-        assert!(!d.tunnels[0].isolated);
+        assert_eq!(d.tunnels.len(), 3);
+        assert!(d.tunnels.iter().all(|t| t.isolated));
     }
 
     #[test]
@@ -342,6 +368,10 @@ mod tests {
                 "wl mss iif gt-haus2 ip6 1298",
                 "wl mss oif gt-haus2 ip 1318",
                 "wl mss oif gt-haus2 ip6 1298",
+                "wl mss iif gt-haus3 ip 1318",
+                "wl mss iif gt-haus3 ip6 1298",
+                "wl mss oif gt-haus3 ip 1318",
+                "wl mss oif gt-haus3 ip6 1298",
             ]
         );
         runtime.pmtu.insert("haus2".into(), 1500);
@@ -368,7 +398,7 @@ mod tests {
         let mut runtime = Runtime::default();
         runtime.pmtu.insert("buero".into(), 1400);
         let d = derive(&cfg, &runtime);
-        assert_eq!(d.mss.len(), 8);
+        assert_eq!(d.mss.len(), 12);
         assert!(
             d.mss
                 .iter()
@@ -388,6 +418,9 @@ mod tests {
             .iter()
             .map(|t| (t.name.as_str(), t.enabled))
             .collect();
-        assert_eq!(enabled, vec![("gt-buero", true), ("gt-haus2", false)]);
+        assert_eq!(
+            enabled,
+            vec![("gt-buero", true), ("gt-haus2", false), ("gt-haus3", true)]
+        );
     }
 }

@@ -100,6 +100,7 @@ pub fn load(mesh_text: &str, local_text: &str) -> Result<LoadOutcome, Vec<Diagno
         )],
         (Some(mesh), _) => validate(mesh, Some(&local)),
     };
+    diags.extend(parsed_mesh.warnings.iter().cloned());
     parsed_mesh.spans.locate(ConfigFile::Mesh, &mut diags);
     parsed_local.spans.locate(ConfigFile::Local, &mut diags);
 
@@ -136,6 +137,7 @@ pub fn check(mesh_text: &str, local_text: Option<&str>) -> Vec<Diagnostic> {
                 Some(mesh) => {
                     let mut diags = validate(mesh, None);
                     parsed.spans.locate(ConfigFile::Mesh, &mut diags);
+                    diags.extend(parsed.warnings.iter().cloned());
                     diags
                 }
             },

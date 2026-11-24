@@ -54,11 +54,10 @@ fn render_mesh_inner(mesh: &Mesh, with_revision: bool) -> String {
     for site in &mesh.sites {
         out.push_str("\n[[site]]\n");
         let _ = writeln!(out, "name = {}", quote(&site.name));
-        let _ = writeln!(out, "role = {}", quote(site.role.as_str()));
-        if let Some(hub) = &site.hub {
-            let _ = writeln!(out, "hub = {}", quote(hub));
-        }
         let _ = writeln!(out, "address = {}", quote(&site.address.to_string()));
+        if let Some(vlans) = &site.vlans {
+            let _ = writeln!(out, "vlans = {}", quote(&vlans.to_string()));
+        }
     }
     for map in &mesh.maps {
         out.push_str("\n[[map]]\n");

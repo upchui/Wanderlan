@@ -46,7 +46,7 @@ echo
 if ((FAILURES > 0)); then
   printf '\033[31m%d check(s) failed:\033[0m\n' "$FAILURES"
   cat "$RUN_DIR/failures"
-  dump_logs hub1 hub2 spoke1 spoke2 spoke3
+  dump_logs site1 site2 site3 site4 site5
   exit 1
 fi
 printf '\033[32mAll integration tests passed.\033[0m\n'

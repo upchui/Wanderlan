@@ -160,7 +160,7 @@ impl fmt::Display for Change {
                 isolated: true,
             } => write!(
                 f,
-                "Isolating port {name} (split horizon: no forwarding between hub tunnels)"
+                "Isolating port {name} (split horizon: frames from one tunnel never enter another)"
             ),
             Self::SetIsolated {
                 name,

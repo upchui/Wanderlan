@@ -8,20 +8,20 @@ need a decision by the project owner.
    different overhead in the MSS formula (40 instead of 20 bytes outer
    header) and IPv6 addresses in `mesh.toml`. Traffic *inside* the stretched
    VLANs may of course be IPv6 (it is layer 2); its TCP MSS is clamped too.
-2. **Backup hub for spokes with automatic failover.** A spoke has exactly one
-   hub. A second hub with automatic switching needs a rule that guarantees
-   that a spoke is connected to at most one hub at any time (otherwise
-   loops), e.g. health checks plus a delay, and a way to express it in
-   `mesh.toml` (`hub = ["a", "b"]` with priorities?). The topology check and
-   the sync are prepared for it (a moved spoke can still fetch the new
-   configuration from its former hub for 5 minutes).
+2. **Sites that cannot reach every other site.** Since 0.2 there are no
+   hubs and spokes: every site has a tunnel to every other site, which needs
+   full reachability in the transport network. A site behind CGNAT that only
+   reaches one VPN server would need its traffic relayed by another site;
+   that requires a loop-free relay rule (the former hub/spoke model, or a
+   computed spanning tree). Decide if this case matters.
 3. **Configurable interface names** for hosts that already use `br0` or
    `gt-*` for something else.
 4. **Trust model of the sync.** Every site may change the mesh of all sites;
    the transport network (VPN) is assumed to be trusted and the control
-   channel accepts only the addresses of direct peers, but messages are not
-   signed. Should changes be signed (e.g. per-site keys or a shared secret),
-   or restricted to hubs?
+   channel accepts only the addresses of direct peers (and join requests
+   with a one-time invitation code), but messages are not signed and codes
+   travel in clear text. Should changes be signed (e.g. per-site keys or a
+   shared secret), or restricted to some sites?
 5. **License.** `Cargo.toml` declares `MIT OR Apache-2.0` as a placeholder;
    the license files are still missing. Which license should apply?
 6. **Duplicate MAC addresses.** The loop guard cannot tell a real loop from

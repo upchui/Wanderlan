@@ -2,6 +2,50 @@
 
 All notable changes to wanderlan are documented in this file.
 
+## [0.2.0] - 2026-11-24
+
+Simpler: the sites behave like one switch, and a new site joins with a
+single command. Update all sites; 0.1 and 0.2 do not sync with each other.
+
+### Like a switch: no hubs and spokes
+
+- Every site has a tunnel to every other site; all tunnel ports are isolated
+  (split horizon), so the network stays loop-free. All sites must reach each
+  other in the transport network.
+- VLANs per site (`[[site]] vlans = "20,30"`), like the allowed VLANs of a
+  switch port; a tunnel carries the VLANs both of its sites take part in.
+  `mesh.vlans` is the default. Mappings (native → VLAN, VLAN → VLAN) as
+  before, checked against the VLANs of their site.
+- `role` and `hub` in existing configurations are ignored with a warning.
+- The loop guard also detects MAC addresses moving between the trunk and a
+  tunnel (a loop through the LANs of two sites) and always shuts down the
+  tunnel, never the trunk.
+
+### Invitations and joining
+
+- `wanderlan invite` on any site creates a one-time code and prints the
+  command for the new site: `wanderlan join <address> <code>`. Codes do not
+  expire; they are used up or deleted (`wanderlan invite list`, `wanderlan
+  invite delete`). They survive restarts (`/var/lib/wanderlan/invites.json`,
+  mode 0600).
+- `wanderlan join <address> <code>`: the new site takes its name from the
+  host name and picks the trunk itself (the interface that does not lead to
+  the inviting site); the inviting site adds it with the source address of
+  the request and answers with the configuration. Both confirm
+  automatically once they reach each other; a site that never comes up is
+  removed again after `commit_timeout` and its code becomes usable again.
+  Wrong codes are rate-limited.
+- The setup wizard offers "Start a new network" (name, trunk and address
+  suggested; afterwards it creates the first invitation) and "Join an
+  existing network". The overview shows the open invitation; `i` creates one
+  (Sites and Setup views).
+
+### Reset
+
+- `wanderlan reset` (and `R` in the Setup view) removes the bridge, the
+  tunnels, all VLAN and MSS rules, the configuration and the invitations; the
+  site is unconfigured again, like after the installation.
+
 ## [0.1.0] - 2026-11-24
 
 First release. Everything below this line went into it.

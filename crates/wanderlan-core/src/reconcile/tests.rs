@@ -34,7 +34,7 @@ fn fresh() -> FakeNet {
 }
 
 #[tokio::test]
-async fn builds_hub_from_scratch() {
+async fn builds_a_site_from_scratch() {
     let net = fresh();
     let d = desired("heim");
     let changes = run(&net, &d).await;
@@ -65,11 +65,15 @@ async fn builds_hub_from_scratch() {
         }
         other => panic!("unexpected kind {other:?}"),
     }
-    let spoke = net.link("gt-haus2").unwrap();
-    assert_eq!(spoke.isolated, Some(false));
+    for port in ["gt-haus2", "gt-haus3"] {
+        assert_eq!(net.link(port).unwrap().isolated, Some(true), "{port}");
+    }
+    // haus2 only takes part in VLANs 20 and 30.
     let vlans = net.vlans("gt-haus2");
-    assert_eq!(vlans.len(), 41);
+    assert_eq!(vlans.keys().copied().collect::<Vec<_>>(), vec![20, 30]);
     assert!(vlans.values().all(|f| *f == VlanFlags::TAGGED));
+    let vlans = net.vlans("gt-haus3");
+    assert_eq!(vlans.len(), 41);
     assert!(!vlans.contains_key(&1));
 
     // The untouched interface stays as it was.
@@ -103,9 +107,14 @@ async fn removed_peer_is_deleted_and_changed_address_recreated() {
     let net = fresh();
     run(&net, &desired("heim")).await;
 
+    // haus2 leaves the network, buero gets a new address.
     let mesh = MESH
-        .replace("hub = \"heim\"", "hub = \"buero\"")
+        .replace(
+            "[[site]]\nname = \"haus2\"\naddress = \"10.8.0.11\"\nvlans = \"20,30\"               # haus2 only takes part in VLANs 20 and 30\n",
+            "",
+        )
         .replace("10.8.0.2\"", "10.8.0.22\"");
+    assert!(!mesh.contains("haus2"));
     let d = derive(&config_from(&mesh, "heim"), &Runtime::default());
     let changes = run(&net, &d).await;
     let text: Vec<String> = changes.iter().map(ToString::to_string).collect();
@@ -231,7 +240,7 @@ async fn teardown_removes_everything_we_created() {
     let net = fresh();
     run(&net, &desired("heim")).await;
     let changes = teardown(&net, |_| {}).await.unwrap();
-    assert_eq!(changes.len(), 3);
+    assert_eq!(changes.len(), 4, "bridge and three tunnels");
     let state = net.state();
     let names: Vec<&str> = state.links.values().map(|l| l.name.as_str()).collect();
     assert_eq!(names, vec!["ens19", "eth0"]);
@@ -344,7 +353,7 @@ async fn port_changes_are_detected_for_fdb_flush() {
 }
 
 #[test]
-fn forwarding_key_reflects_roles_and_tunnels() {
+fn forwarding_key_reflects_tunnels() {
     use crate::topology::forwarding_key;
     let a = config_from(MESH, "heim").mesh;
     let mut b = a.clone();
@@ -355,7 +364,7 @@ fn forwarding_key_reflects_roles_and_tunnels() {
         forwarding_key(&b),
         "VLANs do not matter"
     );
-    b.sites[3].hub = Some("heim".into());
+    b.sites.pop();
     assert_ne!(forwarding_key(&a), forwarding_key(&b));
 }
 
@@ -436,7 +445,7 @@ async fn mss_rules_follow_measurements() {
             .to_string()
             .starts_with("Setting TCP MSS clamping")
     );
-    assert_eq!(net.state().mss.unwrap().len(), 8);
+    assert_eq!(net.state().mss.unwrap().len(), 12);
     assert!(run(&net, &d).await.is_empty());
     teardown(&net, |_| {}).await.unwrap();
     assert_eq!(net.state().mss, None);

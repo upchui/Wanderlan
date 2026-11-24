@@ -1,20 +1,21 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
+assertion_line: 146
 expression: render(&app)
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MAC table  5 Log  6 Setup           "
 "┌ Setup: Welcome ──────────────────────────────────────────────────────────────┐"
 "│                                                                              │"
-"│ wanderlan stretches VLANs across sites on layer 2. It does not build a VPN:  │"
-"│ the sites must already reach each other through an existing transport        │"
-"│ network (usually a VPN), and every site has an address in it.                │"
+"│ wanderlan connects sites on layer 2 like one big switch: VLANs pass between  │"
+"│ all sites, and per site you choose which VLANs take part, map VLAN IDs and   │"
+"│ put untagged traffic into a VLAN. It does not build a VPN: the sites must    │"
+"│ already reach each other through an existing transport network (usually a    │"
+"│ VPN).                                                                        │"
 "│                                                                              │"
-"│ This wizard creates a minimal configuration: this site and one peer that     │"
-"│ already runs wanderlan. The full mesh configuration then arrives             │"
-"│ automatically from that peer as soon as the peer lists this site.            │"
+"│   > Start a new network         this is the first site                       │"
+"│     Join an existing network    with an invitation code from any site        │"
 "│                                                                              │"
-"│ Press Enter to start, Esc to leave the setup.                                │"
-"│                                                                              │"
+"│ Up/Down to choose, Enter to start, Esc to leave the setup.                   │"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"
@@ -25,4 +26,4 @@ expression: render(&app)
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "                                                                unconfigured r0 "
-" Enter  start   Esc  leave setup   ?  help   q  quit                            "
+" Up/Down  choose   Enter  start   Esc  leave setup   ?  help   q  quit          "

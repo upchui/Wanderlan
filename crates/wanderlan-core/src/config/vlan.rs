@@ -92,6 +92,11 @@ impl VlanSet {
         self.0.remove(&vid)
     }
 
+    /// VLAN IDs contained in both sets.
+    pub fn intersection(&self, other: &Self) -> Self {
+        Self(self.0.intersection(&other.0).copied().collect())
+    }
+
     /// Returns the set as a list of inclusive ranges in ascending order.
     pub fn ranges(&self) -> Vec<(u16, u16)> {
         let mut out: Vec<(u16, u16)> = Vec::new();
@@ -133,6 +138,12 @@ impl FromStr for VlanSet {
             set.insert_item(item)?;
         }
         Ok(set)
+    }
+}
+
+impl FromIterator<u16> for VlanSet {
+    fn from_iter<I: IntoIterator<Item = u16>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
     }
 }
 

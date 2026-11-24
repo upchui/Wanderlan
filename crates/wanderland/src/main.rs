@@ -9,6 +9,7 @@ mod daemon;
 mod events;
 mod fdb_guard;
 mod files;
+mod invites;
 mod logging;
 mod probe;
 mod sockopt;

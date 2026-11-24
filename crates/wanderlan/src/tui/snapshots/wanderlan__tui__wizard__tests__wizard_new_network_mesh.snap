@@ -1,5 +1,6 @@
 ---
 source: crates/wanderlan/src/tui/wizard.rs
+assertion_line: 543
 expression: render_mesh(&mesh)
 ---
 # wanderlan mesh configuration, shared by all sites.
@@ -14,12 +15,5 @@ mtu_probe_interval = "5m"
 commit_timeout = "1m"
 
 [[site]]
-name = "haus4"
-role = "spoke"
-hub = "heim"
-address = "10.8.0.14"
-
-[[site]]
 name = "heim"
-role = "hub"
 address = "10.8.0.1"
