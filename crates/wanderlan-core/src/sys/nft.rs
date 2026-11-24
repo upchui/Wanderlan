@@ -1,4 +1,5 @@
-//! TCP MSS clamping with nftables (table `bridge wanderlan`).
+//! TCP MSS clamping and, where a site passes VLANs on between server
+//! tunnels, the split horizon with nftables (table `bridge wanderlan`).
 //!
 //! The rules are applied through the JSON interface of nftables (`nft -j`),
 //! using the `nftables` crate. Every rule carries a comment that encodes it,
@@ -14,12 +15,13 @@ use std::time::{Duration, Instant};
 
 use nftables::batch::Batch;
 use nftables::expr::{
-    Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, TcpOption,
+    Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, Range, SetItem, TcpOption,
 };
 use nftables::helper;
 use nftables::schema::{Chain, NfListObject, NfObject, Rule, Table};
 use nftables::stmt::{Mangle, Match, Operator, Statement};
 use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
+use sha2::{Digest, Sha256};
 
 use super::{SysError, SysResult};
 
@@ -164,15 +166,137 @@ impl fmt::Display for MssRule {
     }
 }
 
+/// Split horizon in nftables: frames of `vlans` that enter through one of
+/// `ports` are not passed on through another of them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SplitRule {
+    /// Tunnel interfaces (at least two).
+    pub ports: BTreeSet<String>,
+    /// VLAN ranges.
+    pub vlans: Vec<(u16, u16)>,
+}
+
+impl SplitRule {
+    /// The comment that identifies the rule (its content is too long for a
+    /// comment, so a hash of it).
+    pub fn comment(&self) -> String {
+        let text = format!("{:?} {:?}", self.ports, self.vlans);
+        let hash = Sha256::digest(text.as_bytes());
+        let hex: String = hash.iter().take(8).map(|b| format!("{b:02x}")).collect();
+        format!("wl split {hex}")
+    }
+
+    fn statements(&self) -> Vec<Statement<'static>> {
+        let ports = || {
+            Expression::Named(NamedExpression::Set(
+                self.ports
+                    .iter()
+                    .map(|p| SetItem::Element(Expression::String(Cow::Owned(p.clone()))))
+                    .collect(),
+            ))
+        };
+        let vlans = Expression::Named(NamedExpression::Set(
+            self.vlans
+                .iter()
+                .map(|&(a, b)| {
+                    SetItem::Element(if a == b {
+                        Expression::Number(u32::from(a))
+                    } else {
+                        Expression::Range(Box::new(Range {
+                            range: [
+                                Expression::Number(u32::from(a)),
+                                Expression::Number(u32::from(b)),
+                            ],
+                        }))
+                    })
+                })
+                .collect(),
+        ));
+        let meta = |key| Expression::Named(NamedExpression::Meta(Meta { key }));
+        vec![
+            Statement::Match(Match {
+                left: meta(MetaKey::Iifname),
+                right: ports(),
+                op: Operator::EQ,
+            }),
+            Statement::Match(Match {
+                left: meta(MetaKey::Oifname),
+                right: ports(),
+                op: Operator::EQ,
+            }),
+            Statement::Match(Match {
+                left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+                    PayloadField {
+                        protocol: Cow::Borrowed("vlan"),
+                        field: Cow::Borrowed("id"),
+                    },
+                ))),
+                right: vlans,
+                op: Operator::EQ,
+            }),
+            Statement::Drop(None),
+        ]
+    }
+}
+
+impl fmt::Display for SplitRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let vlans: Vec<String> = self
+            .vlans
+            .iter()
+            .map(|&(a, b)| {
+                if a == b {
+                    a.to_string()
+                } else {
+                    format!("{a}-{b}")
+                }
+            })
+            .collect();
+        let ports: Vec<&str> = self.ports.iter().map(String::as_str).collect();
+        write!(
+            f,
+            "VLANs {} not between {}",
+            vlans.join(","),
+            ports.join(", ")
+        )
+    }
+}
+
+/// The table as read back: the MSS rules and the comments of the split
+/// horizon rules.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NftState {
+    /// MSS clamping.
+    pub mss: BTreeSet<MssRule>,
+    /// [`SplitRule::comment`] of every split horizon rule.
+    pub split: BTreeSet<String>,
+}
+
+impl NftState {
+    /// The state the given rules produce.
+    pub fn of(mss: &BTreeSet<MssRule>, split: &BTreeSet<SplitRule>) -> Self {
+        Self {
+            mss: mss.clone(),
+            split: split.iter().map(SplitRule::comment).collect(),
+        }
+    }
+
+    /// True if nothing is in it.
+    pub fn is_empty(&self) -> bool {
+        self.mss.is_empty() && self.split.is_empty()
+    }
+}
+
 /// nftables operations.
 pub trait NftOps: Send + Sync {
-    /// The MSS rules currently installed, or `None` if the table is absent.
-    fn mss_rules(&self) -> impl Future<Output = SysResult<Option<BTreeSet<MssRule>>>> + Send;
+    /// The rules currently installed, or `None` if the table is absent.
+    fn nft_state(&self) -> impl Future<Output = SysResult<Option<NftState>>> + Send;
 
     /// Replaces the table contents with the given rules in one transaction.
-    fn set_mss_rules(
+    fn set_nft_rules(
         &self,
-        rules: &BTreeSet<MssRule>,
+        mss: &BTreeSet<MssRule>,
+        split: &BTreeSet<SplitRule>,
     ) -> impl Future<Output = SysResult<()>> + Send;
 
     /// Deletes the table.
@@ -192,7 +316,10 @@ fn table() -> Table<'static> {
 }
 
 /// Builds the transaction that replaces the table contents.
-pub fn replace_batch(rules: &BTreeSet<MssRule>) -> nftables::schema::Nftables<'static> {
+pub fn replace_batch(
+    rules: &BTreeSet<MssRule>,
+    split: &BTreeSet<SplitRule>,
+) -> nftables::schema::Nftables<'static> {
     let mut batch = Batch::new();
     batch.add(NfListObject::Table(table()));
     batch.add_cmd(nftables::schema::NfCmd::Flush(
@@ -208,6 +335,17 @@ pub fn replace_batch(rules: &BTreeSet<MssRule>) -> nftables::schema::Nftables<'s
         policy: Some(NfChainPolicy::Accept),
         ..Chain::default()
     }));
+    // The split horizon first: what is dropped needs no clamping.
+    for rule in split {
+        batch.add(NfListObject::Rule(Rule {
+            family: NfFamily::Bridge,
+            table: Cow::Borrowed(TABLE),
+            chain: Cow::Borrowed(CHAIN),
+            expr: Cow::Owned(rule.statements()),
+            comment: Some(Cow::Owned(rule.comment())),
+            ..Rule::default()
+        }));
+    }
     for rule in rules {
         batch.add(NfListObject::Rule(Rule {
             family: NfFamily::Bridge,
@@ -226,7 +364,7 @@ fn nft_error(op: &str, e: impl std::error::Error + Send + Sync + 'static) -> Sys
 }
 
 impl NftOps for NftCli {
-    async fn mss_rules(&self) -> SysResult<Option<BTreeSet<MssRule>>> {
+    async fn nft_state(&self) -> SysResult<Option<NftState>> {
         let tables = helper::get_current_ruleset_with_args_async(
             helper::DEFAULT_NFT,
             ["list", "tables", "bridge"],
@@ -247,9 +385,15 @@ impl NftOps for NftCli {
         .await
         .map_err(|e| nft_error("list nftables table bridge wanderlan", e))?;
         let mut rules = BTreeSet::new();
+        let mut split = BTreeSet::new();
         for obj in ruleset.objects.iter() {
             if let NfObject::ListObject(NfListObject::Rule(rule)) = obj {
-                match rule.comment.as_deref().and_then(MssRule::from_comment) {
+                let comment = rule.comment.as_deref().unwrap_or_default();
+                if comment.starts_with("wl split ") {
+                    split.insert(comment.to_string());
+                    continue;
+                }
+                match MssRule::from_comment(comment) {
                     Some(r) => {
                         rules.insert(r);
                     }
@@ -266,11 +410,15 @@ impl NftOps for NftCli {
                 }
             }
         }
-        Ok(Some(rules))
+        Ok(Some(NftState { mss: rules, split }))
     }
 
-    async fn set_mss_rules(&self, rules: &BTreeSet<MssRule>) -> SysResult<()> {
-        helper::apply_ruleset_async(&replace_batch(rules))
+    async fn set_nft_rules(
+        &self,
+        rules: &BTreeSet<MssRule>,
+        split: &BTreeSet<SplitRule>,
+    ) -> SysResult<()> {
+        helper::apply_ruleset_async(&replace_batch(rules, split))
             .await
             .map_err(|e| nft_error("apply nftables table bridge wanderlan", e))
     }
@@ -284,13 +432,14 @@ impl NftOps for NftCli {
     }
 }
 
-/// The MSS rules as last read or written (`None`: no table), and when.
-type CachedRules = (Instant, Option<BTreeSet<MssRule>>);
+/// The rules as last read or written (`None`: no table), and when.
+type CachedRules = (Instant, Option<NftState>);
 
-/// [`NftOps`] that remembers the MSS rules. Reading them runs `nft` twice,
-/// so a read within `ttl` of the last read or write answers from memory;
-/// writes always go through and update the memory. A table removed behind
-/// wanderlan's back (e.g. a firewall reload) is noticed within `ttl`.
+/// [`NftOps`] that remembers the rules. Reading them runs `nft` twice, so a
+/// read within `ttl` of the last read or write answers from memory; writes
+/// always go through and update the memory. A table removed behind
+/// wanderlan's back (e.g. a firewall reload) is noticed within `ttl`; while
+/// it holds split horizon rules (which prevent loops), on every read.
 #[derive(Debug, Clone)]
 pub struct CachedNft<N> {
     inner: N,
@@ -308,18 +457,20 @@ impl<N> CachedNft<N> {
         }
     }
 
-    fn cached(&self) -> Option<Option<BTreeSet<MssRule>>> {
+    fn cached(&self) -> Option<Option<NftState>> {
         let guard = self
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard
             .as_ref()
-            .filter(|(at, _)| at.elapsed() < self.ttl)
+            .filter(|(at, state)| {
+                at.elapsed() < self.ttl && state.as_ref().is_none_or(|s| s.split.is_empty())
+            })
             .map(|(_, rules)| rules.clone())
     }
 
-    fn store(&self, rules: Option<Option<BTreeSet<MssRule>>>) {
+    fn store(&self, rules: Option<Option<NftState>>) {
         let mut guard = self
             .cache
             .lock()
@@ -329,18 +480,22 @@ impl<N> CachedNft<N> {
 }
 
 impl<N: NftOps + Sync> NftOps for CachedNft<N> {
-    async fn mss_rules(&self) -> SysResult<Option<BTreeSet<MssRule>>> {
+    async fn nft_state(&self) -> SysResult<Option<NftState>> {
         if let Some(rules) = self.cached() {
             return Ok(rules);
         }
-        let rules = self.inner.mss_rules().await?;
+        let rules = self.inner.nft_state().await?;
         self.store(Some(rules.clone()));
         Ok(rules)
     }
 
-    async fn set_mss_rules(&self, rules: &BTreeSet<MssRule>) -> SysResult<()> {
-        let result = self.inner.set_mss_rules(rules).await;
-        self.store(result.is_ok().then(|| Some(rules.clone())));
+    async fn set_nft_rules(
+        &self,
+        rules: &BTreeSet<MssRule>,
+        split: &BTreeSet<SplitRule>,
+    ) -> SysResult<()> {
+        let result = self.inner.set_nft_rules(rules, split).await;
+        self.store(result.is_ok().then(|| Some(NftState::of(rules, split))));
         result
     }
 
@@ -377,7 +532,7 @@ mod tests {
             ipv6: false,
             mss: 1318,
         }]);
-        let json = serde_json::to_string(&replace_batch(&rules)).unwrap();
+        let json = serde_json::to_string(&replace_batch(&rules, &BTreeSet::new())).unwrap();
         for needle in [
             r#""family":"bridge""#,
             r#""flush":{"table""#,
@@ -399,12 +554,16 @@ mod tests {
     }
 
     impl NftOps for Counting {
-        async fn mss_rules(&self) -> SysResult<Option<BTreeSet<MssRule>>> {
+        async fn nft_state(&self) -> SysResult<Option<NftState>> {
             self.reads
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(None)
         }
-        async fn set_mss_rules(&self, _: &BTreeSet<MssRule>) -> SysResult<()> {
+        async fn set_nft_rules(
+            &self,
+            _: &BTreeSet<MssRule>,
+            _: &BTreeSet<SplitRule>,
+        ) -> SysResult<()> {
             Ok(())
         }
         async fn delete_table(&self) -> SysResult<()> {
@@ -415,8 +574,8 @@ mod tests {
     #[tokio::test]
     async fn the_rules_are_read_from_nft_at_most_once_per_ttl() {
         let cached = CachedNft::new(Counting::default(), Duration::from_secs(60));
-        assert_eq!(cached.mss_rules().await.unwrap(), None);
-        assert_eq!(cached.mss_rules().await.unwrap(), None);
+        assert_eq!(cached.nft_state().await.unwrap(), None);
+        assert_eq!(cached.nft_state().await.unwrap(), None);
         assert_eq!(
             cached
                 .inner
@@ -431,10 +590,14 @@ mod tests {
             ipv6: false,
             mss: 1318,
         }]);
-        cached.set_mss_rules(&rules).await.unwrap();
-        assert_eq!(cached.mss_rules().await.unwrap(), Some(rules));
+        let none = BTreeSet::new();
+        cached.set_nft_rules(&rules, &none).await.unwrap();
+        assert_eq!(
+            cached.nft_state().await.unwrap(),
+            Some(NftState::of(&rules, &none))
+        );
         cached.delete_table().await.unwrap();
-        assert_eq!(cached.mss_rules().await.unwrap(), None);
+        assert_eq!(cached.nft_state().await.unwrap(), None);
         assert_eq!(
             cached
                 .inner
@@ -444,11 +607,65 @@ mod tests {
         );
         // After the ttl it reads again.
         let short = CachedNft::new(Counting::default(), Duration::ZERO);
-        short.mss_rules().await.unwrap();
-        short.mss_rules().await.unwrap();
+        short.nft_state().await.unwrap();
+        short.nft_state().await.unwrap();
         assert_eq!(
             short.inner.reads.load(std::sync::atomic::Ordering::Relaxed),
             2
+        );
+    }
+
+    fn split() -> SplitRule {
+        SplitRule {
+            ports: BTreeSet::from(["gt-a".to_string(), "gt-b".to_string()]),
+            vlans: vec![(10, 19), (21, 21)],
+        }
+    }
+
+    #[test]
+    fn split_horizon_rules_drop_between_their_ports() {
+        let json =
+            serde_json::to_string(&replace_batch(&BTreeSet::new(), &BTreeSet::from([split()])))
+                .unwrap();
+        for needle in [
+            r#"{"match":{"left":{"meta":{"key":"iifname"}},"right":{"set":["gt-a","gt-b"]},"op":"=="}}"#,
+            r#"{"match":{"left":{"meta":{"key":"oifname"}},"right":{"set":["gt-a","gt-b"]},"op":"=="}}"#,
+            r#"{"match":{"left":{"payload":{"protocol":"vlan","field":"id"}},"right":{"set":[{"range":[10,19]},21]},"op":"=="}}"#,
+            r#"{"drop":null}"#,
+        ] {
+            assert!(json.contains(needle), "{needle} missing in {json}");
+        }
+        let comment = split().comment();
+        assert!(
+            comment.starts_with("wl split ") && comment.len() == 25,
+            "{comment}"
+        );
+        assert_ne!(
+            comment,
+            SplitRule {
+                vlans: vec![(10, 19)],
+                ..split()
+            }
+            .comment()
+        );
+    }
+
+    #[tokio::test]
+    async fn split_horizon_rules_are_read_back_every_time() {
+        let cached = CachedNft::new(Counting::default(), Duration::from_secs(60));
+        cached
+            .set_nft_rules(&BTreeSet::new(), &BTreeSet::from([split()]))
+            .await
+            .unwrap();
+        // The write is remembered, but with split horizon rules the next
+        // read still asks nft: a removed table must be noticed at once.
+        cached.nft_state().await.unwrap();
+        assert_eq!(
+            cached
+                .inner
+                .reads
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
         );
     }
 }

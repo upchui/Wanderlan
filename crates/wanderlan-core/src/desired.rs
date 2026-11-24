@@ -5,8 +5,9 @@ use std::net::Ipv4Addr;
 
 use crate::BRIDGE_NAME;
 use crate::config::{Config, LocalVid, NATIVE_VID};
+use crate::forwarding;
 use crate::mtu;
-use crate::sys::nft::{MssRule, PortDir};
+use crate::sys::nft::{MssRule, PortDir, SplitRule};
 use crate::sys::tc::{Direction, TcAction, TcRule};
 use crate::sys::{BridgeOptions, GretapParams, PortVlans, VlanFlags};
 use crate::topology;
@@ -80,6 +81,9 @@ pub struct Desired {
     pub local_address: Ipv4Addr,
     /// TCP MSS clamping rules (nftables).
     pub mss: BTreeSet<MssRule>,
+    /// Split horizon in nftables instead of `isolated` ports, where this
+    /// site passes VLANs on between server tunnels (see [`forwarding`]).
+    pub split: BTreeSet<SplitRule>,
 }
 
 impl Desired {
@@ -155,6 +159,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
     let default_trunk = cfg.trunk();
 
     let self_online = cfg.self_site().is_none_or(|s| s.online);
+    let passing = forwarding::forwarding(network, me);
     let tunnels: Vec<TunnelSpec> = topology::tunnels_for(network, me)
         .into_iter()
         .map(|t| {
@@ -186,7 +191,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
                     ignore_df: true,
                     pmtudisc: false,
                 },
-                isolated: t.isolated(),
+                isolated: passing.isolated.contains(&t.peer.name),
                 vlans: carried.iter().map(|v| (v, VlanFlags::TAGGED)).collect(),
             }
         })
@@ -217,6 +222,14 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
         bridge_options: BRIDGE_OPTIONS,
         trunks,
         mss: mss_rules(cfg, &tunnels, runtime),
+        split: passing
+            .split
+            .iter()
+            .map(|(peers, vlans)| SplitRule {
+                ports: peers.iter().map(|p| topology::gretap_name(p)).collect(),
+                vlans: vlans.ranges(),
+            })
+            .collect(),
         tunnels,
         local_address,
     }

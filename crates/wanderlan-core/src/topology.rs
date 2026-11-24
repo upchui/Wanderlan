@@ -245,12 +245,21 @@ pub fn tree_order(network: &Network) -> Vec<(usize, usize)> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardingKey {
     edges: BTreeSet<(String, String, bool)>,
+    /// The tunnel limits: they decide where VLANs are passed on.
+    limits: Vec<([String; 2], String)>,
 }
 
 /// Computes the [`ForwardingKey`] of a network.
 pub fn forwarding_key(network: &Network) -> ForwardingKey {
+    let mut limits: Vec<([String; 2], String)> = network
+        .tunnels
+        .iter()
+        .map(|t| (t.sites.clone(), t.vlans.to_string()))
+        .collect();
+    limits.sort();
     ForwardingKey {
         edges: edges(network),
+        limits,
     }
 }
 

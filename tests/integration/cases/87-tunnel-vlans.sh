@@ -39,3 +39,54 @@ wait_eq 30 "the tunnel carries everything both have again" "$before" vlan_summar
 wait_for 30 "network.toml on site2 has no limit any more" \
   x site2 "! grep -q '^\[\[tunnel\]\]' /etc/wanderlan/network.toml"
 expect_ping c-site1 10.20.0.2 "VLAN 20: site1 reaches site2 again"
+
+begin "Passing on over a server: a VLAN that reaches a site only through another"
+
+# VLAN 20 only on site1 - site3, site2 - site3 and site3 - site4: a star
+# around site3. site1 and site2 reach each other only through site3.
+all_but_20="10-19,21-50"
+for pair in "site1 site2" "site1 site4" "site2 site4"; do
+  x site1 "wanderlan tunnel-vlans $pair $all_but_20 --confirm" >/dev/null 2>&1
+done
+wait_eq 30 "site2's tunnel to site1 has no VLAN 20" "$all_but_20" vlan_summary site2 gt-site1
+wait_eq 30 "nor its tunnel to site4" "$all_but_20" vlan_summary site2 gt-site4
+wait_for 30 "site3 passes VLAN 20 on with nftables rules" \
+  x site3 "nft list table bridge wanderlan | grep -q 'wl split'"
+check "site3's server tunnels are no longer isolated in the kernel" \
+  x site3 "! bridge -d link show dev gt-site1 | grep -q 'isolated on'"
+check "site1 needs no rules (one server tunnel with VLAN 20)" \
+  x site1 "! nft list table bridge wanderlan 2>/dev/null | grep -q 'wl split'"
+check "site1's server tunnels stay isolated" x site1 "bridge -d link show dev gt-site2 | grep -q 'isolated on'"
+expect_ping c-site1 10.20.0.2 "VLAN 20: site1 reaches site2 through site3"
+expect_ping c-site2 10.20.0.12 "VLAN 20: site2 reaches site4 through site3"
+expect_ping c-site5 10.20.0.2 "VLAN 20: site5 (client of site1) reaches site2 through site1 and site3"
+check "no port is blocked by the loop guard" \
+  test "$(for s in site1 site2 site3 site4; do jqs $s '.blocked | length'; done | sort -u)" = 0
+
+x site3 "nft flush table bridge wanderlan"
+wait_for 30 "a firewall reload on site3 is repaired" \
+  x site3 "nft list table bridge wanderlan | grep -q 'wl split'"
+expect_ping c-site1 10.20.0.2 "VLAN 20: site1 reaches site2 again after the reload"
+
+begin "Passing on: a ring is not passed on"
+
+# VLAN 20 on site1 - site2 - site3 - site4 - site1 only.
+x site1 "wanderlan tunnel-vlans site1 site2 all --confirm" >/dev/null 2>&1
+x site1 "wanderlan tunnel-vlans site1 site4 all --confirm" >/dev/null 2>&1
+x site1 "wanderlan tunnel-vlans site1 site3 $all_but_20 --confirm" >/dev/null 2>&1
+wait_eq 30 "site3's tunnel to site1 has no VLAN 20" "$all_but_20" vlan_summary site3 gt-site1
+wait_for 30 "nobody passes VLAN 20 on in a ring" \
+  x site3 "! nft list table bridge wanderlan 2>/dev/null | grep -q 'wl split'"
+check "site3's server tunnels are isolated again" x site3 "bridge -d link show dev gt-site1 | grep -q 'isolated on'"
+check "wanderlan validate warns about the ring" \
+  x site1 "wanderlan validate /etc/wanderlan/network.toml --local /etc/wanderlan/local.toml 2>&1 | grep -q 'do not reach each other'"
+expect_ping c-site1 10.20.0.2 "VLAN 20: neighbours in the ring reach each other"
+expect_no_ping c-site1 10.20.0.11 "VLAN 20: site1 and site3 do not (no direct tunnel, ring)"
+check "no port is blocked by the loop guard" \
+  test "$(for s in site1 site2 site3 site4; do jqs $s '.blocked | length'; done | sort -u)" = 0
+
+for pair in "site1 site3" "site2 site4"; do
+  x site1 "wanderlan tunnel-vlans $pair all --confirm" >/dev/null 2>&1
+done
+wait_for 30 "all limits are gone" x site2 "! grep -q '^\[\[tunnel\]\]' /etc/wanderlan/network.toml"
+expect_ping c-site1 10.20.0.11 "VLAN 20: site1 reaches site3 directly again"

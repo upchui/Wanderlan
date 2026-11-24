@@ -74,6 +74,14 @@ only 10-20 and `dc – lab` only 30-40, although all three take part in more.
 Together with a trunk of its own for a tunnel, the same VLAN IDs on another
 interface of a site are a network of their own and still reach another site.
 
+A server passes a VLAN on between two other servers when it is the only way
+between them for that VLAN: if VLAN 30 is only on `hq – dc` and `dc – lab`,
+`hq` and `lab` meet through `dc`. Where every pair has its own tunnel with
+the VLAN, it goes directly (split horizon). If the tunnels with a VLAN form a
+ring without every direct tunnel (`a – b – c – d – a`), nobody passes it on
+inside the ring, so `a` and `c` do not meet in it; `wanderlan validate` and
+the TUI warn about that. Both rules together keep the network free of loops.
+
 Besides the VLANs its server gives it, a site can have **own VLANs**: they
 are on its trunk and go to its own clients, but never up to its server. So a
 client can build its own VLANs below it without touching what its server
@@ -437,7 +445,14 @@ than the path still arrive.
 ### Loops
 
 The network itself is loop-free: split horizon between the servers, a tree
-below them. The LANs of two sites may still be connected by another path.
+below them. With limits per tunnel the rule is the same per VLAN: the
+tunnels that carry it fall into blocks (parts in which every two tunnels
+lie on a common cycle); a site passes a VLAN on only between tunnels of
+different blocks, so a frame crosses each block in one hop and never comes
+back. Usually the kernel's `isolated` port flag does this; a site that
+passes VLANs on between servers uses nftables rules (`wl split` in table
+`bridge wanderlan`, checked on every reconcile) and only then drops
+`isolated`. The LANs of two sites may still be connected by another path.
 The loop guard watches the forwarding database of every bridge: if a MAC
 address keeps moving between the trunk and a tunnel, or between two tunnels
 (5 times within 10 s), it shuts the tunnel port down (never the trunk),

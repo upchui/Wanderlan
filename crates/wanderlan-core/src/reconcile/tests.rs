@@ -537,3 +537,54 @@ async fn a_trunk_in_a_foreign_bridge_is_refused() {
         "{err}"
     );
 }
+
+#[tokio::test]
+async fn the_split_horizon_moves_to_nftables_before_isolated_goes() {
+    let net = fresh();
+    run(&net, &desired("buero")).await;
+    // VLAN 40 only on heim - buero and buero - haus3 (haus2 does not have
+    // it): buero is the only way between heim and haus3.
+    let limited = format!(
+        "{NETWORK}\n[[tunnel]]\nbetween = [\"heim\", \"haus3\"]\nvlans = \"10-39,41-50\"\n"
+    );
+    let d = derive(&config_from(&limited, "buero"), &Runtime::default());
+    assert!(
+        !d.split.is_empty(),
+        "the other VLANs keep the split horizon"
+    );
+    assert!(d.tunnels.iter().all(|t| !t.isolated), "{:?}", d.tunnels);
+    let changes = run(&net, &d).await;
+    let text: Vec<String> = changes.iter().map(ToString::to_string).collect();
+    let rules = changes
+        .iter()
+        .position(|c| matches!(c, Change::SetNft { .. }))
+        .expect("nftables rules");
+    let unisolate = changes
+        .iter()
+        .position(|c| {
+            matches!(
+                c,
+                Change::SetIsolated {
+                    isolated: false,
+                    ..
+                }
+            )
+        })
+        .expect("isolated goes");
+    assert!(rules < unisolate, "{text:#?}");
+    assert!(text[rules].contains("split horizon"), "{}", text[rules]);
+    assert_eq!(net.state().split, d.split);
+    assert!(run(&net, &d).await.is_empty(), "stable");
+    // Back: isolated first, then the rules go.
+    let back = run(&net, &desired("buero")).await;
+    let isolate = back
+        .iter()
+        .position(|c| matches!(c, Change::SetIsolated { isolated: true, .. }))
+        .expect("isolated again");
+    let gone = back
+        .iter()
+        .position(|c| matches!(c, Change::DeleteNftTable))
+        .expect("the table goes");
+    assert!(isolate < gone);
+    assert!(net.state().split.is_empty());
+}

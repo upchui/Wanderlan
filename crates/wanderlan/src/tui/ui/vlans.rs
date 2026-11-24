@@ -194,6 +194,25 @@ fn draw_tunnels(frame: &mut Frame, app: &App, draft: &Draft, area: Rect, detail:
                 .collect()
         })
         .unwrap_or_default();
+    lines.extend(
+        draft
+            .within(&FieldPath::network("forwarding"))
+            .map(diagnostic_line),
+    );
+    let me = draft.local.self_name.as_deref().unwrap_or_default();
+    for (vlans, groups) in wanderlan_core::forwarding::forwarding(&draft.network, me).passes {
+        let groups: Vec<String> = groups
+            .iter()
+            .map(|g| g.iter().cloned().collect::<Vec<_>>().join(", "))
+            .collect();
+        lines.push(Line::styled(
+            format!(
+                " {me} passes VLANs {vlans} on between {}",
+                groups.join(" / ")
+            ),
+            theme::dim(),
+        ));
+    }
     if lines.is_empty() {
         lines.push(Line::styled(
             " A tunnel carries the VLANs of both sites; Enter limits it, d lifts the limit.",

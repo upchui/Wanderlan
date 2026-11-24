@@ -31,6 +31,7 @@ pub fn validate(network: &Network, local: Option<&Local>) -> Vec<Diagnostic> {
     v.uplinks(network);
     v.maps(network);
     v.tunnels(network);
+    v.passing_on(network);
     if let Some(local) = local.filter(|l| l.is_configured()) {
         v.local(network, local);
     }
@@ -258,6 +259,27 @@ impl Validator {
                     None => break,
                 }
             }
+        }
+    }
+
+    /// Sites that do not reach each other in a VLAN because the tunnels
+    /// carrying it form a ring (only with limits per tunnel).
+    fn passing_on(&mut self, network: &Network) {
+        if network.tunnels.is_empty() {
+            return;
+        }
+        for (vlans, a, b, pairs) in crate::forwarding::unreachable(network) {
+            let more = if pairs > 1 {
+                format!(" ({pairs} pairs in all)")
+            } else {
+                String::new()
+            };
+            self.warning(
+                FieldPath::network("forwarding"),
+                format!(
+                    "VLANs {vlans}: \"{a}\" and \"{b}\" do not reach each other{more}: their tunnels form a ring, which no site passes on; give them their direct tunnel or break the ring"
+                ),
+            );
         }
     }
 

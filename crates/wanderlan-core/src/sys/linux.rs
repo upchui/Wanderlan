@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::netlink::Netlink;
-use super::nft::{CachedNft, MssRule, NftCli, NftOps};
+use super::nft::{CachedNft, MssRule, NftCli, NftOps, NftState, SplitRule};
 
 /// How long the MSS rules read from nftables are trusted.
 const NFT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
@@ -96,11 +96,15 @@ impl TcOps for LinuxSystem {
 }
 
 impl NftOps for LinuxSystem {
-    async fn mss_rules(&self) -> SysResult<Option<BTreeSet<MssRule>>> {
-        self.nft.mss_rules().await
+    async fn nft_state(&self) -> SysResult<Option<NftState>> {
+        self.nft.nft_state().await
     }
-    async fn set_mss_rules(&self, rules: &BTreeSet<MssRule>) -> SysResult<()> {
-        self.nft.set_mss_rules(rules).await
+    async fn set_nft_rules(
+        &self,
+        rules: &BTreeSet<MssRule>,
+        split: &BTreeSet<SplitRule>,
+    ) -> SysResult<()> {
+        self.nft.set_nft_rules(rules, split).await
     }
     async fn delete_table(&self) -> SysResult<()> {
         self.nft.delete_table().await

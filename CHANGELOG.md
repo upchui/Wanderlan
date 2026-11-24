@@ -211,6 +211,15 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
   <vlans|all|none>`; the peer details mark a limited tunnel.
 - Whoever may change one of the two sites may limit their tunnel; a client
   sees and changes only its own tunnels.
+- Passing on over servers: a server passes a VLAN on between two other
+  servers when it is the only way between them for that VLAN (e.g. VLAN 30
+  only on `hq – dc` and `dc – lab`: `hq` and `lab` meet through `dc`). Per
+  VLAN, tunnels in the same block (every pair with its own tunnel, or a
+  ring) keep the split horizon, tunnels of different blocks pass on: no
+  loops. A ring without every direct tunnel is not passed on; `validate`
+  and the TUI warn. Such a site keeps the split horizon with nftables
+  (`wl split` rules, read back on every reconcile, set before `isolated` is
+  dropped); all others keep the kernel's `isolated` flag as before.
 
 ### Faster, and sync problems in plain sight
 

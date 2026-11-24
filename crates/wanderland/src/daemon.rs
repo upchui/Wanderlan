@@ -462,7 +462,7 @@ impl Controller {
         if cfg.network.mss.is_some() {
             return;
         }
-        let Ok(Some(rules)) = self.sys.mss_rules().await else {
+        let Ok(Some(rules)) = self.sys.nft_state().await.map(|s| s.map(|s| s.mss)) else {
             return;
         };
         let peers = self.direct_peers();

@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use std::collections::BTreeSet;
 
-use super::nft::{MssRule, NftOps};
+use super::nft::{MssRule, NftOps, NftState, SplitRule};
 use super::observe::{FdbEntry, FdbEvent, ObserveOps};
 use super::tc::{IfTc, TcOps, TcRule};
 use super::{
@@ -28,6 +28,8 @@ pub struct FakeState {
     pub tc: BTreeMap<u32, IfTc>,
     /// MSS rules; `None` if the nftables table does not exist.
     pub mss: Option<BTreeSet<MssRule>>,
+    /// Split horizon rules (in the same table).
+    pub split: BTreeSet<SplitRule>,
     /// Bridge FDB entries.
     pub fdb: Vec<FdbEntry>,
     /// Log of all mutating calls, e.g. `create_bridge br0`.
@@ -446,20 +448,28 @@ impl TcOps for FakeNet {
 }
 
 impl NftOps for FakeNet {
-    async fn mss_rules(&self) -> SysResult<Option<BTreeSet<MssRule>>> {
-        Ok(self.lock().mss.clone())
+    async fn nft_state(&self) -> SysResult<Option<NftState>> {
+        let s = self.lock();
+        Ok(s.mss.as_ref().map(|mss| NftState::of(mss, &s.split)))
     }
 
-    async fn set_mss_rules(&self, rules: &BTreeSet<MssRule>) -> SysResult<()> {
+    async fn set_nft_rules(
+        &self,
+        rules: &BTreeSet<MssRule>,
+        split: &BTreeSet<SplitRule>,
+    ) -> SysResult<()> {
         let mut s = self.lock();
-        s.calls.push(format!("set_mss_rules {}", rules.len()));
+        s.calls
+            .push(format!("set_nft_rules {} {}", rules.len(), split.len()));
         s.mss = Some(rules.clone());
+        s.split = split.clone();
         Ok(())
     }
 
     async fn delete_table(&self) -> SysResult<()> {
         let mut s = self.lock();
         s.calls.push("delete_table".into());
+        s.split.clear();
         if s.mss.take().is_none() {
             return Err(err("delete table", "No such file or directory"));
         }
