@@ -99,3 +99,15 @@ pub fn fingerprint(mesh: &Mesh) -> String {
     }
     hex
 }
+
+/// Unified diff between two texts (empty if they are equal).
+pub fn unified_diff(old_label: &str, old: &str, new_label: &str, new: &str) -> String {
+    if old == new {
+        return String::new();
+    }
+    similar::TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(3)
+        .header(old_label, new_label)
+        .to_string()
+}

@@ -29,7 +29,9 @@ case "${ROLE:-site}" in
     ;;
   site)
     make_trunk "$TRUNK_NET"
-    ip route replace default via "$GATEWAY"
+    if [ -n "${GATEWAY:-}" ]; then
+      ip route replace default via "$GATEWAY"
+    fi
     # Start the daemon like systemd would, if this site was configured before
     # (e.g. after a container restart).
     if grep -qs '^self' /etc/wanderlan/local.toml; then
@@ -38,6 +40,16 @@ case "${ROLE:-site}" in
     ;;
   client)
     make_trunk "$TRUNK_NET"
+    ;;
+  looper)
+    a=$(find_if "$TRUNK_NET")
+    b=$(find_if "$TRUNK_NET2")
+    ip addr flush dev "$a"
+    ip addr flush dev "$b"
+    ip link set "$a" name loopa
+    ip link set "$b" name loopb
+    ip link add brl type bridge stp_state 0
+    ip link set brl up
     ;;
   *)
     echo "unknown ROLE ${ROLE}" >&2

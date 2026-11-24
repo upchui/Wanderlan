@@ -8,8 +8,10 @@
 pub mod api;
 pub mod config;
 pub mod desired;
+pub mod loopguard;
 pub mod mtu;
 pub mod reconcile;
+pub mod sync;
 pub mod sys;
 pub mod topology;
 

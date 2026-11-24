@@ -57,6 +57,24 @@ wait_for() {
   pass "$what ($((SECONDS - start))s)"
 }
 
+# wait_eq <seconds> <description> <expected> <command...>: retries until the
+# output of the command (run anew each time) equals the expected value.
+wait_eq() {
+  local timeout="$1" what="$2" want="$3"
+  shift 3
+  local start=$SECONDS got=""
+  while true; do
+    got=$("$@" 2>/dev/null)
+    [ "$got" = "$want" ] && break
+    if ((SECONDS - start >= timeout)); then
+      fail "timed out after ${timeout}s waiting for: $what (got '$got', expected '$want')"
+      return 1
+    fi
+    sleep 1
+  done
+  pass "$what ($((SECONDS - start))s)"
+}
+
 # check <description> <command...>
 check() {
   local what="$1"
@@ -81,12 +99,17 @@ check_not() {
 
 # ---- configuration -------------------------------------------------------
 
+# Revision of the generated meshes. Every new configuration gets a higher
+# revision so the sync between the daemons never prefers an older one.
+MESH_REVISION=${MESH_REVISION:-100}
+
 # mesh_toml <vlans> <site:role[:hub]>... prints a mesh.toml.
 mesh_toml() {
   local vlans="$1"
   shift
-  printf '[mesh]\nvlans = "%s"\nmtu_probe_interval = "%s"\ncommit_timeout = "%s"\n' \
-    "$vlans" "${PROBE_INTERVAL:-15s}" "${COMMIT_TIMEOUT:-60s}"
+  MESH_REVISION=$((MESH_REVISION + 1))
+  printf '[mesh]\nrevision = %s\nvlans = "%s"\nmtu_probe_interval = "%s"\ncommit_timeout = "%s"\n' \
+    "${REVISION:-$MESH_REVISION}" "$vlans" "${PROBE_INTERVAL:-15s}" "${COMMIT_TIMEOUT:-60s}"
   local spec name role hub
   for spec in "$@"; do
     IFS=: read -r name role hub <<<"$spec"
@@ -97,6 +120,13 @@ mesh_toml() {
   if [ -n "${MESH_EXTRA:-}" ]; then
     printf '\n%s\n' "$MESH_EXTRA"
   fi
+}
+
+# renew <mesh-file>: gives a previously generated mesh a new, higher revision
+# (reusing an old file would let the sync bring back a newer configuration).
+renew() {
+  MESH_REVISION=$((MESH_REVISION + 1))
+  sed -i "s/^revision = .*/revision = $MESH_REVISION/" "$1"
 }
 
 # configure <site> <mesh-file>: writes mesh.toml and local.toml of a site.
@@ -178,3 +208,9 @@ expect_vlans() {
     fail "$1: $2 carries VLANs '$got', expected '$3'"
   fi
 }
+
+# status_json <site>: the daemon status as JSON.
+status_json() { x "$1" "wanderlan status --json"; }
+
+# jqs <site> <jq filter>: a value from the daemon status.
+jqs() { status_json "$1" | jq -r "$2"; }

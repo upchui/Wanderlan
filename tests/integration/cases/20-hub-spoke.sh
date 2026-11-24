@@ -85,6 +85,7 @@ for c in c-spoke1 c-hub2 c-spoke3; do
 done
 
 # Back to the five-site topology for the following cases.
+renew "$RUN_DIR/mesh-5.toml"
 for s in hub1 hub2 spoke1 spoke2 spoke3; do
   configure "$s" "$RUN_DIR/mesh-5.toml"
   x "$s" "wl-daemon reload"

@@ -39,6 +39,11 @@ pub struct ProbeConfig {
     pub bind: Option<SocketAddrV4>,
     /// Direct peers by name.
     pub peers: BTreeMap<String, Ipv4Addr>,
+    /// Further sites whose probes are answered but which are not probed
+    /// (peers removed recently, so they can still fetch the new mesh).
+    pub responders: BTreeMap<String, Ipv4Addr>,
+    /// Incremented to request an immediate path MTU measurement.
+    pub generation: u64,
     /// Interval between path MTU measurements; `None` disables them (fixed MSS).
     pub mtu_interval: Option<Duration>,
     /// What this site announces (mesh revision and fingerprint).
@@ -209,10 +214,16 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
                 .peers
                 .iter()
                 .find(|(_, a)| **a == *from.ip())
-                .map(|(n, _)| n.clone());
+                .map(|(n, _)| (n.clone(), true))
+                .or_else(|| {
+                    cfg.responders
+                        .iter()
+                        .find(|(_, a)| **a == *from.ip())
+                        .map(|(n, _)| (n.clone(), false))
+                });
             (peer, cfg.announce)
         };
-        let Some(peer) = peer else {
+        let Some((peer, direct)) = peer else {
             debug!("ignoring probe from {from}, not a peer");
             continue;
         };
@@ -222,7 +233,9 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
                 if let Err(e) = shared.socket.send_to(&reply, from).await {
                     debug!("cannot answer probe from {from}: {e}");
                 }
-                note_announce(&table, &events, &peer, announce).await;
+                if direct {
+                    note_announce(&table, &events, &peer, announce).await;
+                }
             }
             wire::Probe::Reply {
                 seq,
@@ -233,7 +246,9 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
                 if let Some(tx) = waiter {
                     let _ = tx.send((received, announce));
                 }
-                note_announce(&table, &events, &peer, announce).await;
+                if direct {
+                    note_announce(&table, &events, &peer, announce).await;
+                }
             }
         }
     }
@@ -307,7 +322,13 @@ async fn probe_peer(
     let target = SocketAddrV4::new(addr, port);
     let mut next_mtu: Option<Instant> = Some(Instant::now());
     let mut last_pmtu: Option<u16> = None;
+    let mut generation = shared.config.borrow().generation;
     loop {
+        let current = shared.config.borrow().generation;
+        if current != generation {
+            generation = current;
+            next_mtu = Some(Instant::now());
+        }
         let rtt = probe_once(&shared, target, RTT_SIZE, RTT_TIMEOUT).await;
         let became_reachable = update_reachability(&table, &name, rtt);
         if became_reachable {

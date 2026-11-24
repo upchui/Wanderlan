@@ -8,8 +8,10 @@
 pub mod fake;
 pub mod linux;
 pub mod netlink;
+mod netlink_observe;
 mod netlink_tc;
 pub mod nft;
+pub mod observe;
 pub mod tc;
 
 use std::collections::BTreeMap;
@@ -103,6 +105,10 @@ pub struct LinkState {
     pub mtu: u32,
     /// Bridge port isolation, if the link is a bridge port.
     pub isolated: Option<bool>,
+    /// Received bytes.
+    pub rx_bytes: u64,
+    /// Transmitted bytes.
+    pub tx_bytes: u64,
 }
 
 /// Flags of a bridge VLAN entry on a port.
@@ -226,10 +232,10 @@ pub trait NetOps: Send + Sync {
     ) -> impl Future<Output = SysResult<()>> + Send;
 }
 
-/// Everything the reconciler needs from the system.
-pub trait System: NetOps + tc::TcOps + nft::NftOps {}
+/// Everything the daemon needs from the system.
+pub trait System: NetOps + tc::TcOps + nft::NftOps + observe::ObserveOps {}
 
-impl<T: NetOps + tc::TcOps + nft::NftOps> System for T {}
+impl<T: NetOps + tc::TcOps + nft::NftOps + observe::ObserveOps> System for T {}
 
 /// Groups VLAN entries into ranges of consecutive IDs with equal flags.
 /// Entries with the PVID flag are never part of a range (the kernel rejects

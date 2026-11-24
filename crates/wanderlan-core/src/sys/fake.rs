@@ -10,6 +10,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::collections::BTreeSet;
 
 use super::nft::{MssRule, NftOps};
+use super::observe::{FdbEntry, FdbEvent, ObserveOps};
 use super::tc::{IfTc, TcOps, TcRule};
 use super::{
     BridgeOptions, GretapParams, LinkKind, LinkState, LinkUpdate, NetOps, PortVlans, SysError,
@@ -27,6 +28,8 @@ pub struct FakeState {
     pub tc: BTreeMap<u32, IfTc>,
     /// MSS rules; `None` if the nftables table does not exist.
     pub mss: Option<BTreeSet<MssRule>>,
+    /// Bridge FDB entries.
+    pub fdb: Vec<FdbEntry>,
     /// Log of all mutating calls, e.g. `create_bridge br0`.
     pub calls: Vec<String>,
     next_index: u32,
@@ -70,6 +73,8 @@ impl FakeNet {
                 oper_up: false,
                 mtu: 1500,
                 isolated: None,
+                rx_bytes: 0,
+                tx_bytes: 0,
             },
         );
         index
@@ -183,6 +188,8 @@ impl NetOps for FakeNet {
                 oper_up: false,
                 mtu: 1500,
                 isolated: None,
+                rx_bytes: 0,
+                tx_bytes: 0,
             },
         );
         Ok(())
@@ -227,6 +234,8 @@ impl NetOps for FakeNet {
                 oper_up: false,
                 mtu,
                 isolated: None,
+                rx_bytes: 0,
+                tx_bytes: 0,
             },
         );
         Ok(())
@@ -449,5 +458,16 @@ impl NftOps for FakeNet {
             return Err(err("delete table", "No such file or directory"));
         }
         Ok(())
+    }
+}
+
+impl ObserveOps for FakeNet {
+    async fn fdb(&self) -> SysResult<Vec<FdbEntry>> {
+        Ok(self.lock().fdb.clone())
+    }
+
+    fn watch_fdb(&self) -> SysResult<tokio::sync::mpsc::UnboundedReceiver<FdbEvent>> {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        Ok(rx)
     }
 }

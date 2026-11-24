@@ -15,7 +15,7 @@ mod vlan;
 pub use diag::{ConfigFile, Diagnostic, FieldPath, LineIndex, Severity, SpanMap, has_errors};
 pub use model::*;
 pub use raw::{ParsedLocal, ParsedMesh, parse_local, parse_mesh};
-pub use render::{fingerprint, render_local, render_mesh};
+pub use render::{fingerprint, render_local, render_mesh, unified_diff};
 pub use validate::{
     COMMIT_TIMEOUT_RANGE, IFNAME_MAX, MSS_MAX, MSS_MIN, PROBE_INTERVAL_MIN, ifname_error,
     site_name_error, validate,

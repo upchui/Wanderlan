@@ -20,9 +20,13 @@ use super::{
 const IFLA_GRE_IGNORE_DF: u16 = 19;
 
 /// Network operations over an rtnetlink connection.
+///
+/// A netlink socket can run only one dump at a time (a second one fails with
+/// EBUSY), so all dumps on this connection are serialised.
 #[derive(Debug, Clone)]
 pub struct Netlink {
     handle: Handle,
+    dump: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Netlink {
@@ -32,7 +36,15 @@ impl Netlink {
         let (connection, handle, _) =
             rtnetlink::new_connection().map_err(|e| SysError::new("open rtnetlink socket", e))?;
         tokio::spawn(connection);
-        Ok(Self { handle })
+        Ok(Self {
+            handle,
+            dump: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+        })
+    }
+
+    /// Serialises dumps on this connection.
+    pub(crate) async fn dump_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.dump.lock().await
     }
 
     /// The underlying rtnetlink handle (used by other backends).
@@ -50,6 +62,7 @@ fn parse_link(msg: &LinkMessage) -> LinkState {
     let mut kind_name = String::new();
     let mut kind = None;
     let mut isolated = None;
+    let (mut rx_bytes, mut tx_bytes) = (0, 0);
     for attr in &msg.attributes {
         match attr {
             LinkAttribute::IfName(n) => name.clone_from(n),
@@ -57,6 +70,10 @@ fn parse_link(msg: &LinkMessage) -> LinkState {
             LinkAttribute::Controller(m) => master = Some(*m),
             LinkAttribute::Mtu(m) => mtu = *m,
             LinkAttribute::OperState(s) => oper_up = matches!(s, State::Up | State::Unknown),
+            LinkAttribute::Stats64(st) => {
+                rx_bytes = st.rx_bytes;
+                tx_bytes = st.tx_bytes;
+            }
             LinkAttribute::LinkInfo(infos) => {
                 for info in infos {
                     match info {
@@ -91,6 +108,8 @@ fn parse_link(msg: &LinkMessage) -> LinkState {
         oper_up,
         mtu,
         isolated,
+        rx_bytes,
+        tx_bytes,
     }
 }
 
@@ -177,6 +196,7 @@ fn vlan_message(index: u32, bridge_self: bool, vlans: &[(u16, VlanFlags)]) -> Li
 
 impl NetOps for Netlink {
     async fn links(&self) -> SysResult<Vec<LinkState>> {
+        let _dump = self.dump_guard().await;
         let mut stream = self.handle.link().get().execute();
         let mut out = Vec::new();
         while let Some(msg) = stream
@@ -190,6 +210,7 @@ impl NetOps for Netlink {
     }
 
     async fn port_vlans(&self) -> SysResult<BTreeMap<u32, PortVlans>> {
+        let _dump = self.dump_guard().await;
         let mut stream = self
             .handle
             .link()

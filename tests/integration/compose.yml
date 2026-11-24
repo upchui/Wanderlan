@@ -131,6 +131,19 @@ services:
     networks:
       tr-spoke3: { ipv4_address: 10.200.13.20 }
 
+  # Bridges the trunk networks of spoke1 and spoke2 on request, creating a
+  # layer-2 loop outside wanderlan (for the loop guard test).
+  looper:
+    <<: *common
+    hostname: looper
+    environment:
+      ROLE: looper
+      TRUNK_NET: "10.200.11."
+      TRUNK_NET2: "10.200.12."
+    networks:
+      tr-spoke1: { ipv4_address: 10.200.11.30 }
+      tr-spoke2: { ipv4_address: 10.200.12.30 }
+
 networks:
   ul-hub1:
     internal: true

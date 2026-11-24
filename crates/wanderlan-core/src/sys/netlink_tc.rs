@@ -112,6 +112,11 @@ impl Netlink {
         msg: RouteNetlinkMessage,
         flags: u16,
     ) -> SysResult<Vec<TcMessage>> {
+        let _dump = if flags & NLM_F_DUMP == 0 {
+            None
+        } else {
+            Some(self.dump_guard().await)
+        };
         let mut req = NetlinkMessage::from(msg);
         req.header.flags = NLM_F_REQUEST | flags;
         let mut handle = self.handle().clone();

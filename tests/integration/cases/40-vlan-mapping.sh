@@ -18,8 +18,8 @@ for s in hub1 hub2 spoke1 spoke2 spoke3; do
   x "$s" "wl-daemon reload"
 done
 
-wait_for 20 "spoke3: trunk0 has VLAN 20 as untagged PVID" \
-  test "$(vlan_summary spoke3 trunk0)" = "10-19,20:pu,21-50"
+wait_eq 20 "spoke3: trunk0 has VLAN 20 as untagged PVID" "10-19,20:pu,21-50" \
+  vlan_summary spoke3 trunk0
 check "spoke3: ingress rule translates VLAN 130 to 30" \
   x spoke3 "tc filter show dev trunk0 ingress | grep -A8 'vlan_id 130' | grep -q 'modify id 30'"
 check "spoke3: egress rule translates VLAN 30 back to 130" \
