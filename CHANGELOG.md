@@ -246,6 +246,32 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
   time "stays a client of" its old server; the message no longer claims it
   was removed.
 
+### A better terminal UI
+
+- The bottom bar always shows `? help` and `q quit` and drops the least
+  important keys when it is narrow; missing keys are in it.
+- Messages that do not fit get a second line; `M` shows the last 20. The
+  status line of every view names problems of this site (an error, blocked
+  ports, refused changes, a change not taken over). The draft says how many
+  changes it holds; new and changed mappings and tunnel limits are marked.
+- Below 80×24 the TUI says the terminal is too small instead of cutting.
+- Every list keeps its scroll position, shows a scrollbar when it overflows
+  and moves with PgUp/PgDn/Home/End. The overview shares its space between
+  the neighbours and the sites, with one cursor through both; it shows all
+  sites now. Sites lost the boxes that repeated Settings (7). Forms wrap
+  their hints and scroll; wide terminals show VLANs and trunk per tunnel.
+- `c` and `r` work while a window is open; `r` asks, deleting an invitation
+  asks, Esc in a form with input asks; Enter means no where a wrong yes
+  loses something.
+- `/` searches in Sites, the VLAN mappings, the tunnels and the log. The log
+  shows local time (from `TZ` or `/etc/localtime`; `t` switches to UTC).
+- Site details (Sites, Enter, or Enter on a site in the overview): role,
+  VLANs, every tunnel with what it carries, mappings, rights; Up/Down goes
+  to the next site, as in the peer details. Edit is `e`.
+- With `--mouse` a click selects a row (a second click opens it), the
+  wheel scrolls the list under the pointer instead of moving the focus of a
+  form, and the keys of the bottom bar can be clicked.
+
 ### More to see
 
 - Settings view (7): every setting with an explanation.

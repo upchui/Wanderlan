@@ -12,7 +12,7 @@ use wanderlan_core::config::{VlanSet, parse_network, render_network};
 
 use super::draw;
 use crate::client::ClientError;
-use crate::tui::app::{App, MessageKind, Msg, Reply};
+use crate::tui::app::{App, MessageKind, Modal, Msg, Reply};
 use crate::tui::fixtures;
 
 fn render(app: &App) -> String {
@@ -423,4 +423,108 @@ fn a_long_form_hint_wraps() {
         key(&mut app, KeyCode::Tab);
     }
     insta::assert_snapshot!(render(&app));
+}
+
+fn typed(app: &mut App, text: &str) {
+    for c in text.chars() {
+        key(app, KeyCode::Char(c));
+    }
+}
+
+#[test]
+fn sites_search() {
+    let mut app = connected();
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Char('/'));
+    typed(&mut app, "haus 10-50");
+    insta::assert_snapshot!(render(&app));
+    // Enter keeps the filter; Up/Down move among the rows shown.
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::End);
+    let d = app.draft.as_ref().unwrap();
+    assert_eq!(d.network.sites[app.sites_selected].name, "haus5");
+}
+
+#[test]
+fn log_search_in_local_time() {
+    let mut app = connected();
+    app.log.zone = crate::tui::localtime::from_rule("CET-1CEST,M3.5.0,M10.5.0/3");
+    key(&mut app, KeyCode::Char('5'));
+    key(&mut app, KeyCode::Char('/'));
+    typed(&mut app, "loop");
+    key(&mut app, KeyCode::Enter);
+    insta::assert_snapshot!(render(&app));
+    key(&mut app, KeyCode::Char('t'));
+    assert!(render(&app).contains("times in UTC"), "t switches to UTC");
+}
+
+#[test]
+fn site_details() {
+    let mut app = connected();
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Enter);
+    insta::assert_snapshot!(render(&app));
+    // Down: the next site of the tree (haus6, the client of heim).
+    key(&mut app, KeyCode::Down);
+    assert!(render(&app).contains(" haus6 "), "{}", render(&app));
+}
+
+#[test]
+fn the_mouse_selects_opens_and_scrolls() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let mut app = App::new("/run/wanderlan/wanderlan.sock", true);
+    app.start();
+    app.update(Msg::Connected);
+    reply(
+        &mut app,
+        Request::Status,
+        Reply::Status(Box::new(fixtures::status())),
+    );
+    reply(
+        &mut app,
+        Request::GetConfig,
+        Reply::Config(fixtures::config_texts()),
+    );
+    let mouse = |app: &mut App, kind, column, row| {
+        app.update(Msg::Mouse(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+        render(app);
+    };
+    key(&mut app, KeyCode::Char('2'));
+    render(&app);
+    // Row 5 of the screen is the third site row (buero).
+    mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 10, 5);
+    let name = |app: &App| {
+        app.draft.as_ref().unwrap().network.sites[app.sites_selected]
+            .name
+            .clone()
+    };
+    assert_eq!(name(&app), "buero");
+    assert!(app.modal.is_none());
+    // A click on the selected row opens it.
+    mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 10, 5);
+    assert!(matches!(&app.modal, Some(Modal::Site { name }) if name == "buero"));
+    key(&mut app, KeyCode::Esc);
+    render(&app);
+    // The wheel over the list moves the selection.
+    mouse(&mut app, MouseEventKind::ScrollDown, 10, 5);
+    assert_eq!(name(&app), "haus2");
+    // A click on "?" in the help bar opens the help.
+    let bar = app.scrolls.bar.borrow().clone();
+    let (start, _, _) = bar
+        .iter()
+        .find(|(_, _, k)| *k == "?")
+        .copied()
+        .expect("? in the bar");
+    mouse(
+        &mut app,
+        MouseEventKind::Down(MouseButton::Left),
+        start + 1,
+        23,
+    );
+    assert!(matches!(app.modal, Some(Modal::Help { .. })));
 }

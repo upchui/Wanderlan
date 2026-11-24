@@ -71,6 +71,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Modal::Messages { scroll } => popup::messages(frame, app, *scroll, body),
             Modal::Invites { selected } => details::invites(frame, app, *selected, body),
             Modal::Peer { name } => details::peer(frame, app, name, body),
+            Modal::Site { name } => details::site(frame, app, name, body),
         }
     }
 }
@@ -342,12 +343,19 @@ fn draw_help_bar(frame: &mut Frame, app: &App, area: Rect) {
         }
     }
     let mut spans = Vec::new();
+    let mut hits = Vec::new();
+    let mut x = area.x;
     for (i, (key, what)) in keys.iter().enumerate() {
         if shown[i] {
+            let w = u16::try_from(width(&keys[i])).unwrap_or_default();
+            hits.push((x, x + w, *key));
+            x += w;
             spans.push(Span::styled(format!(" {key} "), theme::key()));
             spans.push(Span::raw(format!(" {what}  ")));
         }
     }
+    *app.scrolls.bar.borrow_mut() = hits;
+    app.scrolls.bar_row.set(area.y);
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 

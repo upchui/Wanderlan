@@ -130,8 +130,17 @@ fn vlans_text(vlans: &VlanSet) -> String {
 }
 
 fn draw_tunnels(frame: &mut Frame, app: &App, draft: &Draft, area: Rect, detail: Rect) {
-    let rows = draft.tunnel_rows();
+    let rows = app.visible_tunnels();
     let selected = app.tunnels_selected.min(rows.len().saturating_sub(1));
+    let area = if app.tunnels_filter.is_shown() {
+        let [filter, rest] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(area);
+        app.tunnels_filter
+            .draw(frame, filter, rows.len(), draft.tunnel_rows().len());
+        rest
+    } else {
+        area
+    };
     let header = Row::new(vec!["", "TUNNEL", "KIND", "CARRIES", "LIMIT"]).style(theme::header());
     let running = app.running.as_ref().and_then(|r| r.network.as_ref());
     let table_rows: Vec<Row> = rows
@@ -244,11 +253,23 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
     let header =
         Row::new(vec!["", "#", "SITE", "LOCAL", "SHARED", "MEANING"]).style(theme::header());
     let running = app.running.as_ref().and_then(|r| r.network.as_ref());
-    let rows: Vec<Row> = draft
-        .network
-        .maps
+    let shown = app.visible_maps();
+    let area = if app.maps_filter.is_shown() {
+        let [filter, rest] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(area);
+        app.maps_filter
+            .draw(frame, filter, shown.len(), draft.network.maps.len());
+        rest
+    } else {
+        area
+    };
+    let selected_row = shown
         .iter()
-        .enumerate()
+        .position(|i| *i == app.maps_selected)
+        .unwrap_or_default();
+    let rows: Vec<Row> = shown
+        .iter()
+        .filter_map(|&i| draft.network.maps.get(i).map(|m| (i, m)))
         .map(|(i, map)| {
             let at = |key: &str| draft.worst_at(&FieldPath::map_field(i, key));
             let marker = match running {
@@ -320,7 +341,7 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
             table,
             area,
             &app.scrolls.maps,
-            Some(app.maps_selected),
+            Some(selected_row),
             total,
             list::BOXED,
         );

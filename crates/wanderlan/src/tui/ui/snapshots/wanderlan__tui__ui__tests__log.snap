@@ -25,4 +25,4 @@ expression: render(&app)
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "                                  1 blocked (see 1)  draft: no changes  heim r7 "
-" l  level   p  peer   End  follow   PgUp/PgDn  page   ?  help   q  quit         "
+" l  level   p  peer   End  follow   /  search   1-7  views   ?  help   q  quit  "

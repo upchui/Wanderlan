@@ -25,4 +25,4 @@ expression: render(&app)
 "│ history      ███████████████████████████████                                 │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "                                  1 blocked (see 1)  draft: no changes  heim r7 "
-" Esc  close                                                                     "
+" Up/Down  next peer   Esc  close                                                "

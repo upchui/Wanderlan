@@ -19,7 +19,18 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         not_configured(frame, area);
         return;
     };
-    let [table, detail] = Layout::vertical([Constraint::Min(4), Constraint::Length(3)]).areas(area);
+    let filter_height = u16::from(app.sites_filter.is_shown());
+    let [filter, table, detail] = Layout::vertical([
+        Constraint::Length(filter_height),
+        Constraint::Min(4),
+        Constraint::Length(3),
+    ])
+    .areas(area);
+    if filter_height > 0 {
+        let shown = app.visible_sites().len();
+        app.sites_filter
+            .draw(frame, filter, shown, draft.network.sites.len());
+    }
     draw_table(frame, app, draft, table);
     frame.render_widget(
         Paragraph::new(detail_lines(app, draft)).wrap(Wrap { trim: false }),
@@ -40,7 +51,7 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         "TUNNEL",
     ])
     .style(theme::header());
-    let order = topology::tree_order(&draft.network);
+    let order = app.visible_sites();
     let rows: Vec<Row> = order
         .iter()
         .filter_map(|(i, depth)| draft.network.sites.get(*i).map(|s| (*i, *depth, s)))
@@ -149,7 +160,7 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
     }
     if let Some(site) = draft.network.sites.get(app.sites_selected) {
         let text = format!(
-            " {}: {}; VLANs and online state changed by {} (Enter: edit).",
+            " {}: {}; changed by {} (Enter: details, e: edit).",
             site.name,
             format::role(site.uplink.as_deref()),
             policy::managed_label(&draft.network, site)

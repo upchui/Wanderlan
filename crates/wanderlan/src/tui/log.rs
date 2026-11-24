@@ -5,6 +5,9 @@ use std::collections::BTreeSet;
 use crossterm::event::{KeyCode, KeyEvent};
 use wanderlan_core::api::{Event, Level};
 
+use super::filter::Filter;
+use super::localtime::Zone;
+
 /// Events kept in memory.
 pub const MAX_EVENTS: usize = 2000;
 
@@ -23,6 +26,22 @@ pub struct LogState {
     /// Number of matching events hidden below the window; 0 follows new
     /// events.
     pub scroll: usize,
+    /// Text search (`/`).
+    pub text: Filter,
+    /// The local time zone; `None`: UTC.
+    pub zone: Option<Zone>,
+    /// Show UTC even with a local zone (`t`).
+    pub utc: bool,
+}
+
+impl LogState {
+    /// The offset (seconds) and name of the shown time at `time_ms`.
+    pub fn offset_at(&self, time_ms: u64) -> (i32, String) {
+        match (&self.zone, self.utc) {
+            (Some(zone), false) => zone.at(i64::try_from(time_ms / 1000).unwrap_or(i64::MAX)),
+            _ => (0, "UTC".into()),
+        }
+    }
 }
 
 impl LogState {
@@ -72,6 +91,11 @@ impl LogState {
                 .peer
                 .as_deref()
                 .is_none_or(|p| event.peer.as_deref() == Some(p))
+            && self.text.matches(&[
+                &event.message,
+                event.peer.as_deref().unwrap_or_default(),
+                level_name(event.level),
+            ])
     }
 
     /// Events passing the filters, oldest first.

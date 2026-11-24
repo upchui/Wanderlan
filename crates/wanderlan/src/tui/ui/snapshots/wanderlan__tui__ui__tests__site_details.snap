@@ -1,0 +1,28 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+"┌ heim   Up/Down: next site   e: edit   Esc: close ────────────────────────────┐"
+"│ Role         server   this site                                              │"
+"│ Address      10.8.0.1   online                                               │"
+"│ VLANs        10-50   own VLANs none                                          │"
+"│ Changes      every site that is not managed by another                       │"
+"│ Clients      haus6                                                           │"
+"│                                                                              │"
+"│ Tunnels                                                                      │"
+"│   to buero        server      carries 10-50                                  │"
+"│   to haus2        server      carries 20,30                                  │"
+"│   to haus3        server      carries 10-50                                  │"
+"│   to haus5        server      carries 10-50                                  │"
+"│   to haus6        its client  carries 10-50                                  │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                  1 blocked (see 1)  draft: no changes  heim r7 "
+" Up/Down  next site   e  edit   Esc  close                                      "

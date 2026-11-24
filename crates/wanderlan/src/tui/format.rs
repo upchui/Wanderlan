@@ -73,6 +73,12 @@ pub fn clock(time_ms: u64) -> (String, String) {
     (date, time)
 }
 
+/// Like [`clock`], for a time `offset` seconds away from UTC.
+pub fn clock_at(time_ms: u64, offset: i32) -> (String, String) {
+    let shifted = i64::try_from(time_ms).unwrap_or(i64::MAX) + i64::from(offset) * 1000;
+    clock(u64::try_from(shifted).unwrap_or_default())
+}
+
 /// Splits a text into lines of at most `width` characters, breaking at
 /// spaces where possible.
 pub fn wrap(text: &str, width: usize) -> Vec<String> {

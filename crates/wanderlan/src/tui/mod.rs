@@ -9,12 +9,14 @@
 mod app;
 mod diff;
 mod draft;
+mod filter;
 #[cfg(test)]
 mod fixtures;
 mod form;
 mod format;
 mod help;
 mod input;
+mod localtime;
 mod log;
 mod macs;
 mod theme;
@@ -121,6 +123,7 @@ async fn next_daemon_event(conn: &mut Option<Connection>) -> Option<api::Event> 
 
 async fn event_loop(terminal: &mut Term, socket: &Path, mouse: bool) -> Result<()> {
     let mut app = App::new(socket.display().to_string(), mouse);
+    app.log.zone = localtime::load();
     let (answers_tx, mut answers) = mpsc::unbounded_channel::<(u64, Msg)>();
     let (local_tx, mut local) = mpsc::unbounded_channel::<Msg>();
     let mut conn: Option<Connection> = None;

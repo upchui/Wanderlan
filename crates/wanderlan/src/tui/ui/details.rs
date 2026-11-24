@@ -7,9 +7,10 @@ use ratatui::style::Style;
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Axis, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Sparkline, Table,
+    Axis, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Sparkline, Table, Wrap,
 };
 use wanderlan_core::api::{PeerStatus, Traffic};
+use wanderlan_core::{policy, topology};
 
 use super::{health_style, list, port_state, titled};
 use crate::tui::app::{App, HISTORY_LEN};
@@ -237,6 +238,123 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, area: Rect) {
         Sparkline::default().data(&rtts).style(theme::title()),
         rtt_spark,
     );
+}
+
+/// Everything about one site of the draft.
+pub fn site(frame: &mut Frame, app: &App, name: &str, area: Rect) {
+    frame.render_widget(Clear, area);
+    let Some((network, site)) = app
+        .draft
+        .as_ref()
+        .and_then(|d| d.network.site(name).map(|s| (&d.network, s)))
+    else {
+        frame.render_widget(
+            Paragraph::new(format!(" {name} is not in the draft. Esc closes."))
+                .block(titled(" Site ")),
+            area,
+        );
+        return;
+    };
+    let me = app
+        .draft
+        .as_ref()
+        .and_then(|d| d.local.self_name.clone())
+        .unwrap_or_default();
+    let dim = |t: &str| Span::styled(t.to_string(), theme::dim());
+    let vlans_text = |v: &wanderlan_core::config::VlanSet| {
+        if v.is_empty() {
+            "none".to_string()
+        } else {
+            v.to_string()
+        }
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            label("Role"),
+            Span::raw(format::role(site.uplink.as_deref())),
+            if site.name == me {
+                dim("   this site")
+            } else {
+                Span::raw("")
+            },
+        ]),
+        Line::from(vec![
+            label("Address"),
+            Span::raw(site.address.to_string()),
+            if site.online {
+                dim("   online")
+            } else {
+                Span::styled("   OFFLINE", theme::warn())
+            },
+        ]),
+        Line::from(vec![
+            label("VLANs"),
+            Span::raw(network.vlans_of(site).to_string()),
+            dim("   own VLANs "),
+            Span::raw(
+                site.own_vlans
+                    .as_ref()
+                    .map_or_else(|| "none".into(), ToString::to_string),
+            ),
+        ]),
+        Line::from(vec![
+            label("Changes"),
+            Span::raw(policy::managers(network, site)),
+        ]),
+    ];
+    let clients: Vec<&str> = network
+        .sites
+        .iter()
+        .filter(|s| s.uplink.as_deref() == Some(name))
+        .map(|s| s.name.as_str())
+        .collect();
+    if !clients.is_empty() {
+        lines.push(Line::from(vec![
+            label("Clients"),
+            Span::raw(clients.join(", ")),
+        ]));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(" Tunnels", theme::header()));
+    let tunnels = topology::tunnels_for(network, name);
+    if tunnels.is_empty() {
+        lines.push(Line::styled("   none", theme::dim()));
+    }
+    for t in &tunnels {
+        let kind = match t.kind {
+            topology::TunnelKind::Server => "server",
+            topology::TunnelKind::Uplink => "its server",
+            topology::TunnelKind::Client => "its client",
+        };
+        let carries = topology::tunnel_vlans(network, name, &t.peer.name).unwrap_or_default();
+        let mut spans = vec![
+            Span::raw(format!("   to {:<13}", t.peer.name)),
+            Span::styled(format!("{kind:<12}"), theme::dim()),
+            Span::raw(format!("carries {}", vlans_text(&carries))),
+        ];
+        if let Some(limit) = network.tunnel_limit(name, &t.peer.name) {
+            spans.push(dim(&format!("  (limited to {})", vlans_text(limit))));
+        }
+        lines.push(Line::from(spans));
+    }
+    let maps: Vec<String> = network
+        .maps_of(name)
+        .map(|m| format!("{} → {}", m.local, m.shared))
+        .collect();
+    if !maps.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            label("Mappings"),
+            Span::raw(maps.join(", ")),
+        ]));
+    }
+    let title = format!(" {name}   Up/Down: next site   e: edit   Esc: close ");
+    let block = titled(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let total = lines.len();
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    list::scrollbar(frame, area, 1, 1, total, 0, usize::from(inner.height));
 }
 
 /// The open invitations with their rules.

@@ -624,17 +624,15 @@ fn page_keys_and_the_overview_cursor() {
     assert_eq!(app.overview_selected, peers + sites - 1);
     press(&mut app, KeyCode::Home);
     assert_eq!(app.overview_selected, 0);
-    // Enter on a site shows it in the Sites view.
+    // Enter on a site shows its details.
     for _ in 0..peers {
         press(&mut app, KeyCode::Down);
     }
     press(&mut app, KeyCode::Enter);
-    assert_eq!(app.view, View::Sites);
     let first = app.overview_sites()[0].name.clone();
-    assert_eq!(
-        app.draft.as_ref().unwrap().network.sites[app.sites_selected].name,
-        first
-    );
+    assert!(matches!(&app.modal, Some(Modal::Site { name }) if *name == first));
+    press(&mut app, KeyCode::Esc);
+    press(&mut app, KeyCode::Char('2'));
     // End and Home in the sites (tree order: haus6 is the second row).
     press(&mut app, KeyCode::End);
     assert_eq!(
@@ -743,4 +741,16 @@ fn deleting_an_invitation_asks() {
         matches!(&app.modal, Some(Modal::Invites { .. })),
         "yes: back to the list"
     );
+}
+
+#[test]
+fn the_peer_details_go_to_the_next_peer() {
+    let mut app = connected();
+    app.update(key(KeyCode::Enter));
+    assert!(matches!(&app.modal, Some(Modal::Peer { name }) if name == "buero"));
+    app.update(key(KeyCode::Down));
+    assert!(matches!(&app.modal, Some(Modal::Peer { name }) if name == "haus2"));
+    app.update(key(KeyCode::Up));
+    app.update(key(KeyCode::Up));
+    assert!(matches!(&app.modal, Some(Modal::Peer { name }) if name == "buero"));
 }

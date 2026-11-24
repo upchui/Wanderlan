@@ -17,8 +17,17 @@ const PEER_WIDTH: usize = 12;
 const PREFIX_WIDTH: usize = 9 + 6 + PEER_WIDTH + 1;
 
 pub fn draw(frame: &mut Frame, log: &LogState, area: Rect) {
-    let [filters, list] = Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(area);
+    let search = u16::from(log.text.is_shown());
+    let [filters, text, list] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(search),
+        Constraint::Min(3),
+    ])
+    .areas(area);
     let events = log.filtered();
+    if search > 0 {
+        log.text.draw(frame, text, events.len(), log.events.len());
+    }
     let level = match log.min_level {
         None | Some(Level::Info) => "all",
         Some(Level::Warn) => "warn and error",
@@ -43,7 +52,13 @@ pub fn draw(frame: &mut Frame, log: &LogState, area: Rect) {
     ]);
     frame.render_widget(Paragraph::new(line), filters);
 
-    let block = titled(" Events (times in UTC) ");
+    let now = log.events.last().map_or(0, |e| e.time_ms);
+    let zone = log.offset_at(now).1;
+    let block = titled(if zone == "UTC" {
+        " Events (times in UTC) ".to_string()
+    } else {
+        format!(" Events (local time, {zone}; t: UTC) ")
+    });
     let inner = block.inner(list);
     let height = usize::from(inner.height);
     let width = usize::from(inner.width);
@@ -52,7 +67,7 @@ pub fn draw(frame: &mut Frame, log: &LogState, area: Rect) {
     let mut lines = Vec::new();
     let mut last_date = None;
     for event in events.get(start..end).unwrap_or_default() {
-        let (date, time) = format::clock(event.time_ms);
+        let (date, time) = format::clock_at(event.time_ms, log.offset_at(event.time_ms).0);
         if last_date.as_ref() != Some(&date) {
             lines.push(Line::styled(format!("-- {date} --"), theme::dim()));
             last_date = Some(date);

@@ -13,12 +13,30 @@ use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState, Table, T
 pub struct Scroll {
     offset: Cell<usize>,
     page: Cell<usize>,
+    /// Where the rows were drawn (for the mouse).
+    rows: Cell<Rect>,
 }
 
 impl Scroll {
     /// Rows the last frame showed (at least 1): the step of PgUp/PgDn.
     pub fn page(&self) -> usize {
         self.page.get().max(1)
+    }
+
+    /// The row (of all rows) at a screen position, if the last frame drew
+    /// one there.
+    pub fn row_at(&self, column: u16, row: u16) -> Option<usize> {
+        let rows = self.rows.get();
+        let inside = column >= rows.x
+            && column < rows.x + rows.width
+            && row >= rows.y
+            && row < rows.y + rows.height;
+        inside.then(|| self.offset.get() + usize::from(row - rows.y))
+    }
+
+    /// True if the last frame drew the list under this position.
+    pub fn contains(&self, column: u16, row: u16) -> bool {
+        self.row_at(column, row).is_some()
     }
 }
 
@@ -57,6 +75,13 @@ pub fn show(
     frame.render_stateful_widget(table, area, &mut state);
     scroll.offset.set(state.offset());
     scroll.page.set(visible);
+    let shown = total.saturating_sub(state.offset()).min(visible);
+    scroll.rows.set(Rect {
+        x: area.x + border,
+        y: area.y + top,
+        width: area.width.saturating_sub(2 * border),
+        height: u16::try_from(shown).unwrap_or_default(),
+    });
     scrollbar(frame, area, top, border, total, state.offset(), visible);
 }
 

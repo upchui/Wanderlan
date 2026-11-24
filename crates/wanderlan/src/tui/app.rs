@@ -22,8 +22,10 @@ use wanderlan_core::policy;
 use wanderlan_core::topology::{self, gretap_name};
 
 use super::diff::{self, DiffLine};
-use super::draft::{Draft, Running};
+use super::draft::{Draft, Running, TunnelRow};
+use super::filter::Filter;
 use super::form::{Form, FormEvent, FormKind, trunk_hint, tunnel_trunk_hint};
+use super::format;
 use super::log::LogState;
 use super::macs::MacState;
 use super::ui::list;
@@ -311,6 +313,11 @@ pub enum Modal {
         /// First visible line.
         scroll: u16,
     },
+    /// Everything about one site: role, VLANs, tunnels, mappings, rights.
+    Site {
+        /// The site.
+        name: String,
+    },
     /// Traffic and details of one peer.
     Peer {
         /// The peer.
@@ -438,6 +445,37 @@ pub struct Scrolls {
     pub invites: list::Scroll,
     /// Largest scroll offset of the help screen at its last size.
     pub help_max: std::cell::Cell<u16>,
+    /// Keys of the help bar as drawn: first and last column, label.
+    pub bar: std::cell::RefCell<Vec<(u16, u16, &'static str)>>,
+    /// Screen row of the help bar.
+    pub bar_row: std::cell::Cell<u16>,
+}
+
+/// A list the mouse can point at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListId {
+    Peers,
+    Network,
+    Sites,
+    Maps,
+    Tunnels,
+    Macs,
+    Invites,
+}
+
+/// The key a label of the help bar stands for; `None` for labels that
+/// name several keys (Up/Down, 1-7, ...).
+fn bar_key(label: &str) -> Option<KeyCode> {
+    let first = label.split('/').next().unwrap_or(label);
+    match first {
+        "Enter" => Some(KeyCode::Enter),
+        "Esc" => Some(KeyCode::Esc),
+        "Tab" => Some(KeyCode::Tab),
+        "End" => Some(KeyCode::End),
+        "Home" => Some(KeyCode::Home),
+        _ if first.chars().count() == 1 => first.chars().next().map(KeyCode::Char),
+        _ => None,
+    }
 }
 
 /// Moves a selection in a list of `count` rows: Up/Down (j/k) one row,
@@ -501,6 +539,12 @@ pub struct App {
     pub maps_selected: usize,
     /// The VLAN view shows the tunnels instead of the mappings (`t`).
     pub vlans_tunnels: bool,
+    /// Search in the Sites view.
+    pub sites_filter: Filter,
+    /// Search in the VLAN mappings.
+    pub maps_filter: Filter,
+    /// Search in the tunnels.
+    pub tunnels_filter: Filter,
     /// Selected tunnel in the VLAN view.
     pub tunnels_selected: usize,
     /// The setup wizard.
@@ -553,6 +597,9 @@ impl App {
             sites_selected: 0,
             maps_selected: 0,
             vlans_tunnels: false,
+            sites_filter: Filter::default(),
+            maps_filter: Filter::default(),
+            tunnels_filter: Filter::default(),
             tunnels_selected: 0,
             wizard: Wizard::new(),
             invitation: None,
@@ -1270,10 +1317,19 @@ impl App {
             self.maps_selected = self
                 .maps_selected
                 .min(d.network.maps.len().saturating_sub(1));
-            self.tunnels_selected = self
-                .tunnels_selected
-                .min(d.tunnel_rows().len().saturating_sub(1));
         }
+        // The selection stays on a row that is shown.
+        let sites = self.visible_sites();
+        if !sites.is_empty() && !sites.iter().any(|(i, _)| *i == self.sites_selected) {
+            self.sites_selected = sites[0].0;
+        }
+        let maps = self.visible_maps();
+        if !maps.is_empty() && !maps.contains(&self.maps_selected) {
+            self.maps_selected = maps[0];
+        }
+        self.tunnels_selected = self
+            .tunnels_selected
+            .min(self.visible_tunnels().len().saturating_sub(1));
     }
 
     // ----- keys -------------------------------------------------------
@@ -1294,6 +1350,7 @@ impl App {
                 Modal::Help { .. }
                     | Modal::Messages { .. }
                     | Modal::Peer { .. }
+                    | Modal::Site { .. }
                     | Modal::Invites { .. }
             )
         ) && key.modifiers.is_empty()
@@ -1333,6 +1390,12 @@ impl App {
             self.macs.handle_key(key);
             return;
         }
+        if let Some(filter) = self.typing_filter() {
+            filter.handle_key(key);
+            self.log.scroll = 0;
+            self.clamp_selection();
+            return;
+        }
         if self.on_global_key(key, fx) {
             return;
         }
@@ -1353,21 +1416,167 @@ impl App {
         if !self.mouse {
             return;
         }
-        let code = match mouse.kind {
-            MouseEventKind::ScrollUp => KeyCode::Up,
-            MouseEventKind::ScrollDown => KeyCode::Down,
-            MouseEventKind::Down(MouseButton::Left) if mouse.row == 0 && self.modal.is_none() => {
+        let (column, row) = (mouse.column, mouse.row);
+        let press = |app: &mut Self, code: KeyCode, fx: &mut Vec<Effect>| {
+            app.on_key(&KeyEvent::new(code, KeyModifiers::NONE), fx);
+        };
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) if row == 0 && self.modal.is_none() => {
                 if let Some((view, ..)) = tab_layout()
                     .into_iter()
-                    .find(|(_, _, start, end)| (*start..*end).contains(&mouse.column))
+                    .find(|(_, _, start, end)| (*start..*end).contains(&column))
                 {
                     self.set_view(view, fx);
                 }
-                return;
             }
-            _ => return,
+            MouseEventKind::Down(MouseButton::Left) if row == self.scrolls.bar_row.get() => {
+                let label = self
+                    .scrolls
+                    .bar
+                    .borrow()
+                    .iter()
+                    .find(|(start, end, _)| (*start..*end).contains(&column))
+                    .map(|(_, _, label)| *label);
+                if let Some(code) = label.and_then(bar_key) {
+                    press(self, code, fx);
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some((list, index)) = self.list_at(column, row) {
+                    self.click(list, index, fx);
+                }
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let up = mouse.kind == MouseEventKind::ScrollUp;
+                let code = if up { KeyCode::Up } else { KeyCode::Down };
+                match self.list_at_or_near(column, row) {
+                    // The overview's network list has its own part of the cursor.
+                    Some(ListId::Network) => {
+                        let peers = self.status.as_ref().map_or(0, |s| s.peers.len());
+                        let sites = self.overview_sites().len();
+                        let at = self.overview_selected.max(peers) - peers;
+                        let next = if up {
+                            at.saturating_sub(1)
+                        } else {
+                            (at + 1).min(sites.saturating_sub(1))
+                        };
+                        self.overview_selected = peers + next;
+                    }
+                    Some(ListId::Peers) => {
+                        let peers = self.status.as_ref().map_or(0, |s| s.peers.len());
+                        let at = self.overview_selected.min(peers.saturating_sub(1));
+                        self.overview_selected = if up {
+                            at.saturating_sub(1)
+                        } else {
+                            (at + 1).min(peers.saturating_sub(1))
+                        };
+                    }
+                    Some(_) => press(self, code, fx),
+                    // Windows and views that scroll as a whole; never the
+                    // focus of a form or a setup step.
+                    None if matches!(
+                        self.modal,
+                        Some(
+                            Modal::Help { .. }
+                                | Modal::Messages { .. }
+                                | Modal::Review(_)
+                                | Modal::Peer { .. }
+                                | Modal::Site { .. }
+                        )
+                    ) || (self.modal.is_none() && self.view == View::Log) =>
+                    {
+                        press(self, code, fx);
+                    }
+                    None => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The lists on the screen now.
+    fn lists(&self) -> Vec<(ListId, &list::Scroll)> {
+        match (&self.modal, self.view) {
+            (Some(Modal::Invites { .. }), _) => vec![(ListId::Invites, &self.scrolls.invites)],
+            (Some(_), _) => Vec::new(),
+            (None, View::Overview) => vec![
+                (ListId::Peers, &self.scrolls.peers),
+                (ListId::Network, &self.scrolls.network),
+            ],
+            (None, View::Sites) => vec![(ListId::Sites, &self.scrolls.sites)],
+            (None, View::Vlans) if self.vlans_tunnels => {
+                vec![(ListId::Tunnels, &self.scrolls.tunnels)]
+            }
+            (None, View::Vlans) => vec![(ListId::Maps, &self.scrolls.maps)],
+            (None, View::Macs) => vec![(ListId::Macs, &self.scrolls.macs)],
+            (None, _) => Vec::new(),
+        }
+    }
+
+    /// The list and row under the mouse.
+    fn list_at(&self, column: u16, row: u16) -> Option<(ListId, usize)> {
+        self.lists()
+            .into_iter()
+            .find_map(|(id, scroll)| scroll.row_at(column, row).map(|r| (id, r)))
+    }
+
+    /// The list under the mouse, also below its last row (the wheel).
+    fn list_at_or_near(&self, column: u16, row: u16) -> Option<ListId> {
+        self.list_at(column, row).map(|(id, _)| id).or_else(|| {
+            self.lists()
+                .into_iter()
+                .find(|(_, scroll)| scroll.contains(column, row.saturating_sub(1)))
+                .map(|(id, _)| id)
+        })
+    }
+
+    /// A click on a row: selects it, or opens it if it is selected.
+    fn click(&mut self, list: ListId, index: usize, fx: &mut Vec<Effect>) {
+        let peers = self.status.as_ref().map_or(0, |s| s.peers.len());
+        let open = match list {
+            ListId::Peers | ListId::Network => {
+                let target = if list == ListId::Peers {
+                    index
+                } else {
+                    peers + index
+                };
+                let again = self.overview_selected == target;
+                self.overview_selected = target;
+                again
+            }
+            ListId::Sites => {
+                let Some(&(site, _)) = self.visible_sites().get(index) else {
+                    return;
+                };
+                let again = self.sites_selected == site;
+                self.sites_selected = site;
+                again
+            }
+            ListId::Maps => {
+                let Some(&map) = self.visible_maps().get(index) else {
+                    return;
+                };
+                let again = self.maps_selected == map;
+                self.maps_selected = map;
+                again
+            }
+            ListId::Tunnels => {
+                let again = self.tunnels_selected == index;
+                self.tunnels_selected = index;
+                again
+            }
+            ListId::Macs => {
+                self.macs.selected = index;
+                false
+            }
+            ListId::Invites => {
+                self.modal = Some(Modal::Invites { selected: index });
+                false
+            }
         };
-        self.on_key(&KeyEvent::new(code, KeyModifiers::NONE), fx);
+        if open {
+            self.on_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), fx);
+        }
     }
 
     fn on_global_key(&mut self, key: &KeyEvent, fx: &mut Vec<Effect>) -> bool {
@@ -1602,10 +1811,25 @@ impl App {
                 }),
                 _ => Some(Modal::Messages { scroll }),
             },
-            Modal::Peer { name } => match key.code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
-                _ => Some(Modal::Peer { name }),
-            },
+            Modal::Peer { name } => {
+                // Up/Down: the previous or next peer.
+                let peers: Vec<String> = self
+                    .status
+                    .as_ref()
+                    .map(|s| s.peers.iter().map(|p| p.name.clone()).collect())
+                    .unwrap_or_default();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
+                    code => {
+                        let at = peers.iter().position(|p| *p == name).unwrap_or_default();
+                        let name = nav(code, at, peers.len(), 1)
+                            .and_then(|i| peers.get(i).cloned())
+                            .unwrap_or(name);
+                        Some(Modal::Peer { name })
+                    }
+                }
+            }
+            Modal::Site { name } => self.on_site_key(name, key),
             Modal::Review(review) => self.on_review_key(review, key, fx),
         }
     }
@@ -1869,6 +2093,83 @@ impl App {
         }));
     }
 
+    /// The rows of the Sites view: (index in the network, depth in the
+    /// tree), in tree order, passing the search.
+    pub fn visible_sites(&self) -> Vec<(usize, usize)> {
+        let Some(d) = &self.draft else {
+            return Vec::new();
+        };
+        topology::tree_order(&d.network)
+            .into_iter()
+            .filter(|(i, _)| {
+                d.network.sites.get(*i).is_some_and(|s| {
+                    let vlans = d.network.vlans_of(s).to_string();
+                    let address = s.address.to_string();
+                    let role = format::role(s.uplink.as_deref());
+                    let managed = policy::managed_label(&d.network, s);
+                    self.sites_filter
+                        .matches(&[&s.name, &address, &vlans, &role, &managed])
+                })
+            })
+            .collect()
+    }
+
+    /// Indices of the VLAN mappings passing the search.
+    pub fn visible_maps(&self) -> Vec<usize> {
+        let Some(d) = &self.draft else {
+            return Vec::new();
+        };
+        d.network
+            .maps
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| {
+                self.maps_filter
+                    .matches(&[&m.site, &m.local.to_string(), &m.shared.to_string()])
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The rows of the tunnel table passing the search.
+    pub fn visible_tunnels(&self) -> Vec<TunnelRow> {
+        let Some(d) = &self.draft else {
+            return Vec::new();
+        };
+        let text = |v: &Option<wanderlan_core::config::VlanSet>| {
+            v.as_ref().map(ToString::to_string).unwrap_or_default()
+        };
+        d.tunnel_rows()
+            .into_iter()
+            .filter(|r| {
+                let kind = match r.servers {
+                    Some(true) => "servers",
+                    Some(false) => "client",
+                    None => "no tunnel",
+                };
+                self.tunnels_filter.matches(&[
+                    &r.sites[0],
+                    &r.sites[1],
+                    kind,
+                    &text(&r.carries),
+                    &text(&r.limit),
+                ])
+            })
+            .collect()
+    }
+
+    /// The search of the current view while it is typed.
+    fn typing_filter(&mut self) -> Option<&mut Filter> {
+        let filter = match self.view {
+            View::Sites => &mut self.sites_filter,
+            View::Vlans if self.vlans_tunnels => &mut self.tunnels_filter,
+            View::Vlans => &mut self.maps_filter,
+            View::Log => &mut self.log.text,
+            _ => return None,
+        };
+        filter.editing.then_some(filter)
+    }
+
     /// The sites of the overview's network list, in its order (servers
     /// with their clients below).
     pub fn overview_sites(&self) -> Vec<&SiteSummary> {
@@ -1912,28 +2213,58 @@ impl App {
                     self.modal = Some(Modal::Peer {
                         name: peer.name.clone(),
                     });
-                } else if let Some(site) = self
+                } else if let Some(name) = self
                     .overview_sites()
                     .get(self.overview_selected.saturating_sub(peers))
                     .map(|s| s.name.clone())
                 {
-                    self.show_site(&site, fx);
+                    self.modal = Some(Modal::Site { name });
                 }
             }
             _ => {}
         }
     }
 
-    /// Shows a site: the Sites view with it selected.
-    fn show_site(&mut self, name: &str, fx: &mut Vec<Effect>) {
-        if let Some(i) = self
-            .draft
-            .as_ref()
-            .and_then(|d| d.network.sites.iter().position(|s| s.name == name))
-        {
-            self.sites_selected = i;
+    /// Keys of the site details: Up/Down the previous or next site (as in
+    /// Sites), `e` edits it.
+    fn on_site_key(&mut self, name: String, key: &KeyEvent) -> Option<Modal> {
+        let names: Vec<String> = self
+            .visible_sites()
+            .into_iter()
+            .filter_map(|(i, _)| self.draft.as_ref()?.network.sites.get(i))
+            .map(|s| s.name.clone())
+            .collect();
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
+            KeyCode::Char('e') => {
+                let index = self
+                    .draft
+                    .as_ref()
+                    .and_then(|d| d.network.sites.iter().position(|s| s.name == name));
+                match index {
+                    Some(i) if self.may_change(&name) => {
+                        self.sites_selected = i;
+                        let draft = self.draft.as_ref()?;
+                        Some(Modal::Form(Form::site(draft, Some(i))))
+                    }
+                    _ => Some(Modal::Site { name }),
+                }
+            }
+            code => {
+                let at = names.iter().position(|n| *n == name).unwrap_or_default();
+                let name = nav(code, at, names.len(), 1)
+                    .and_then(|i| names.get(i).cloned())
+                    .unwrap_or(name);
+                if let Some(i) = self
+                    .draft
+                    .as_ref()
+                    .and_then(|d| d.network.sites.iter().position(|s| s.name == name))
+                {
+                    self.sites_selected = i;
+                }
+                Some(Modal::Site { name })
+            }
         }
-        self.set_view(View::Sites, fx);
     }
 
     fn on_settings_key(&mut self, key: &KeyEvent, fx: &mut Vec<Effect>) {
@@ -2017,10 +2348,7 @@ impl App {
             .as_ref()
             .and_then(|d| d.network.sites.get(self.sites_selected))
             .map(|s| s.name.clone());
-        let edits = matches!(
-            key.code,
-            KeyCode::Enter | KeyCode::Char('e' | 'd') | KeyCode::Delete
-        );
+        let edits = matches!(key.code, KeyCode::Char('e' | 'd') | KeyCode::Delete);
         if edits
             && let Some(name) = &selected_site
             && !self.may_change(name)
@@ -2033,11 +2361,8 @@ impl App {
         };
         let selected = self.sites_selected;
         let count = draft.network.sites.len();
-        // Up/Down follow the tree shown (servers with their clients below).
-        let order: Vec<usize> = topology::tree_order(&draft.network)
-            .into_iter()
-            .map(|(i, _)| i)
-            .collect();
+        // Up/Down follow the rows shown (tree order, search).
+        let order: Vec<usize> = self.visible_sites().into_iter().map(|(i, _)| i).collect();
         let row = order
             .iter()
             .position(|i| *i == selected)
@@ -2047,8 +2372,14 @@ impl App {
             return;
         }
         match key.code {
+            KeyCode::Char('/') => self.sites_filter.start(),
             KeyCode::Char('n') => self.modal = Some(Modal::Form(Form::site(draft, None))),
-            KeyCode::Enter | KeyCode::Char('e') if selected < count => {
+            KeyCode::Enter => {
+                if let Some(name) = selected_site {
+                    self.modal = Some(Modal::Site { name });
+                }
+            }
+            KeyCode::Char('e') if selected < count => {
                 self.modal = Some(Modal::Form(Form::site(draft, Some(selected))));
             }
             KeyCode::Char('m') => self.modal = Some(Modal::Form(Form::network(draft))),
@@ -2135,11 +2466,20 @@ impl App {
         };
         let selected = self.maps_selected;
         let count = draft.network.maps.len();
-        if let Some(n) = nav(key.code, selected, count, self.scrolls.maps.page()) {
-            self.maps_selected = n;
+        let shown = self.visible_maps();
+        let row = shown
+            .iter()
+            .position(|i| *i == selected)
+            .unwrap_or_default();
+        if let Some(n) = nav(key.code, row, shown.len(), self.scrolls.maps.page()) {
+            self.maps_selected = shown.get(n).copied().unwrap_or(selected);
             return;
         }
+        let Some(draft) = &self.draft else {
+            return;
+        };
         match key.code {
+            KeyCode::Char('/') => self.maps_filter.start(),
             KeyCode::Char('v') => {
                 if self.may_change_network_vlans()
                     && let Some(draft) = &self.draft
@@ -2181,7 +2521,8 @@ impl App {
             self.not_configured();
             return;
         };
-        let rows = draft.tunnel_rows();
+        let _ = draft;
+        let rows = self.visible_tunnels();
         let count = rows.len();
         let selected = self.tunnels_selected.min(count.saturating_sub(1));
         let Some(row) = rows.into_iter().nth(selected) else {
@@ -2193,6 +2534,7 @@ impl App {
             return;
         }
         match key.code {
+            KeyCode::Char('/') => self.tunnels_filter.start(),
             KeyCode::Enter | KeyCode::Char('e') => {
                 if row.servers.is_none() {
                     self.say(
@@ -2231,6 +2573,17 @@ impl App {
 
     fn on_log_key(&mut self, key: &KeyEvent) {
         match key.code {
+            KeyCode::Char('/') => self.log.text.start(),
+            KeyCode::Char('t') => {
+                if self.log.zone.is_none() {
+                    self.say(
+                        MessageKind::Info,
+                        "No local time zone found (TZ, /etc/localtime): the log shows UTC.",
+                    );
+                } else {
+                    self.log.utc = !self.log.utc;
+                }
+            }
             KeyCode::Char('l') => self.log.cycle_level(),
             KeyCode::Char('p') => {
                 let peers: Vec<String> = self

@@ -50,14 +50,13 @@ pub const SECTIONS: &[Section] = &[
         title: "2 Sites",
         keys: &[
             ("Up/Down", "select a site"),
+            ("/", "search (name, address, VLANs, role, manager)"),
             ("i", "invite a new site with its own rules (code + command)"),
             ("I", "open invitations: show, delete"),
             ("o", "take the site online / offline (in the draft)"),
             ("n", "new site by hand"),
-            (
-                "e, Enter",
-                "edit the site; \"Changes\": who may change its VLANs",
-            ),
+            ("Enter", "details: role, VLANs, tunnels, mappings, rights"),
+            ("e", "edit the site; \"Changes\": who may change its VLANs"),
             ("d, Del", "delete the site and its VLAN mappings"),
             (
                 "m",
@@ -79,6 +78,7 @@ pub const SECTIONS: &[Section] = &[
             ("e, Enter", "edit the mapping"),
             ("d, Del", "delete the mapping"),
             ("t", "tunnels: what each carries (Enter: limit it)"),
+            ("/", "search in the mappings or the tunnels"),
         ],
         text: "In the tunnel list (t): Enter limits what a tunnel carries, d lifts \
                the limit; below it says which VLANs this site passes on.",
@@ -100,6 +100,8 @@ pub const SECTIONS: &[Section] = &[
         keys: &[
             ("l", "level filter: all, warn and error, error"),
             ("p", "peer filter: all, then each peer"),
+            ("/", "search the messages"),
+            ("t", "local time / UTC"),
             ("Up/Down, PgUp/PgDn", "scroll"),
             ("End / Home", "follow new events / oldest event"),
         ],
@@ -137,7 +139,11 @@ pub const SECTIONS: &[Section] = &[
             ("Esc", "close the window (a form with input asks first)"),
             ("c, r", "confirm / roll back also in windows without text"),
             ("n, d", "open invitations: new, delete"),
-            ("Enter, q", "also close the peer details"),
+            ("Enter, q", "also close the peer and site details"),
+            (
+                "Up/Down",
+                "in the details: the previous / next peer or site",
+            ),
         ],
         text: "",
     },
@@ -221,7 +227,8 @@ pub fn bar(app: &App) -> Vec<Binding> {
                 ("d", "delete"),
                 ("Esc", "close"),
             ],
-            Modal::Peer { .. } => vec![("Esc", "close")],
+            Modal::Peer { .. } => vec![("Up/Down", "next peer"), ("Esc", "close")],
+            Modal::Site { .. } => vec![("Up/Down", "next site"), ("e", "edit"), ("Esc", "close")],
             Modal::Form(_) => vec![
                 ("Tab", "next field"),
                 ("Left/Right", "choose"),
@@ -242,6 +249,16 @@ pub fn bar(app: &App) -> Vec<Binding> {
             },
         };
     }
+    let typing = match app.view {
+        View::Sites => app.sites_filter.editing,
+        View::Vlans if app.vlans_tunnels => app.tunnels_filter.editing,
+        View::Vlans => app.maps_filter.editing,
+        View::Log => app.log.text.editing,
+        _ => false,
+    };
+    if typing {
+        return vec![("Enter", "keep filter"), ("Esc", "clear filter")];
+    }
     let common: [Binding; 2] = [("?", "help"), ("q", "quit")];
     let mut keys: Vec<Binding> = if !matches!(app.conn, Conn::Connected) {
         vec![("1-7", "views")]
@@ -254,7 +271,8 @@ pub fn bar(app: &App) -> Vec<Binding> {
                 ("Up/Down", "choose"),
             ],
             View::Sites => vec![
-                ("Enter", "edit"),
+                ("Enter", "details"),
+                ("e", "edit"),
                 ("i", "invite"),
                 ("o", "on/off"),
                 ("n", "new"),
@@ -262,6 +280,7 @@ pub fn bar(app: &App) -> Vec<Binding> {
                 ("I", "invites"),
                 ("m", "network"),
                 ("l", "this host"),
+                ("/", "search"),
             ],
             View::Settings => vec![("Enter", "change"), ("Up/Down", "choose")],
             View::Vlans if app.vlans_tunnels => vec![
@@ -270,6 +289,7 @@ pub fn bar(app: &App) -> Vec<Binding> {
                 ("t", "mappings"),
                 ("v", "VLANs"),
                 ("o", "own VLANs"),
+                ("/", "search"),
             ],
             View::Vlans => vec![
                 ("n", "new"),
@@ -278,6 +298,7 @@ pub fn bar(app: &App) -> Vec<Binding> {
                 ("t", "tunnels"),
                 ("v", "VLANs"),
                 ("o", "own VLANs"),
+                ("/", "search"),
             ],
             View::Macs if app.macs.editing => {
                 return vec![("Enter", "keep filter"), ("Esc", "clear filter")];
@@ -292,6 +313,7 @@ pub fn bar(app: &App) -> Vec<Binding> {
                 ("l", "level"),
                 ("p", "peer"),
                 ("End", "follow"),
+                ("/", "search"),
                 ("PgUp/PgDn", "page"),
                 ("Home", "oldest"),
             ],

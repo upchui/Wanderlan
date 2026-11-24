@@ -471,23 +471,35 @@ event log (`wanderlan log`).
 ## Terminal UI
 
 `wanderlan` without arguments starts the TUI: keyboard first, works over SSH
-and in 80×24 (`--mouse` enables the mouse). `?` shows all keys.
+and needs at least 80×24 (larger terminals show more). `?` shows all keys,
+the bar at the bottom the most important ones of each view. Every list
+scrolls with Up/Down, PgUp/PgDn, Home and End and shows a scrollbar when it
+holds more than fits; `/` searches in Sites, VLANs, MACs and Log. `--mouse`
+enables the mouse: a click selects a row (a second click opens it), the
+wheel scrolls the list under the pointer, the keys in the bottom bar can be
+clicked.
 
 | Key | View |
 |-----|------|
-| `1` | Overview: this site with its role, the tunnel neighbours live (reply, round trip, path MTU, MSS, port state, MAC addresses, throughput, config in sync or `refused`), traffic of the tunnels and of every trunk, and all known sites with role and link (`via hq` for sites without a tunnel from here), each server with its clients indented below. `Enter` on a neighbour: traffic graph, round-trip history, min/avg/max round trip, jitter, probe loss, latency, counters. |
-| `2` | Sites: name, address, VLANs, role, manager, tunnel; clients indented below their server. Invite (`i`), open invitations (`I`), online/offline (`o`), new (`n`), edit (`Enter`: VLANs, "Changes", "Connected to"), delete (`d`). |
+| `1` | Overview: this site with its role, the tunnel neighbours live (reply, round trip, path MTU, MSS, port state, MAC addresses, throughput, config in sync or `refused`), traffic of the tunnels and of every trunk, and all known sites with role and link (`via hq` for sites without a tunnel from here), each server with its clients indented below. One cursor runs through the neighbours and the sites. `Enter` on a neighbour: traffic graph, round-trip history, min/avg/max round trip, jitter, probe loss, latency, counters (Up/Down: the next neighbour); on a site: its details. |
+| `2` | Sites: name, address, VLANs, role, manager, tunnel; clients indented below their server. `Enter`: details (role, VLANs, every tunnel with what it carries, mappings, who may change it; Up/Down: the next site). Invite (`i`), open invitations (`I`), online/offline (`o`), new (`n`), edit (`e`: VLANs, "Changes", "Connected to"), delete (`d`), network and host settings (`m`, `l`). |
 | `3` | VLANs: the VLANs of the network (`v`), the own VLANs of this site (`o`) and the mappings (`n`, `Enter`, `d`) with their site and its role; conflicts are marked right away. `t` switches to the tunnels: what each carries, its limit (`Enter`, `d`). |
 | `4` | MAC addresses: filter (`/`), sort (`s`, `o`). |
-| `5` | Log: live events, filter by level (`l`) and site (`p`). |
+| `5` | Log: live events in local time (`t`: UTC), filter by level (`l`), site (`p`) and text (`/`). |
 | `6` | Setup: new network or join; on a configured site invite (`i`) and reset (`R`). |
 | `7` | Settings: every setting with an explanation, the trunk of every tunnel, and the role and rights of this site. |
 
-Changes are collected in a draft. `a` shows the difference to the running
-configuration and applies it; a banner counts down until it is confirmed
-(`c`) or rolled back (`r`). `x` discards the draft, `q` quits. When the
-daemon is not reachable, the TUI shows the state of the service and its last
-log lines and keeps trying.
+Changes are collected in a draft; the status line says how many it holds,
+and new or changed rows are marked `+` or `*`. `a` shows the difference to
+the running configuration and applies it; a banner counts down until it is
+confirmed (`c`) or rolled back (`r`, asks first), also while a window is
+open. `x` discards the draft, `q` quits; where a wrong "yes" would lose
+something (reset, discard, roll back, quitting with a draft, closing a form
+with input) Enter means no and only `y` is yes. Messages that do not fit get
+a second line, `M` shows the last ones, and the status line of every view
+names problems of this site (an error, blocked ports, refused changes).
+When the daemon is not reachable, the TUI shows the state of the service and
+its last log lines and keeps trying.
 
 ## Command line
 
