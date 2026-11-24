@@ -377,7 +377,7 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
                     mtu: Some(GRETAP_MTU),
                     isolated: spec.isolated,
                     up: spec.enabled,
-                    up_reason: (!spec.enabled).then(|| "blocked by the loop guard".to_string()),
+                    up_reason: spec.down_reason.clone(),
                     vlans: &spec.vlans,
                 },
                 link,

@@ -10,7 +10,7 @@ use wanderlan_core::config::{FieldPath, LocalVid, Severity, VlanMap};
 use super::{diagnostic_line, not_configured, severity_style, titled};
 use crate::tui::app::App;
 use crate::tui::draft::Draft;
-use crate::tui::theme;
+use crate::tui::{format, theme};
 
 pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let Some(draft) = &app.draft else {
@@ -110,7 +110,13 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
             let at = |key: &str| draft.worst_at(&FieldPath::map_field(i, key));
             Row::new(vec![
                 Cell::from(format!("{}", i + 1)),
-                marked(map.site.clone(), at("site")),
+                marked(
+                    draft
+                        .mesh
+                        .site(&map.site)
+                        .map_or_else(|| map.site.clone(), format::site_with_kind),
+                    at("site"),
+                ),
                 marked(map.local.to_string(), at("local")),
                 marked(map.shared.to_string(), at("shared")),
                 Cell::from(effect(map)),
@@ -121,7 +127,7 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
     let empty = rows.is_empty();
     let widths = [
         Constraint::Length(3),
-        Constraint::Length(14),
+        Constraint::Length(21),
         Constraint::Length(8),
         Constraint::Length(8),
         Constraint::Min(10),

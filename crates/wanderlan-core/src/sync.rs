@@ -2,10 +2,12 @@
 //!
 //! Every daemon announces the revision and fingerprint of its confirmed
 //! `mesh.toml` in its control probes. A site fetches the mesh from a direct
-//! peer that announces a newer one: a higher revision, or the same revision
-//! with a different content whose fingerprint is larger (a deterministic
-//! tie-break for concurrent edits). Rejected fingerprints are never fetched
-//! again, so a configuration that cannot be applied here does not loop.
+//! peer that announces a newer one: a higher revision (also with the same
+//! content, e.g. a site taken offline and online again, so that the revision
+//! numbers agree everywhere), or the same revision with a different content
+//! whose fingerprint is larger (a deterministic tie-break for concurrent
+//! edits). Rejected fingerprints are never fetched again, so a configuration
+//! that cannot be applied here does not loop.
 
 use std::collections::BTreeSet;
 
@@ -31,9 +33,8 @@ impl Version {
 
     /// True if `self` should replace `ours`.
     pub fn is_newer_than(&self, ours: &Version) -> bool {
-        self.fingerprint != ours.fingerprint
-            && (self.revision > ours.revision
-                || (self.revision == ours.revision && self.fingerprint > ours.fingerprint))
+        self.revision > ours.revision
+            || (self.revision == ours.revision && self.fingerprint > ours.fingerprint)
     }
 }
 
@@ -100,7 +101,11 @@ mod tests {
             "tie-break: larger fingerprint wins"
         );
         assert!(!v(3, "aa").is_newer_than(&ours));
-        assert!(!v(9, "bb").is_newer_than(&ours), "same content");
+        assert!(
+            v(9, "bb").is_newer_than(&ours),
+            "same content, higher revision: adopt the revision"
+        );
+        assert!(!v(3, "bb").is_newer_than(&ours), "the same version");
     }
 
     #[test]

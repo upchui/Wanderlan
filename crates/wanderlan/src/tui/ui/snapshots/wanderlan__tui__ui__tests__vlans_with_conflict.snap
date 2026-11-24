@@ -1,6 +1,5 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 92
 expression: render(&app)
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
@@ -9,9 +8,9 @@ expression: render(&app)
 "│ Default of every site (native = untagged); limit a site in Sites (2).        │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "┌ VLAN mappings: 2 (1 with conflicts) ─────────────────────────────────────────┐"
-"│#   SITE           LOCAL    SHARED   MEANING                                  │"
-"│1   haus3          native   20       untagged at haus3 = shared VLAN 20       │"
-"│2   haus3          130      20 !     VLAN 130 at haus3 = shared VLAN 20       │"
+"│#   SITE                  LOCAL    SHARED   MEANING                           │"
+"│1   haus3 (server)        native   20       untagged at haus3 = shared VLAN 20│"
+"│2   haus3 (server)        130      20 !     VLAN 130 at haus3 = shared VLAN 20│"
 "│                                                                              │"
 "│                                                                              │"
 "│                                                                              │"

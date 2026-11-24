@@ -137,7 +137,8 @@ check "site2 limits itself to VLANs 10-40" \
   x site2 "wanderlan apply --mesh /tmp/site2-vlans.toml >/dev/null && wanderlan confirm >/dev/null"
 wait_eq 30 "the tunnel site2-site5 no longer carries VLAN 45" "10-40" vlan_summary site2 gt-site5
 expect_no_ping c-site5 10.45.0.1 "VLAN 45: no way from site5 to site1 without site2"
-x site2 "sed '/^name = \"site2\"\$/{n;/^vlans = \"10-40\"\$/d;}' /etc/wanderlan/mesh.toml > /tmp/site2-all.toml"
+# The daemon writes the file in canonical order (name, address, vlans, ...).
+x site2 "sed '/^name = \"site2\"\$/,/^\[/{/^vlans = \"10-40\"\$/d;}' /etc/wanderlan/mesh.toml > /tmp/site2-all.toml"
 check "site2 takes part in all VLANs again" \
   x site2 "wanderlan apply --mesh /tmp/site2-all.toml >/dev/null && wanderlan confirm >/dev/null"
 expect_ping c-site5 10.45.0.1 "VLAN 45: site5 reaches site1 again"

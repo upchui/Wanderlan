@@ -312,12 +312,19 @@ impl Form {
     /// Form for a new VLAN mapping (`None`) or an existing one.
     pub fn map(draft: &Draft, index: Option<usize>, site_hint: Option<&str>) -> Self {
         let existing = index.and_then(|i| draft.mesh.maps.get(i));
-        let sites: Vec<String> = draft.mesh.sites.iter().map(|s| s.name.clone()).collect();
+        // "marcel (client)": where the mapped traffic comes from.
+        let sites: Vec<String> = draft
+            .mesh
+            .sites
+            .iter()
+            .map(format::site_with_kind)
+            .collect();
         let site = existing
             .map(|m| m.site.clone())
             .or_else(|| site_hint.map(str::to_string))
             .or_else(|| draft.local.self_name.clone())
             .unwrap_or_default();
+        let site = draft.mesh.site(&site).map_or(site, format::site_with_kind);
         let (local, shared) = existing.map_or_else(
             || ("native".to_string(), String::new()),
             |m| (m.local.to_string(), m.shared.to_string()),
@@ -843,7 +850,13 @@ impl Form {
     }
 
     fn parse_map(&mut self) -> Option<VlanMap> {
-        let site = self.value("site");
+        // The choice reads "marcel (client)"; site names have no spaces.
+        let site = self
+            .value("site")
+            .split(" (")
+            .next()
+            .unwrap_or_default()
+            .to_string();
         if site.is_empty() {
             self.set_error("site", "the mesh has no sites");
         }

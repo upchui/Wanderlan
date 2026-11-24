@@ -111,6 +111,17 @@ pub fn wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// `server` or `client`, without the uplink (where the site name is next to
+/// it, e.g. in the VLAN mappings).
+pub fn kind(uplink: Option<&str>) -> &'static str {
+    if uplink.is_some() { "client" } else { "server" }
+}
+
+/// A site name with its kind: `marcel (client)`.
+pub fn site_with_kind(site: &wanderlan_core::config::Site) -> String {
+    format!("{} ({})", site.name, kind(site.uplink.as_deref()))
+}
+
 /// The role of a site: `server`, or `client of <uplink>`.
 pub fn role(uplink: Option<&str>) -> String {
     uplink.map_or_else(|| "server".to_string(), |u| format!("client of {u}"))

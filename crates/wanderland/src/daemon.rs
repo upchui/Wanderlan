@@ -1354,6 +1354,13 @@ impl Controller {
             )));
         }
         let fingerprint = config::fingerprint(&cfg.mesh);
+        // A peer with the content this change is based on (only a higher
+        // revision number) does not make it outdated.
+        let base_fingerprint = self
+            .confirmed
+            .as_ref()
+            .map(|c| config::fingerprint(&c.mesh))
+            .unwrap_or_default();
         // Only peers that stay peers (same name and address) and answer now
         // count; a site of another or an old network must not block a change.
         let current = self.direct_peers();
@@ -1366,7 +1373,10 @@ impl Controller {
             t.iter()
                 .filter(|(name, p)| p.reachable && relevant.contains(*name))
                 .filter_map(|(name, p)| p.announce.map(|a| (name.clone(), a)))
-                .find(|(_, a)| a.revision > base && fingerprint_hex(&a.fingerprint) != fingerprint)
+                .find(|(_, a)| {
+                    let theirs = fingerprint_hex(&a.fingerprint);
+                    a.revision > base && theirs != fingerprint && theirs != base_fingerprint
+                })
         });
         if let Some((peer, a)) = newer {
             return Err(ApiError::new(format!(

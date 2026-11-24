@@ -136,6 +136,14 @@ single command. Update all sites; 0.1 and 0.2 do not sync with each other.
   `wanderlan role <site> server|client <site>`.
 - A client that joins again through another site becomes a client of that
   site.
+- VLAN mappings (table and form) show whether a site is a server or a client:
+  `marcel (client)`.
+- Sync: a higher revision with the same content (e.g. a site taken offline
+  and online again quickly) is adopted, so the revisions agree everywhere;
+  a local change is no longer refused as outdated because a peer only has a
+  higher revision number with the same content.
+- The log names why a tunnel is down: blocked by the loop guard, this site
+  offline, or the peer offline (before it always said loop guard).
 
 ### Trunk per tunnel
 

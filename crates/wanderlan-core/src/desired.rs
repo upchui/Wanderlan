@@ -58,8 +58,10 @@ pub struct TunnelSpec {
     /// Split horizon: isolated ports do not forward to each other. Every
     /// tunnel port is isolated, so frames from one tunnel never enter another.
     pub isolated: bool,
-    /// Whether the port should be up (false if blocked by the loop guard).
+    /// Whether the port should be up.
     pub enabled: bool,
+    /// Why it is down: blocked by the loop guard, or a site is offline.
+    pub down_reason: Option<String>,
     /// VLAN membership: the VLANs both ends take part in.
     pub vlans: PortVlans,
 }
@@ -152,10 +154,20 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
         .map(|t| {
             let name = t.ifname();
             let theirs = mesh.effective_vlans(t.peer);
+            // Down while blocked by the loop guard, or while this site or the
+            // peer is offline (set up but not taken online yet).
+            let down_reason = if blocked.contains(&name) {
+                Some("blocked by the loop guard".to_string())
+            } else if !self_online {
+                Some("this site is offline".to_string())
+            } else if !t.peer.online {
+                Some(format!("site \"{}\" is offline", t.peer.name))
+            } else {
+                None
+            };
             TunnelSpec {
-                // Down while blocked by the loop guard, or while this site or
-                // the peer is offline (set up but not taken online yet).
-                enabled: !blocked.contains(&name) && self_online && t.peer.online,
+                enabled: down_reason.is_none(),
+                down_reason,
                 name,
                 peer: t.peer.name.clone(),
                 bridge: bridge_for(cfg.trunk_for(&t.peer.name), default_trunk),
