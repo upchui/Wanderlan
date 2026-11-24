@@ -9,6 +9,7 @@ docker volume create wanderlan-cargo-registry >/dev/null
 docker run --rm -t \
   --user "$(id -u):$(id -g)" \
   -e CARGO_HOME=/cargo -e CARGO_TERM_COLOR=always \
+  -e INSTA_UPDATE -e INSTA_FORCE_PASS \
   -v wanderlan-cargo-registry:/cargo \
   -v "$PWD":/src -w /src \
   wanderlan-base cargo "$@"
