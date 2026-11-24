@@ -3,3 +3,4 @@
 /tests/integration/.run
 *.rejected
 /.claude/worktrees/
+/.apt-pages

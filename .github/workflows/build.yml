@@ -1,0 +1,69 @@
+name: Build
+
+# Builds the static binaries and the .deb natively on amd64 and arm64,
+# smoke-tests the package (scripts/smoke-test.sh) and uploads it as the
+# artifact dist-<arch>. CI and Release both use this workflow, so a release
+# is built and tested exactly like every commit.
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Version without Debian revision, e.g. 0.1.0+57.gc256ea5
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  # No build summary or build record: they add an artifact per build and
+  # repeat the whole event payload.
+  DOCKER_BUILD_SUMMARY: false
+  DOCKER_BUILD_RECORD_UPLOAD: false
+
+jobs:
+  package:
+    name: package (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v4
+      - name: Build binaries and .deb (native ${{ matrix.arch }})
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: artifacts
+          build-args: WANDERLAN_VERSION=${{ inputs.version }}
+          outputs: type=local,dest=dist
+          provenance: false
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
+      - name: Install the .deb on Debian 13 (testnode image, reuses the build)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/Dockerfile
+          target: testnode
+          build-args: WANDERLAN_VERSION=${{ inputs.version }}
+          load: true
+          tags: wanderlan-testnode
+          provenance: false
+          cache-from: type=gha,scope=build-${{ matrix.arch }}
+      - name: Smoke test of the package
+        env:
+          VERSION: ${{ inputs.version }}
+        run: scripts/smoke-test.sh dist "${VERSION}-1" wanderlan-testnode
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error

@@ -1,0 +1,65 @@
+name: Publish
+
+# Every commit on main whose CI run is green goes into the APT repository on
+# GitHub Pages (suite stable) with the version CI built, e.g.
+# 0.1.0+57.gc256ea5-1; then the installation from the repository is tested.
+# Nothing to do by hand: committing to main is enough.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: APT repository
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: write
+    # One publication of main at a time; a newer waiting one replaces an
+    # older waiting one (the pool keeps the newest builds anyway).
+    concurrency:
+      group: apt-publish-main
+      cancel-in-progress: false
+    outputs:
+      deb_version: ${{ steps.v.outputs.deb_version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Packages built by CI
+        uses: actions/download-artifact@v8
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+      - id: v
+        name: Package version
+        run: |
+          ls -l dist
+          deb_version=$(dpkg-deb -f dist/wanderlan_*_amd64.deb Version)
+          echo "deb_version=$deb_version" >> "$GITHUB_OUTPUT"
+          echo "### wanderlan $deb_version" >> "$GITHUB_STEP_SUMMARY"
+      - uses: ./.github/actions/apt-publish
+        with:
+          dist: dist
+          message: "APT repository: wanderlan ${{ steps.v.outputs.deb_version }}"
+          signing-key: ${{ secrets.APT_GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.APT_GPG_PASSPHRASE }}
+
+  verify:
+    name: verify
+    needs: publish
+    uses: ./.github/workflows/verify-apt.yml
+    with:
+      deb_version: ${{ needs.publish.outputs.deb_version }}

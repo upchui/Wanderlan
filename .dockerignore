@@ -2,3 +2,4 @@ target
 dist
 .git
 tests/integration/.run
+.apt-pages

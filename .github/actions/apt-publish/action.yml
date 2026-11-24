@@ -1,0 +1,45 @@
+name: Publish to the APT repository
+description: >-
+  Adds the .deb packages of a directory to the signed APT repository on the
+  gh-pages branch (scripts/apt-repo.sh, retention of commit builds) and
+  pushes the result as a single commit. Needs contents: write.
+
+inputs:
+  dist:
+    description: Directory with the .deb packages
+    required: true
+  message:
+    description: Commit message on gh-pages
+    required: true
+  signing-key:
+    description: Armored private signing key (secret APT_GPG_PRIVATE_KEY)
+    required: false
+    default: ""
+  passphrase:
+    description: Passphrase of the signing key, if it has one
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Check the signing key
+      shell: bash
+      env:
+        APT_GPG_PRIVATE_KEY: ${{ inputs.signing-key }}
+      run: |
+        if [ -z "$APT_GPG_PRIVATE_KEY" ]; then
+          echo "::error title=APT signing key missing::The repository secret APT_GPG_PRIVATE_KEY is not set. Add the armored private key under Settings > Secrets and variables > Actions (see README, Maintainers). Nothing was published."
+          exit 1
+        fi
+    - name: Build the repository tools image
+      shell: bash
+      run: docker build -q -f docker/Dockerfile --target aptrepo -t wanderlan-aptrepo . >/dev/null
+    - name: Update the repository and push gh-pages
+      shell: bash
+      env:
+        APT_GPG_PRIVATE_KEY: ${{ inputs.signing-key }}
+        APT_GPG_PASSPHRASE: ${{ inputs.passphrase }}
+        DIST: ${{ inputs.dist }}
+        MESSAGE: ${{ inputs.message }}
+      run: "$GITHUB_ACTION_PATH/publish.sh"

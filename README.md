@@ -81,8 +81,11 @@ sudo apt update && sudo apt install wanderlan
 On minimal installations `curl` and `gpg` may be missing:
 `sudo apt install curl gpg`.
 
-Updates come with `sudo apt upgrade`. Older versions stay in the
-repository: `apt-cache madison wanderlan` lists them and
+Every commit on `main` that passes all tests is published automatically,
+as version `<version>+<build>.g<commit>` (e.g. `0.1.0+57.gc256ea5-1`);
+updates come with `sudo apt upgrade`. The last 20 of these builds and every
+tagged release (e.g. `0.1.0-1`) stay in the repository:
+`apt-cache madison wanderlan` lists them and
 `sudo apt install wanderlan=<version>` downgrades.
 
 The package installs
@@ -93,7 +96,7 @@ The package installs
 | `/usr/bin/wanderlan` | terminal UI and command line |
 | `/usr/lib/systemd/system/wanderland.service` | systemd unit, enabled and started |
 | `/etc/wanderlan/mesh.toml`, `local.toml` | configuration (conffiles, empty templates) |
-| `/usr/share/doc/wanderlan/examples/` | example configuration |
+| `/usr/share/doc/wanderlan/examples/` | example configuration (`wanderlan init` prints it too; minimal images such as Docker's `-slim` skip `/usr/share/doc`) |
 | `/usr/lib/modules-load.d/wanderlan.conf` | kernel modules loaded at boot |
 
 and creates the group `wanderlan`. Members of this group can use the TUI and
@@ -420,21 +423,40 @@ and an in-memory implementation), `wanderland` (daemon) and `wanderlan`
 
 ## Maintainers: releases and the APT repository
 
-One-time setup:
+Publishing is automatic: every push to `main` whose CI run is green
+(`ci.yml`: fmt, clippy, tests, packages for amd64 and arm64 with a smoke
+test, integration tests) is published by `publish.yml`:
+
+* version `<Cargo.toml version>+<CI run number>.g<commit>`, package version
+  with `-1`; the run number makes every build newer than the one before,
+* the packages go into the signed repository on the branch `gh-pages`
+  (one commit without history, so the branch does not grow), suite `stable`;
+  the newest 20 commit builds per architecture stay, tagged releases forever,
+* `verify-apt.yml` then waits until GitHub Pages serves the version,
+  installs it with the commands above on fresh Debian 13, Debian 12 and
+  Ubuntu 24.04, installs exactly this version and downgrades to the previous
+  one, and runs two hosts with the example configuration.
+
+Tags are optional: the tag `v<version>` (equal to the version in
+`Cargo.toml`) makes `release.yml` build the same way, create a GitHub release
+with binaries, packages and `SHA256SUMS`, and add `<version>-1` to the
+repository, where it is kept forever. Later commit builds
+(`<version>+<build>…`) count as newer. To start a new version line, raise
+the version in `Cargo.toml`.
+
+One-time setup (done for this repository):
 
 1. Create the signing key (RSA 4096) outside the repository:
    `scripts/gen-apt-key.sh ~/wanderlan-apt-key`, and commit its public part
-   as `key.gpg` in the repository root (the release publishes it as
-   `key.gpg` on GitHub Pages as well). Current key fingerprint:
+   as `key.gpg` in the repository root (every publication puts it on GitHub
+   Pages as well). Current key fingerprint:
    `F6C4 00CF 318B FD47 E3A6  B8A7 7BC2 D7AE 6699 82D4`.
 2. Store `private.asc` as the repository secret `APT_GPG_PRIVATE_KEY`
    (Settings → Secrets and variables → Actions) and keep a backup offline.
-3. After the first release, set GitHub Pages to "Deploy from a branch",
-   branch `gh-pages`, folder `/`.
+   Without it a publication stops with an error and changes nothing.
+3. Set GitHub Pages to "Deploy from a branch", branch `gh-pages`, folder `/`.
 
-A release: set the version in `Cargo.toml`, update `CHANGELOG.md`, push the
-tag `v<version>`. `release.yml` builds amd64 and arm64 natively, creates the
-GitHub release with binaries, packages and `SHA256SUMS`, adds the packages to
-the signed repository on `gh-pages` (older versions stay), waits until Pages
-serves it, installs it on fresh Debian 13, Debian 12 and Ubuntu 24.04 with
-the commands above and runs two hosts with the example configuration.
+Locally: `scripts/build.sh` (with `WANDERLAN_VERSION=…` for a specific
+version), `scripts/smoke-test.sh dist <package version>`,
+`scripts/test-apt-repo.sh` (retention, indices and signatures of the
+repository script with a throwaway key).

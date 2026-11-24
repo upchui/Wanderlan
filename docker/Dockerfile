@@ -46,9 +46,12 @@ RUN --mount=type=cache,target=/src/target,id=wanderlan-target-check \
 
 # Release build and .deb package. RUST_TARGET defaults to the musl target of
 # the platform being built; set it to cross-compile (e.g. arm64 on amd64).
+# WANDERLAN_VERSION overrides the version from Cargo.toml (binaries, package
+# version "<version>-1" and file names); CI sets it for every commit on main.
 FROM deps AS build
 ARG TARGETARCH
 ARG RUST_TARGET=""
+ARG WANDERLAN_VERSION=""
 COPY . .
 RUN --mount=type=cache,target=/src/target,id=wanderlan-target-build \
     set -eu; \
@@ -60,11 +63,16 @@ RUN --mount=type=cache,target=/src/target,id=wanderlan-target-build \
         *) echo "unsupported architecture ${TARGETARCH}" >&2; exit 1 ;; \
       esac; \
     fi; \
+    version="${WANDERLAN_VERSION}"; \
+    if [ -z "$version" ]; then \
+      version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1); \
+    fi; \
+    export WANDERLAN_VERSION="$version"; \
     cargo build --release --locked --offline --target "$target" -p wanderland -p wanderlan; \
     mkdir -p /out; \
-    cargo deb --no-build --locked --offline --target "$target" -p wanderlan --output /out/; \
+    cargo deb --no-build --locked --offline --target "$target" -p wanderlan \
+      --deb-version "${version}-1" --output /out/; \
     case "$target" in x86_64*) arch=amd64 ;; aarch64*) arch=arm64 ;; esac; \
-    version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1); \
     cp "target/$target/release/wanderland" "/out/wanderland-${version}-linux-${arch}"; \
     cp "target/$target/release/wanderlan" "/out/wanderlan-${version}-linux-${arch}"; \
     ls -l /out
@@ -100,10 +108,11 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 
 # A fresh Debian/Ubuntu that installs wanderlan from the published APT
-# repository with exactly the commands from the README.
+# repository with exactly the commands from the README. MIN_VERSION: the
+# installed (newest) version must be at least this one.
 FROM ${REPOTEST_BASE} AS repotest
 ARG REPO_URL=https://upchui.github.io/Wanderlan
-ARG EXPECT_VERSION=""
+ARG MIN_VERSION=""
 ARG CACHE_BUST=""
 ENV DEBIAN_FRONTEND=noninteractive
 # Prerequisites a minimal container lacks (a normal installation has them),
@@ -119,7 +128,7 @@ RUN echo "repotest ${CACHE_BUST}" \
 RUN wanderlan --version && wanderland --version \
  && installed=$(dpkg-query -W -f '${Version}' wanderlan) \
  && echo "installed wanderlan ${installed}" \
- && if [ -n "${EXPECT_VERSION}" ]; then test "${installed}" = "${EXPECT_VERSION}"; fi \
+ && if [ -n "${MIN_VERSION}" ]; then dpkg --compare-versions "${installed}" ge "${MIN_VERSION}"; fi \
  && getent group wanderlan \
  && test -f /lib/systemd/system/wanderland.service -o -f /usr/lib/systemd/system/wanderland.service \
  && wanderlan init | grep -q '^\[mesh\]' 

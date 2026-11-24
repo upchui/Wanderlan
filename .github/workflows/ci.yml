@@ -1,7 +1,11 @@
 name: CI
 
+# Every push to a branch and every pull request: fmt, clippy, tests, the
+# packages for amd64 and arm64 with a smoke test, and the integration tests.
+# A green run on main is published to the APT repository by publish.yml.
 on:
   push:
+    branches: ["**"]
   pull_request:
 
 permissions:
@@ -11,67 +15,77 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  DOCKER_BUILD_SUMMARY: false
+  DOCKER_BUILD_RECORD_UPLOAD: false
+
 jobs:
+  version:
+    name: version
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: v
+        name: Version of this build
+        # main: <Cargo.toml version>+<run number>.g<commit>, newer with every
+        # run; elsewhere the plain Cargo.toml version (never published).
+        run: |
+          base=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+            version="${base}+${GITHUB_RUN_NUMBER}.g${GITHUB_SHA::7}"
+          else
+            version="$base"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "### wanderlan $version" >> "$GITHUB_STEP_SUMMARY"
+
   check:
     name: fmt, clippy, tests
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Build check stage
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
           target: check
           push: false
+          provenance: false
           cache-from: type=gha,scope=check
           cache-to: type=gha,mode=max,scope=check
+      - name: APT repository script (retention, indices, signatures)
+        run: scripts/test-apt-repo.sh
 
   build:
-    name: package (${{ matrix.arch }})
-    runs-on: ubuntu-24.04
-    strategy:
-      matrix:
-        include:
-          - arch: amd64
-            rust_target: ""
-          - arch: arm64
-            rust_target: aarch64-unknown-linux-musl
-    steps:
-      - uses: actions/checkout@v5
-      - uses: docker/setup-buildx-action@v3
-      - name: Build binaries and .deb
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: docker/Dockerfile
-          target: artifacts
-          build-args: RUST_TARGET=${{ matrix.rust_target }}
-          outputs: type=local,dest=dist
-          cache-from: type=gha,scope=build-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=build-${{ matrix.arch }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: wanderlan-${{ matrix.arch }}
-          path: dist/
+    name: build
+    needs: version
+    uses: ./.github/workflows/build.yml
+    with:
+      version: ${{ needs.version.outputs.version }}
 
   integration:
     name: integration tests
+    needs: version
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
       - name: Load kernel modules
         run: scripts/load-modules.sh
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
       - name: Build testnode image (installs the .deb)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile
           target: testnode
+          build-args: WANDERLAN_VERSION=${{ needs.version.outputs.version }}
           load: true
           tags: wanderlan-testnode
+          provenance: false
           cache-from: type=gha,scope=build-amd64
       - name: Run integration tests
         run: tests/integration/run.sh

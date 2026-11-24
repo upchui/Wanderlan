@@ -6,6 +6,25 @@ All notable changes to wanderlan are documented in this file.
 
 First release. Everything below this line went into it.
 
+### Continuous delivery
+
+- Every commit on `main` whose CI run is green is published to the APT
+  repository automatically (`publish.yml`), as version
+  `<version>+<CI run>.g<commit>-1`; the binaries report the same version.
+  The newest 20 commit builds per architecture stay in the repository,
+  tagged releases forever; a published file never changes.
+- After every publication `verify-apt.yml` installs from the repository on
+  Debian 13, Debian 12 and Ubuntu 24.04 (README commands, exactly this
+  version, downgrade) and runs two hosts with the example configuration.
+- CI and Release build through the same workflow (`build.yml`): native
+  amd64 and arm64 builds with a smoke test of the package
+  (`scripts/smoke-test.sh`).
+- Fix: the release smoke test validated the examples under
+  `/usr/share/doc`, which slim Debian images do not install; it now checks
+  the unpacked package and the installation separately.
+- Workflows use the Node 24 versions of the Docker and artifact actions,
+  without provenance attestation and build records.
+
 ### Fixes
 
 - Loop guard: the FDB watch socket has a 4 MiB buffer and NETLINK_NO_ENOBUFS,

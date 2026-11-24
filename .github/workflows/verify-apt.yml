@@ -1,0 +1,90 @@
+name: Verify APT repository
+
+# After a publication: waits until GitHub Pages serves the version, installs
+# wanderlan with the README commands on fresh Debian 13, Debian 12 and
+# Ubuntu 24.04, installs exactly the published version and an older one, and
+# runs two hosts with the example configuration.
+on:
+  workflow_call:
+    inputs:
+      deb_version:
+        description: Published package version, e.g. 0.1.0+57.gc256ea5-1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+  DEB_VERSION: ${{ inputs.deb_version }}
+
+jobs:
+  served:
+    name: GitHub Pages serves the version
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Wait for Pages (index and signature consistent)
+        run: |
+          repo="$PAGES_URL/apt/dists/stable"
+          for _ in $(seq 1 60); do
+            if curl -fsSL "$repo/InRelease" -o InRelease \
+              && curl -fsSL "$repo/main/binary-amd64/Packages" -o Packages \
+              && grep -qx "Version: $DEB_VERSION" Packages \
+              && grep -q " $(sha256sum < Packages | cut -d' ' -f1) .* main/binary-amd64/Packages\$" InRelease; then
+              echo "$PAGES_URL serves wanderlan $DEB_VERSION"
+              exit 0
+            fi
+            sleep 20
+          done
+          echo "::error::$PAGES_URL did not serve wanderlan $DEB_VERSION within 20 minutes. Check Settings > Pages: Deploy from a branch, gh-pages, / (root)."
+          exit 1
+
+  install:
+    name: install (${{ matrix.base }})
+    needs: served
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        base: ["debian:13", "debian:12", "ubuntu:24.04"]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install with the README commands
+        run: |
+          docker build -f docker/Dockerfile --target repotest \
+            --build-arg REPOTEST_BASE=${{ matrix.base }} \
+            --build-arg REPO_URL="$PAGES_URL" \
+            --build-arg MIN_VERSION="$DEB_VERSION" \
+            --build-arg CACHE_BUST="$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            -t wanderlan-repotest .
+      - name: Install exactly this version, then downgrade to an older one
+        run: |
+          docker run --rm -e DEB_VERSION wanderlan-repotest bash -euc '
+            versions=$(apt-cache madison wanderlan | awk "{print \$3}")
+            echo "published versions:"; echo "$versions"
+            installed() { dpkg-query -W -f "\${Version}" wanderlan; }
+            apt-get install -y --allow-downgrades "wanderlan=$DEB_VERSION"
+            test "$(installed)" = "$DEB_VERSION"
+            older=""
+            for v in $versions; do
+              if dpkg --compare-versions "$v" lt "$DEB_VERSION"; then older="$v"; break; fi
+            done
+            if [ -n "$older" ]; then
+              apt-get install -y --allow-downgrades "wanderlan=$older"
+              test "$(installed)" = "$older"
+              echo "downgrade from $DEB_VERSION to $older works"
+            else
+              echo "no older version published yet"
+            fi'
+
+  acceptance:
+    name: two hosts with the example configuration (Debian 13)
+    needs: install
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - name: Load kernel modules
+        run: scripts/load-modules.sh
+      - name: Install from the repository and run the example configuration
+        run: REPO_URL="$PAGES_URL" tests/repotest/run.sh

@@ -19,4 +19,11 @@ pub mod topology;
 pub const BRIDGE_NAME: &str = "br0";
 
 /// Version of the wanderlan workspace, shared by all binaries.
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+///
+/// Builds from CI set `WANDERLAN_VERSION` to the package version, e.g.
+/// `0.1.0+57.gc256ea5` for a commit on main; otherwise it is the version
+/// from `Cargo.toml`.
+pub const VERSION: &str = match option_env!("WANDERLAN_VERSION") {
+    Some(v) if !v.is_empty() => v,
+    _ => env!("CARGO_PKG_VERSION"),
+};

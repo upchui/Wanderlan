@@ -10,16 +10,63 @@
 # <pages>/apt/dists/stable/main/binary-{amd64,arm64}/Packages(.gz),
 # <pages>/apt/pool/main/w/wanderlan/*.deb. Older packages stay in the pool,
 # so `apt install wanderlan=<version>` can downgrade.
+#
+# Retention: builds of commits on main have a "+" in their version
+# (0.1.0+57.gc256ea5-1); per architecture only the newest KEEP of them
+# (default 20) stay. Tagged releases (no "+", e.g. 0.1.0-1) stay forever.
 set -euo pipefail
 
 pages="${1:?usage: apt-repo.sh <pages-dir> <deb>...}"
 shift
+mkdir -p "$pages"
+pages=$(cd "$pages" && pwd)   # absolute: the script changes directories below
 : "${APT_GPG_PRIVATE_KEY:?the armored private signing key must be in APT_GPG_PRIVATE_KEY}"
+keep="${KEEP:-20}"
 
 pool="$pages/apt/pool/main/w/wanderlan"
 mkdir -p "$pool"
+# A published file never changes: apt clients that already know its hash
+# would reject it. Adding the same version again (a re-run) keeps the
+# published file.
 for deb in "$@"; do
-  cp -v "$deb" "$pool/"
+  name=$(basename "$deb")
+  if [ ! -e "$pool/$name" ]; then
+    cp -v "$deb" "$pool/"
+  elif cmp -s "$deb" "$pool/$name"; then
+    echo "$name is already published"
+  else
+    echo "warning: $name is already published with different content; the published file stays" >&2
+  fi
+done
+
+# Reads versions (one per line) and prints them newest first, in dpkg order.
+newest_first() {
+  local sorted=() v i placed
+  while read -r v; do
+    [ -n "$v" ] || continue
+    placed=0
+    for i in "${!sorted[@]}"; do
+      if dpkg --compare-versions "$v" gt "${sorted[$i]}"; then
+        sorted=("${sorted[@]:0:$i}" "$v" "${sorted[@]:$i}")
+        placed=1
+        break
+      fi
+    done
+    [ "$placed" = 1 ] || sorted+=("$v")
+  done
+  if [ "${#sorted[@]}" -gt 0 ]; then printf '%s\n' "${sorted[@]}"; fi
+}
+
+for arch in amd64 arm64; do
+  n=0
+  while read -r v; do
+    case "$v" in *+*) ;; *) continue ;; esac
+    n=$((n + 1))
+    if [ "$n" -gt "$keep" ]; then
+      rm -v "$pool/wanderlan_${v}_${arch}.deb"
+    fi
+  done < <(find "$pool" -maxdepth 1 -name "wanderlan_*_${arch}.deb" -printf '%f\n' \
+             | sed -n "s/^wanderlan_\(.*\)_${arch}\.deb\$/\1/p" | newest_first)
 done
 
 export GNUPGHOME
