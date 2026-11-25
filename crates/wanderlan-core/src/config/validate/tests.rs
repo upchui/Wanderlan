@@ -3,7 +3,7 @@ use crate::config::{
     parse_network, render_local, render_network,
 };
 
-const EXAMPLE_NETWORK: &str = include_str!("../../../../../packaging/examples/network.toml");
+const EXAMPLE_NETWORK: &str = include_str!("../testdata/network-v1.toml");
 const EXAMPLE_LOCAL: &str = include_str!("../../../../../packaging/examples/local.toml");
 const LOCAL: &str = "self = \"haus2\"\ntrunk = \"ens19\"\n";
 
@@ -490,14 +490,21 @@ fn uplinks_make_clients_and_old_configurations_are_migrated() {
     assert_eq!(network.site("alex").unwrap().uplink, None);
     // Written explicitly from now on; the canonical form reads back the same.
     let text = render_network(&network);
-    assert_eq!(text.matches("uplink = \"alex\"").count(), 2, "{text}");
+    assert_eq!(text.matches("server = \"alex\"").count(), 2, "{text}");
     assert_eq!(parse_network(&text).unwrap().network.unwrap(), network);
-    // A server with a manager stays a server: `uplink = ""`.
+    // A server with a manager stays a server: no `server` in format 2,
+    // `uplink = ""` in the form the sites exchange.
     let mut server = network.clone();
     server.sites[1].uplink = None;
     let text = render_network(&server);
-    assert!(text.contains("uplink = \"\""), "{text}");
+    assert!(
+        text.contains("[site.marcel]\naddress = \"10.0.10.5\"\nmanaged_by = \"alex\"\n"),
+        "{text}"
+    );
     assert_eq!(parse_network(&text).unwrap().network.unwrap(), server);
+    let wire = crate::config::render_network_wire(&server);
+    assert!(wire.contains("uplink = \"\""), "{wire}");
+    assert_eq!(parse_network(&wire).unwrap().network.unwrap(), server);
 }
 
 #[test]
@@ -506,7 +513,7 @@ fn uplinks_must_lead_to_a_server() {
     let unknown = CLIENTS.replace("uplink = \"alex\"", "uplink = \"nowhere\"");
     let err = single_error(&unknown, local);
     assert!(
-        err.message.contains("uplink \"nowhere\" is not a site"),
+        err.message.contains("server \"nowhere\" is not a site"),
         "{err}"
     );
     assert_eq!(
@@ -517,7 +524,7 @@ fn uplinks_must_lead_to_a_server() {
     assert!(
         single_error(&itself, local)
             .message
-            .contains("uplink is the site itself")
+            .contains("cannot be its own server")
     );
     let looped = CLIENTS
         .replace("uplink = \"alex\"", "uplink = \"marcel\"")
@@ -529,7 +536,7 @@ fn uplinks_must_lead_to_a_server() {
     assert!(
         errs.iter().any(|e| e
             .message
-            .contains("uplinks form a loop: marcel -> site2 -> marcel")),
+            .contains("the servers form a loop: marcel -> site2 -> marcel")),
         "{errs:#?}"
     );
 }
@@ -622,14 +629,19 @@ fn tunnel_limits_are_read_written_and_checked() {
             .expect("none")
             .is_empty()
     );
+    // Three servers: both limits at heim, the first of them.
     let text = render_network(&cfg.network);
     assert!(
-        text.contains("[[tunnel]]\nbetween = [\"buero\", \"heim\"]\nvlans = \"20-30\"\n"),
+        text.contains("tunnel_vlans = { buero = \"20-30\", haus2 = \"none\" }\n"),
         "{text}"
     );
-    assert!(text.contains("vlans = \"none\""), "{text}");
     let again = parse_network(&text).unwrap().network.unwrap();
     assert_eq!(again.tunnels, cfg.network.tunnels);
+    let wire = crate::config::render_network_wire(&cfg.network);
+    assert!(
+        wire.contains("[[tunnel]]\nbetween = [\"buero\", \"heim\"]\nvlans = \"20-30\"\n"),
+        "{wire}"
+    );
     assert_ne!(
         fingerprint(&again),
         fingerprint(&Network {
@@ -670,7 +682,7 @@ fn wrong_tunnel_limits_are_errors() {
     );
     let err = single_error(&twice, LOCAL);
     assert!(
-        err.message.contains("already has its VLANs in tunnel #1"),
+        err.message.contains("is limited twice (tunnel #1 and #2)"),
         "{err}"
     );
 }
@@ -746,4 +758,265 @@ fn a_trunk_port_belongs_to_one_segment() {
         "{:?}",
         outcome.warnings
     );
+}
+
+// Format 2: `[site.<name>]` with `map` and `tunnel_vlans` inside.
+
+const EXAMPLE_NETWORK_2: &str = include_str!("../../../../../packaging/examples/network.toml");
+
+/// `text` with `from` replaced; fails if `from` is not there (a silent
+/// no-op would test nothing).
+fn edit(text: &str, from: &str, to: &str) -> String {
+    assert!(text.contains(from), "{from:?} not in the text");
+    text.replacen(from, to, 1)
+}
+
+#[test]
+fn both_formats_describe_the_same_network() {
+    let old = parse_network(EXAMPLE_NETWORK).unwrap();
+    let new = parse_network(EXAMPLE_NETWORK_2).unwrap();
+    assert!(old.old_format);
+    assert!(!new.old_format);
+    assert_eq!(old.network, new.network);
+    let outcome = load(EXAMPLE_NETWORK_2, EXAMPLE_LOCAL).expect("example loads");
+    assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
+}
+
+#[test]
+fn format_2_is_written_and_read_back() {
+    let network = parse_network(EXAMPLE_NETWORK_2).unwrap().network.unwrap();
+    let text = render_network(&network);
+    assert!(
+        text.contains(
+            "\n[site.haus3]\naddress = \"10.8.0.12\"\nmap = { 20 = \"native\", 30 = 130 }\n"
+        ),
+        "{text}"
+    );
+    assert!(
+        !text.contains("[[site]]") && !text.contains("[[map]]"),
+        "{text}"
+    );
+    let again = parse_network(&text).unwrap();
+    assert!(!again.old_format);
+    assert_eq!(again.network.as_ref(), Some(&network));
+    assert_eq!(render_network(&network), text, "canonical");
+}
+
+/// The form the sites send each other, and its fingerprint: exactly what
+/// wanderlan 1.0 sent. If this changes, sites of different versions no
+/// longer see the same network as the same.
+#[test]
+fn the_wire_form_never_changes() {
+    let network = parse_network(EXAMPLE_NETWORK_2).unwrap().network.unwrap();
+    let wire = crate::config::render_network_wire(&network);
+    assert_eq!(
+        wire,
+        "# wanderlan network configuration, shared by all sites.\n\
+         # This file is kept identical on all sites by the wanderlan daemon.\n\
+         # Change it with the `wanderlan` TUI or edit it and run `wanderlan apply`.\n\
+         \n[network]\nrevision = 0\nvlans = \"10-50\"\ncontrol_port = 51821\n\
+         mtu_probe_interval = \"5m\"\ncommit_timeout = \"1m\"\n\
+         \n[[site]]\nname = \"heim\"\naddress = \"10.8.0.1\"\n\
+         \n[[site]]\nname = \"buero\"\naddress = \"10.8.0.2\"\n\
+         \n[[site]]\nname = \"haus2\"\naddress = \"10.8.0.11\"\nvlans = \"20,30\"\n\
+         \n[[site]]\nname = \"haus3\"\naddress = \"10.8.0.12\"\n\
+         \n[[map]]\nsite = \"haus3\"\nlocal = \"native\"\nshared = 20\n\
+         \n[[map]]\nsite = \"haus3\"\nlocal = 130\nshared = 30\n"
+    );
+    assert_eq!(
+        fingerprint(&network),
+        "8bafc5da21a7724f3687059252586b7ce8751c9a463d6831eefdeaaa260b76cf"
+    );
+    // And older sites read it: format 1.
+    assert!(parse_network(&wire).unwrap().old_format);
+}
+
+#[test]
+fn sites_keep_the_order_of_the_file() {
+    let text = "[network]\nvlans = \"10\"\n\n[site.zeta]\naddress = \"10.0.0.1\"\nmap = { 30 = 130, 10 = \"native\" }\n\n[site.alpha]\naddress = \"10.0.0.2\"\n";
+    let network = parse_network(text).unwrap().network.unwrap();
+    let names: Vec<&str> = network.sites.iter().map(|s| s.name.as_str()).collect();
+    assert_eq!(names, ["zeta", "alpha"]);
+    let shared: Vec<u16> = network.maps.iter().map(|m| m.shared).collect();
+    assert_eq!(shared, [30, 10]);
+}
+
+#[test]
+fn server_and_tunnel_limits_in_format_2() {
+    let text = edit(
+        EXAMPLE_NETWORK_2,
+        "[site.haus2]\naddress = \"10.8.0.11\"\n",
+        "[site.haus2]\naddress = \"10.8.0.11\"\nserver = \"heim\"\ntunnel_vlans = { heim = \"20\" }\n",
+    );
+    let text = edit(
+        &text,
+        "[site.heim]\naddress = \"10.8.0.1\"\n",
+        "[site.heim]\naddress = \"10.8.0.1\"\ntunnel_vlans = { buero = \"none\" }\n",
+    );
+    let network = parse_network(&text).unwrap().network.unwrap();
+    assert_eq!(
+        network.site("haus2").unwrap().uplink.as_deref(),
+        Some("heim")
+    );
+    assert_eq!(network.tunnels.len(), 2);
+    assert_eq!(
+        network
+            .tunnel_limit("heim", "haus2")
+            .map(ToString::to_string),
+        Some("20".to_string())
+    );
+    assert!(network.tunnel_limit("buero", "heim").unwrap().is_empty());
+    // Written back at the client, between two servers at the first one.
+    let rendered = render_network(&network);
+    assert!(
+        rendered.contains("[site.haus2]\naddress = \"10.8.0.11\"\nserver = \"heim\"\nvlans = \"20,30\"\ntunnel_vlans = { heim = \"20\" }\n"),
+        "{rendered}"
+    );
+    assert!(
+        rendered
+            .contains("[site.heim]\naddress = \"10.8.0.1\"\ntunnel_vlans = { buero = \"none\" }\n"),
+        "{rendered}"
+    );
+    assert_eq!(parse_network(&rendered).unwrap().network.unwrap(), network);
+    // A manager alone does not make a site a client (only in format 1).
+    let managed = edit(
+        EXAMPLE_NETWORK_2,
+        "[site.buero]\naddress = \"10.8.0.2\"\n",
+        "[site.buero]\naddress = \"10.8.0.2\"\nmanaged_by = \"heim\"\n",
+    );
+    let network = parse_network(&managed).unwrap().network.unwrap();
+    assert_eq!(network.site("buero").unwrap().uplink, None);
+}
+
+#[test]
+fn format_1_files_with_a_manager_become_explicit_clients() {
+    let old = edit(
+        EXAMPLE_NETWORK,
+        "name = \"haus2\"\naddress = \"10.8.0.11\"\n",
+        "name = \"haus2\"\naddress = \"10.8.0.11\"\nmanaged_by = \"heim\"\n",
+    );
+    let network = parse_network(&old).unwrap().network.unwrap();
+    assert_eq!(
+        network.site("haus2").unwrap().uplink.as_deref(),
+        Some("heim")
+    );
+    let new = render_network(&network);
+    assert!(
+        new.contains(
+            "[site.haus2]\naddress = \"10.8.0.11\"\nserver = \"heim\"\nmanaged_by = \"heim\"\n"
+        ),
+        "{new}"
+    );
+    assert_eq!(parse_network(&new).unwrap().network.unwrap(), network);
+}
+
+#[test]
+fn errors_in_format_2_name_the_line() {
+    let haus3 = "[site.haus3]\naddress = \"10.8.0.12\"\n";
+    for (from, to, needle, message) in [
+        (
+            haus3,
+            "[site.haus3]\naddress = \"10.8.0.12\"\ncolour = \"red\"\n",
+            "colour",
+            "unknown field `colour`",
+        ),
+        (
+            haus3,
+            "[site.haus3]\naddress = \"10.8.0.12\"\nserver = \"\"\n",
+            "server = \"\"",
+            "a site without `server` is a server",
+        ),
+        (
+            haus3,
+            "[site.haus3]\naddress = \"10.8.0.12\"\nserver = \"nowhere\"\n",
+            "server = \"nowhere\"",
+            "server \"nowhere\" is not a site of the network",
+        ),
+        (
+            haus3,
+            "[site.haus3]\naddress = \"10.8.0.12\"\nserver = \"haus3\"\n",
+            "server = \"haus3\"",
+            "cannot be its own server",
+        ),
+        (
+            "map = { 20 = \"native\", 30 = 130 }",
+            "map = { 20 = \"native\", 30x = 130 }",
+            "30x",
+            "\"30x\" is not a VLAN ID",
+        ),
+        (
+            "map = { 20 = \"native\", 30 = 130 }",
+            "map = { 20 = \"native\", 5000 = 130 }",
+            "5000",
+            "\"5000\" is not a VLAN ID",
+        ),
+        (
+            "map = { 20 = \"native\", 30 = 130 }",
+            "map = { 20 = \"untagged\", 30 = 130 }",
+            "\"untagged\"",
+            "must be a VLAN ID or \"native\"",
+        ),
+        (
+            "map = { 20 = \"native\", 30 = 130 }",
+            "map = { 20 = \"native\", 30 = 9999 }",
+            "9999",
+            "must be between 1 and 4094",
+        ),
+        (
+            "map = { 20 = \"native\", 30 = 130 }",
+            "map = { 20 = \"native\", 30 = 130, 60 = 160 }",
+            "60 = 160",
+            "source VLAN 60 is not one of the VLANs",
+        ),
+        (
+            haus3,
+            "[site.haus3]\naddress = \"10.8.0.12\"\ntunnel_vlans = { nowhere = \"20\" }\n",
+            "nowhere",
+            "site \"nowhere\" does not exist",
+        ),
+        (
+            haus3,
+            "[site.haus3]\naddress = \"10.8.0.12\"\ntunnel_vlans = { haus3 = \"20\" }\n",
+            "haus3 = ",
+            "not \"haus3\" with itself",
+        ),
+        (
+            haus3,
+            "[site.haus3]\naddress = \"10.8.0.12\"\ntunnel_vlans = { heim = \"5000\" }\n",
+            "\"5000\"",
+            "tunnel_vlans: heim:",
+        ),
+        (
+            "[site.buero]\naddress = \"10.8.0.2\"\n",
+            "[site.buero]\n",
+            "[site.buero]",
+            "site \"buero\": address is missing",
+        ),
+        (
+            "\n[site.heim]",
+            "\n[[map]]\nsite = \"heim\"\nlocal = 5\nshared = 20\n\n[site.heim]",
+            "[[map]]",
+            "belongs to the older format",
+        ),
+    ] {
+        let text = edit(EXAMPLE_NETWORK_2, from, to);
+        let line = line_of(&text, "", needle);
+        let err = single_error(&text, LOCAL);
+        assert!(err.message.contains(message), "{message:?} not in {err}");
+        assert_eq!(err.line, Some(line), "wrong line for {err}\n{text}");
+    }
+    // Limited at both sites.
+    let both = edit(
+        EXAMPLE_NETWORK_2,
+        "[site.heim]\naddress = \"10.8.0.1\"\n",
+        "[site.heim]\naddress = \"10.8.0.1\"\ntunnel_vlans = { buero = \"20\" }\n",
+    );
+    let both = edit(
+        &both,
+        "[site.buero]\naddress = \"10.8.0.2\"\n",
+        "[site.buero]\naddress = \"10.8.0.2\"\ntunnel_vlans = { heim = \"30\" }\n",
+    );
+    let err = single_error(&both, LOCAL);
+    assert!(err.message.contains("is limited at both sites"), "{err}");
+    assert_eq!(err.line, Some(line_of(&both, "[site.buero]", "heim = ")));
 }

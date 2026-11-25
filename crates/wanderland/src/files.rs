@@ -50,8 +50,10 @@ impl Paths {
     /// Moves the files of older versions (`mesh.toml` with a `[mesh]`
     /// table) to `network.toml`, in the configuration directory and in the
     /// confirmed copy. A `network.toml` with a configuration of its own
-    /// (not just the package template or comments) is kept. Returns a line
-    /// per moved file.
+    /// (not just the package template or comments) is kept. Then a
+    /// `network.toml` in format 1 (`[[site]]`, `[[map]]`) is written in
+    /// format 2; the old file stays as `network.toml.v1` for an older
+    /// version. Returns a line per moved or converted file.
     pub fn migrate(&self) -> Result<Vec<String>> {
         let mut moved = Vec::new();
         for dir in [self.config_dir.clone(), self.confirmed_dir()] {
@@ -70,7 +72,33 @@ impl Paths {
                 remove_optional(&old)?;
             }
         }
+        for (path, backup) in [
+            (self.network(), Some(self.old_format_copy())),
+            (self.confirmed_dir().join("network.toml"), None),
+        ] {
+            let text = read_optional(&path)?;
+            let Ok(parsed) = wanderlan_core::config::parse_network(&text) else {
+                continue;
+            };
+            let (Some(network), true) = (parsed.network, parsed.old_format) else {
+                continue;
+            };
+            if let Some(backup) = backup {
+                write_atomic(&backup, &text)?;
+                moved.push(format!(
+                    "{} was converted to the new format; the old file is kept as {}",
+                    path.display(),
+                    backup.display()
+                ));
+            }
+            write_atomic(&path, &render_network(&network))?;
+        }
         Ok(moved)
+    }
+
+    /// `network.toml` in format 1 as it was before the conversion.
+    fn old_format_copy(&self) -> PathBuf {
+        self.config_dir.join("network.toml.v1")
     }
 
     /// Reads both files; missing files are empty.
@@ -159,7 +187,11 @@ impl Paths {
         };
         attempt(write_atomic(&self.network(), TEMPLATE_NETWORK));
         attempt(write_atomic(&self.local(), TEMPLATE_LOCAL));
-        for name in ["network.toml.rejected", "local.toml.rejected"] {
+        for name in [
+            "network.toml.rejected",
+            "local.toml.rejected",
+            "network.toml.v1",
+        ] {
             attempt(remove_optional(&self.config_dir.join(name)));
         }
         match std::fs::read_dir(&self.state_dir) {
@@ -304,6 +336,49 @@ mod tests {
 
     const OLD: &str = "# comment\n[mesh]\nrevision = 3\nvlans = \"10-50\"\n\n[[site]]\nname = \"a\"\naddress = \"10.0.0.1\"\n";
 
+    /// The same network in format 2.
+    fn in_format_2(text: &str) -> String {
+        let network = wanderlan_core::config::parse_network(text)
+            .unwrap()
+            .network
+            .unwrap();
+        render_network(&network)
+    }
+
+    #[test]
+    fn a_network_toml_in_format_1_is_converted() {
+        let (base, paths) = temp_paths("migrate-format");
+        let old = "[network]\nrevision = 7\nvlans = \"10-50\"\n\n[[site]]\nname = \"hq\"\naddress = \"10.0.0.1\"\n\n[[site]]\nname = \"lab\"\naddress = \"10.0.0.2\"\nuplink = \"hq\"\n\n[[map]]\nsite = \"lab\"\nlocal = 130\nshared = 30\n";
+        std::fs::write(paths.network(), old).unwrap();
+        std::fs::write(paths.local(), "self = \"lab\"\ntrunk = \"ens19\"\n").unwrap();
+        paths.save_copy().unwrap();
+        let moved = paths.migrate().unwrap();
+        assert_eq!(moved.len(), 1, "{moved:?}");
+        assert!(moved[0].contains("network.toml.v1"), "{moved:?}");
+        let new = std::fs::read_to_string(paths.network()).unwrap();
+        assert!(
+            new.contains(
+                "[site.lab]\naddress = \"10.0.0.2\"\nserver = \"hq\"\nmap = { 30 = 130 }\n"
+            ),
+            "{new}"
+        );
+        assert!(new.contains("revision = 7"), "{new}");
+        assert_eq!(
+            std::fs::read_to_string(paths.old_format_copy()).unwrap(),
+            old
+        );
+        // The same network, the confirmed copy too.
+        let parse = |t: &str| wanderlan_core::config::parse_network(t).unwrap().network;
+        assert_eq!(parse(&new), parse(old));
+        assert_eq!(
+            std::fs::read_to_string(paths.confirmed_dir().join("network.toml")).unwrap(),
+            new
+        );
+        // A second start changes nothing.
+        assert!(paths.migrate().unwrap().is_empty());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     #[test]
     fn the_files_of_older_versions_are_moved() {
         let (base, paths) = temp_paths("migrate");
@@ -314,14 +389,13 @@ mod tests {
         std::fs::create_dir_all(paths.confirmed_dir()).unwrap();
         std::fs::write(paths.confirmed_dir().join("mesh.toml"), OLD).unwrap();
         let moved = paths.migrate().unwrap();
-        assert_eq!(moved.len(), 3, "{moved:?}");
+        // Three files moved, then network.toml written in format 2.
+        assert_eq!(moved.len(), 4, "{moved:?}");
         let new = std::fs::read_to_string(paths.network()).unwrap();
-        assert_eq!(new, OLD.replace("[mesh]", "[network]"));
-        assert!(
-            wanderlan_core::config::parse_network(&new)
-                .unwrap()
-                .network
-                .is_some()
+        assert_eq!(new, in_format_2(&OLD.replace("[mesh]", "[network]")));
+        assert_eq!(
+            std::fs::read_to_string(paths.old_format_copy()).unwrap(),
+            OLD.replace("[mesh]", "[network]")
         );
         for dir in [&paths.config_dir, &paths.confirmed_dir()] {
             assert!(!dir.join("mesh.toml").exists());
@@ -338,10 +412,10 @@ mod tests {
         let (base, paths) = temp_paths("migrate-comments");
         std::fs::write(paths.network(), "# not configured\n").unwrap();
         std::fs::write(paths.config_dir.join("mesh.toml"), OLD).unwrap();
-        assert_eq!(paths.migrate().unwrap().len(), 1);
+        assert_eq!(paths.migrate().unwrap().len(), 2);
         assert_eq!(
             std::fs::read_to_string(paths.network()).unwrap(),
-            OLD.replace("[mesh]", "[network]")
+            in_format_2(&OLD.replace("[mesh]", "[network]"))
         );
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -413,6 +487,7 @@ mod tests {
         std::fs::write(paths.network(), "configured").unwrap();
         std::fs::write(paths.local(), "self = \"a\"").unwrap();
         std::fs::write(paths.config_dir.join("network.toml.rejected"), "x").unwrap();
+        std::fs::write(paths.old_format_copy(), "[[site]]").unwrap();
         paths.save_copy().unwrap();
         paths.set_marker().unwrap();
         std::fs::write(paths.invites(), "[]").unwrap();
@@ -426,6 +501,7 @@ mod tests {
             TEMPLATE_LOCAL
         );
         assert!(!paths.config_dir.join("network.toml.rejected").exists());
+        assert!(!paths.old_format_copy().exists());
         assert!(paths.state_dir.exists(), "the state directory itself stays");
         assert_eq!(std::fs::read_dir(&paths.state_dir).unwrap().count(), 0);
         assert_eq!(paths.leftovers(), Vec::<String>::new());

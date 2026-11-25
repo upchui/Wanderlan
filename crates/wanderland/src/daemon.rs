@@ -25,7 +25,7 @@ use wanderlan_core::api::{
 };
 use wanderlan_core::config::{
     self, Config, ConfigFile, Diagnostic, Loaded, Network, render_local, render_network,
-    unified_diff,
+    render_network_wire, unified_diff,
 };
 use wanderlan_core::desired::{self, OWNER_ALIAS, Runtime};
 use wanderlan_core::join::{self, JoinReply, JoinRequest};
@@ -782,7 +782,8 @@ impl Controller {
         let announce = match &self.confirmed {
             None => Announce::default(),
             Some(c) => {
-                let own = render_network(&c.network);
+                // Peers get the network in the form every version reads.
+                let own = render_network_wire(&c.network);
                 for (name, addr) in peers.iter().chain(responders.iter()) {
                     let client = c
                         .network
@@ -797,9 +798,9 @@ impl Controller {
                             Some(reason) => format!(
                                 "{REFUSED_MARKER}{}\n{}",
                                 reason.replace('\n', " "),
-                                render_network(&v)
+                                render_network_wire(&v)
                             ),
-                            None => render_network(&v),
+                            None => render_network_wire(&v),
                         };
                         views.insert(*addr, text);
                     } else {
@@ -1438,15 +1439,16 @@ impl Controller {
                     admission.name, invite.code
                 ),
             );
-            let network = render_network(&view::view_for(&confirmed.network, &admission.name));
+            let network = render_network_wire(&view::view_for(&confirmed.network, &admission.name));
             return JoinReply::Ok {
                 site: admission.name,
                 via,
                 network,
             };
         }
-        // The new site gets its view of the network only.
-        let network = render_network(&view::view_for(&admission.network, &admission.name));
+        // The new site gets its view of the network only, in the form every
+        // version reads.
+        let network = render_network_wire(&view::view_for(&admission.network, &admission.name));
         let site = admission.name;
         if !admission.added {
             self.events.emit(

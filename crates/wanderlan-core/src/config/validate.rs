@@ -233,7 +233,7 @@ impl Validator {
             if up == site.name {
                 self.error(
                     path,
-                    format!("site \"{}\": uplink is the site itself", site.name),
+                    format!("site \"{}\" cannot be its own server", site.name),
                 );
                 continue;
             }
@@ -241,7 +241,7 @@ impl Validator {
                 self.error(
                     path,
                     format!(
-                        "site \"{}\": uplink \"{up}\" is not a site of the network",
+                        "site \"{}\": server \"{up}\" is not a site of the network",
                         site.name
                     ),
                 );
@@ -254,7 +254,10 @@ impl Validator {
                 if chain.contains(&current) {
                     if chain.first() == Some(&current) {
                         chain.push(current);
-                        self.error(path, format!("uplinks form a loop: {}", chain.join(" -> ")));
+                        self.error(
+                            path,
+                            format!("the servers form a loop: {}", chain.join(" -> ")),
+                        );
                     }
                     break;
                 }
@@ -297,7 +300,7 @@ impl Validator {
             if let Some(missing) = tunnel.sites.iter().find(|s| network.site(s).is_none()) {
                 self.error(
                     path,
-                    format!("tunnel #{n}: site \"{missing}\" does not exist"),
+                    format!("tunnel limit between \"{a}\" and \"{b}\": site \"{missing}\" does not exist"),
                 );
                 continue;
             }
@@ -305,7 +308,7 @@ impl Validator {
                 self.error(
                     path,
                     format!(
-                        "tunnel #{n}: the tunnel between \"{a}\" and \"{b}\" already has its VLANs in tunnel #{}",
+                        "the tunnel between \"{a}\" and \"{b}\" is limited twice (tunnel #{} and #{n})",
                         first + 1
                     ),
                 );
@@ -316,7 +319,7 @@ impl Validator {
                 self.warning(
                     path,
                     format!(
-                        "tunnel #{n}: \"{a}\" and \"{b}\" have no tunnel with each other; this entry has no effect"
+                        "tunnel limit between \"{a}\" and \"{b}\": they have no tunnel with each other; this limit has no effect"
                     ),
                 );
             }

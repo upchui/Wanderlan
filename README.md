@@ -222,7 +222,7 @@ addresses.
 
 The first site of a network is a **server**. A site that joins with an
 invitation becomes a **client** of the site that invited it, like a cable
-plugged into a switch: its only tunnel leads to that site (its *uplink*), so
+plugged into a switch: its only tunnel leads to that site (its *server*), so
 a client only has to reach its server in the transport network. Servers are
 connected with each other (every server with every other server), so servers
 must reach each other.
@@ -424,7 +424,9 @@ trunk = "ens19"     # the interface carrying the VLANs (several: ["ens19", "ens2
 trunk = "ens20"
 ```
 
-`network.toml` on `hq` (a server):
+`network.toml` on `hq` (a server). Every site is a table `[site.<name>]`
+with everything about it: its server, its VLANs, its mappings and the limits
+of its tunnels.
 
 ```toml
 [network]
@@ -435,36 +437,37 @@ commit_timeout = "60s"        # changes are rolled back unless confirmed in time
 # control_port = 51821        # UDP/TCP port for probes, sync and joining
 revision = 12                 # maintained by wanderlan
 
-[[site]]
-name = "hq"
+[site.hq]
 address = "10.8.0.1"          # address in the transport network
 
-[[site]]
-name = "dc"                   # a second server
+[site.dc]                     # a second server (no `server`)
 address = "10.8.0.2"
 
-[[site]]
-name = "office"
+[site.office]
 address = "10.8.0.11"
-vlans = "10,20"               # office only takes part in VLANs 10 and 20
+server = "hq"                 # a client of hq
 managed_by = "hq"             # invited by hq
-uplink = "hq"                 # a client of hq
+vlans = "10,20"               # office only takes part in VLANs 10 and 20
+map = { 20 = 120 }            # source VLAN 20 = VLAN 120 at office
 
-[[site]]
-name = "lab"
+[site.lab]
 address = "10.8.0.12"
-online = false                # joined, not taken online yet
+server = "hq"
 managed_by = "hq"
-uplink = "hq"
-
-[[map]]                       # untagged traffic at lab is VLAN 30
-site = "lab"
-local = "native"
-shared = 30
+online = false                # joined, not taken online yet
+map = { 30 = "native" }       # source VLAN 30 = untagged at lab
+tunnel_vlans = { hq = "30-40" }  # the tunnel to hq carries at most 30-40
 ```
 
-The `network.toml` of `lab` contains only `hq` (as its server), `lab` and lab's
-mapping.
+`map` reads like the VLAN mapping view: `source VLAN = VLAN on the trunk of
+this site` (or `"native"` for the untagged traffic). The `network.toml` of
+`lab` contains only `hq` (as its server) and `lab`.
+
+Files of wanderlan 1.0.20 and older (`[[site]]` with `name`, `[[map]]`,
+`[[tunnel]]`) are still read. The daemon writes such a file in the new form
+when it starts and keeps the old one as `network.toml.v1` (an older version
+can only read that one). The sites exchange the network in the old form, so
+sites with older and newer versions keep working together.
 
 ### Settings
 
@@ -476,19 +479,16 @@ mapping.
 | `network.mss` | unset | Fixed TCP MSS (536 to 1460) instead of the measured value. |
 | `network.control_port` | `51821` | UDP and TCP port of the daemons on the site addresses. |
 | `network.revision` | `0` | Revision counter of the sync; raised by the daemon. |
-| `site.name` | | Unique; `a-z`, `0-9` and `-`, at most 12 characters (it is part of the interface name `gt-<name>`). |
-| `site.address` | | Unique IPv4 address of the site in the transport network. |
-| `site.vlans` | `network.vlans` | VLANs this site takes part in. |
-| `site.own_vlans` | none | The site's own VLANs: on its trunk and towards its own clients, never towards its server. The site itself may always change them. |
-| `site.uplink` | none | The site this one is a client of; none: a server. `""` marks a server explicitly. |
-| `site.online` | `true` | `false`: the tunnels of the site stay down. Sites that join start with `false`. |
-| `site.managed_by` | none | The site that manages this one (the inviting site). |
-| `site.self_managed` | `false` | The site may also change its own VLANs, mappings and online state. |
-| `map.site` | | The site the mapping belongs to. |
-| `map.local` | | The mapped VLAN: `"native"` (untagged) or the VLAN ID on the site's trunk (not 1). |
-| `map.shared` | | The source VLAN: the VLAN in the network; one of the VLANs of the site, not 1. |
-| `tunnel.between` | | The two sites of a tunnel, e.g. `["dc", "lab"]`. |
-| `tunnel.vlans` | | The most this tunnel carries (on top of the VLANs of both sites), e.g. `"30-40"`; `"none"`: no VLAN at all. |
+| `[site.<name>]` | | One table per site. The name is unique; `a-z`, `0-9` and `-`, at most 12 characters (it is part of the interface name `gt-<name>`). |
+| `site.<name>.address` | | Unique IPv4 address of the site in the transport network. |
+| `site.<name>.server` | none | The site this one is a client of; none: a server. |
+| `site.<name>.managed_by` | none | The site that manages this one (the inviting site). |
+| `site.<name>.self_managed` | `false` | The site may also change its own VLANs, mappings and online state. |
+| `site.<name>.online` | `true` | `false`: the tunnels of the site stay down. Sites that join start with `false`. |
+| `site.<name>.vlans` | `network.vlans` | VLANs this site takes part in. |
+| `site.<name>.own_vlans` | none | The site's own VLANs: on its trunk and towards its own clients, never towards its server. The site itself may always change them. |
+| `site.<name>.map` | none | VLAN mappings: `{ <source VLAN> = <mapped VLAN> }`. The source VLAN is the VLAN in the network (one of the VLANs of the site, not 1), the mapped VLAN its ID on the site's trunk or `"native"` (untagged), e.g. `{ 30 = "native", 40 = 140 }`. |
+| `site.<name>.tunnel_vlans` | none | The most the tunnel to another site carries (on top of the VLANs of both sites), e.g. `{ dc = "30-40" }`; `"none"`: no VLAN at all. At one of the two sites. |
 | `self` (local) | | Which site of `network.toml` this host is. |
 | `trunk` (local) | | The interface carrying the VLANs, or several (`["ens19", "ens22"]`, bridged like switch ports, the first is the main port). |
 | `tunnels.<site>.trunk` (local) | `trunk` | A trunk of its own for the tunnel to `<site>`: one interface or several. A port belongs to one segment. |
@@ -498,15 +498,16 @@ with file and line:
 
 ```
 network.toml:24: error: site "office": vlans: VLAN ID 5000 is outside 1-4094
-network.toml:42: error: map #2: source VLAN 60 is not one of the VLANs of site "office" (10,20)
+network.toml:26: error: map #2: source VLAN 60 is not one of the VLANs of site "office" (10,20)
 ```
 
-Names and addresses are unique, uplinks lead to an existing site and never
-in a circle, mappings use VLANs of their site (at most one native mapping
+Names and addresses are unique, servers are existing sites and never form
+a circle, mappings use VLANs of their site (at most one native mapping
 per site, no mapped VLAN used twice, no source VLAN mapped twice per site),
 `self` exists, and unknown keys are errors (typos). Older files load
-too: `role` and `hub` (wanderlan 0.1) are ignored with a warning, and a site
-with `managed_by` but without `uplink` is a client of its manager.
+too: `role` and `hub` (wanderlan 0.1) are ignored with a warning, and in the
+old form (`[[site]]`) a site with `managed_by` but without `uplink` is a
+client of its manager.
 
 ## How it works
 

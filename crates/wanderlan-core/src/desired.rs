@@ -375,7 +375,7 @@ mod tests {
     use super::*;
     use crate::config::{Loaded, load};
 
-    const NETWORK: &str = include_str!("../../../packaging/examples/network.toml");
+    const NETWORK: &str = include_str!("config/testdata/network-v1.toml");
 
     fn config(self_name: &str) -> Config {
         let local = format!("self = \"{self_name}\"\ntrunk = \"ens19\"\n");

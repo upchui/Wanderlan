@@ -1,11 +1,14 @@
 ---
 source: crates/wanderlan/src/tui/wizard.rs
-assertion_line: 551
 expression: render_network(&network)
 ---
 # wanderlan network configuration, shared by all sites.
 # This file is kept identical on all sites by the wanderlan daemon.
 # Change it with the `wanderlan` TUI or edit it and run `wanderlan apply`.
+#
+# [site.<name>]: `server` is the site it is a client of (none: a server);
+# map = { <source VLAN> = <VLAN on its trunk, or "native"> };
+# tunnel_vlans = { <other site> = <the most that tunnel carries> }.
 
 [network]
 revision = 0
@@ -14,6 +17,5 @@ control_port = 51821
 mtu_probe_interval = "5m"
 commit_timeout = "1m"
 
-[[site]]
-name = "heim"
+[site.heim]
 address = "10.8.0.1"

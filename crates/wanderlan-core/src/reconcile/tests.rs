@@ -8,7 +8,7 @@ use crate::sys::fake::FakeNet;
 use crate::sys::tc::{IfTc, TcRule};
 use crate::sys::{BridgeOptions, LinkKind, LinkState, NetOps, VlanFlags};
 
-const NETWORK: &str = include_str!("../../../../packaging/examples/network.toml");
+const NETWORK: &str = include_str!("../config/testdata/network-v1.toml");
 
 fn config_from(network: &str, self_name: &str) -> Config {
     let local = format!("self = \"{self_name}\"\ntrunk = \"ens19\"\n");

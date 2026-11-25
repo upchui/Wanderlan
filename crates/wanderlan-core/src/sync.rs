@@ -126,7 +126,7 @@ mod tests {
 
     #[test]
     fn accept_requires_self() {
-        let network = parse_network(include_str!("../../../packaging/examples/network.toml"))
+        let network = parse_network(include_str!("config/testdata/network-v1.toml"))
             .unwrap()
             .network
             .unwrap();

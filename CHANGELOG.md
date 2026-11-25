@@ -35,6 +35,23 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 - Fix: an interface that is no longer a trunk port is taken off the bridge;
   before, it stayed bridged after the trunk was changed.
 
+### A more readable network.toml
+
+- Every site is a table `[site.<name>]` with everything about it:
+  `server = "hq"` for a client (a server has no `server`; no more
+  `uplink = ""`), its VLANs, its mappings as `map = { <source VLAN> =
+  <mapped VLAN> }` (e.g. `map = { 13 = 113, 20 = "native" }`, read like the
+  mapping view) and the limits of its tunnels as `tunnel_vlans = { hq =
+  "30-40" }`. Before: `[[site]]` with `name`, separate `[[map]]` blocks with
+  `site`, `local` and `shared`, and `[[tunnel]] between = [...]`.
+- The old form is still read. The daemon writes an old file in the new form
+  when it starts (the revision stays) and keeps it as `network.toml.v1`; an
+  older version can only read that one.
+- The sites exchange the network in the old form, byte for byte as before,
+  so sites with older and newer versions keep syncing during an update.
+- Messages say `server` where they said `uplink`, and name the sites of a
+  tunnel limit instead of its number.
+
 ### VLAN mappings: source VLAN and mapped VLAN
 
 - A mapping now speaks of the **source VLAN** (the VLAN of the network,

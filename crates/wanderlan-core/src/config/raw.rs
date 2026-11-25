@@ -3,6 +3,14 @@
 //! All keys are optional at this level so that missing values produce our own
 //! messages with line numbers instead of generic serde errors. Unknown keys are
 //! rejected to catch typos.
+//!
+//! `network.toml` comes in two formats with the same model:
+//! * format 2 (written since 1.0.21): `[site.<name>]` tables with the
+//!   mappings (`map = { <source VLAN> = <VLAN on the trunk> }`) and tunnel
+//!   limits (`tunnel_vlans = { <site> = "<VLANs>" }`) inside the site;
+//! * format 1: `[[site]]`, `[[map]]` and `[[tunnel]]` arrays. The sites
+//!   exchange the network in this format (see `render_network_wire`), so it
+//!   is read forever.
 
 use std::net::Ipv4Addr;
 use std::ops::Range;
@@ -97,6 +105,63 @@ enum RawLocalVid {
     Text(String),
 }
 
+/// A TOML table read in the order of the file (sites keep their order),
+/// with the position of every key.
+#[derive(Debug)]
+struct Ordered<V>(Vec<(Spanned<String>, V)>);
+
+impl<'de, V: Deserialize<'de>> Deserialize<'de> for Ordered<V> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct Visit<V>(std::marker::PhantomData<V>);
+        impl<'de, V: Deserialize<'de>> serde::de::Visitor<'de> for Visit<V> {
+            type Value = Ordered<V>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a table")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = map.next_entry()? {
+                    entries.push(entry);
+                }
+                Ok(Ordered(entries))
+            }
+        }
+        d.deserialize_map(Visit(std::marker::PhantomData))
+    }
+}
+
+/// `network.toml` in format 2.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawNetworkFile2 {
+    network: Option<Spanned<RawNetworkSection>>,
+    site: Option<Ordered<Spanned<RawSite2>>>,
+    /// `[[map]]` of format 1 next to `[site.<name>]`: explained, not read.
+    map: Option<Spanned<toml::Value>>,
+    /// `[[tunnel]]` of format 1 next to `[site.<name>]`: explained.
+    tunnel: Option<Spanned<toml::Value>>,
+}
+
+/// `[site.<name>]` in format 2.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawSite2 {
+    address: Option<Spanned<String>>,
+    server: Option<Spanned<String>>,
+    managed_by: Option<Spanned<String>>,
+    self_managed: Option<Spanned<bool>>,
+    online: Option<Spanned<bool>>,
+    vlans: Option<Spanned<RawVlans>>,
+    own_vlans: Option<Spanned<RawVlans>>,
+    /// Source VLAN (key) = VLAN on the trunk of the site, or `"native"`.
+    map: Option<Spanned<Ordered<Spanned<RawLocalVid>>>>,
+    /// Other site (key) = the most the tunnel to it carries.
+    tunnel_vlans: Option<Spanned<Ordered<Spanned<RawVlans>>>>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawLocal {
@@ -140,6 +205,8 @@ pub struct ParsedNetwork {
     pub spans: SpanMap,
     /// Warnings found while reading (e.g. keys that are no longer used).
     pub warnings: Vec<Diagnostic>,
+    /// The file is in format 1 (`[[site]]`, `[[map]]`, `[[tunnel]]`).
+    pub old_format: bool,
 }
 
 /// Result of parsing `local.toml`.
@@ -231,8 +298,27 @@ fn toml_error(file: ConfigFile, spans: &SpanMap, err: &toml::de::Error) -> Diagn
     diag
 }
 
-/// Parses `network.toml`. Returns all syntax and type errors at once.
+/// Parses `network.toml` in either format. Returns all syntax and type
+/// errors at once.
 pub fn parse_network(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
+    if is_format_1(text) {
+        parse_network_1(text)
+    } else {
+        parse_network_2(text)
+    }
+}
+
+/// Format 1: `[[site]]` is an array, or there are only `[[map]]` or
+/// `[[tunnel]]` entries. A file that does not parse at all goes to format 2,
+/// whose parser reports the same syntax error.
+fn is_format_1(text: &str) -> bool {
+    toml::from_str::<toml::Table>(text).is_ok_and(|t| match t.get("site") {
+        Some(site) => site.is_array(),
+        None => t.contains_key("map") || t.contains_key("tunnel"),
+    })
+}
+
+fn parse_network_1(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
     let mut lw = Lowering::new(ConfigFile::Network, text);
     let raw: RawNetworkFile = match toml::from_str(text) {
         Ok(raw) => raw,
@@ -244,6 +330,7 @@ pub fn parse_network(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
             network: None,
             spans: lw.spans,
             warnings: Vec::new(),
+            old_format: false,
         });
     }
 
@@ -309,8 +396,234 @@ pub fn parse_network(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
             network: Some(network),
             spans: lw.spans,
             warnings: lw.diags,
+            old_format: true,
         })
     }
+}
+
+fn parse_network_2(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
+    let mut lw = Lowering::new(ConfigFile::Network, text);
+    let raw: RawNetworkFile2 = match toml::from_str(text) {
+        Ok(raw) => raw,
+        Err(e) => return Err(vec![toml_error(ConfigFile::Network, &lw.spans, &e)]),
+    };
+    let sites = raw.site.map(|s| s.0).unwrap_or_default();
+    if raw.network.is_none() && sites.is_empty() && raw.map.is_none() && raw.tunnel.is_none() {
+        return Ok(ParsedNetwork {
+            network: None,
+            spans: lw.spans,
+            warnings: Vec::new(),
+            old_format: false,
+        });
+    }
+    for (key, value, example) in [
+        ("map", raw.map, "map = { 30 = 130 }"),
+        ("tunnel", raw.tunnel, "tunnel_vlans = { lab = \"30-40\" }"),
+    ] {
+        if let Some(value) = value {
+            let path = FieldPath::network(key);
+            lw.span(&path, value.span());
+            lw.error(
+                path,
+                format!(
+                    "[[{key}]] belongs to the older format of this file; write it into its site instead, e.g. {example} under [site.<name>]"
+                ),
+            );
+        }
+    }
+
+    let network_path = FieldPath::network("");
+    let section = lw.take(&network_path, raw.network);
+    let mut network = Network::new(VlanSet::new());
+    match section {
+        None => lw.error(
+            FieldPath::root(),
+            "the [network] table is missing (it needs at least `vlans = \"10-50\"`)",
+        ),
+        Some(section) => lower_section(&mut lw, section, &mut network),
+    }
+
+    let (mut map_index, mut tunnel_index) = (0, 0);
+    for (i, (name, raw_site)) in sites.into_iter().enumerate() {
+        lw.span(&FieldPath::site(i), raw_site.span());
+        let raw_site = raw_site.into_inner();
+        let site_name = name.get_ref().clone();
+        let label = format!("site \"{site_name}\"");
+        if let Some(server) = &raw_site.server
+            && server.get_ref().trim().is_empty()
+        {
+            let path = FieldPath::site_field(i, "uplink");
+            lw.span(&path, server.span());
+            lw.error(
+                path,
+                format!(
+                    "{label}: `server = \"\"` is not needed: a site without `server` is a server"
+                ),
+            );
+        }
+        let site = RawSite {
+            name: Some(name),
+            address: raw_site.address,
+            vlans: raw_site.vlans,
+            own_vlans: raw_site.own_vlans,
+            online: raw_site.online,
+            managed_by: raw_site.managed_by,
+            self_managed: raw_site.self_managed,
+            uplink: raw_site.server,
+            role: None,
+            hub: None,
+        };
+        if let Some((site, _)) = lower_site(&mut lw, i, site) {
+            network.sites.push(site);
+        }
+        if let Some(map) = raw_site.map {
+            let table = map.span();
+            for (source, mapped) in map.into_inner().0 {
+                if let Some(map) = lower_map_2(
+                    &mut lw,
+                    map_index,
+                    &site_name,
+                    table.clone(),
+                    source,
+                    mapped,
+                ) {
+                    network.maps.push(map);
+                }
+                map_index += 1;
+            }
+        }
+        if let Some(limits) = raw_site.tunnel_vlans {
+            let table = limits.span();
+            for (other, vlans) in limits.into_inner().0 {
+                if let Some(tunnel) = lower_tunnel_2(
+                    &mut lw,
+                    tunnel_index,
+                    &site_name,
+                    table.clone(),
+                    other,
+                    vlans,
+                ) {
+                    if network.tunnels.iter().any(|t| t.sites == tunnel.sites) {
+                        let [a, b] = &tunnel.sites;
+                        lw.error(
+                            FieldPath::tunnel_field(tunnel_index, "between"),
+                            format!(
+                                "the tunnel between \"{a}\" and \"{b}\" is limited at both sites; keep one `tunnel_vlans` entry"
+                            ),
+                        );
+                    } else {
+                        network.tunnels.push(tunnel);
+                    }
+                }
+                tunnel_index += 1;
+            }
+        }
+    }
+
+    if lw.diags.iter().any(Diagnostic::is_error) {
+        Err(lw.diags)
+    } else {
+        Ok(ParsedNetwork {
+            network: Some(network),
+            spans: lw.spans,
+            warnings: lw.diags,
+            old_format: false,
+        })
+    }
+}
+
+/// One entry of `map = { <source VLAN> = <VLAN on the trunk> | "native" }`.
+fn lower_map_2(
+    lw: &mut Lowering,
+    i: usize,
+    site: &str,
+    table: Range<usize>,
+    source: Spanned<String>,
+    mapped: Spanned<RawLocalVid>,
+) -> Option<VlanMap> {
+    lw.span(&FieldPath::map(i), table.clone());
+    lw.span(&FieldPath::map_field(i, "site"), table);
+    let shared_path = FieldPath::map_field(i, "shared");
+    lw.span(&shared_path, source.span());
+    let local_path = FieldPath::map_field(i, "local");
+    lw.span(&local_path, mapped.span());
+    let label = format!("site \"{site}\": map");
+    let source = source.into_inner();
+    let shared = match source.trim().parse::<u16>() {
+        Ok(v) if (VID_MIN..=VID_MAX).contains(&v) => Some(v),
+        _ => {
+            lw.error(
+                shared_path,
+                format!(
+                    "{label}: \"{source}\" is not a VLAN ID ({VID_MIN}-{VID_MAX}); write map = {{ <source VLAN> = <VLAN on the trunk> }}, e.g. {{ 30 = 130 }}"
+                ),
+            );
+            None
+        }
+    };
+    let local = match mapped.into_inner() {
+        RawLocalVid::Text(t) if t == "native" => Some(LocalVid::Native),
+        RawLocalVid::Text(t) => {
+            lw.error(
+                local_path,
+                format!(
+                    "{label}: {source} = \"{t}\": the VLAN on the trunk must be a VLAN ID or \"native\""
+                ),
+            );
+            None
+        }
+        RawLocalVid::Num(n) => lw
+            .int_in_range(&local_path, n, i64::from(VID_MIN), i64::from(VID_MAX))
+            .and_then(|v| u16::try_from(v).ok())
+            .map(LocalVid::Vid),
+    };
+    Some(VlanMap {
+        site: site.to_string(),
+        local: local?,
+        shared: shared?,
+    })
+}
+
+/// One entry of `tunnel_vlans = { <other site> = "<VLANs>" | "none" }`.
+fn lower_tunnel_2(
+    lw: &mut Lowering,
+    i: usize,
+    site: &str,
+    table: Range<usize>,
+    other: Spanned<String>,
+    vlans: Spanned<RawVlans>,
+) -> Option<TunnelVlans> {
+    lw.span(&FieldPath::tunnel(i), table);
+    let between_path = FieldPath::tunnel_field(i, "between");
+    lw.span(&between_path, other.span());
+    let vlans_path = FieldPath::tunnel_field(i, "vlans");
+    lw.span(&vlans_path, vlans.span());
+    let other = other.into_inner();
+    let label = format!("site \"{site}\": tunnel_vlans");
+    let sites = if other == site {
+        lw.error(
+            between_path,
+            format!("{label}: a tunnel connects two sites, not \"{site}\" with itself"),
+        );
+        None
+    } else {
+        Some(site_pair(site, &other))
+    };
+    let vlans = match vlans.into_inner() {
+        RawVlans::Text(t) if t.trim() == "none" => Some(VlanSet::new()),
+        RawVlans::Text(t) if t.trim().is_empty() => Some(VlanSet::all()),
+        v => match parse_vlans(v) {
+            Ok(set) => Some(set),
+            Err(e) => {
+                lw.error(vlans_path, format!("{label}: {other}: {e}"));
+                None
+            }
+        },
+    };
+    Some(TunnelVlans {
+        sites: sites?,
+        vlans: vlans?,
+    })
 }
 
 fn lower_section(lw: &mut Lowering, s: RawNetworkSection, network: &mut Network) {
@@ -417,7 +730,7 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
             lw.warning(
                 path,
                 format!(
-                    "{label}: `{field}` is no longer used and is ignored; use `uplink` to make a site a client of another"
+                    "{label}: `{field}` is no longer used and is ignored; use `server` to make a site a client of another"
                 ),
             );
         }

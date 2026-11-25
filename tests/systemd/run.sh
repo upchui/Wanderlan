@@ -254,7 +254,7 @@ begin "Removing the package removes everything, installing it again brings it ba
 x alpha "dpkg -r wanderlan >/dev/null 2>&1"
 check "the package is removed" x alpha "! test -x /usr/bin/wanderland"
 check "nothing of wanderlan is left" nothing_left alpha
-check "the configuration is kept" x alpha "grep -q 'name = \"alpha\"' /etc/wanderlan/network.toml"
+check "the configuration is kept" x alpha "grep -qx '\[site.alpha\]' /etc/wanderlan/network.toml"
 x alpha "dpkg -i /var/cache/wanderlan-test/wanderlan.deb >/dev/null 2>&1"
 wait_for 20 "alpha runs again with its configuration" \
   x alpha "systemctl is-active wanderland | grep -qx active && wanderlan status --json | jq -e '.state == \"running\"'"

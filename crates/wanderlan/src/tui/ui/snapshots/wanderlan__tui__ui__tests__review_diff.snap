@@ -6,7 +6,7 @@ expression: render(&app)
 "┌ Review: draft against the running configuration ─────────────────────────────┐"
 "│--- network.toml (running)                                                    │"
 "│+++ network.toml (draft)                                                      │"
-"│@@ -4,7 +4,7 @@                                                               │"
+"│@@ -8,7 +8,7 @@                                                               │"
 "│                                                                              │"
 "│ [network]                                                                    │"
 "│ revision = 7                                                                 │"

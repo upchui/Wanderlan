@@ -27,22 +27,31 @@ else
 fi
 expect_ping c-site4 10.20.0.13 "VLAN 20: site4 reaches site5"
 
-begin "Upgrade from an older build: its configuration file is moved"
+begin "Upgrade from an older build: its configuration file is moved and converted"
 
 rev=$(jqs site4 .revision)
+# The network as the sites exchange it, in format 1 (what older builds
+# also wrote to disk): site1 asks site4 for it.
+x site1 "exec 3<>/dev/tcp/${ADDR[site4]}/51821 && printf 'NETWORK\n' >&3 && cat <&3" >"$RUN_DIR/site4-format1.toml"
+check "the sites exchange the network in format 1" \
+  grep -q '^name = "site4"$' "$RUN_DIR/site4-format1.toml"
 x site4 "wl-daemon stop"
 # What an older build left behind: the file under its old name with the old
 # table name, the confirmed copy likewise, and the package's new template.
-x site4 "sed 's/^\[network\]\$/[mesh]/' /etc/wanderlan/network.toml > /etc/wanderlan/mesh.toml && cp /etc/wanderlan/mesh.toml /var/lib/wanderlan/confirmed/mesh.toml && rm /var/lib/wanderlan/confirmed/network.toml && printf '# This site is not configured yet.\n' > /etc/wanderlan/network.toml"
+sed 's/^\[network\]$/[mesh]/' "$RUN_DIR/site4-format1.toml" | put site4 /etc/wanderlan/mesh.toml
+x site4 "cp /etc/wanderlan/mesh.toml /var/lib/wanderlan/confirmed/mesh.toml && rm /var/lib/wanderlan/confirmed/network.toml && printf '# This site is not configured yet.\n' > /etc/wanderlan/network.toml"
 check "the old file has the old table name" x site4 "grep -qx '\[mesh\]' /etc/wanderlan/mesh.toml"
 x site4 "wl-daemon start"
 wait_for 30 "site4 runs again" x site4 "wanderlan status --json | jq -e '.state == \"running\"'"
-check "network.toml holds the configuration with a [network] table" \
-  x site4 "grep -qx '\[network\]' /etc/wanderlan/network.toml && grep -q 'name = \"site4\"' /etc/wanderlan/network.toml"
+check "network.toml holds the configuration in the new format" \
+  x site4 "grep -qx '\[network\]' /etc/wanderlan/network.toml && grep -qx '\[site.site4\]' /etc/wanderlan/network.toml && ! grep -q '^\[\[site\]\]' /etc/wanderlan/network.toml"
+check "the file in the old format is kept as network.toml.v1" \
+  x site4 "grep -q '^name = \"site4\"' /etc/wanderlan/network.toml.v1"
 check "the old files are gone" \
   x site4 "[ ! -e /etc/wanderlan/mesh.toml ] && [ ! -e /var/lib/wanderlan/confirmed/mesh.toml ]"
 check "the revision is the same ($rev)" test "$(jqs site4 .revision)" = "$rev"
-check "the log says what was moved" x site4 "wanderlan log | grep -q 'to /etc/wanderlan/network.toml'"
+check "the log says what was moved and converted" \
+  x site4 "wanderlan log | grep -q 'to /etc/wanderlan/network.toml' && wanderlan log | grep -q 'converted to the new format'"
 expect_ping c-site4 10.20.0.13 "VLAN 20: site4 reaches site5"
 
 begin "A second daemon started by mistake changes nothing"

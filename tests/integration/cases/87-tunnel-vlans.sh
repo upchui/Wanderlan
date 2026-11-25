@@ -16,7 +16,7 @@ wait_eq 30 "site1's tunnel to site2 carries 10-19,21-50" "10-19,21-50" vlan_summ
 wait_eq 30 "site2's tunnel to site1 too" "10-19,21-50" vlan_summary site2 gt-site1
 check "the tunnel site1-site3 is unchanged" test "$(vlan_summary site1 gt-site3)" = "$before"
 wait_for 30 "network.toml on site2 has the limit" \
-  x site2 "grep -A2 '^\[\[tunnel\]\]' /etc/wanderlan/network.toml | grep -q 'between = \[\"site1\", \"site2\"\]'"
+  x site2 "grep -qE '^tunnel_vlans = \{ (site1 = \"10-19,21-50\"|site2 = \"10-19,21-50\") \}' /etc/wanderlan/network.toml"
 check "the status shows what the tunnel carries" \
   test "$(jqs site1 '.peers[] | select(.name == "site2") | .vlans')" = "10-19,21-50"
 expect_no_ping c-site1 10.20.0.2 "VLAN 20: site1 no longer reaches site2"
@@ -37,7 +37,7 @@ fi
 check "site1 lifts the limit" x site1 "wanderlan tunnel-vlans site1 site2 all --confirm"
 wait_eq 30 "the tunnel carries everything both have again" "$before" vlan_summary site1 gt-site2
 wait_for 30 "network.toml on site2 has no limit any more" \
-  x site2 "! grep -q '^\[\[tunnel\]\]' /etc/wanderlan/network.toml"
+  x site2 "! grep -q '^tunnel_vlans' /etc/wanderlan/network.toml"
 expect_ping c-site1 10.20.0.2 "VLAN 20: site1 reaches site2 again"
 
 begin "Passing on over a server: a VLAN that reaches a site only through another"
@@ -88,5 +88,5 @@ check "no port is blocked by the loop guard" \
 for pair in "site1 site3" "site2 site4"; do
   x site1 "wanderlan tunnel-vlans $pair all --confirm" >/dev/null 2>&1
 done
-wait_for 30 "all limits are gone" x site2 "! grep -q '^\[\[tunnel\]\]' /etc/wanderlan/network.toml"
+wait_for 30 "all limits are gone" x site2 "! grep -q '^tunnel_vlans' /etc/wanderlan/network.toml"
 expect_ping c-site1 10.20.0.11 "VLAN 20: site1 reaches site3 directly again"

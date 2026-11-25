@@ -1,0 +1,51 @@
+# wanderlan example network configuration.
+#
+# Usually nobody writes this file by hand: set up the first site with
+# `wanderlan` ("Start a new network"), then add every further site with an
+# invitation: `wanderlan invite` on any site that is already part of the
+# network, `wanderlan join <address> <code>` on the new one. The daemons keep
+# this file identical on all sites.
+#
+# wanderlan does not build a VPN. Every site must already be reachable at its
+# `address` through an existing transport network, usually a VPN set up
+# beforehand (WireGuard, IPsec, a provider network, ...). Sites without
+# `uplink` are servers: they are connected with each other and must reach
+# each other there. A site with `uplink` is a client of that site: its only
+# GRETAP tunnel leads there (sites that join with an invitation become
+# clients of the inviting site).
+
+[network]
+vlans = "10-50"               # VLANs of every site that does not list its own
+mtu_probe_interval = "5m"     # how often the path MTU to each peer is measured
+# mss = 1300                  # optional: fixed TCP MSS instead of measuring
+commit_timeout = "60s"        # changes are rolled back unless confirmed in time
+
+[[site]]
+name = "heim"
+address = "10.8.0.1"
+
+[[site]]
+name = "buero"
+address = "10.8.0.2"
+
+[[site]]
+name = "haus2"
+address = "10.8.0.11"
+vlans = "20,30"               # haus2 only takes part in VLANs 20 and 30
+
+[[site]]
+name = "haus3"
+address = "10.8.0.12"
+# uplink = "heim"             # would make haus3 a client of heim
+
+# Source VLAN 20 ("shared") is untagged ("local", the mapped VLAN) at haus3.
+[[map]]
+site = "haus3"
+local = "native"
+shared = 20
+
+# Source VLAN 30 is mapped VLAN 130 on the trunk of haus3.
+[[map]]
+site = "haus3"
+local = 130
+shared = 30

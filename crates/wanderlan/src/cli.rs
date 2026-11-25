@@ -371,7 +371,9 @@ pub async fn run(args: Args) -> Result<ExitCode> {
         }) => {
             let uplink = match (role.as_str(), uplink) {
                 ("server", None) => None,
-                ("server", Some(_)) => bail!("a server has no uplink"),
+                ("server", Some(_)) => {
+                    bail!("a server is a client of no site: wanderlan role {site} server")
+                }
                 (_, Some(up)) => Some(up),
                 (_, None) => {
                     bail!("name the site it is a client of: wanderlan role {site} client <site>")
