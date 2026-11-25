@@ -270,8 +270,21 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<()> {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let tmp = dir.join(format!(".{name}.tmp"));
-    std::fs::write(&tmp, content).with_context(|| format!("cannot write {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))
+    // On the disk before the rename, and the rename itself too: after a
+    // power loss the old or the new file, never an empty one.
+    {
+        use std::io::Write as _;
+        let mut file = std::fs::File::create(&tmp)
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+        file.write_all(content.as_bytes())
+            .and_then(|()| file.sync_all())
+            .with_context(|| format!("cannot write {}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("cannot replace {}", path.display()))?;
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all();
+    }
+    Ok(())
 }
 
 #[cfg(test)]

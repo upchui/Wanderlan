@@ -14,6 +14,8 @@ pub const MSS_MIN: u16 = 536;
 pub const MSS_MAX: u16 = 1460;
 /// Smallest accepted MTU probe interval.
 pub const PROBE_INTERVAL_MIN: Duration = Duration::from_secs(10);
+/// Longest interval between path MTU measurements.
+pub const PROBE_INTERVAL_MAX: Duration = Duration::from_secs(24 * 60 * 60);
 /// Accepted range for the commit timeout.
 pub const COMMIT_TIMEOUT_RANGE: (Duration, Duration) =
     (Duration::from_secs(10), Duration::from_secs(3600));
@@ -107,12 +109,15 @@ impl Validator {
                 "network.vlans must contain at least one VLAN",
             );
         }
-        if network.mtu_probe_interval < PROBE_INTERVAL_MIN {
+        if network.mtu_probe_interval < PROBE_INTERVAL_MIN
+            || network.mtu_probe_interval > PROBE_INTERVAL_MAX
+        {
             self.error(
                 FieldPath::network("mtu_probe_interval"),
                 format!(
-                    "network.mtu_probe_interval must be at least {}",
-                    humantime::format_duration(PROBE_INTERVAL_MIN)
+                    "network.mtu_probe_interval must be between {} and {}",
+                    humantime::format_duration(PROBE_INTERVAL_MIN),
+                    humantime::format_duration(PROBE_INTERVAL_MAX)
                 ),
             );
         }

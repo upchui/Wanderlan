@@ -29,6 +29,8 @@ pub struct Netlink {
     dump: std::sync::Arc<tokio::sync::Mutex<()>>,
     /// Set once the kernel turned out to have no per-VLAN counters.
     no_vlan_stats: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The task running the connection, until someone takes it to watch it.
+    connection: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl Netlink {
@@ -37,12 +39,22 @@ impl Netlink {
     pub fn connect() -> SysResult<Self> {
         let (connection, handle, _) =
             rtnetlink::new_connection().map_err(|e| SysError::new("open rtnetlink socket", e))?;
-        tokio::spawn(connection);
+        let task = tokio::spawn(connection);
         Ok(Self {
             handle,
             dump: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             no_vlan_stats: std::sync::Arc::default(),
+            connection: std::sync::Arc::new(std::sync::Mutex::new(Some(task))),
         })
+    }
+
+    /// The task of the netlink connection (once). When it ends, every
+    /// request fails from then on: whoever runs for long should watch it.
+    pub fn take_connection(&self) -> Option<tokio::task::JoinHandle<()>> {
+        self.connection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     /// Remembers that the kernel has no per-VLAN counters per port.

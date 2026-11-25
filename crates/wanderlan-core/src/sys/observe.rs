@@ -54,6 +54,8 @@ pub enum FdbEvent {
         mac: [u8; 6],
         /// VLAN.
         vlan: Option<u16>,
+        /// Index of the bridge.
+        bridge: Option<u32>,
     },
 }
 
@@ -64,7 +66,7 @@ pub trait ObserveOps: Send + Sync {
 
     /// Starts watching the forwarding database; changes arrive on the
     /// returned channel until it is dropped.
-    fn watch_fdb(&self) -> SysResult<mpsc::UnboundedReceiver<FdbEvent>>;
+    fn watch_fdb(&self) -> SysResult<mpsc::Receiver<FdbEvent>>;
 
     /// The per-VLAN counters of all bridge ports.
     fn vlan_stats(&self) -> impl Future<Output = SysResult<Vec<VlanCounters>>> + Send;

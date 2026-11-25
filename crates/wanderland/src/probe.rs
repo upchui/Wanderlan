@@ -88,6 +88,10 @@ pub struct PeerProbe {
     /// What the peer announced last.
     #[serde(skip)]
     pub announce: Option<wire::Announce>,
+    /// Last answered probe on the monotonic clock (a clock step at boot
+    /// does not move it).
+    #[serde(skip)]
+    pub last_reply_at: Option<Instant>,
     #[serde(skip)]
     lost: u32,
     /// Recent probes: round trip in ms, or `None` if unanswered.
@@ -143,9 +147,12 @@ pub enum ProbeEvent {
     },
 }
 
+/// A probe waiting for its reply: from that peer, with that sequence number.
+type PendingKey = (Ipv4Addr, u32);
+
 struct Shared {
     socket: UdpSocket,
-    pending: Mutex<HashMap<u32, oneshot::Sender<(u16, wire::Announce)>>>,
+    pending: Mutex<HashMap<PendingKey, oneshot::Sender<(u16, wire::Announce)>>>,
     seq: AtomicU32,
     config: watch::Receiver<ProbeConfig>,
 }
@@ -158,6 +165,9 @@ pub fn spawn(
 ) -> JoinHandle<()> {
     tokio::spawn(run(config, table, events))
 }
+
+/// How often the probe tasks are checked.
+const SUPERVISE: Duration = Duration::from_secs(10);
 
 async fn run(
     mut config: watch::Receiver<ProbeConfig>,
@@ -192,13 +202,24 @@ async fn run(
         });
         let receiver = tokio::spawn(receive(shared.clone(), table.clone(), events.clone()));
         let mut prober: BTreeMap<String, (Ipv4Addr, JoinHandle<()>)> = BTreeMap::new();
+        let mut gone = false;
         loop {
             let current = config.borrow_and_update().clone();
             if current.bind != Some(bind) {
                 break;
             }
             sync_probers(&mut prober, &current, &shared, &table, &events);
-            if config.changed().await.is_err() {
+            // Every few seconds also without a change: a task that ended is
+            // started again (the receiver with a new socket).
+            tokio::select! {
+                r = config.changed() => {
+                    if r.is_err() {
+                        gone = true;
+                    }
+                }
+                () = tokio::time::sleep(SUPERVISE) => {}
+            }
+            if gone || receiver.is_finished() {
                 break;
             }
         }
@@ -230,7 +251,8 @@ fn sync_probers(
     events: &mpsc::Sender<ProbeEvent>,
 ) {
     probers.retain(|name, (addr, task)| {
-        let keep = config.peers.get(name) == Some(addr);
+        // A task that ended (it never should) is started again below.
+        let keep = config.peers.get(name) == Some(addr) && !task.is_finished();
         if !keep {
             task.abort();
         }
@@ -305,7 +327,11 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
                 received,
                 announce,
             } => {
-                let waiter = shared.pending.lock().ok().and_then(|mut p| p.remove(&seq));
+                let waiter = shared
+                    .pending
+                    .lock()
+                    .ok()
+                    .and_then(|mut p| p.remove(&(*from.ip(), seq)));
                 if let Some(tx) = waiter {
                     let _ = tx.send((received, announce));
                 }
@@ -354,22 +380,35 @@ async fn probe_once(
     let announce = shared.config.borrow().announce_for(*peer.ip());
     let packet = wire::request(seq, size, &announce);
     let (tx, rx) = oneshot::channel();
+    let key = (*peer.ip(), seq);
     if let Ok(mut p) = shared.pending.lock() {
-        p.insert(seq, tx);
+        p.insert(key, tx);
     }
+    // Removed again also when the prober is aborted while waiting.
+    let _pending = PendingGuard { shared, key };
     let start = Instant::now();
-    let result = match shared.socket.send_to(&packet, peer).await {
+    match shared.socket.send_to(&packet, peer).await {
         // EMSGSIZE: larger than the local interface MTU.
         Err(_) => None,
         Ok(_) => match tokio::time::timeout(timeout, rx).await {
             Ok(Ok((received, _))) if usize::from(received) == packet.len() => Some(start.elapsed()),
             _ => None,
         },
-    };
-    if let Ok(mut p) = shared.pending.lock() {
-        p.remove(&seq);
     }
-    result
+}
+
+/// Removes a waiting probe when the wait ends, however it ends.
+struct PendingGuard<'a> {
+    shared: &'a Shared,
+    key: PendingKey,
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut p) = self.shared.pending.lock() {
+            p.remove(&self.key);
+        }
+    }
 }
 
 /// Probing loop for one peer: reachability every few seconds, path MTU when
@@ -473,6 +512,7 @@ fn update_reachability(table: &ProbeTable, name: &str, rtt: Option<Duration>) ->
             entry.reachable = true;
             entry.lost = 0;
             entry.last_reply = Some(SystemTime::now());
+            entry.last_reply_at = Some(Instant::now());
             entry.rtt_ms = Some(rtt.as_secs_f64() * 1000.0);
             !was
         }

@@ -49,6 +49,8 @@ pub fn spawn(
         // One guard per bridge: the same MAC in two segments is no loop.
         let mut guards: BTreeMap<u32, LoopGuard> = BTreeMap::new();
         let mut failing = false;
+        let mut ports = ports;
+        let mut map = ports.borrow_and_update().clone();
         loop {
             match sys.watch_fdb() {
                 Ok(mut events) => {
@@ -57,7 +59,7 @@ pub fn spawn(
                         failing = false;
                     }
                     while let Some(event) = events.recv().await {
-                        if !handle(&mut guards, event, &ports, &inputs).await {
+                        if !handle(&mut guards, event, &mut ports, &mut map, &inputs).await {
                             return;
                         }
                     }
@@ -80,20 +82,28 @@ pub fn spawn(
 async fn handle(
     guards: &mut BTreeMap<u32, LoopGuard>,
     event: FdbEvent,
-    ports: &watch::Receiver<PortMap>,
+    ports: &mut watch::Receiver<PortMap>,
+    map: &mut PortMap,
     inputs: &mpsc::Sender<Input>,
 ) -> bool {
     let entry = match event {
         FdbEvent::Learned(entry) => entry,
-        FdbEvent::Removed { mac, vlan } => {
-            for guard in guards.values_mut() {
-                guard.forget(mac, vlan);
+        // Only in the bridge it was removed from.
+        FdbEvent::Removed { mac, vlan, bridge } => {
+            for (b, guard) in guards.iter_mut() {
+                if bridge.is_none_or(|x| x == *b) {
+                    guard.forget(mac, vlan);
+                }
             }
             return true;
         }
     };
-    let map = ports.borrow().clone();
-    guards.retain(|b, _| map.bridges.contains(b));
+    // A copy of the ports only when they changed, not for every event.
+    if ports.has_changed().unwrap_or(false) {
+        *map = ports.borrow_and_update().clone();
+        guards.retain(|b, _| map.bridges.contains(b));
+    }
+    let map = &*map;
     let Some(bridge) = entry.bridge.filter(|b| map.bridges.contains(b)) else {
         return true;
     };
@@ -155,10 +165,11 @@ mod tests {
 
     /// A MAC that keeps moving between `a` and `b` of bridge 1.
     async fn moves(map: PortMap, a: u32, b: u32) -> Option<String> {
-        let (_tx, rx) = watch::channel(map);
+        let (_tx, mut rx) = watch::channel(map);
+        let mut map = rx.borrow_and_update().clone();
         let (inputs, mut out) = mpsc::channel(4);
         let mut guards = BTreeMap::new();
-        for i in 0..12 {
+        for i in 0..30 {
             let entry = FdbEntry {
                 mac: [2, 0, 0, 0, 0, 1],
                 vlan: Some(20),
@@ -167,7 +178,14 @@ mod tests {
                 permanent: false,
                 updated_secs: None,
             };
-            handle(&mut guards, FdbEvent::Learned(entry), &rx, &inputs).await;
+            handle(
+                &mut guards,
+                FdbEvent::Learned(entry),
+                &mut rx,
+                &mut map,
+                &inputs,
+            )
+            .await;
         }
         match out.try_recv() {
             Ok(Input::Loop(report)) => Some(report.port),

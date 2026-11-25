@@ -399,14 +399,33 @@ fn nft_error(op: &str, e: impl std::error::Error + Send + Sync + 'static) -> Sys
     SysError::new(op, e)
 }
 
+/// How long one `nft` call may take (a stuck lock would block everything).
+const NFT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Runs an `nft` call with [`NFT_TIMEOUT`].
+async fn timed<T, E: std::error::Error + Send + Sync + 'static>(
+    op: &str,
+    call: impl Future<Output = Result<T, E>>,
+) -> SysResult<T> {
+    match tokio::time::timeout(NFT_TIMEOUT, call).await {
+        Ok(result) => result.map_err(|e| nft_error(op, e)),
+        Err(_) => Err(SysError::new(
+            op,
+            format!("nft did not answer within {} s", NFT_TIMEOUT.as_secs()),
+        )),
+    }
+}
+
 impl NftOps for NftCli {
     async fn nft_state(&self) -> SysResult<Option<NftState>> {
-        let tables = helper::get_current_ruleset_with_args_async(
-            helper::DEFAULT_NFT,
-            ["list", "tables", "bridge"],
+        let tables = timed(
+            "list nftables tables",
+            helper::get_current_ruleset_with_args_async(
+                helper::DEFAULT_NFT,
+                ["list", "tables", "bridge"],
+            ),
         )
-        .await
-        .map_err(|e| nft_error("list nftables tables", e))?;
+        .await?;
         let exists = tables
             .objects
             .iter()
@@ -414,12 +433,14 @@ impl NftOps for NftCli {
         if !exists {
             return Ok(None);
         }
-        let ruleset = helper::get_current_ruleset_with_args_async(
-            helper::DEFAULT_NFT,
-            ["list", "table", "bridge", TABLE],
+        let ruleset = timed(
+            "list nftables table bridge wanderlan",
+            helper::get_current_ruleset_with_args_async(
+                helper::DEFAULT_NFT,
+                ["list", "table", "bridge", TABLE],
+            ),
         )
-        .await
-        .map_err(|e| nft_error("list nftables table bridge wanderlan", e))?;
+        .await?;
         let rules: Vec<(&str, &str)> = ruleset
             .objects
             .iter()
@@ -439,17 +460,21 @@ impl NftOps for NftCli {
         rules: &BTreeSet<MssRule>,
         split: &BTreeSet<SplitRule>,
     ) -> SysResult<()> {
-        helper::apply_ruleset_async(&replace_batch(rules, split))
-            .await
-            .map_err(|e| nft_error("apply nftables table bridge wanderlan", e))
+        timed(
+            "apply nftables table bridge wanderlan",
+            helper::apply_ruleset_async(&replace_batch(rules, split)),
+        )
+        .await
     }
 
     async fn delete_table(&self) -> SysResult<()> {
         let mut batch = Batch::new();
         batch.delete(NfListObject::Table(table()));
-        helper::apply_ruleset_async(&batch.to_nftables())
-            .await
-            .map_err(|e| nft_error("delete nftables table bridge wanderlan", e))
+        timed(
+            "delete nftables table bridge wanderlan",
+            helper::apply_ruleset_async(&batch.to_nftables()),
+        )
+        .await
     }
 }
 

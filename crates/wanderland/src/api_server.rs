@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -20,6 +20,11 @@ const GROUP: &str = "wanderlan";
 
 /// How often the server checks that its socket file is still there.
 const SOCKET_CHECK: std::time::Duration = std::time::Duration::from_secs(5);
+/// Longest request line.
+const MAX_REQUEST: u64 = 1024 * 1024;
+/// Messages waiting for a client at most; a client that does not read is
+/// dropped instead of filling the memory.
+const OUT_QUEUE: usize = 1024;
 
 /// Identity of a socket file (device and inode).
 type FileId = (u64, u64);
@@ -119,7 +124,7 @@ fn group_id(name: &str) -> Option<u32> {
 
 async fn serve(stream: UnixStream, events: Arc<EventLog>, inputs: mpsc::Sender<Input>) {
     let (read, mut write) = stream.into_split();
-    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
+    let (out_tx, mut out_rx) = mpsc::channel::<String>(OUT_QUEUE);
     let writer = tokio::spawn(async move {
         while let Some(mut line) = out_rx.recv().await {
             line.push('\n');
@@ -128,21 +133,48 @@ async fn serve(stream: UnixStream, events: Arc<EventLog>, inputs: mpsc::Sender<I
             }
         }
     });
-    let mut lines = BufReader::new(read).lines();
+    let mut reader = BufReader::new(read);
+    let mut buf = Vec::new();
     let mut forwarder: Option<JoinHandle<()>> = None;
-    while let Ok(Some(line)) = lines.next_line().await {
+    let invalid = |why: String| {
+        ServerMessage::Response(ResponseEnvelope {
+            id: 0,
+            result: None,
+            error: Some(ApiError::new(format!("invalid request: {why}"))),
+        })
+    };
+    loop {
+        buf.clear();
+        match (&mut reader)
+            .take(MAX_REQUEST + 1)
+            .read_until(b'\n', &mut buf)
+            .await
+        {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        if buf.len() as u64 > MAX_REQUEST {
+            let _ = send(
+                &out_tx,
+                &invalid(format!("longer than {MAX_REQUEST} bytes")),
+            );
+            break;
+        }
+        let Ok(line) = std::str::from_utf8(&buf) else {
+            if !send(&out_tx, &invalid("not UTF-8".into())) {
+                break;
+            }
+            continue;
+        };
         if line.trim().is_empty() {
             continue;
         }
-        let envelope: RequestEnvelope = match serde_json::from_str(&line) {
+        let envelope: RequestEnvelope = match serde_json::from_str(line) {
             Ok(e) => e,
             Err(e) => {
-                let resp = ResponseEnvelope {
-                    id: 0,
-                    result: None,
-                    error: Some(ApiError::new(format!("invalid request: {e}"))),
-                };
-                send(&out_tx, &ServerMessage::Response(resp));
+                if !send(&out_tx, &invalid(e.to_string())) {
+                    break;
+                }
                 continue;
             }
         };
@@ -156,7 +188,12 @@ async fn serve(stream: UnixStream, events: Arc<EventLog>, inputs: mpsc::Sender<I
             forwarder = Some(tokio::spawn(async move {
                 loop {
                     match rx.recv().await {
-                        Ok(event) => send(&tx, &ServerMessage::Event { event }),
+                        // A client that does not read gets no more events.
+                        Ok(event) => {
+                            if !send(&tx, &ServerMessage::Event { event }) {
+                                break;
+                            }
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             debug!("subscriber lagged by {n} events");
                         }
@@ -191,7 +228,9 @@ async fn serve(stream: UnixStream, events: Arc<EventLog>, inputs: mpsc::Sender<I
                 error: Some(error),
             },
         };
-        send(&out_tx, &ServerMessage::Response(resp));
+        if !send(&out_tx, &ServerMessage::Response(resp)) {
+            break;
+        }
     }
     if let Some(f) = forwarder {
         f.abort();
@@ -200,8 +239,11 @@ async fn serve(stream: UnixStream, events: Arc<EventLog>, inputs: mpsc::Sender<I
     let _ = writer.await;
 }
 
-fn send(tx: &mpsc::UnboundedSender<String>, msg: &ServerMessage) {
-    if let Ok(line) = serde_json::to_string(msg) {
-        let _ = tx.send(line);
+/// Queues a message for the client; false if the client does not keep up
+/// (or is gone): then it is dropped.
+fn send(tx: &mpsc::Sender<String>, msg: &ServerMessage) -> bool {
+    match serde_json::to_string(msg) {
+        Ok(line) => tx.try_send(line).is_ok(),
+        Err(_) => true,
     }
 }

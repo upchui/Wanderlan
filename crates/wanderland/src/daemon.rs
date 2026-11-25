@@ -114,6 +114,12 @@ impl Rejected {
 }
 /// Shortest accepted confirmation timeout.
 const MIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Name of the netlink connection among the background tasks.
+const NETLINK_TASK: &str = "netlink connection";
+/// The longest one reconcile may take.
+const RECONCILE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Largest network revision (network.toml holds an i64).
+const MAX_REVISION: u64 = i64::MAX as u64;
 
 /// Inputs of the controller.
 #[derive(Debug)]
@@ -170,10 +176,30 @@ const JOIN_FAILURE_WINDOW: Duration = Duration::from_secs(60);
 struct Pending {
     previous: Option<Config>,
     deadline: Instant,
-    applied_at: SystemTime,
+    /// When it was applied (monotonic: compared with the probe replies).
+    applied_at: std::time::Instant,
     source: ChangeSource,
     from_files: bool,
     fingerprint: String,
+    /// For changes of a client merged here: the fingerprint the client
+    /// announced, rejected too on a rollback (else fetched again at once).
+    announced: Option<String>,
+}
+
+/// Learned MAC addresses per bridge port index.
+type MacCounts = Arc<BTreeMap<u32, usize>>;
+
+/// Derived from the configuration and the runtime state; computed again
+/// only when one of them changed (the status is asked for every second).
+#[derive(Clone)]
+struct Derived {
+    config_id: u64,
+    runtime: Runtime,
+    desired: Option<Arc<desired::Desired>>,
+    /// Fingerprint of the configuration in effect.
+    fingerprint: String,
+    /// Version of the confirmed configuration.
+    confirmed: Option<Version>,
 }
 
 /// State of the daemon.
@@ -208,7 +234,12 @@ struct Controller {
     /// The version each client of this site should have (its view).
     expected: BTreeMap<String, Version>,
     /// The FDB as read last, for the status.
-    fdb_cache: std::sync::Mutex<Option<(Instant, Vec<wanderlan_core::sys::observe::FdbEntry>)>>,
+    /// The MAC addresses per port as counted last, for the status.
+    fdb_cache: std::sync::Mutex<Option<(Instant, MacCounts)>>,
+    /// Counts the changes of the configuration in effect (cache key).
+    config_id: u64,
+    /// What the status needs from the configuration, until it changes.
+    derived: std::sync::Mutex<Option<Derived>>,
     fetching: bool,
     fetch_backoff: BTreeMap<String, Instant>,
     grace: BTreeMap<String, (Ipv4Addr, Instant)>,
@@ -216,6 +247,8 @@ struct Controller {
     invites: Invites,
     join_failures: BTreeMap<Ipv4Addr, VecDeque<Instant>>,
     joining: bool,
+    /// The last error of a step retried every second, logged once.
+    last_repeated: Option<String>,
 }
 
 /// Runs the daemon until SIGTERM or SIGINT.
@@ -256,6 +289,11 @@ pub async fn run(args: Args) -> Result<()> {
         "loop guard",
         fdb_guard::spawn(&sys, ports_rx, inputs_tx.clone()),
     ));
+    // Without the netlink connection nothing works any more: its end ends
+    // the daemon, and systemd starts it again.
+    if let Some(connection) = sys.net.take_connection() {
+        tasks.push((NETLINK_TASK, connection));
+    }
 
     let paths = Paths {
         config_dir: args.config_dir.clone(),
@@ -286,6 +324,8 @@ pub async fn run(args: Args) -> Result<()> {
         sync_problem: None,
         expected: BTreeMap::new(),
         fdb_cache: std::sync::Mutex::new(None),
+        config_id: 0,
+        derived: std::sync::Mutex::new(None),
         fetching: false,
         fetch_backoff: BTreeMap::new(),
         grace: BTreeMap::new(),
@@ -293,6 +333,7 @@ pub async fn run(args: Args) -> Result<()> {
         invites,
         join_failures: BTreeMap::new(),
         joining: false,
+        last_repeated: None,
     };
     ctl.startup();
     ctl.seed_measurements().await;
@@ -344,13 +385,22 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
 
-    for (_, task) in tasks {
-        task.abort();
+    // The netlink connection stays until everything is removed.
+    let mut connection = None;
+    for (name, task) in tasks {
+        if name == NETLINK_TASK {
+            connection = Some(task);
+        } else {
+            task.abort();
+        }
     }
     info!("Stopping; removing everything wanderlan created");
     let removed = reconcile::teardown(&ctl.sys, |c| info!("{c}"))
         .await
         .context("cleanup failed")?;
+    if let Some(task) = connection {
+        task.abort();
+    }
     let _ = std::fs::remove_file(&args.socket);
     info!("Stopped ({} changes undone)", removed.len());
     Ok(())
@@ -505,7 +555,7 @@ impl Controller {
             {
                 self.runtime.pmtu.insert(
                     peer.to_string(),
-                    rule.mss + wanderlan_core::mtu::MSS_OVERHEAD,
+                    rule.mss.saturating_add(wanderlan_core::mtu::MSS_OVERHEAD),
                 );
             }
         }
@@ -582,6 +632,7 @@ impl Controller {
     fn set_config(&mut self, cfg: Option<Config>) {
         let old_peers = self.direct_peers();
         self.config = cfg;
+        self.config_id += 1;
         let new_peers = self.direct_peers();
         let now = Instant::now();
         for (name, addr) in old_peers {
@@ -596,9 +647,19 @@ impl Controller {
         self.runtime
             .pmtu
             .retain(|peer, _| new_peers.contains_key(peer));
-        self.runtime
-            .blocked
-            .retain(|port| new_peers.keys().any(|p| topology::gretap_name(p) == *port));
+        // A port shut by the loop guard stays shut while it exists: tunnels
+        // of peers that are gone and trunk ports no longer used are freed.
+        let trunk_ports: BTreeSet<&String> =
+            self.config.as_ref().map_or_else(BTreeSet::new, |cfg| {
+                std::iter::once(&cfg.local.trunk)
+                    .chain(cfg.local.tunnel_trunks.values())
+                    .flatten()
+                    .collect()
+            });
+        self.runtime.blocked.retain(|port| {
+            new_peers.keys().any(|p| topology::gretap_name(p) == *port)
+                || trunk_ports.contains(port)
+        });
         self.publish();
     }
 
@@ -679,7 +740,10 @@ impl Controller {
             announce,
             announce_to,
         });
-        self.offer.send_replace(Offer { bind, views });
+        self.offer.send_replace(Offer {
+            bind,
+            views: Arc::new(views),
+        });
     }
 
     async fn handle(&mut self, input: Input) {
@@ -697,6 +761,11 @@ impl Controller {
                 request,
                 reply,
             } => {
+                // The joining site has given up waiting (it was told so):
+                // admitting it now would only be rolled back later.
+                if reply.is_closed() {
+                    return;
+                }
                 let answer = self.admit(from, request).await;
                 let _ = reply.send(answer);
             }
@@ -736,6 +805,15 @@ impl Controller {
         }
     }
 
+    /// An error of a step that is retried every second: logged when it is
+    /// new, not every time.
+    fn error_once(&mut self, message: String) {
+        if self.last_repeated.as_deref() != Some(message.as_str()) {
+            self.events.error(message.clone());
+            self.last_repeated = Some(message);
+        }
+    }
+
     /// Housekeeping: automatic confirmation of synced changes, sync retries.
     async fn every_second(&mut self) {
         if let Some(p) = &self.pending
@@ -747,7 +825,7 @@ impl Controller {
             let reachable = self.probes.read().ok().and_then(|t| {
                 t.iter()
                     .filter(|(name, _)| peers.contains_key(*name))
-                    .find(|(_, pp)| pp.last_reply.is_some_and(|r| r > since))
+                    .find(|(_, pp)| pp.last_reply_at.is_some_and(|r| r > since))
                     .map(|(name, _)| name.clone())
             });
             if let Some(via) = reachable {
@@ -760,7 +838,7 @@ impl Controller {
                             c.revision
                         ),
                     ),
-                    Err(e) => self.events.error(e.message),
+                    Err(e) => self.error_once(e.message),
                 }
             }
         }
@@ -771,7 +849,7 @@ impl Controller {
             let site = site.clone();
             let up = self.probes.read().ok().is_some_and(|t| {
                 t.get(&site)
-                    .and_then(|pp| pp.last_reply)
+                    .and_then(|pp| pp.last_reply_at)
                     .is_some_and(|r| r > since)
             });
             if up {
@@ -784,7 +862,7 @@ impl Controller {
                             c.revision
                         ),
                     ),
-                    Err(e) => self.events.error(e.message),
+                    Err(e) => self.error_once(e.message),
                 }
             }
         }
@@ -802,7 +880,10 @@ impl Controller {
             return;
         };
         let me = confirmed.self_name().to_string();
-        let ours = Version::of(&confirmed.network);
+        let ours = match self.derived().confirmed {
+            Some(v) => v,
+            None => Version::of(&confirmed.network),
+        };
         let port = confirmed.network.control_port;
         let tunnels: Vec<(String, TunnelKind)> = topology::tunnels_for(&confirmed.network, &me)
             .into_iter()
@@ -826,6 +907,10 @@ impl Controller {
             let Some(announce) = probe.announce else {
                 continue;
             };
+            // A revision that no network.toml can hold is not adopted.
+            if announce.revision > MAX_REVISION {
+                continue;
+            }
             let theirs = Version {
                 revision: announce.revision,
                 fingerprint: fingerprint_hex(&announce.fingerprint),
@@ -942,7 +1027,11 @@ impl Controller {
         };
         cfg.network.revision = revision;
         if let Err(e) = self.paths.write_confirmed(&cfg) {
-            warn!("cannot write the configuration files: {e:#}");
+            let message = format!("cannot write the configuration files: {e:#}");
+            if self.last_repeated.as_deref() != Some(message.as_str()) {
+                warn!("{message}");
+                self.last_repeated = Some(message);
+            }
             return;
         }
         debug!("Peer \"{peer}\" has revision {revision} with the same content; taken over");
@@ -982,7 +1071,12 @@ impl Controller {
                 return;
             }
         };
-        let Some(network) = parsed else { return };
+        let Some(network) = parsed else {
+            // Nothing in it (e.g. only comments): not again every second.
+            self.fetch_backoff
+                .insert(peer, Instant::now() + FETCH_BACKOFF);
+            return;
+        };
         let fingerprint = config::fingerprint(&network);
         let network = match mode {
             FetchMode::Merge => {
@@ -1039,7 +1133,14 @@ impl Controller {
             }
             Ok(cfg) => {
                 let source = ChangeSource::Sync { peer: peer.clone() };
-                if let Err(e) = self.apply(cfg, source, None, None, false).await {
+                let result = self.apply(cfg, source, None, None, false).await;
+                if result.is_ok()
+                    && mode == FetchMode::Merge
+                    && let Some(p) = &mut self.pending
+                {
+                    p.announced = Some(fingerprint.clone());
+                }
+                if let Err(e) = result {
                     // Possibly transient (e.g. a busy kernel); try again later.
                     self.fetch_backoff
                         .insert(peer.clone(), Instant::now() + FETCH_BACKOFF);
@@ -1186,6 +1287,11 @@ impl Controller {
     async fn admit(&mut self, from: Ipv4Addr, request: JoinRequest) -> JoinReply {
         let error = |message: String| JoinReply::Error { message };
         let now = Instant::now();
+        // Addresses without recent failures are forgotten.
+        self.join_failures.retain(|_, f| {
+            f.back()
+                .is_some_and(|t| now.duration_since(*t) <= JOIN_FAILURE_WINDOW)
+        });
         let failures = self.join_failures.entry(from).or_default();
         while failures
             .front()
@@ -1439,6 +1545,9 @@ impl Controller {
         if let Ok(mut fdb) = self.fdb_cache.lock() {
             *fdb = None;
         }
+        if let Ok(mut d) = self.derived.lock() {
+            *d = None;
+        }
         self.generation += 1;
         if let Ok(mut t) = self.probes.write() {
             t.clear();
@@ -1579,9 +1688,11 @@ impl Controller {
             .filter(|d| !d.is_error())
             .collect();
         let diff = self.diff_against_running(&cfg);
+        // Within the range of commit_timeout: a huge value from the API
+        // would never roll back (or overflow the deadline).
         let timeout = timeout
             .unwrap_or(cfg.network.commit_timeout)
-            .max(MIN_TIMEOUT);
+            .clamp(MIN_TIMEOUT, config::COMMIT_TIMEOUT_RANGE.1);
         let fingerprint = config::fingerprint(&cfg.network);
         let previous = self.config.clone();
         self.set_config(Some(cfg));
@@ -1612,10 +1723,11 @@ impl Controller {
         self.pending = Some(Pending {
             previous,
             deadline: Instant::now() + timeout,
-            applied_at: SystemTime::now(),
+            applied_at: std::time::Instant::now(),
             source,
             from_files,
             fingerprint,
+            announced: None,
         });
         self.events.emit(
             Level::Info,
@@ -1703,7 +1815,11 @@ impl Controller {
                 .is_none_or(|v| v.fingerprint != config::fingerprint(&cfg.network));
             if changed {
                 let base = previous_version.map_or(0, |v| v.revision);
-                cfg.network.revision = base.max(cfg.network.revision) + 1;
+                // The files hold at most an i64.
+                cfg.network.revision = base
+                    .max(cfg.network.revision)
+                    .saturating_add(1)
+                    .min(MAX_REVISION);
             }
             self.rejected.clear();
             // A change of its own: the last refusal is history.
@@ -1725,7 +1841,11 @@ impl Controller {
         }
         self.confirmed = Some(cfg.clone());
         self.set_config(Some(cfg.clone()));
-        self.runtime.blocked.clear();
+        // A change the user confirmed lifts the blocks of the loop guard
+        // (it may have fixed the loop); an automatic confirmation does not.
+        if user {
+            self.runtime.blocked.clear();
+        }
         if user {
             self.events.info(format!(
                 "Change confirmed; network revision {} is in effect",
@@ -1745,6 +1865,9 @@ impl Controller {
         let peer = match &pending.source {
             ChangeSource::Sync { peer } => {
                 self.reject(pending.fingerprint.clone());
+                if let Some(announced) = &pending.announced {
+                    self.reject(announced.clone());
+                }
                 Some(peer.clone())
             }
             ChangeSource::Join { site } => {
@@ -1799,7 +1922,14 @@ impl Controller {
 
     /// Reconciles; errors are logged only when they change.
     async fn reconcile(&mut self) {
-        if let Err(e) = self.reconcile_once().await {
+        let result = self.reconcile_once().await;
+        // The loop guard needs the ports even when not everything worked
+        // (tunnels from before a restart forward traffic all the same); on
+        // success `reconcile_once` has updated them.
+        if result.is_err() {
+            self.update_port_map().await;
+        }
+        if let Err(e) = result {
             let msg = e.to_string();
             if self.last_error.as_deref() != Some(msg.as_str()) {
                 self.events
@@ -1816,8 +1946,19 @@ impl Controller {
         self.runtime.underlay_mtu = self.underlay_mtus(&cfg).await;
         let desired = desired::derive(&cfg, &self.runtime);
         let events = self.events.clone();
-        let changes =
-            reconcile::reconcile(&self.sys, &desired, |c| events.info(c.to_string())).await?;
+        // A hanging kernel or nft call must not block the daemon (and with
+        // it the API and the rollback deadline).
+        let changes = tokio::time::timeout(
+            RECONCILE_TIMEOUT,
+            reconcile::reconcile(&self.sys, &desired, |c| events.info(c.to_string())),
+        )
+        .await
+        .map_err(|_| {
+            reconcile::ReconcileError::Sys(wanderlan_core::sys::SysError::new(
+                "apply the configuration",
+                format!("no answer within {} s", RECONCILE_TIMEOUT.as_secs()),
+            ))
+        })??;
         let key = topology::forwarding_key(&cfg.network);
         let network_changed = self.applied_key.as_ref().is_some_and(|k| *k != key);
         if network_changed || reconcile::ports_changed(&changes) {
@@ -2042,15 +2183,85 @@ impl Controller {
         })
     }
 
+    /// The desired state, the fingerprints and the confirmed version, from
+    /// the cache while neither the configuration nor the runtime changed.
+    fn derived(&self) -> Derived {
+        let mut guard = self
+            .derived
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(d) = guard
+            .as_ref()
+            .filter(|d| d.config_id == self.config_id && d.runtime == self.runtime)
+        {
+            return d.clone();
+        }
+        let fresh = Derived {
+            config_id: self.config_id,
+            runtime: self.runtime.clone(),
+            desired: self
+                .config
+                .as_ref()
+                .map(|cfg| Arc::new(desired::derive(cfg, &self.runtime))),
+            fingerprint: self
+                .config
+                .as_ref()
+                .map(|c| config::fingerprint(&c.network))
+                .unwrap_or_default(),
+            confirmed: self.confirmed.as_ref().map(|c| Version::of(&c.network)),
+        };
+        *guard = Some(fresh.clone());
+        fresh
+    }
+
+    /// MAC addresses per bridge port (learned ones), at most
+    /// `FDB_CACHE_TTL` old: the FDB can be large and the status is asked
+    /// for every second.
+    async fn macs_per_port(&self) -> MacCounts {
+        let cached = self
+            .fdb_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|(at, _)| at.elapsed() < FDB_CACHE_TTL)
+            .map(|(_, counts)| counts.clone());
+        if let Some(counts) = cached {
+            return counts;
+        }
+        let fdb = self.sys.fdb().await.unwrap_or_default();
+        self.count_macs(&fdb)
+    }
+
+    /// Counts the learned addresses per port and keeps the result.
+    fn count_macs(
+        &self,
+        fdb: &[wanderlan_core::sys::observe::FdbEntry],
+    ) -> Arc<BTreeMap<u32, usize>> {
+        let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
+        for e in fdb.iter().filter(|e| !e.permanent) {
+            *counts.entry(e.port).or_default() += 1;
+        }
+        let counts = Arc::new(counts);
+        *self
+            .fdb_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some((Instant::now(), counts.clone()));
+        counts
+    }
+
     async fn mac_table(&self) -> Result<Vec<MacEntry>, ApiError> {
         let links = self.sys.links().await.map_err(api_err)?;
         let fdb = self.sys.fdb().await.map_err(api_err)?;
+        // Fresh anyway: the status gets the counts from it too.
+        self.count_macs(&fdb);
         let bridges: BTreeSet<u32> = owned_bridges(&links).into_iter().map(|(i, _)| i).collect();
+        let names: std::collections::HashMap<u32, &str> =
+            links.iter().map(|l| (l.index, l.name.as_str())).collect();
         let name_of = |i: u32| {
-            links
-                .iter()
-                .find(|l| l.index == i)
-                .map_or_else(|| format!("#{i}"), |l| l.name.clone())
+            names
+                .get(&i)
+                .map_or_else(|| format!("#{i}"), |n| (*n).to_string())
         };
         let mut out: Vec<MacEntry> = fdb
             .into_iter()
@@ -2068,35 +2279,14 @@ impl Controller {
 
     async fn status(&self) -> Status {
         let links = self.sys.links().await.unwrap_or_default();
-        // The FDB can be large and the TUI asks every second.
-        let cached = {
-            let guard = self
-                .fdb_cache
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            guard
-                .as_ref()
-                .filter(|(at, _)| at.elapsed() < FDB_CACHE_TTL)
-                .map(|(_, fdb)| fdb.clone())
-        };
-        let fdb = match cached {
-            Some(fdb) => fdb,
-            None => {
-                let fdb = self.sys.fdb().await.unwrap_or_default();
-                let mut guard = self
-                    .fdb_cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                *guard = Some((Instant::now(), fdb.clone()));
-                fdb
-            }
-        };
+        let macs_per_port = self.macs_per_port().await;
+        let derived = self.derived();
         let probes = self.probes.read().map(|t| t.clone()).unwrap_or_default();
         let rates = self.rates.read().map(|r| r.clone()).unwrap_or_default();
-        let confirmed_fp = self
+        let confirmed_fp = derived
             .confirmed
             .as_ref()
-            .map(|c| config::fingerprint(&c.network))
+            .map(|v| v.fingerprint.clone())
             .unwrap_or_default();
         let pending = self.pending.as_ref().map(|p| PendingChange {
             remaining_secs: p
@@ -2130,7 +2320,10 @@ impl Controller {
                 sync_problem: None,
             };
         };
-        let desired = desired::derive(cfg, &self.runtime);
+        let desired = derived
+            .desired
+            .clone()
+            .unwrap_or_else(|| Arc::new(desired::derive(cfg, &self.runtime)));
         let me = cfg.self_site();
         let tunnels = topology::tunnels_for(&cfg.network, cfg.self_name());
         let direct: BTreeSet<&str> = tunnels.iter().map(|t| t.peer.name.as_str()).collect();
@@ -2151,11 +2344,7 @@ impl Controller {
                         Some(_) => PortState::Down,
                     }
                 };
-                let macs = link.map_or(0, |l| {
-                    fdb.iter()
-                        .filter(|e| e.port == l.index && !e.permanent)
-                        .count()
-                });
+                let macs = link.map_or(0, |l| macs_per_port.get(&l.index).copied().unwrap_or(0));
                 let probe = probes.get(&t.peer.name);
                 let mss = desired
                     .mss
@@ -2262,7 +2451,7 @@ impl Controller {
             trunk: Some(cfg.trunk().to_string()),
             vlans: me.map(|s| cfg.network.effective_vlans(s).to_string()),
             revision: cfg.network.revision,
-            fingerprint: config::fingerprint(&cfg.network),
+            fingerprint: derived.fingerprint.clone(),
             pending,
             last_error: self.last_error.clone(),
             peers,

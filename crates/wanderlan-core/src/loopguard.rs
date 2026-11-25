@@ -12,8 +12,10 @@ use std::time::{Duration, Instant};
 
 /// Default observation window.
 pub const WINDOW: Duration = Duration::from_secs(10);
-/// Default number of moves within the window that counts as a loop.
-pub const THRESHOLD: usize = 5;
+/// Default number of moves within the window that counts as a loop. A real
+/// loop moves an address hundreds of times a second; a device roaming
+/// between sites or a duplicated MAC address moves it a few times.
+pub const THRESHOLD: usize = 20;
 /// After a detection, further detections are suppressed for this long so
 /// that the remaining frames of the loop do not shut down more ports.
 pub const HOLD_OFF: Duration = Duration::from_secs(30);
@@ -113,6 +115,11 @@ impl LoopGuard {
             return None;
         }
         if self.quiet_until.is_some_and(|q| now < q) {
+            // Hold-off: keep only what a detection needs, not every move of
+            // a storm.
+            while track.moves.len() > self.threshold {
+                track.moves.pop_front();
+            }
             return None;
         }
         let moves: Vec<Move> = track.moves.drain(..).collect();
@@ -167,6 +174,38 @@ mod tests {
 
     fn tunnel(p: u32) -> bool {
         p >= 10
+    }
+
+    #[test]
+    fn a_storm_during_the_hold_off_keeps_only_what_is_needed() {
+        let mut g = LoopGuard::new(Duration::from_secs(10), 5);
+        let t = Instant::now();
+        let mut detections = 0;
+        for i in 0..1000u32 {
+            let port = if i % 2 == 0 { GT_A } else { GT_B };
+            if g.learned(t, MAC, Some(20), port, tunnel).is_some() {
+                detections += 1;
+            }
+        }
+        assert_eq!(detections, 1, "once, then the hold-off");
+        let kept = g
+            .macs
+            .values()
+            .map(|track| track.moves.len())
+            .max()
+            .unwrap();
+        assert!(kept <= 5, "{kept} moves kept");
+    }
+
+    #[test]
+    fn the_default_threshold_ignores_a_few_moves() {
+        let mut g = LoopGuard::default();
+        let t = Instant::now();
+        // A device that changes sites a few times (roaming, a duplicated MAC).
+        for i in 0..10u32 {
+            let port = if i % 2 == 0 { GT_A } else { GT_B };
+            assert!(g.learned(t, MAC, Some(20), port, tunnel).is_none());
+        }
     }
 
     #[test]

@@ -543,8 +543,8 @@ impl ObserveOps for FakeNet {
         Ok(self.lock().fdb.clone())
     }
 
-    fn watch_fdb(&self) -> SysResult<tokio::sync::mpsc::UnboundedReceiver<FdbEvent>> {
-        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    fn watch_fdb(&self) -> SysResult<tokio::sync::mpsc::Receiver<FdbEvent>> {
+        let (_tx, rx) = tokio::sync::mpsc::channel(1);
         Ok(rx)
     }
 

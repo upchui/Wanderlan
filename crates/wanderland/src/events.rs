@@ -46,13 +46,17 @@ impl EventLog {
             peer: peer.map(str::to_string),
             message,
         };
-        if let Ok(mut h) = self.history.lock() {
+        // Sent while the history is locked: a subscriber gets an event either
+        // in the history or from the channel, never both.
+        let mut history = self.history.lock();
+        if let Ok(h) = &mut history {
             if h.len() == CAPACITY {
                 h.pop_front();
             }
             h.push_back(event.clone());
         }
         let _ = self.tx.send(event);
+        drop(history);
     }
 
     /// Informational event.

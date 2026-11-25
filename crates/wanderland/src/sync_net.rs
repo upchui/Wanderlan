@@ -10,6 +10,7 @@
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -29,6 +30,10 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LINE: u64 = 4096;
 /// Time the controller may take to answer a join request.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// Connections served at the same time at most; more are closed at once.
+const MAX_CONNECTIONS: usize = 64;
+/// The longest one connection may take, whatever it does.
+const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What the server offers.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -36,8 +41,8 @@ pub struct Offer {
     /// Address to listen on.
     pub bind: Option<SocketAddrV4>,
     /// What each allowed address gets: the confirmed network.toml as that
-    /// peer may see it.
-    pub views: BTreeMap<Ipv4Addr, String>,
+    /// peer may see it (shared, so every connection does not copy it).
+    pub views: Arc<BTreeMap<Ipv4Addr, String>>,
 }
 
 /// Starts the server; it follows changes of the offer.
@@ -66,19 +71,38 @@ async fn run(mut offer: watch::Receiver<Offer>, inputs: mpsc::Sender<Input>) {
             }
         };
         info!("Serving the network configuration to peers on {bind} (TCP)");
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
         loop {
             tokio::select! {
-                accepted = listener.accept() => {
-                    if let Ok((stream, from)) = accepted {
+                accepted = listener.accept() => match accepted {
+                    Ok((stream, from)) => {
+                        // Too many at once (a flood): close this one.
+                        let Ok(slot) = slots.clone().try_acquire_owned() else {
+                            debug!("sync request from {from} refused: too many connections");
+                            continue;
+                        };
                         let current = offer.borrow().clone();
                         let inputs = inputs.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = serve(stream, from, &current, &inputs).await {
-                                debug!("sync request from {from} failed: {e:#}");
+                            let _slot = slot;
+                            match tokio::time::timeout(
+                                CONNECTION_TIMEOUT,
+                                serve(stream, from, &current, &inputs),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(e)) => debug!("sync request from {from} failed: {e:#}"),
+                                Err(_) => debug!("sync request from {from} took too long"),
                             }
                         });
                     }
-                }
+                    // E.g. out of file descriptors: no busy loop.
+                    Err(e) => {
+                        debug!("sync accept failed: {e}");
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                    }
+                },
                 r = offer.changed() => {
                     if r.is_err() {
                         return;

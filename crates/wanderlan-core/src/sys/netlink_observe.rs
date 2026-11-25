@@ -24,6 +24,8 @@ use super::{SysError, SysResult};
 const USER_HZ: u64 = 100;
 /// Receive buffer of the FDB watch socket.
 const FDB_RX_BUFFER: usize = 4 * 1024 * 1024;
+/// FDB events waiting for the loop guard at most.
+const FDB_EVENTS: usize = 8192;
 
 /// Parses a bridge FDB message; `None` for other neighbour messages.
 fn parse(msg: &NeighbourMessage) -> Option<FdbEntry> {
@@ -196,7 +198,7 @@ impl ObserveOps for Netlink {
         Ok(out)
     }
 
-    fn watch_fdb(&self) -> SysResult<mpsc::UnboundedReceiver<FdbEvent>> {
+    fn watch_fdb(&self) -> SysResult<mpsc::Receiver<FdbEvent>> {
         let (mut connection, handle, mut messages) =
             new_multicast_connection(&[MulticastGroup::Neigh])
                 .map_err(|e| SysError::new("watch bridge FDB", e))?;
@@ -210,12 +212,15 @@ impl ObserveOps for Netlink {
         if let Err(e) = socket.set_no_enobufs(true) {
             tracing::warn!("cannot set NETLINK_NO_ENOBUFS on the FDB watch socket: {e}");
         }
-        let (tx, rx) = mpsc::unbounded_channel();
+        // Bounded: in a storm events are dropped here instead of piling up
+        // in memory (a real loop still makes far more than enough).
+        let (tx, rx) = mpsc::channel(FDB_EVENTS);
         // The connection runs in the same task as the forwarding, so both end
         // together once the receiver is dropped.
         tokio::spawn(async move {
             let _handle = handle;
             let forward = async {
+                let mut dropped: u64 = 0;
                 while let Some((msg, _)) = messages.next().await {
                     let event = match msg.payload {
                         NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(m)) => {
@@ -225,14 +230,21 @@ impl ObserveOps for Netlink {
                             parse(&m).map(|e| FdbEvent::Removed {
                                 mac: e.mac,
                                 vlan: e.vlan,
+                                bridge: e.bridge,
                             })
                         }
                         _ => None,
                     };
-                    if let Some(event) = event
-                        && tx.send(event).is_err()
-                    {
-                        break;
+                    let Some(event) = event else { continue };
+                    match tx.try_send(event) {
+                        Ok(()) => {}
+                        Err(mpsc::error::TrySendError::Full(_)) => {
+                            dropped += 1;
+                            if dropped.is_power_of_two() {
+                                tracing::debug!("FDB watch: {dropped} events dropped (storm)");
+                            }
+                        }
+                        Err(mpsc::error::TrySendError::Closed(_)) => break,
                     }
                 }
             };
@@ -262,7 +274,7 @@ impl ObserveOps for LinuxSystem {
         self.net.output_interface(dst, src).await
     }
 
-    fn watch_fdb(&self) -> SysResult<mpsc::UnboundedReceiver<FdbEvent>> {
+    fn watch_fdb(&self) -> SysResult<mpsc::Receiver<FdbEvent>> {
         self.net.watch_fdb()
     }
 }
