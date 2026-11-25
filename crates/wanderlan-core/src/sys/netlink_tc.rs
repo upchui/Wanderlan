@@ -192,21 +192,30 @@ impl TcOps for Netlink {
                 ..IfTc::default()
             };
             for direction in [Direction::Ingress, Direction::Egress] {
-                let mut seen_prios = Vec::new();
+                let mut seen = Vec::new();
                 for f in self.dump_filters(index, direction).await? {
-                    // Each filter is reported twice: once for its priority
-                    // (handle 0, no options) and once with its handle.
+                    // A priority is reported once on its own (handle 0, no
+                    // options), then every filter in it with its handle.
                     if kind(&f).is_none() || f.header.handle == TcHandle::UNSPEC {
                         continue;
                     }
                     let prio = (f.header.info >> 16) as u16;
-                    if seen_prios.contains(&prio) {
+                    let handle = u32::from(f.header.handle);
+                    if seen.contains(&(prio, handle)) {
                         continue;
                     }
-                    seen_prios.push(prio);
+                    seen.push((prio, handle));
                     match cookie(&f).and_then(TcRule::from_cookie) {
-                        Some(rule) if rule.direction == direction && rule.prio() == prio => {
+                        Some(rule)
+                            if rule.direction == direction
+                                && prio == rule.prio()
+                                && handle == rule.handle() =>
+                        {
                             state.ours.push(rule);
+                        }
+                        Some(rule) if rule.direction == direction && prio == rule.legacy_prio() => {
+                            state.ours.push(rule);
+                            state.legacy = true;
                         }
                         _ => state.foreign += 1,
                     }
@@ -242,7 +251,12 @@ impl TcOps for Netlink {
     }
 
     async fn add_tc_rule(&self, index: u32, rule: &TcRule) -> SysResult<()> {
-        let mut msg = header(index, 0, parent(rule.direction), info(rule.prio()))?;
+        let mut msg = header(
+            index,
+            rule.handle(),
+            parent(rule.direction),
+            info(rule.prio()),
+        )?;
         msg.attributes.push(TcAttribute::Kind("flower".into()));
         msg.attributes.push(TcAttribute::Options(vec![
             TcOption::Flower(TcFilterFlowerOption::EthType(ETH_P_8021Q)),
@@ -259,14 +273,33 @@ impl TcOps for Netlink {
     }
 
     async fn del_tc_rule(&self, index: u32, rule: &TcRule) -> SysResult<()> {
-        let msg = header(index, 0, parent(rule.direction), info(rule.prio()))?;
-        self.tc_request(
-            &format!("remove tc rule ({rule})"),
-            RouteNetlinkMessage::DelTrafficFilter(msg),
-            NLM_F_ACK,
-        )
-        .await
-        .map(drop)
+        let op = format!("remove tc rule ({rule})");
+        let mut msg = header(
+            index,
+            rule.handle(),
+            parent(rule.direction),
+            info(rule.prio()),
+        )?;
+        msg.attributes.push(TcAttribute::Kind("flower".into()));
+        let first = self
+            .tc_request(&op, RouteNetlinkMessage::DelTrafficFilter(msg), NLM_F_ACK)
+            .await;
+        if first.is_ok() {
+            return Ok(());
+        }
+        // A rule of an older version: its own priority, handle 0 removes it.
+        let legacy = header(index, 0, parent(rule.direction), info(rule.legacy_prio()))?;
+        match self
+            .tc_request(
+                &op,
+                RouteNetlinkMessage::DelTrafficFilter(legacy),
+                NLM_F_ACK,
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(_) => first.map(drop),
+        }
     }
 }
 
@@ -288,5 +321,17 @@ mod tests {
         let i = info(0xC000 + 30);
         assert_eq!(i >> 16, 0xC000 + 30);
         assert_eq!((i & 0xFFFF) as u16, ETH_P_8021Q.to_be());
+    }
+
+    #[test]
+    fn all_rules_share_one_priority_with_the_vlan_as_handle() {
+        let rule = TcRule {
+            direction: Direction::Ingress,
+            vid: 130,
+            action: TcAction::Translate(30),
+        };
+        assert_eq!(rule.prio(), 0xC000);
+        assert_eq!(rule.handle(), 130);
+        assert_eq!(rule.legacy_prio(), 0xC000 + 130);
     }
 }

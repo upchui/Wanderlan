@@ -26,6 +26,8 @@ check "site5: egress rule translates VLAN 30 back to 130" \
   x site5 "tc filter show dev trunk0 egress | grep -A8 'vlan_id 30' | grep -q 'modify id 130'"
 check "site5: incoming frames tagged with VLAN 30 are dropped" \
   x site5 "tc filter show dev trunk0 ingress | grep -A8 'vlan_id 30' | grep -q 'gact action drop'"
+check "site5: all rules of a direction share one priority (0xc000), the VLAN is the handle" \
+  x site5 "[ \"\$(tc filter show dev trunk0 ingress | grep -o 'pref [0-9]*' | sort -u)\" = 'pref 49152' ] && tc filter show dev trunk0 ingress | grep -q 'handle 0x82 '"
 check "site2 (no mappings) has no tc rules" x site2 "[ -z \"\$(tc filter show dev trunk0 ingress 2>/dev/null)\" ]"
 
 # Native mapping: an untagged client at site5 is in VLAN 20 everywhere.

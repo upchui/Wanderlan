@@ -5,6 +5,10 @@
 //! using the `nftables` crate. Every rule carries a comment that encodes it,
 //! e.g. `wl mss oif gt-hub2 ip 1318`, so the current state can be read back
 //! and compared without parsing expressions.
+//!
+//! Every bridged frame of the host passes the base chain, so it holds as
+//! little as possible: the split horizon (sets) and one gate that sends TCP
+//! SYNs to the chain with the MSS rules. All other frames leave after it.
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -19,7 +23,7 @@ use nftables::expr::{
 };
 use nftables::helper;
 use nftables::schema::{Chain, NfListObject, NfObject, Rule, Table};
-use nftables::stmt::{Mangle, Match, Operator, Statement};
+use nftables::stmt::{JumpTarget, Mangle, Match, Operator, Statement};
 use nftables::types::{NfChainPolicy, NfChainType, NfFamily, NfHook};
 use sha2::{Digest, Sha256};
 
@@ -33,8 +37,12 @@ const GREATER_THAN: Operator = Operator::LT;
 
 /// Name of the nftables table (family bridge).
 pub const TABLE: &str = "wanderlan";
-/// Name of the chain in that table.
+/// Name of the base chain in that table (hook forward).
 pub const CHAIN: &str = "forward";
+/// Name of the chain with the MSS rules, reached only by TCP SYNs.
+pub const MSS_CHAIN: &str = "wl-mss";
+/// Comment of the rule that sends TCP SYNs to [`MSS_CHAIN`].
+const GATE: &str = "wl mss gate";
 
 /// Whether a rule matches frames leaving or entering through a port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -127,16 +135,7 @@ impl MssRule {
                 right: Expression::String(Cow::Owned(self.port.clone())),
                 op: Operator::EQ,
             }),
-            Statement::Match(Match {
-                left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
-                    PayloadField {
-                        protocol: Cow::Borrowed("tcp"),
-                        field: Cow::Borrowed("flags"),
-                    },
-                ))),
-                right: Expression::String(Cow::Borrowed("syn")),
-                op: Operator::IN,
-            }),
+            syn(),
             Statement::Match(Match {
                 left: maxseg(),
                 right: Expression::Number(u32::from(self.mss)),
@@ -335,6 +334,12 @@ pub fn replace_batch(
         policy: Some(NfChainPolicy::Accept),
         ..Chain::default()
     }));
+    batch.add(NfListObject::Chain(Chain {
+        family: NfFamily::Bridge,
+        table: Cow::Borrowed(TABLE),
+        name: Cow::Borrowed(MSS_CHAIN),
+        ..Chain::default()
+    }));
     // The split horizon first: what is dropped needs no clamping.
     for rule in split {
         batch.add(NfListObject::Rule(Rule {
@@ -346,17 +351,48 @@ pub fn replace_batch(
             ..Rule::default()
         }));
     }
-    for rule in rules {
+    // Only TCP SYNs go on to the MSS rules (one rule per port, direction
+    // and IP version); every other frame stops here.
+    if !rules.is_empty() {
         batch.add(NfListObject::Rule(Rule {
             family: NfFamily::Bridge,
             table: Cow::Borrowed(TABLE),
             chain: Cow::Borrowed(CHAIN),
+            expr: Cow::Owned(vec![
+                syn(),
+                Statement::Jump(JumpTarget {
+                    target: Cow::Borrowed(MSS_CHAIN),
+                }),
+            ]),
+            comment: Some(Cow::Borrowed(GATE)),
+            ..Rule::default()
+        }));
+    }
+    for rule in rules {
+        batch.add(NfListObject::Rule(Rule {
+            family: NfFamily::Bridge,
+            table: Cow::Borrowed(TABLE),
+            chain: Cow::Borrowed(MSS_CHAIN),
             expr: Cow::Owned(rule.statements()),
             comment: Some(Cow::Owned(rule.comment())),
             ..Rule::default()
         }));
     }
     batch.to_nftables()
+}
+
+/// `tcp flags syn`: a TCP SYN (also a SYN-ACK).
+fn syn() -> Statement<'static> {
+    Statement::Match(Match {
+        left: Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+            PayloadField {
+                protocol: Cow::Borrowed("tcp"),
+                field: Cow::Borrowed("flags"),
+            },
+        ))),
+        right: Expression::String(Cow::Borrowed("syn")),
+        op: Operator::IN,
+    })
 }
 
 fn nft_error(op: &str, e: impl std::error::Error + Send + Sync + 'static) -> SysError {
@@ -384,33 +420,18 @@ impl NftOps for NftCli {
         )
         .await
         .map_err(|e| nft_error("list nftables table bridge wanderlan", e))?;
-        let mut rules = BTreeSet::new();
-        let mut split = BTreeSet::new();
-        for obj in ruleset.objects.iter() {
-            if let NfObject::ListObject(NfListObject::Rule(rule)) = obj {
-                let comment = rule.comment.as_deref().unwrap_or_default();
-                if comment.starts_with("wl split ") {
-                    split.insert(comment.to_string());
-                    continue;
-                }
-                match MssRule::from_comment(comment) {
-                    Some(r) => {
-                        rules.insert(r);
-                    }
-                    // An unknown rule in our table: report a state that never
-                    // matches the desired one, so the table gets rewritten.
-                    None => {
-                        rules.insert(MssRule {
-                            port: String::from("?"),
-                            dir: PortDir::In,
-                            ipv6: false,
-                            mss: 0,
-                        });
-                    }
-                }
-            }
-        }
-        Ok(Some(NftState { mss: rules, split }))
+        let rules: Vec<(&str, &str)> = ruleset
+            .objects
+            .iter()
+            .filter_map(|obj| match obj {
+                NfObject::ListObject(NfListObject::Rule(rule)) => Some((
+                    rule.chain.as_ref(),
+                    rule.comment.as_deref().unwrap_or_default(),
+                )),
+                _ => None,
+            })
+            .collect();
+        Ok(Some(parse_rules(&rules)))
     }
 
     async fn set_nft_rules(
@@ -430,6 +451,38 @@ impl NftOps for NftCli {
             .await
             .map_err(|e| nft_error("delete nftables table bridge wanderlan", e))
     }
+}
+
+/// The state from the rules of the table, as (chain, comment). Anything not
+/// in the place this version puts it (an MSS rule in the base chain of an
+/// older version, a missing gate, an unknown rule) yields a state that never
+/// matches the desired one, so the table is written anew.
+fn parse_rules(rules: &[(&str, &str)]) -> NftState {
+    let mut mss = BTreeSet::new();
+    let mut split = BTreeSet::new();
+    let mut gate = false;
+    let mut misplaced = false;
+    for &(chain, comment) in rules {
+        match (chain, MssRule::from_comment(comment)) {
+            (CHAIN, _) if comment.starts_with("wl split ") => {
+                split.insert(comment.to_string());
+            }
+            (CHAIN, _) if comment == GATE => gate = true,
+            (MSS_CHAIN, Some(rule)) => {
+                mss.insert(rule);
+            }
+            _ => misplaced = true,
+        }
+    }
+    if misplaced || gate == mss.is_empty() {
+        mss.insert(MssRule {
+            port: String::from("?"),
+            dir: PortDir::In,
+            ipv6: false,
+            mss: 0,
+        });
+    }
+    NftState { mss, split }
 }
 
 /// The rules as last read or written (`None`: no table), and when.
@@ -542,9 +595,39 @@ mod tests {
             r#""mangle""#,
             r#""comment":"wl mss oif gt-hub2 ip 1318""#,
             r#""oifname""#,
+            // Only TCP SYNs reach the MSS rules.
+            r#""chain":"wl-mss""#,
+            r#"{"jump":{"target":"wl-mss"}}"#,
+            r#""comment":"wl mss gate""#,
         ] {
             assert!(json.contains(needle), "{needle} missing in {json}");
         }
+        // No gate without MSS rules.
+        let json =
+            serde_json::to_string(&replace_batch(&BTreeSet::new(), &BTreeSet::new())).unwrap();
+        assert!(!json.contains("wl mss gate"), "{json}");
+    }
+
+    #[test]
+    fn the_table_of_an_older_version_is_written_anew() {
+        let rule = MssRule {
+            port: "gt-a".into(),
+            dir: PortDir::In,
+            ipv6: false,
+            mss: 1318,
+        };
+        let comment = rule.comment();
+        let want = NftState::of(&BTreeSet::from([rule]), &BTreeSet::new());
+        // This version: the gate in the base chain, the rule behind it.
+        let now = parse_rules(&[(CHAIN, GATE), (MSS_CHAIN, &comment)]);
+        assert_eq!(now, want);
+        // An older version: the MSS rule in the base chain, no gate.
+        assert_ne!(parse_rules(&[(CHAIN, &comment)]), want);
+        // A gate without rules, a rule without the gate.
+        assert_ne!(parse_rules(&[(MSS_CHAIN, &comment)]), want);
+        assert!(!parse_rules(&[(CHAIN, GATE)]).is_empty());
+        // Nothing: the empty state.
+        assert!(parse_rules(&[]).is_empty());
     }
 
     /// Counts the reads of the rules.

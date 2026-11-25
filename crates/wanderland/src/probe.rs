@@ -25,6 +25,10 @@ pub const RTT_INTERVAL: Duration = Duration::from_secs(5);
 const RTT_TIMEOUT: Duration = Duration::from_secs(1);
 /// Timeout of a single MTU probe.
 const MTU_TIMEOUT: Duration = Duration::from_millis(400);
+/// Longest wait for one MTU probe (a slow, full uplink).
+const MTU_TIMEOUT_MAX: Duration = Duration::from_secs(2);
+/// When a measurement failed: try again after this long.
+const MTU_RETRY: Duration = Duration::from_secs(30);
 /// Attempts per probe size before a size counts as too large.
 const MTU_ATTEMPTS: usize = 3;
 /// Consecutive lost probes after which a peer counts as unreachable.
@@ -397,15 +401,14 @@ async fn probe_peer(
 
         let mtu_interval = shared.config.borrow().mtu_interval;
         let due = next_mtu.is_some_and(|t| Instant::now() >= t);
-        if let (Some(interval), true, Some(_)) = (mtu_interval, due, rtt) {
-            let pmtu = mtu::search(mtu::PROBE_MIN, mtu::PROBE_MAX, |size| {
+        if let (Some(interval), true, Some(rtt)) = (mtu_interval, due, rtt) {
+            // A loaded uplink answers late: wait at least twice the round trip.
+            let timeout = (rtt * 2).clamp(MTU_TIMEOUT, MTU_TIMEOUT_MAX);
+            let measured = mtu::search(mtu::PROBE_MIN, mtu::PROBE_MAX, |size| {
                 let shared = shared.clone();
                 async move {
                     for _ in 0..MTU_ATTEMPTS {
-                        if probe_once(&shared, target, size, MTU_TIMEOUT)
-                            .await
-                            .is_some()
-                        {
+                        if probe_once(&shared, target, size, timeout).await.is_some() {
                             return true;
                         }
                     }
@@ -413,7 +416,18 @@ async fn probe_peer(
                 }
             })
             .await;
-            next_mtu = Some(Instant::now() + interval);
+            // A failed measurement keeps the last good value (the MSS clamp
+            // stays) and is tried again soon.
+            let pmtu = measured.or(last_pmtu);
+            let wait = if measured.is_some() {
+                interval
+            } else {
+                MTU_RETRY.min(interval)
+            };
+            next_mtu = Instant::now().checked_add(wait);
+            if let (None, Some(last)) = (measured, last_pmtu) {
+                warn!("Path MTU to \"{name}\" could not be measured again; keeping {last} bytes");
+            }
             if let Ok(mut t) = table.write() {
                 let entry = t.entry(name.clone()).or_default();
                 entry.pmtu = pmtu;

@@ -461,6 +461,28 @@ async fn translation_rules_are_installed_once() {
 }
 
 #[tokio::test]
+async fn translation_rules_of_an_older_version_move_into_one_priority() {
+    let net = fresh();
+    let d = desired("haus3");
+    run(&net, &d).await;
+    net.mark_tc_legacy("ens19");
+    let changes = run(&net, &d).await;
+    let dels = changes
+        .iter()
+        .filter(|c| matches!(c, Change::DelTcRule { .. }))
+        .count();
+    let adds = changes
+        .iter()
+        .filter(|c| matches!(c, Change::AddTcRule { .. }))
+        .count();
+    assert_eq!((dels, adds), (3, 3), "{changes:?}");
+    let tc = net.tc("ens19");
+    assert!(!tc.legacy);
+    assert_eq!(tc.ours.len(), 3);
+    assert!(run(&net, &d).await.is_empty(), "once");
+}
+
+#[tokio::test]
 async fn removing_the_mapping_removes_rules_and_qdisc() {
     let net = fresh();
     run(&net, &desired("haus3")).await;

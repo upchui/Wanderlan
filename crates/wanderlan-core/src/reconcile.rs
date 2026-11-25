@@ -538,11 +538,18 @@ fn tc_changes(desired: &Desired, actual: &Actual) -> Vec<Change> {
         trunks.insert(trunk.index);
         let wanted: BTreeSet<TcRule> = spec.tc.iter().copied().collect();
         let current = actual.tc.get(&trunk.index).cloned().unwrap_or_default();
-        let have: BTreeSet<TcRule> = current.ours.iter().copied().collect();
-        for rule in have.difference(&wanted) {
+        let mut have: BTreeSet<TcRule> = current.ours.iter().copied().collect();
+        // Rules of an older version (one priority each) are put in place
+        // anew, all in one priority.
+        let gone: Vec<TcRule> = if current.legacy {
+            std::mem::take(&mut have).into_iter().collect()
+        } else {
+            have.difference(&wanted).copied().collect()
+        };
+        for rule in gone {
             dels.push(Change::DelTcRule {
                 dev: trunk.name.clone(),
-                rule: *rule,
+                rule,
             });
         }
         let missing: Vec<&TcRule> = wanted.difference(&have).collect();
@@ -557,7 +564,7 @@ fn tc_changes(desired: &Desired, actual: &Actual) -> Vec<Change> {
                 rule: *rule,
             });
         }
-        if wanted.is_empty() && !have.is_empty() && current.foreign == 0 {
+        if wanted.is_empty() && !current.ours.is_empty() && current.foreign == 0 {
             qdisc_dels.push(Change::DelClsact {
                 dev: trunk.name.clone(),
             });

@@ -234,7 +234,7 @@ pub async fn run(args: Args) -> Result<()> {
     let (offer_tx, offer_rx) = watch::channel(Offer::default());
     let (ports_tx, ports_rx) = watch::channel(PortMap::default());
     let rates: Rates = Arc::new(RwLock::new(BTreeMap::new()));
-    let vlan_rates: VlanRates = Arc::new(RwLock::new(BTreeMap::new()));
+    let vlan_rates: VlanRates = Arc::new(RwLock::new(stats::VlanTraffic::default()));
 
     let mut tasks = vec![
         (
@@ -296,6 +296,10 @@ pub async fn run(args: Args) -> Result<()> {
     };
     ctl.startup();
     ctl.seed_measurements().await;
+    if let Some(warning) = bridge_netfilter_warning() {
+        warn!("{warning}");
+        ctl.events.warn(warning);
+    }
 
     let mut ticker = tokio::time::interval(Duration::from_secs(args.reconcile_interval.max(1)));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -353,6 +357,28 @@ pub async fn run(args: Args) -> Result<()> {
 }
 
 /// wanderlan's bridges (index, name): br0 and those of further trunks.
+/// A warning if br_netfilter sends bridged frames through iptables (Docker
+/// loads it with `bridge-nf-call-iptables = 1`): the bridge option of
+/// wanderlan can only add to that, not switch it off, so untagged frames of
+/// the trunk then pass iptables and conntrack.
+fn bridge_netfilter_warning() -> Option<String> {
+    let on = |name: &str| {
+        std::fs::read_to_string(format!("/proc/sys/net/bridge/{name}"))
+            .is_ok_and(|v| v.trim() == "1")
+    };
+    let calls: Vec<&str> = ["bridge-nf-call-iptables", "bridge-nf-call-ip6tables"]
+        .into_iter()
+        .filter(|n| on(n))
+        .collect();
+    (!calls.is_empty()).then(|| {
+        format!(
+            "br_netfilter is loaded with {} = 1 (e.g. by Docker): untagged frames on the trunk pass iptables and conntrack, which costs throughput. Set net.bridge.{} = 0 if nothing on this host needs it.",
+            calls.join(", "),
+            calls[0]
+        )
+    })
+}
+
 fn owned_bridges(links: &[wanderlan_core::sys::LinkState]) -> Vec<(u32, String)> {
     links
         .iter()
@@ -1787,6 +1813,7 @@ impl Controller {
         let Some(cfg) = self.config.clone() else {
             return Ok(Vec::new());
         };
+        self.runtime.underlay_mtu = self.underlay_mtus(&cfg).await;
         let desired = desired::derive(&cfg, &self.runtime);
         let events = self.events.clone();
         let changes =
@@ -1898,6 +1925,34 @@ impl Controller {
             .collect())
     }
 
+    /// Peer → MTU of the interface its tunnel leaves by (an upper bound of the
+    /// path MTU, for the MSS until the path is measured).
+    async fn underlay_mtus(&self, cfg: &Config) -> BTreeMap<String, u16> {
+        let by_index = self.tunnel_interfaces().await;
+        if by_index.is_empty() {
+            return BTreeMap::new();
+        }
+        let Ok(links) = self.sys.links().await else {
+            return BTreeMap::new();
+        };
+        let mut out = BTreeMap::new();
+        for (index, peers) in by_index {
+            let Some(mtu) = links
+                .iter()
+                .find(|l| l.index == index)
+                .and_then(|l| u16::try_from(l.mtu).ok())
+            else {
+                continue;
+            };
+            for peer in peers {
+                if cfg.network.site(&peer).is_some() {
+                    out.insert(peer, mtu);
+                }
+            }
+        }
+        out
+    }
+
     /// Interface index → the peers whose tunnel leaves through it, as the
     /// kernel routes the tunnel packets (from our address, with the policy
     /// rules, e.g. of a VPN).
@@ -1947,11 +2002,24 @@ impl Controller {
             })
             .map(|l| l.name.as_str())
             .collect();
-        let rates = self
-            .vlan_rates
-            .read()
-            .map(|r| r.clone())
-            .unwrap_or_default();
+        // Asked for: the sampler reads the counters from now on. Until it
+        // has, the counters as they are now (rates 0).
+        let fresh = match self.vlan_rates.write() {
+            Ok(mut v) => {
+                v.wanted = Some(std::time::Instant::now());
+                v.is_fresh().then(|| v.rates.clone())
+            }
+            Err(_) => None,
+        };
+        let rates = match fresh {
+            Some(rates) => rates,
+            None => {
+                let counters = self.sys.vlan_stats().await.unwrap_or_default();
+                let names: std::collections::HashMap<u32, &str> =
+                    links.iter().map(|l| (l.index, l.name.as_str())).collect();
+                stats::counters_only(&counters, |i| names.get(&i).map(|n| (*n).to_string()))
+            }
+        };
         let ports = rates
             .into_iter()
             .filter(|((port, _), _)| ports_of_ours.contains(port.as_str()))

@@ -138,6 +138,15 @@ impl FakeNet {
             .unwrap_or_default()
     }
 
+    /// Marks wanderlan's tc rules of a link as left by an older version (at
+    /// one priority per VLAN).
+    pub fn mark_tc_legacy(&self, name: &str) {
+        let mut s = self.lock();
+        if let Some(index) = s.links.values().find(|l| l.name == name).map(|l| l.index) {
+            s.tc.entry(index).or_default().legacy = true;
+        }
+    }
+
     /// Adds a foreign filter (not created by wanderlan) to a link.
     pub fn add_foreign_filter(&self, name: &str) {
         let mut s = self.lock();
@@ -459,7 +468,7 @@ impl TcOps for FakeNet {
         if entry
             .ours
             .iter()
-            .any(|r| r.direction == rule.direction && r.prio() == rule.prio())
+            .any(|r| r.direction == rule.direction && r.handle() == rule.handle())
         {
             return Err(err("add tc rule", "File exists"));
         }
@@ -475,7 +484,10 @@ impl TcOps for FakeNet {
         let before = entry.ours.len();
         entry
             .ours
-            .retain(|r| !(r.direction == rule.direction && r.prio() == rule.prio()));
+            .retain(|r| !(r.direction == rule.direction && r.handle() == rule.handle()));
+        if entry.ours.is_empty() {
+            entry.legacy = false;
+        }
         if entry.ours.len() == before {
             return Err(err("del tc rule", "No such file or directory"));
         }

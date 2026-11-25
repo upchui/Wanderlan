@@ -12,7 +12,10 @@ use std::future::Future;
 
 use super::SysResult;
 
-/// First tc priority used by wanderlan; a rule uses `TC_PRIO_BASE + vid`.
+/// The tc priority of all of wanderlan's rules of one direction: one flower
+/// instance, so a frame costs one hash lookup however many rules there are.
+/// A rule's handle is its VLAN ID. Older versions put each rule at
+/// `TC_PRIO_BASE + vid` (see [`TcRule::legacy_prio`]).
 pub const TC_PRIO_BASE: u16 = 0xC000;
 /// Prefix of the action cookies of wanderlan's rules.
 pub const COOKIE_PREFIX: &str = "wl:";
@@ -47,8 +50,19 @@ pub struct TcRule {
 }
 
 impl TcRule {
-    /// tc priority of the rule (unique per direction).
+    /// tc priority of the rule.
     pub fn prio(&self) -> u16 {
+        TC_PRIO_BASE
+    }
+
+    /// tc handle of the rule: its VLAN ID, unique per direction (a VLAN ID
+    /// is matched by at most one rule of a direction).
+    pub fn handle(&self) -> u32 {
+        u32::from(self.vid)
+    }
+
+    /// The priority older versions used for this rule (one per VLAN).
+    pub fn legacy_prio(&self) -> u16 {
         TC_PRIO_BASE.saturating_add(self.vid)
     }
 
@@ -126,6 +140,9 @@ pub struct IfTc {
     pub ours: Vec<TcRule>,
     /// Number of other filters on the clsact qdisc.
     pub foreign: usize,
+    /// Some of wanderlan's rules are still at the priorities of an older
+    /// version (one per VLAN); they are put in place anew.
+    pub legacy: bool,
 }
 
 /// tc operations needed for VLAN translation.
@@ -179,6 +196,8 @@ mod tests {
         }
         assert_eq!(TcRule::from_cookie(b"other"), None);
         assert_eq!(TcRule::from_cookie(b"wl:q1>2"), None);
-        assert_eq!(rules[0].prio(), 0xC000 + 4094);
+        assert_eq!(rules[0].prio(), 0xC000, "one priority for all");
+        assert_eq!(rules[0].handle(), 4094);
+        assert_eq!(rules[0].legacy_prio(), 0xC000 + 4094);
     }
 }

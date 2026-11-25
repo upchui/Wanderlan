@@ -133,6 +133,9 @@ pub struct Runtime {
     pub blocked: BTreeSet<String>,
     /// Measured path MTU per peer site.
     pub pmtu: BTreeMap<String, u16>,
+    /// MTU of the interface the tunnel to a peer site leaves by: the path
+    /// MTU is at most that, so it gives an MSS until the path is measured.
+    pub underlay_mtu: BTreeMap<String, u16>,
 }
 
 /// Computes the desired state.
@@ -258,9 +261,10 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
 
 /// MSS clamping per tunnel port: a fixed value from the configuration, or
 /// the value derived from the measured path MTU of the peer. Ports without a
-/// measurement use the smallest measured value; without any measurement
-/// there are no rules yet. Rules apply to SYNs entering and leaving through
-/// the port, so both ends of a connection see the smaller value.
+/// measurement use the smaller of the smallest measured value and the MTU of
+/// the interface towards the peer (the path cannot be larger), so no TCP
+/// connection starts unclamped. Rules apply to SYNs entering and leaving
+/// through the port, so both ends of a connection see the smaller value.
 fn mss_rules(cfg: &Config, tunnels: &[TunnelSpec], runtime: &Runtime) -> BTreeSet<MssRule> {
     let measured: BTreeMap<&str, u16> = tunnels
         .iter()
@@ -274,11 +278,19 @@ fn mss_rules(cfg: &Config, tunnels: &[TunnelSpec], runtime: &Runtime) -> BTreeSe
     let fallback = measured.values().copied().min();
     let mut out = BTreeSet::new();
     for t in tunnels {
+        let underlay = runtime
+            .underlay_mtu
+            .get(&t.peer)
+            .map(|m| mtu::mss_for_pmtu(*m));
+        let preliminary = match (fallback, underlay) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         let mss = cfg
             .network
             .mss
             .or_else(|| measured.get(t.name.as_str()).copied())
-            .or(fallback);
+            .or(preliminary);
         let Some(mss) = mss else { continue };
         for dir in [PortDir::In, PortDir::Out] {
             for ipv6 in [false, true] {
@@ -578,6 +590,34 @@ mod tests {
             d.mss
                 .iter()
                 .any(|r| r.comment() == "wl mss oif gt-buero ip 1318")
+        );
+    }
+
+    #[test]
+    fn the_interface_towards_a_peer_gives_an_mss_before_it_is_measured() {
+        let mut runtime = Runtime::default();
+        // The tunnel to buero leaves over a VPN with MTU 1420.
+        runtime.underlay_mtu.insert("buero".into(), 1420);
+        let d = derive(&config("heim"), &runtime);
+        let buero: Vec<String> = d
+            .mss
+            .iter()
+            .filter(|r| r.port == "gt-buero")
+            .map(MssRule::comment)
+            .collect();
+        assert!(
+            buero.contains(&"wl mss oif gt-buero ip 1338".to_string()),
+            "{buero:?}"
+        );
+        // Measured, the measurement counts; others take the smaller value.
+        runtime.pmtu.insert("buero".into(), 1400);
+        runtime.underlay_mtu.insert("haus2".into(), 1500);
+        let d = derive(&config("heim"), &runtime);
+        let has = |c: &str| d.mss.iter().any(|r| r.comment() == c);
+        assert!(has("wl mss oif gt-buero ip 1318"));
+        assert!(
+            has("wl mss oif gt-haus2 ip 1318"),
+            "min(measured 1318, 1418)"
         );
     }
 

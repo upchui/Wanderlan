@@ -18,6 +18,8 @@ check "site5 clamps IPv6 TCP to 1298" \
   x site5 "nft list table bridge wanderlan | grep -q 'meta protocol ip6 oifname \"gt-site2\" .*maxseg size set 1298'"
 check "site2 clamps SYNs from site5 to 1318 as well" \
   x site2 "nft list table bridge wanderlan | grep -q 'iifname \"gt-site5\" .*maxseg size set 1318'"
+check "every bridged frame passes one rule: only TCP SYNs go on to the MSS rules" \
+  x site5 "nft list chain bridge wanderlan forward | grep -q 'tcp flags.*jump wl-mss' && ! nft list chain bridge wanderlan forward | grep -q maxseg && nft list chain bridge wanderlan wl-mss | grep -q 'maxseg size set 1318'"
 
 # Large TCP transfer between the untagged client at site5 (VLAN 20) and site1's client.
 x c-site5 "head -c 100M /dev/urandom > /tmp/data && sha256sum < /tmp/data | cut -d' ' -f1 > /tmp/data.sha"

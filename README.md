@@ -503,7 +503,9 @@ with `managed_by` but without `uplink` is a client of its manager.
 The daemon creates, and removes again when it stops:
 
 * `br0`: a bridge with VLAN filtering, STP off, no default VLAN and no
-  netfilter calls, counting the traffic per VLAN and port
+  netfilter calls of its own (if `br_netfilter` is loaded, e.g. by Docker,
+  with `net.bridge.bridge-nf-call-iptables = 1`, untagged frames still pass
+  iptables; the daemon warns about it), counting the traffic per VLAN and port
   (`vlan_stats_per_port`), with the trunk as a port. The kernel takes the
   counters only from a new bridge, so a bridge of an older version is built
   anew once (a short interruption); on a kernel without them the bridge
@@ -517,8 +519,12 @@ The daemon creates, and removes again when it stops:
 * the VLANs of the site on the trunk (VLAN 1 untagged as the native VLAN) and
   on every tunnel the VLANs both ends take part in;
 * tc `clsact` filters on the trunk for translations (recognised by their
-  action cookie `wl:…`);
-* the nftables table `bridge wanderlan` for MSS clamping.
+  action cookie `wl:…`), all in one flower priority per direction
+  (`0xc000`, handle = VLAN ID), so a frame costs one lookup however many
+  translations there are;
+* the nftables table `bridge wanderlan` for MSS clamping: every bridged
+  frame of the host passes one rule there, only TCP SYNs go on to the MSS
+  rules (chain `wl-mss`).
 
 Everything it creates carries the interface alias `wanderlan`; foreign
 interfaces are never touched (a foreign `br0` or `gt-*` stops the
