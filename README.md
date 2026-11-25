@@ -5,7 +5,7 @@ there, only over the internet.**
 
 Say the main office (`hq`), or your home, has a firewall at 10.0.0.1 with
 the network 10.0.0.0/24, its DHCP server, the NAS and the printers. Now a
-second office, a second flat or a holiday house (`office`) should simply be
+second office, a second apartment or a holiday house (`office`) should simply be
 part of that network, without building a network of its own there. With
 wanderlan, a small Linux box at each site does that: the devices plugged
 into the switch at `office` get their address from the DHCP server at `hq`,
@@ -29,14 +29,14 @@ Typical uses:
 
 * **A second office in the network of the main office.** The same
   addresses, the same file server and printers, behind the same firewall.
-* **A second flat or house in your home network.** You have set up the
+* **A second apartment or house in your home network.** You have set up the
   network at home just right: VLANs for the family, guests and the smart
-  home devices, a DNS filter, the NAS, the firewall rules. In a second flat,
-  a holiday home or at your parents' place you want exactly that network,
-  not a second one to set up and keep in step: put the box there, and every
-  device on the switch or the Wi-Fi access point behind it is in your home
-  network, with the same VLANs (the access point's SSIDs on them), DNS and
-  smart home.
+  home devices, a DNS filter, the NAS, the firewall rules. In a second
+  apartment, a holiday home or at your parents' place you want exactly that
+  network, not a second one to set up and keep in step: put the box there,
+  and every device on the switch or the Wi-Fi access point behind it is in
+  your home network, with the same VLANs (the access point's SSIDs on them),
+  DNS and smart home.
 
 What that means:
 
