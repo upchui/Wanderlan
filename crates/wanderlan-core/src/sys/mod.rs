@@ -58,6 +58,10 @@ pub struct BridgeOptions {
     /// Whether bridged traffic passes iptables/ip6tables/arptables
     /// (only relevant if `br_netfilter` is loaded).
     pub nf_call: bool,
+    /// Traffic counters per VLAN and port (`vlan_stats_enabled` and
+    /// `vlan_stats_per_port`). The kernel sets the per-port part only while
+    /// no port has VLANs, so in practice only when the bridge is created.
+    pub vlan_stats: bool,
 }
 
 /// Parameters of a GRETAP interface.
@@ -176,7 +180,15 @@ pub trait NetOps: Send + Sync {
         options: &BridgeOptions,
     ) -> impl Future<Output = SysResult<()>> + Send;
 
-    /// Changes the options of an existing bridge.
+    /// False once the kernel turned out to have no per-VLAN counters per
+    /// port (a bridge created with them came back without); bridges are
+    /// then not rebuilt for them.
+    fn vlan_stats_supported(&self) -> bool {
+        true
+    }
+
+    /// Changes the options of an existing bridge (all but the per-port part
+    /// of [`BridgeOptions::vlan_stats`], which only a new bridge gets).
     fn set_bridge_options(
         &self,
         index: u32,

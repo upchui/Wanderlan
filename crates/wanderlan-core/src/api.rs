@@ -55,6 +55,8 @@ pub enum Request {
     Interfaces,
     /// Learned MAC addresses → [`Vec<MacEntry>`].
     MacTable,
+    /// Traffic per VLAN and bridge port → [`VlanTraffic`].
+    VlanTraffic,
     /// Re-enables a port shut down by the loop guard → [`Done`].
     Unblock(UnblockParams),
     /// Measures the path MTU to all peers again → [`Done`].
@@ -645,6 +647,41 @@ impl Interface {
         });
         self.is_listed() && kind_ok && master_ok
     }
+}
+
+/// Traffic per VLAN on the ports of this site's bridges.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VlanTraffic {
+    /// True if the bridges count per VLAN and port.
+    pub available: bool,
+    /// Why not, or what is missing.
+    pub note: Option<String>,
+    /// One entry per port and VLAN, sorted by port, then VLAN.
+    pub ports: Vec<VlanPortTraffic>,
+}
+
+/// Traffic of one VLAN on one bridge port. Received: from the port into the
+/// bridge (e.g. from the peer); sent: from the bridge out of the port.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VlanPortTraffic {
+    /// Bridge port (`gt-<peer>` or a trunk port).
+    pub port: String,
+    /// The peer behind a tunnel port; `None` for a trunk port.
+    pub peer: Option<String>,
+    /// VLAN (shared ID).
+    pub vid: u16,
+    /// Receive rate in bit/s.
+    pub rx_bps: u64,
+    /// Transmit rate in bit/s.
+    pub tx_bps: u64,
+    /// Bytes received.
+    pub rx_bytes: u64,
+    /// Bytes sent.
+    pub tx_bytes: u64,
+    /// Packets received.
+    pub rx_packets: u64,
+    /// Packets sent.
+    pub tx_packets: u64,
 }
 
 /// A learned MAC address.

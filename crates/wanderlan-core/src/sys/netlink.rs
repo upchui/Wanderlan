@@ -27,6 +27,8 @@ const IFLA_GRE_IGNORE_DF: u16 = 19;
 pub struct Netlink {
     handle: Handle,
     dump: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Set once the kernel turned out to have no per-VLAN counters.
+    no_vlan_stats: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Netlink {
@@ -39,7 +41,20 @@ impl Netlink {
         Ok(Self {
             handle,
             dump: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            no_vlan_stats: std::sync::Arc::default(),
         })
+    }
+
+    /// Remembers that the kernel has no per-VLAN counters per port.
+    fn no_vlan_stats(&self, bridge: &str, why: &str) {
+        if !self
+            .no_vlan_stats
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            tracing::warn!(
+                "bridge {bridge}: the kernel has no per-VLAN counters per port ({why}); traffic per VLAN is not shown"
+            );
+        }
     }
 
     /// Serialises dumps on this connection.
@@ -126,7 +141,9 @@ fn parse_bridge(opts: &[InfoBridge]) -> BridgeOptions {
         stp: false,
         default_pvid: 1,
         nf_call: false,
+        vlan_stats: false,
     };
+    let (mut stats, mut per_port) = (false, false);
     for opt in opts {
         match opt {
             InfoBridge::VlanFiltering(v) => out.vlan_filtering = *v,
@@ -135,9 +152,12 @@ fn parse_bridge(opts: &[InfoBridge]) -> BridgeOptions {
             InfoBridge::NfCallIpTables(v) => out.nf_call |= *v,
             InfoBridge::NfCallIp6Tables(v) => out.nf_call |= *v,
             InfoBridge::NfCallArpTables(v) => out.nf_call |= *v,
+            InfoBridge::VlanStatsEnabled(v) => stats = *v,
+            InfoBridge::VlanStatsPerPort(v) => per_port = *v,
             _ => {}
         }
     }
+    out.vlan_stats = stats && per_port;
     out
 }
 
@@ -164,8 +184,11 @@ fn parse_gretap(opts: &[InfoGre]) -> GretapParams {
     out
 }
 
-fn bridge_info(options: &BridgeOptions) -> Vec<InfoBridge> {
-    vec![
+/// The bridge attributes for `options`. The per-port counters go only into
+/// a new bridge: on one whose ports have VLANs the kernel refuses them
+/// (EBUSY), even unchanged.
+fn bridge_info(options: &BridgeOptions, create: bool) -> Vec<InfoBridge> {
+    let mut info = vec![
         InfoBridge::VlanFiltering(options.vlan_filtering),
         InfoBridge::StpState(if options.stp {
             BridgeStpState::KernelStp
@@ -176,7 +199,12 @@ fn bridge_info(options: &BridgeOptions) -> Vec<InfoBridge> {
         InfoBridge::NfCallIpTables(options.nf_call),
         InfoBridge::NfCallIp6Tables(options.nf_call),
         InfoBridge::NfCallArpTables(options.nf_call),
-    ]
+        InfoBridge::VlanStatsEnabled(options.vlan_stats),
+    ];
+    if create {
+        info.push(InfoBridge::VlanStatsPerPort(options.vlan_stats));
+    }
+    info
 }
 
 fn vlan_message(index: u32, bridge_self: bool, vlans: &[(u16, VlanFlags)]) -> LinkMessage {
@@ -265,16 +293,53 @@ impl NetOps for Netlink {
     }
 
     async fn create_bridge(&self, name: &str, options: &BridgeOptions) -> SysResult<()> {
-        let mut builder = LinkBridge::new(name);
-        for info in bridge_info(options) {
-            builder = builder.append_info_data(info);
+        let add = |options: BridgeOptions| {
+            let mut builder = LinkBridge::new(name);
+            for info in bridge_info(&options, true) {
+                builder = builder.append_info_data(info);
+            }
+            self.handle.link().add(builder.build()).execute()
+        };
+        let stats = options.vlan_stats && self.vlan_stats_supported();
+        let first = add(BridgeOptions {
+            vlan_stats: stats,
+            ..*options
+        })
+        .await;
+        match first {
+            Ok(()) if stats => {
+                // An old kernel may ignore the attributes it does not know.
+                let created = self.links().await?.into_iter().find(|l| l.name == name);
+                if let Some(LinkState {
+                    kind: LinkKind::Bridge(got),
+                    ..
+                }) = created
+                    && !got.vlan_stats
+                {
+                    self.no_vlan_stats(name, "the new bridge came back without them");
+                }
+                Ok(())
+            }
+            Ok(()) => Ok(()),
+            Err(e) if stats => {
+                // Without the counters, if that is what the kernel refused.
+                add(BridgeOptions {
+                    vlan_stats: false,
+                    ..*options
+                })
+                .await
+                .map_err(|again| SysError::new(format!("create bridge {name}"), again))?;
+                self.no_vlan_stats(name, &e.to_string());
+                Ok(())
+            }
+            Err(e) => Err(SysError::new(format!("create bridge {name}"), e)),
         }
-        self.handle
-            .link()
-            .add(builder.build())
-            .execute()
-            .await
-            .map_err(|e| SysError::new(format!("create bridge {name}"), e))
+    }
+
+    fn vlan_stats_supported(&self) -> bool {
+        !self
+            .no_vlan_stats
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     async fn set_bridge_options(
@@ -284,7 +349,7 @@ impl NetOps for Netlink {
         options: &BridgeOptions,
     ) -> SysResult<()> {
         let mut builder = LinkBridge::new(name).index(index);
-        for info in bridge_info(options) {
+        for info in bridge_info(options, false) {
             builder = builder.append_info_data(info);
         }
         self.handle
@@ -406,11 +471,37 @@ impl NetOps for Netlink {
 
 #[cfg(test)]
 mod tests {
-    use rtnetlink::packet_route::link::InfoKind;
+    use rtnetlink::packet_route::link::{InfoBridge, InfoKind};
+
+    use super::{BridgeOptions, bridge_info, parse_bridge};
+    use crate::desired::BRIDGE_OPTIONS;
 
     #[test]
     fn kind_names_match_kernel() {
         assert_eq!(InfoKind::GreTap.to_string(), "gretap");
         assert_eq!(InfoKind::Bridge.to_string(), "bridge");
+    }
+
+    #[test]
+    fn per_vlan_counters_need_both_options() {
+        let created = bridge_info(&BRIDGE_OPTIONS, true);
+        assert!(created.contains(&InfoBridge::VlanStatsEnabled(true)));
+        assert!(created.contains(&InfoBridge::VlanStatsPerPort(true)));
+        assert_eq!(parse_bridge(&created), BRIDGE_OPTIONS);
+        // A change never sends the per-port part: the kernel refuses it
+        // while ports have VLANs.
+        let changed = bridge_info(&BRIDGE_OPTIONS, false);
+        assert!(
+            !changed
+                .iter()
+                .any(|i| matches!(i, InfoBridge::VlanStatsPerPort(_)))
+        );
+        let only_enabled = [InfoBridge::VlanStatsEnabled(true)];
+        assert!(!parse_bridge(&only_enabled).vlan_stats);
+        let without = BridgeOptions {
+            vlan_stats: false,
+            ..BRIDGE_OPTIONS
+        };
+        assert_eq!(parse_bridge(&bridge_info(&without, true)), without);
     }
 }

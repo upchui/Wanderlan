@@ -1,9 +1,13 @@
-//! [`ObserveOps`] with rtnetlink (RTM_GETNEIGH dumps and RTNLGRP_NEIGH).
+//! [`ObserveOps`] with rtnetlink (RTM_GETNEIGH dumps and RTNLGRP_NEIGH,
+//! RTM_GETSTATS dumps for the per-VLAN counters).
 
 use futures_util::StreamExt as _;
 use rtnetlink::packet_core::{NLM_F_DUMP, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload};
 use rtnetlink::packet_route::neighbour::{
     NeighbourAddress, NeighbourAttribute, NeighbourFlags, NeighbourMessage, NeighbourState,
+};
+use rtnetlink::packet_route::stats::{
+    BridgeXstat, LinkXstatGroup, StatsAttribute, StatsFilterMask, StatsMessage,
 };
 use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
 use rtnetlink::sys::AsyncSocket as _;
@@ -12,7 +16,7 @@ use tokio::sync::mpsc;
 
 use super::linux::LinuxSystem;
 use super::netlink::Netlink;
-use super::observe::{FdbEntry, FdbEvent, ObserveOps};
+use super::observe::{FdbEntry, FdbEvent, ObserveOps, VlanCounters};
 use super::{SysError, SysResult};
 
 /// Kernel ticks per second of `NDA_CACHEINFO` (USER_HZ).
@@ -62,7 +66,64 @@ fn parse(msg: &NeighbourMessage) -> Option<FdbEntry> {
     })
 }
 
+/// The per-VLAN counters of one bridge port in a stats message.
+fn parse_vlan_stats(msg: &StatsMessage) -> Vec<VlanCounters> {
+    let port = msg.header.ifindex;
+    msg.attributes
+        .iter()
+        .filter_map(|a| match a {
+            StatsAttribute::LinkXstatsPort(groups) => Some(groups),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|g| match g {
+            LinkXstatGroup::Bridge(x) => Some(x),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|x| match x {
+            BridgeXstat::Vlan(v) => Some(VlanCounters {
+                port,
+                vid: v.vid,
+                rx_bytes: v.rx_bytes,
+                rx_packets: v.rx_packets,
+                tx_bytes: v.tx_bytes,
+                tx_packets: v.tx_packets,
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
 impl ObserveOps for Netlink {
+    async fn vlan_stats(&self) -> SysResult<Vec<VlanCounters>> {
+        let _dump = self.dump_guard().await;
+        let mut msg = StatsMessage::default();
+        msg.header.filter_mask = StatsFilterMask::LinkXstatsPort;
+        let mut req = NetlinkMessage::from(RouteNetlinkMessage::GetStats(msg));
+        req.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
+        let mut handle = self.handle().clone();
+        let mut responses = handle
+            .request(req)
+            .map_err(|e| SysError::new("read the VLAN counters", e))?;
+        let mut out = Vec::new();
+        while let Some(resp) = responses.next().await {
+            match resp.payload {
+                NetlinkPayload::Error(err) if err.code.is_some() => {
+                    return Err(SysError::new(
+                        "read the VLAN counters",
+                        rtnetlink::Error::NetlinkError(err),
+                    ));
+                }
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewStats(m)) => {
+                    out.extend(parse_vlan_stats(&m));
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
     async fn fdb(&self) -> SysResult<Vec<FdbEntry>> {
         let _dump = self.dump_guard().await;
         let mut msg = NeighbourMessage::default();
@@ -145,7 +206,53 @@ impl ObserveOps for LinuxSystem {
         self.net.fdb().await
     }
 
+    async fn vlan_stats(&self) -> SysResult<Vec<VlanCounters>> {
+        self.net.vlan_stats().await
+    }
+
     fn watch_fdb(&self) -> SysResult<mpsc::UnboundedReceiver<FdbEvent>> {
         self.net.watch_fdb()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rtnetlink::packet_route::stats::{
+        BridgeVlanXstats, BridgeXstat, LinkXstatGroup, StatsAttribute, StatsMessage,
+    };
+
+    use super::{VlanCounters, parse_vlan_stats};
+
+    #[test]
+    fn vlan_counters_of_a_port() {
+        let mut msg = StatsMessage::default();
+        msg.header.ifindex = 7;
+        let vlan = |vid: u16, rx: u64| {
+            let mut v = BridgeVlanXstats::default();
+            v.vid = vid;
+            v.rx_bytes = rx;
+            v.rx_packets = rx / 100;
+            v.tx_bytes = 2 * rx;
+            v.tx_packets = rx / 50;
+            BridgeXstat::Vlan(v)
+        };
+        msg.attributes = vec![StatsAttribute::LinkXstatsPort(vec![
+            LinkXstatGroup::Bridge(vec![vlan(10, 1000), vlan(20, 5000)]),
+        ])];
+        let got = parse_vlan_stats(&msg);
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            got[1],
+            VlanCounters {
+                port: 7,
+                vid: 20,
+                rx_bytes: 5000,
+                rx_packets: 50,
+                tx_bytes: 10000,
+                tx_packets: 100,
+            }
+        );
+        // Other interfaces (no bridge port) carry no counters.
+        assert!(parse_vlan_stats(&StatsMessage::default()).is_empty());
     }
 }

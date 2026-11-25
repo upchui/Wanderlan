@@ -93,7 +93,7 @@ pub const SECTIONS: &[Section] = &[
             ("s", "sort by the next column (MAC, VLAN, port, age)"),
             ("o", "reverse the order"),
         ],
-        text: "",
+        text: "A filter word vlan:20 shows VLAN 20 only.",
     },
     Section {
         title: "5 Log",
@@ -155,13 +155,24 @@ pub const SECTIONS: &[Section] = &[
             ("Esc", "close the window (a form with input asks first)"),
             ("c, r", "confirm / roll back also in windows without text"),
             ("n, d", "open invitations: new, delete"),
-            ("Enter, q", "also close the peer and site details"),
-            (
-                "Up/Down",
-                "in the details: the previous / next peer or site",
-            ),
+            ("q", "also closes the peer, site and VLAN windows"),
+            ("Up/Down", "site details: the previous / next site"),
         ],
         text: "",
+    },
+    Section {
+        title: "Peer details and VLANs",
+        keys: &[
+            ("Up/Down", "a VLAN of the tunnel (the busiest first)"),
+            ("Enter", "that VLAN live: every port, its MACs, a graph"),
+            ("Left/Right", "the previous / next peer"),
+            ("VLAN: Up/Down", "the previous / next VLAN of this site"),
+            ("VLAN: m", "the MAC table of this VLAN"),
+            ("VLAN: Esc", "back to the peer"),
+        ],
+        text: "IN is what the bridge receives from a port (the peer or the trunk), \
+               OUT what it sends there. The bridge counts per VLAN and port; after \
+               the update it is built anew once for that (a short interruption).",
     },
     Section {
         title: "How changes work",
@@ -243,7 +254,17 @@ pub fn bar(app: &App) -> Vec<Binding> {
                 ("d", "delete"),
                 ("Esc", "close"),
             ],
-            Modal::Peer { .. } => vec![("Up/Down", "next peer"), ("Esc", "close")],
+            Modal::Peer { .. } => vec![
+                ("Up/Down", "VLAN"),
+                ("Enter", "open VLAN"),
+                ("Left/Right", "other peer"),
+                ("Esc", "close"),
+            ],
+            Modal::Vlan { back, .. } => vec![
+                ("Up/Down", "other VLAN"),
+                ("m", "its MACs"),
+                ("Esc", if back.is_some() { "back" } else { "close" }),
+            ],
             Modal::Site { .. } => vec![("Up/Down", "next site"), ("e", "edit"), ("Esc", "close")],
             Modal::Ports(_) => vec![
                 ("Space", "choose"),

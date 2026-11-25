@@ -84,7 +84,8 @@ impl MacState {
     }
 
     /// Entries passing the filter, in display order. All whitespace
-    /// separated filter words must match (MAC, VLAN, port or site).
+    /// separated filter words must match (MAC, VLAN, port or site);
+    /// `vlan:20` matches VLAN 20 only.
     pub fn visible(&self) -> Vec<&MacEntry> {
         let words: Vec<String> = self
             .filter
@@ -98,9 +99,10 @@ impl MacState {
             .filter(|e| {
                 let vlan = e.vlan.map(|v| v.to_string()).unwrap_or_default();
                 let port = e.port.to_lowercase();
-                words
-                    .iter()
-                    .all(|w| e.mac.contains(w.as_str()) || vlan == *w || port.contains(w.as_str()))
+                words.iter().all(|w| match w.strip_prefix("vlan:") {
+                    Some(only) => vlan == only,
+                    None => e.mac.contains(w.as_str()) || vlan == *w || port.contains(w.as_str()),
+                })
             })
             .collect();
         list.sort_by(|a, b| {

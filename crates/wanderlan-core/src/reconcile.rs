@@ -34,6 +34,8 @@ pub struct Actual {
     pub tc: BTreeMap<u32, IfTc>,
     /// The nftables rules, `None` if the table does not exist.
     pub nft: Option<NftState>,
+    /// The kernel can count traffic per VLAN and port.
+    pub vlan_stats_supported: bool,
 }
 
 impl Actual {
@@ -53,6 +55,7 @@ impl Actual {
             vlans,
             tc,
             nft,
+            vlan_stats_supported: net.vlan_stats_supported(),
         })
     }
 
@@ -142,9 +145,14 @@ fn vid_list(vids: impl IntoIterator<Item = u16>) -> String {
 impl fmt::Display for Change {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::CreateBridge { name, .. } => write!(
+            Self::CreateBridge { name, options } => write!(
                 f,
-                "Creating bridge {name} with VLAN filtering, STP off and no default VLAN"
+                "Creating bridge {name} with VLAN filtering, STP off and no default VLAN{}",
+                if options.vlan_stats {
+                    ", counting the traffic per VLAN"
+                } else {
+                    ""
+                }
             ),
             Self::SetBridgeOptions { name, options } => write!(
                 f,
@@ -267,23 +275,41 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
     let mut vlan_adds = Vec::new();
     let mut ups = Vec::new();
 
-    // Bridges: one per trunk (segment).
+    // Bridges: one per trunk (segment). Per-VLAN counters only where the
+    // kernel has them.
+    let options = BridgeOptions {
+        vlan_stats: desired.bridge_options.vlan_stats && actual.vlan_stats_supported,
+        ..desired.bridge_options
+    };
     let wanted_bridges: BTreeSet<&str> = desired.bridges().collect();
     let mut bridge_index: BTreeMap<&str, u32> = BTreeMap::new();
+    let mut rebuild = Vec::new();
     for name in desired.bridges() {
         let create = Change::CreateBridge {
             name: name.to_string(),
-            options: desired.bridge_options,
+            options,
         };
         match actual.links.get(name) {
             Some(link) if !is_owned(link) => return Err(PlanError::Foreign(link.name.clone())),
             Some(link) => match &link.kind {
-                LinkKind::Bridge(options) => {
+                LinkKind::Bridge(has) => {
                     bridge_index.insert(name, link.index);
-                    if *options != desired.bridge_options {
+                    if options.vlan_stats && !has.vlan_stats {
+                        // The kernel takes the per-port counters only while
+                        // no port has VLANs: build the bridge anew, once.
+                        // Its ports are attached again in the next round.
+                        rebuild.push(Change::DeleteLink {
+                            name: link.name.clone(),
+                            reason: "a new bridge counts the traffic per VLAN; once".into(),
+                        });
+                        rebuild.push(create);
+                    } else if *has != options {
                         bridge_changes.push(Change::SetBridgeOptions {
                             name: link.name.clone(),
-                            options: desired.bridge_options,
+                            options: BridgeOptions {
+                                vlan_stats: has.vlan_stats,
+                                ..options
+                            },
                         });
                     }
                 }
@@ -297,6 +323,11 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
             },
             None => bridge_changes.push(create),
         }
+    }
+    // Rebuilt bridges lose their ports: nothing else this round, the next
+    // one plans against the new bridges.
+    if !rebuild.is_empty() {
+        return Ok(rebuild);
     }
     // Our bridges: ports may move between them. Bridges whose trunk is no
     // longer used are removed.

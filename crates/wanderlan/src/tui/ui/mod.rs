@@ -14,6 +14,7 @@ mod ports;
 mod review;
 pub mod settings;
 mod sites;
+mod vlan;
 mod vlans;
 mod wizard;
 
@@ -71,7 +72,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Modal::Help { scroll } => popup::help(frame, app, *scroll, body),
             Modal::Messages { scroll } => popup::messages(frame, app, *scroll, body),
             Modal::Invites { selected } => details::invites(frame, app, *selected, body),
-            Modal::Peer { name } => details::peer(frame, app, name, body),
+            Modal::Peer { name, vlan } => details::peer(frame, app, name, *vlan, body),
+            Modal::Vlan { vid, back } => vlan::draw(frame, app, *vid, back.as_deref(), body),
             Modal::Site { name } => details::site(frame, app, name, body),
             Modal::Ports(p) => ports::draw(frame, app, p, body),
         }

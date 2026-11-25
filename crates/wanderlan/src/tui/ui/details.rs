@@ -14,7 +14,7 @@ use wanderlan_core::{policy, topology};
 
 use super::{health_style, list, port_state, titled};
 use crate::tui::app::{App, HISTORY_LEN};
-use crate::tui::{format, theme};
+use crate::tui::{format, theme, traffic};
 
 fn label(text: &str) -> Span<'static> {
     Span::styled(format!(" {text:<13}"), theme::dim())
@@ -72,7 +72,70 @@ fn quality_line(peer: &PeerStatus) -> Line<'static> {
 }
 
 /// Traffic graph and everything known about one peer.
-pub fn peer(frame: &mut Frame, app: &App, name: &str, area: Rect) {
+/// The VLANs on the tunnel to `peer` with their live traffic; `vlan` is
+/// the chosen one (`None`: the first).
+fn peer_vlans(frame: &mut Frame, app: &App, peer: &str, vlan: Option<u16>, area: Rect) {
+    let block = titled(" VLANs  Enter: open ");
+    let message = |frame: &mut Frame, text: String, style| {
+        let inner = block.inner(area);
+        frame.render_widget(block.clone(), area);
+        let lines: Vec<Line> = format::wrap(&text, usize::from(inner.width.saturating_sub(1)))
+            .into_iter()
+            .map(|l| Line::styled(format!(" {l}"), style))
+            .collect();
+        frame.render_widget(Paragraph::new(lines), inner);
+    };
+    let traffic = match (&app.vlan_traffic, &app.vlan_traffic_error) {
+        (_, Some(e)) => return message(frame, format!("Cannot read: {e}"), theme::bad()),
+        (None, None) => return message(frame, "Loading ...".into(), theme::dim()),
+        (Some(t), _) if !t.available => {
+            let why = t.note.clone().unwrap_or_default();
+            return message(frame, format!("No traffic per VLAN: {why}."), theme::dim());
+        }
+        (Some(t), None) => t,
+    };
+    let list = traffic::peer_vlans(traffic, peer);
+    if list.is_empty() {
+        return message(frame, "No VLAN on this tunnel.".into(), theme::dim());
+    }
+    let selected = vlan
+        .and_then(|v| list.iter().position(|p| p.vid == v))
+        .unwrap_or_default();
+    let rows: Vec<Row> = list
+        .iter()
+        .map(|p| {
+            let idle = p.rx_bps == 0 && p.tx_bps == 0;
+            Row::new(vec![
+                Cell::from(p.vid.to_string()),
+                Cell::from(format::rate(p.rx_bps)),
+                Cell::from(format::rate(p.tx_bps)),
+            ])
+            .style(if idle { theme::dim() } else { Style::new() })
+        })
+        .collect();
+    let total = rows.len();
+    list::show(
+        frame,
+        Table::new(
+            rows,
+            [
+                Constraint::Length(5),
+                Constraint::Length(8),
+                Constraint::Length(8),
+            ],
+        )
+        .header(Row::new(vec!["VLAN", "IN b/s", "OUT b/s"]).style(theme::header()))
+        .block(block)
+        .row_highlight_style(theme::selected()),
+        area,
+        &app.scrolls.peer_vlans,
+        Some(selected),
+        total,
+        list::BOXED,
+    );
+}
+
+pub fn peer(frame: &mut Frame, app: &App, name: &str, vlan: Option<u16>, area: Rect) {
     frame.render_widget(Clear, area);
     let Some(peer) = app
         .status
@@ -87,7 +150,7 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, area: Rect) {
         return;
     };
     let block = titled(format!(
-        " {} ({}) via {}   Esc: close ",
+        " {} ({}) via {}   Left/Right: other peer  Esc: close ",
         peer.name, peer.address, peer.port
     ));
     let inner = block.inner(area);
@@ -221,7 +284,10 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, area: Rect) {
             .bounds([0.0, top])
             .labels(vec![Span::raw("0"), Span::raw(top_label)]),
     );
+    let [graph, vlans] =
+        Layout::horizontal([Constraint::Min(30), Constraint::Length(28)]).areas(graph);
     frame.render_widget(chart, graph);
+    peer_vlans(frame, app, name, vlan, vlans);
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let rtts: Vec<u64> = samples

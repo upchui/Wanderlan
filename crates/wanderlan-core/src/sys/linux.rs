@@ -38,6 +38,9 @@ impl NetOps for LinuxSystem {
     async fn port_vlans(&self) -> SysResult<BTreeMap<u32, PortVlans>> {
         self.net.port_vlans().await
     }
+    fn vlan_stats_supported(&self) -> bool {
+        self.net.vlan_stats_supported()
+    }
     async fn create_bridge(&self, name: &str, options: &BridgeOptions) -> SysResult<()> {
         self.net.create_bridge(name, options).await
     }

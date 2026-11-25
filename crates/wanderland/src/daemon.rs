@@ -20,7 +20,8 @@ use tracing::{debug, info, warn};
 use wanderlan_core::api::{
     ApiError, Applied, ChangeSource, ConfigInput, ConfigTexts, Confirmed, Done, Interface,
     Invitation, JoinParams, Joined, Level, MacEntry, PeerStatus, PendingChange, PortState,
-    PortTraffic, Request, ResetReport, SiteState, SiteSummary, Status, Validation,
+    PortTraffic, Request, ResetReport, SiteState, SiteSummary, Status, Validation, VlanPortTraffic,
+    VlanTraffic,
 };
 use wanderlan_core::config::{
     self, Config, ConfigFile, Diagnostic, Loaded, Network, render_local, render_network,
@@ -48,7 +49,7 @@ use crate::fdb_guard::{self, LoopReport, PortMap};
 use crate::files::Paths;
 use crate::invites::{Invite, Invites};
 use crate::probe::{self, ProbeConfig, ProbeEvent, ProbeTable};
-use crate::stats::{self, Rates};
+use crate::stats::{self, Rates, VlanRates};
 use crate::sync_net::{self, Offer};
 
 /// Delays of the extra flushes after a topology change. Sites apply a new
@@ -194,6 +195,7 @@ struct Controller {
     offer: watch::Sender<Offer>,
     ports: watch::Sender<PortMap>,
     rates: Rates,
+    vlan_rates: VlanRates,
     inputs: mpsc::Sender<Input>,
     /// Fingerprints not to fetch again, until when.
     rejected: Rejected,
@@ -232,6 +234,7 @@ pub async fn run(args: Args) -> Result<()> {
     let (offer_tx, offer_rx) = watch::channel(Offer::default());
     let (ports_tx, ports_rx) = watch::channel(PortMap::default());
     let rates: Rates = Arc::new(RwLock::new(BTreeMap::new()));
+    let vlan_rates: VlanRates = Arc::new(RwLock::new(BTreeMap::new()));
 
     let mut tasks = vec![
         (
@@ -239,7 +242,10 @@ pub async fn run(args: Args) -> Result<()> {
             probe::spawn(probe_rx, probes.clone(), probe_event_tx),
         ),
         ("sync", sync_net::spawn(offer_rx, inputs_tx.clone())),
-        ("statistics", stats::spawn(sys.clone(), rates.clone())),
+        (
+            "statistics",
+            stats::spawn(sys.clone(), rates.clone(), vlan_rates.clone()),
+        ),
         (
             "API",
             api_server::spawn(args.socket.clone(), events.clone(), inputs_tx.clone())
@@ -272,6 +278,7 @@ pub async fn run(args: Args) -> Result<()> {
         offer: offer_tx,
         ports: ports_tx,
         rates,
+        vlan_rates,
         inputs: inputs_tx,
         rejected: Rejected::default(),
         refused: BTreeMap::new(),
@@ -1061,6 +1068,7 @@ impl Controller {
             }
             Request::Interfaces => to_value(&self.interfaces().await?),
             Request::MacTable => to_value(&self.mac_table().await?),
+            Request::VlanTraffic => to_value(&self.vlan_traffic().await?),
             Request::Unblock(params) => {
                 if !self.runtime.blocked.remove(&params.port) {
                     return Err(ApiError::new(format!(
@@ -1886,6 +1894,63 @@ impl Controller {
                 managed: l.alias.as_deref() == Some(OWNER_ALIAS),
             })
             .collect())
+    }
+
+    /// The traffic per VLAN on the ports of our bridges.
+    async fn vlan_traffic(&self) -> Result<VlanTraffic, ApiError> {
+        let links = self.sys.links().await.map_err(api_err)?;
+        let bridges = owned_bridges(&links);
+        let without: Vec<&str> = links
+            .iter()
+            .filter(|l| bridges.iter().any(|(i, _)| *i == l.index))
+            .filter(|l| !matches!(l.kind, LinkKind::Bridge(o) if o.vlan_stats))
+            .map(|l| l.name.as_str())
+            .collect();
+        let note = if !self.sys.vlan_stats_supported() {
+            Some("the kernel has no per-VLAN counters per port".to_string())
+        } else if bridges.is_empty() {
+            Some("there is no bridge yet".to_string())
+        } else if !without.is_empty() {
+            Some(format!(
+                "{} does not count per VLAN yet; it is built anew when the daemon starts",
+                without.join(", ")
+            ))
+        } else {
+            None
+        };
+        let ports_of_ours: BTreeSet<&str> = links
+            .iter()
+            .filter(|l| {
+                l.master
+                    .is_some_and(|m| bridges.iter().any(|(i, _)| *i == m))
+            })
+            .map(|l| l.name.as_str())
+            .collect();
+        let rates = self
+            .vlan_rates
+            .read()
+            .map(|r| r.clone())
+            .unwrap_or_default();
+        let ports = rates
+            .into_iter()
+            .filter(|((port, _), _)| ports_of_ours.contains(port.as_str()))
+            .map(|((port, vid), r)| VlanPortTraffic {
+                peer: port.strip_prefix(GRETAP_PREFIX).map(str::to_string),
+                port,
+                vid,
+                rx_bps: r.rx_bps,
+                tx_bps: r.tx_bps,
+                rx_bytes: r.counters.rx_bytes,
+                tx_bytes: r.counters.tx_bytes,
+                rx_packets: r.counters.rx_packets,
+                tx_packets: r.counters.tx_packets,
+            })
+            .collect();
+        Ok(VlanTraffic {
+            available: note.is_none(),
+            note,
+            ports,
+        })
     }
 
     async fn mac_table(&self) -> Result<Vec<MacEntry>, ApiError> {

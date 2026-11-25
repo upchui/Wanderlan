@@ -274,6 +274,14 @@ hq
   ens20 ── wl-ens20 ───── gt-dc     ══ dc
 ```
 
+**Watch the traffic of one VLAN.** Overview (`1`), `Enter` on a neighbour:
+beside its traffic graph the VLANs of the tunnel with what comes in and goes
+out now, the busiest first. `Up`/`Down` chooses one, `Enter` opens it: every
+port of this site with the VLAN (tunnels and trunk ports), in and out now,
+bytes and packets, the MAC addresses behind each port, a graph, where the
+VLAN is on the trunk (mapped or not), which tunnels carry it and where this
+site passes it on. `m` shows its MAC table. CLI: `wanderlan vlan 20`.
+
 **Start over on a site.** Setup (`6`), `R`, or `sudo wanderlan reset`: the
 bridges, tunnels, all rules, the configuration and the invitations are
 removed and the site is unconfigured again, like after the installation
@@ -399,7 +407,11 @@ with `managed_by` but without `uplink` is a client of its manager.
 The daemon creates, and removes again when it stops:
 
 * `br0`: a bridge with VLAN filtering, STP off, no default VLAN and no
-  netfilter calls, with the trunk as a port;
+  netfilter calls, counting the traffic per VLAN and port
+  (`vlan_stats_per_port`), with the trunk as a port. The kernel takes the
+  counters only from a new bridge, so a bridge of an older version is built
+  anew once (a short interruption); on a kernel without them the bridge
+  stays as it is and the traffic per VLAN is not shown;
 * `wl-<interface>`: the same for every further trunk ("trunk per tunnel");
 * `gt-<peer>`: a GRETAP tunnel (`ignore-df`, `nopmtudisc`, MTU 1500) to its
   server, to each of its clients and, on a server, to every other server. The
@@ -496,10 +508,10 @@ clicked.
 
 | Key | View |
 |-----|------|
-| `1` | Overview: this site with its role, the tunnel neighbours live (reply, round trip, path MTU, MSS, port state, MAC addresses, throughput, config in sync or `refused`), traffic of the tunnels and of every trunk, and all known sites with role and link (`via hq` for sites without a tunnel from here), each server with its clients indented below. One cursor runs through the neighbours and the sites. `Enter` on a neighbour: traffic graph, round-trip history, min/avg/max round trip, jitter, probe loss, latency, counters (Up/Down: the next neighbour); on a site: its details. |
+| `1` | Overview: this site with its role, the tunnel neighbours live (reply, round trip, path MTU, MSS, port state, MAC addresses, throughput, config in sync or `refused`), traffic of the tunnels and of every trunk, and all known sites with role and link (`via hq` for sites without a tunnel from here), each server with its clients indented below. One cursor runs through the neighbours and the sites. `Enter` on a neighbour: traffic graph, the VLANs of the tunnel with their live traffic (Up/Down, `Enter` opens one: every port, MACs, graph; `m` its MAC table), round-trip history, min/avg/max round trip, jitter, probe loss, latency, counters (Left/Right: the next neighbour); on a site: its details. |
 | `2` | Sites: name, address, VLANs, role, manager, tunnel; clients indented below their server. `Enter`: details (role, VLANs, every tunnel with what it carries, mappings, who may change it; Up/Down: the next site). Invite (`i`), open invitations (`I`), online/offline (`o`), new (`n`), edit (`e`: VLANs, "Changes", "Connected to"), delete (`d`), network settings (`m`), trunk ports of this host (`l`). |
 | `3` | VLANs: the VLANs of the network (`v`), the own VLANs of this site (`o`) and the mappings (`n`, `Enter`, `d`) with their site and its role; conflicts are marked right away. `t` switches to the tunnels: what each carries, its limit (`Enter`, `d`). |
-| `4` | MAC addresses: filter (`/`), sort (`s`, `o`). |
+| `4` | MAC addresses: filter (`/`; `vlan:20` for one VLAN), sort (`s`, `o`). |
 | `5` | Log: live events in local time (`t`: UTC), filter by level (`l`), site (`p`) and text (`/`). |
 | `6` | Setup: new network or join; on a configured site invite (`i`) and reset (`R`). |
 | `7` | Settings: every setting with an explanation, the trunk of every tunnel, and the role and rights of this site. `Enter` on a trunk lists the interfaces of the host to choose from (`Space`, `m`: main port). |
@@ -522,6 +534,7 @@ its last log lines and keeps trying.
 |---------|---------|
 | `wanderlan status [--json]` | This site, all known sites with role and link, the tunnel neighbours |
 | `wanderlan log [-f]` | Event log |
+| `wanderlan vlan <vid> [--json]` | Traffic of one VLAN on every port of this site now, its counters and MAC addresses |
 | `wanderlan invite [--name N] [--vlans V] [--native VID] [--map L:S]... [--self-managed]` | Create an invitation with rules; prints `wanderlan join <address> <code>` |
 | `wanderlan invite list` / `wanderlan invite delete <code>` | Open invitations of this site |
 | `wanderlan join <address>[:port] <code> [--name N] [--trunk IF]` | Join a network (on an unconfigured site) |

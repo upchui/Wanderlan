@@ -10,7 +10,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::collections::BTreeSet;
 
 use super::nft::{MssRule, NftOps, NftState, SplitRule};
-use super::observe::{FdbEntry, FdbEvent, ObserveOps};
+use super::observe::{FdbEntry, FdbEvent, ObserveOps, VlanCounters};
 use super::tc::{IfTc, TcOps, TcRule};
 use super::{
     BridgeOptions, GretapParams, LinkKind, LinkState, LinkUpdate, NetOps, PortVlans, SysError,
@@ -34,6 +34,12 @@ pub struct FakeState {
     pub fdb: Vec<FdbEntry>,
     /// Log of all mutating calls, e.g. `create_bridge br0`.
     pub calls: Vec<String>,
+    /// Per-VLAN counters reported by [`ObserveOps::vlan_stats`].
+    pub vlan_counters: Vec<VlanCounters>,
+    /// A kernel without per-VLAN counters per port: bridges come without.
+    pub no_vlan_stats: bool,
+    /// A bridge asked for counters came without them.
+    vlan_stats_missed: bool,
     next_index: u32,
 }
 
@@ -88,6 +94,16 @@ impl FakeNet {
         link.index = index;
         s.links.insert(index, link);
         index
+    }
+
+    /// Sets what [`ObserveOps::vlan_stats`] reports.
+    pub fn set_vlan_counters(&self, counters: Vec<VlanCounters>) {
+        self.lock().vlan_counters = counters;
+    }
+
+    /// Behaves like a kernel without per-VLAN counters per port.
+    pub fn without_vlan_stats(&self) {
+        self.lock().no_vlan_stats = true;
     }
 
     /// Returns a copy of the current state.
@@ -176,13 +192,18 @@ impl NetOps for FakeNet {
         if s.name_taken(name) {
             return Err(err("create bridge", "File exists"));
         }
+        let mut options = *options;
+        if options.vlan_stats && s.no_vlan_stats {
+            options.vlan_stats = false;
+            s.vlan_stats_missed = true;
+        }
         let index = s.alloc();
         s.links.insert(
             index,
             LinkState {
                 index,
                 name: name.to_string(),
-                kind: LinkKind::Bridge(*options),
+                kind: LinkKind::Bridge(options),
                 alias: None,
                 master: None,
                 admin_up: false,
@@ -195,6 +216,10 @@ impl NetOps for FakeNet {
         Ok(())
     }
 
+    fn vlan_stats_supported(&self) -> bool {
+        !self.lock().vlan_stats_missed
+    }
+
     async fn set_bridge_options(
         &self,
         index: u32,
@@ -204,8 +229,12 @@ impl NetOps for FakeNet {
         let mut s = self.lock();
         s.calls.push(format!("set_bridge_options {name}"));
         match s.links.get_mut(&index) {
-            Some(link) if matches!(link.kind, LinkKind::Bridge(_)) => {
-                link.kind = LinkKind::Bridge(*options);
+            // The per-VLAN counters stay as the bridge was created.
+            Some(link) if let LinkKind::Bridge(old) = link.kind => {
+                link.kind = LinkKind::Bridge(BridgeOptions {
+                    vlan_stats: old.vlan_stats,
+                    ..*options
+                });
                 Ok(())
             }
             _ => Err(err("set bridge options", "not a bridge")),
@@ -485,5 +514,9 @@ impl ObserveOps for FakeNet {
     fn watch_fdb(&self) -> SysResult<tokio::sync::mpsc::UnboundedReceiver<FdbEvent>> {
         let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
         Ok(rx)
+    }
+
+    async fn vlan_stats(&self) -> SysResult<Vec<VlanCounters>> {
+        Ok(self.lock().vlan_counters.clone())
     }
 }

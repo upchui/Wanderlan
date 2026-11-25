@@ -496,7 +496,7 @@ fn enter_on_a_peer_opens_its_details_and_history_grows() {
     }
     assert_eq!(app.history.get("buero").map(VecDeque::len), Some(4));
     app.update(key(KeyCode::Enter));
-    assert!(matches!(&app.modal, Some(Modal::Peer { name }) if name == "buero"));
+    assert!(matches!(&app.modal, Some(Modal::Peer { name, .. }) if name == "buero"));
     app.update(key(KeyCode::Esc));
     assert!(app.modal.is_none());
 }
@@ -844,10 +844,74 @@ fn deleting_an_invitation_asks() {
 fn the_peer_details_go_to_the_next_peer() {
     let mut app = connected();
     app.update(key(KeyCode::Enter));
-    assert!(matches!(&app.modal, Some(Modal::Peer { name }) if name == "buero"));
+    assert!(matches!(&app.modal, Some(Modal::Peer { name, .. }) if name == "buero"));
+    app.update(key(KeyCode::Right));
+    assert!(matches!(&app.modal, Some(Modal::Peer { name, .. }) if name == "haus2"));
+    app.update(key(KeyCode::Left));
+    app.update(key(KeyCode::Left));
+    assert!(matches!(&app.modal, Some(Modal::Peer { name, .. }) if name == "buero"));
+}
+
+#[test]
+fn from_the_peer_details_to_one_vlan_and_back() {
+    let mut app = connected();
+    let fx = app.update(key(KeyCode::Enter));
+    assert!(
+        requests(&fx).contains(&&Request::VlanTraffic),
+        "the VLANs are read right away"
+    );
+    app.update(reply(
+        Request::VlanTraffic,
+        Reply::VlanTraffic(fixtures::vlan_traffic()),
+    ));
+    // buero's VLANs, the busiest first: 20, 10, 30.
     app.update(key(KeyCode::Down));
-    assert!(matches!(&app.modal, Some(Modal::Peer { name }) if name == "haus2"));
-    app.update(key(KeyCode::Up));
-    app.update(key(KeyCode::Up));
-    assert!(matches!(&app.modal, Some(Modal::Peer { name }) if name == "buero"));
+    assert!(matches!(
+        &app.modal,
+        Some(Modal::Peer { vlan: Some(10), .. })
+    ));
+    let fx = app.update(key(KeyCode::Enter));
+    assert!(
+        matches!(&app.modal, Some(Modal::Vlan { vid: 10, back: Some(b) }) if b == "buero"),
+        "{:?}",
+        app.modal
+    );
+    assert!(requests(&fx).contains(&&Request::MacTable), "its MACs");
+    // Up/Down: the VLANs of this site in order.
+    app.update(key(KeyCode::Down));
+    assert!(matches!(&app.modal, Some(Modal::Vlan { vid: 20, .. })));
+    // Refreshed while open (once the last request is answered).
+    app.update(reply(
+        Request::VlanTraffic,
+        Reply::VlanTraffic(fixtures::vlan_traffic()),
+    ));
+    let polled = (0..4)
+        .flat_map(|_| app.update(Msg::Tick))
+        .filter(|e| matches!(e, Effect::Request(Request::VlanTraffic)))
+        .count();
+    assert!(polled >= 1, "polled while the window is open");
+    // Esc goes back to the peer, with the VLAN chosen.
+    app.update(key(KeyCode::Esc));
+    assert!(matches!(&app.modal, Some(Modal::Peer { name, vlan: Some(20) }) if name == "buero"));
+    // m in the VLAN window: the MAC table of this VLAN.
+    app.update(key(KeyCode::Enter));
+    app.update(ch('m'));
+    assert!(app.modal.is_none());
+    assert_eq!(app.view, View::Macs);
+    assert_eq!(app.macs.filter.value(), "vlan:20");
+}
+
+#[test]
+fn the_vlan_history_follows_the_answers() {
+    let mut app = connected();
+    for _ in 0..3 {
+        app.update(reply(
+            Request::VlanTraffic,
+            Reply::VlanTraffic(fixtures::vlan_traffic()),
+        ));
+    }
+    let samples = app.vlan_history.get(&20).expect("VLAN 20");
+    assert_eq!(samples.len(), 3);
+    // All ports: gt-buero 2.4M + gt-haus2 300k + ens19 2.1M in.
+    assert_eq!(samples[0].rx_bps, 4_800_000);
 }

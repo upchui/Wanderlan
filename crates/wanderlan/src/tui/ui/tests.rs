@@ -581,3 +581,42 @@ fn trunk_ports_of_a_tunnel() {
     key(&mut app, KeyCode::Enter);
     insta::assert_snapshot!(render(&app));
 }
+
+#[test]
+fn peer_details_with_its_vlans() {
+    let mut app = connected();
+    key(&mut app, KeyCode::Enter);
+    reply(
+        &mut app,
+        Request::VlanTraffic,
+        Reply::VlanTraffic(fixtures::vlan_traffic()),
+    );
+    key(&mut app, KeyCode::Down);
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
+fn one_vlan_live() {
+    let mut app = connected();
+    reply(&mut app, Request::MacTable, Reply::Macs(fixtures::macs()));
+    key(&mut app, KeyCode::Enter);
+    reply(
+        &mut app,
+        Request::VlanTraffic,
+        Reply::VlanTraffic(fixtures::vlan_traffic()),
+    );
+    key(&mut app, KeyCode::Enter);
+    assert!(matches!(app.modal, Some(Modal::Vlan { vid: 20, .. })));
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
+fn no_traffic_per_vlan_without_counters() {
+    let mut app = connected();
+    key(&mut app, KeyCode::Enter);
+    let mut traffic = fixtures::vlan_traffic();
+    traffic.available = false;
+    traffic.note = Some("the kernel has no per-VLAN counters per port".into());
+    reply(&mut app, Request::VlanTraffic, Reply::VlanTraffic(traffic));
+    assert!(render(&app).contains("No traffic per VLAN"));
+}

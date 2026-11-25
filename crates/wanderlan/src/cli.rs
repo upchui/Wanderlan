@@ -10,7 +10,8 @@ use clap::{Parser, Subcommand};
 use wanderlan_core::api::{
     self, Applied, ApplyFilesParams, ApplyParams, ChangeSource, ConfigInput, ConfigTexts,
     Confirmed, Done, Event, Interface, Invitation, InviteParams, JoinParams, Joined, Level,
-    PortState, Request, ResetReport, SiteRules, SiteState, Status, UnblockParams,
+    MacEntry, PortState, Request, ResetReport, SiteRules, SiteState, Status, UnblockParams,
+    VlanPortTraffic, VlanTraffic,
 };
 use wanderlan_core::config::{self, ConfigFile, Severity};
 use wanderlan_core::join;
@@ -84,6 +85,15 @@ pub enum Command {
     },
     /// Print the running network.toml (on a client: its part of the network).
     Export,
+    /// Show the live traffic of one VLAN on every port of this site and
+    /// the MAC addresses in it.
+    Vlan {
+        /// The VLAN (shared ID), e.g. 20.
+        vid: u16,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Re-enable a tunnel port shut down by the loop guard.
     Unblock {
         /// Tunnel interface, e.g. gt-haus2.
@@ -340,6 +350,7 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Log { follow }) => log(&socket, follow).await,
+        Some(Command::Vlan { vid, json }) => vlan(&socket, vid, json).await,
         Some(Command::Probe) => {
             let client = connect(&socket).await?;
             let _: Done = client.call(Request::ProbeNow).await?;
@@ -1147,6 +1158,77 @@ fn port_state(s: PortState) -> &'static str {
         PortState::Missing => "missing",
         PortState::Offline => "offline",
     }
+}
+
+/// Formats a byte count.
+fn bytes(n: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let v = n as f64;
+    if v >= 1e12 {
+        format!("{:.1} TB", v / 1e12)
+    } else if v >= 1e9 {
+        format!("{:.1} GB", v / 1e9)
+    } else if v >= 1e6 {
+        format!("{:.1} MB", v / 1e6)
+    } else if v >= 1e3 {
+        format!("{:.1} KB", v / 1e3)
+    } else {
+        format!("{n} B")
+    }
+}
+
+/// `wanderlan vlan <vid>`: the traffic of one VLAN per port and its MACs.
+async fn vlan(socket: &Path, vid: u16, json: bool) -> Result<ExitCode> {
+    let client = connect(socket).await?;
+    let traffic: VlanTraffic = client.call(Request::VlanTraffic).await?;
+    let macs: Vec<MacEntry> = client.call(Request::MacTable).await?;
+    let ports: Vec<&VlanPortTraffic> = traffic.ports.iter().filter(|p| p.vid == vid).collect();
+    let macs: Vec<&MacEntry> = macs.iter().filter(|m| m.vlan == Some(vid)).collect();
+    if json {
+        let out = serde_json::json!({
+            "vid": vid,
+            "available": traffic.available,
+            "note": traffic.note,
+            "ports": ports,
+            "macs": macs,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    if let Some(note) = &traffic.note {
+        println!("NOTE: no traffic per VLAN: {note}");
+    }
+    if ports.is_empty() {
+        println!("VLAN {vid} is on no port of this site.");
+        return Ok(ExitCode::FAILURE);
+    }
+    println!("VLAN {vid} (in: from the port into the bridge, out: from the bridge to the port)");
+    println!(
+        "{:<16} {:>11} {:>11} {:>10} {:>10} {:>21}  MACS",
+        "PORT", "IN", "OUT", "RECEIVED", "SENT", "PACKETS IN/OUT"
+    );
+    for p in &ports {
+        let name = match &p.peer {
+            Some(_) => p.port.clone(),
+            None => format!("{} (trunk)", p.port),
+        };
+        let count = macs.iter().filter(|m| m.port == p.port).count();
+        println!(
+            "{name:<16} {:>11} {:>11} {:>10} {:>10} {:>21}  {count}",
+            rate(p.rx_bps),
+            rate(p.tx_bps),
+            bytes(p.rx_bytes),
+            bytes(p.tx_bytes),
+            format!("{} / {}", p.rx_packets, p.tx_packets),
+        );
+    }
+    if !macs.is_empty() {
+        println!("MAC addresses in VLAN {vid}:");
+        for m in &macs {
+            println!("  {} on {}", m.mac, m.port);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Formats a bit rate.

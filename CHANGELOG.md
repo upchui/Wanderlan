@@ -28,6 +28,20 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 - Fix: an interface that is no longer a trunk port is taken off the bridge;
   before, it stayed bridged after the trunk was changed.
 
+### Live traffic per VLAN
+
+- The peer details (Overview, `Enter`) list the VLANs of the tunnel with
+  their traffic now, the busiest first; `Enter` opens one: every port of
+  this site with that VLAN, in and out now, bytes, packets, the MAC
+  addresses behind each port, a graph, the mapping at this site, the
+  tunnels that carry it and where it is passed on. `m` opens its MAC table
+  (filter word `vlan:20`). Left/Right go to the next peer (was Up/Down).
+- `wanderlan vlan <vid> [--json]` prints the same.
+- The bridges count per VLAN and port (`vlan_stats_per_port`). The kernel
+  takes that only from a new bridge: after the update the bridge is built
+  anew once, a short interruption. A kernel without the counters keeps its
+  bridge and shows no traffic per VLAN.
+
 ### Version numbers
 
 - wanderlan is 1.0.0, and every commit on `main` raises the last number:

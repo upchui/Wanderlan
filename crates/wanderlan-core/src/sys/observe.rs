@@ -1,4 +1,5 @@
-//! Observing the bridge: forwarding database (learned MAC addresses).
+//! Observing the bridge: forwarding database (learned MAC addresses) and
+//! the traffic counters per VLAN and port.
 
 use std::future::Future;
 
@@ -23,6 +24,25 @@ pub struct FdbEntry {
     pub updated_secs: Option<u64>,
 }
 
+/// Traffic of one VLAN on one bridge port, counted by the bridge (needs
+/// [`super::BridgeOptions::vlan_stats`]). Received: into the bridge from
+/// the port; sent: out of the bridge to the port.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VlanCounters {
+    /// Index of the bridge port.
+    pub port: u32,
+    /// VLAN.
+    pub vid: u16,
+    /// Bytes received.
+    pub rx_bytes: u64,
+    /// Packets received.
+    pub rx_packets: u64,
+    /// Bytes sent.
+    pub tx_bytes: u64,
+    /// Packets sent.
+    pub tx_packets: u64,
+}
+
 /// A change of the forwarding database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FdbEvent {
@@ -45,4 +65,7 @@ pub trait ObserveOps: Send + Sync {
     /// Starts watching the forwarding database; changes arrive on the
     /// returned channel until it is dropped.
     fn watch_fdb(&self) -> SysResult<mpsc::UnboundedReceiver<FdbEvent>>;
+
+    /// The per-VLAN counters of all bridge ports.
+    fn vlan_stats(&self) -> impl Future<Output = SysResult<Vec<VlanCounters>>> + Send;
 }

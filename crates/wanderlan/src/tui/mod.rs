@@ -21,6 +21,7 @@ mod log;
 mod macs;
 mod ports;
 mod theme;
+mod traffic;
 mod ui;
 mod wizard;
 
@@ -229,6 +230,7 @@ async fn perform(client: &Client, request: Request) -> Result<Reply, ClientError
         r @ Request::Confirm => Reply::Confirmed(client.call(r).await?),
         r @ Request::Interfaces => Reply::Interfaces(client.call(r).await?),
         r @ Request::MacTable => Reply::Macs(client.call(r).await?),
+        r @ Request::VlanTraffic => Reply::VlanTraffic(client.call(r).await?),
         r @ Request::Validate(_) => {
             let _: api::Validation = client.call(r).await?;
             Reply::Done

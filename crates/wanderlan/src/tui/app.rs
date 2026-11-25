@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, VecDeque};
 use wanderlan_core::api::{
     ApiError, Applied, ApplyParams, ChangeSource, ConfigInput, ConfigTexts, Confirmed, Event,
     Interface, Invitation, InviteParams, Joined, MacEntry, PeerStatus, PendingChange, PortState,
-    Request, ResetReport, SiteState, SiteSummary, Status, UnblockParams,
+    Request, ResetReport, SiteState, SiteSummary, Status, UnblockParams, VlanTraffic,
 };
 use wanderlan_core::config::{Diagnostic, has_errors, render_local, render_network};
 use wanderlan_core::policy;
@@ -29,6 +29,7 @@ use super::format;
 use super::log::LogState;
 use super::macs::MacState;
 use super::ports::{PortPicker, PortTarget};
+use super::traffic;
 use super::ui::list;
 use super::wizard::{self, Mode, Step, Wizard};
 use crate::client::ClientError;
@@ -41,6 +42,9 @@ pub const RETRY_TICKS: u32 = 2;
 const MESSAGE_TICKS: u32 = 10;
 /// Ticks between MAC table refreshes while the MAC view is open.
 const MAC_REFRESH_TICKS: u64 = 2;
+/// Ticks between refreshes of the traffic per VLAN while a peer or a VLAN
+/// is shown (the daemon samples every 2 s).
+const VLAN_REFRESH_TICKS: u64 = 2;
 /// Ticks after which an unanswered status request is sent again.
 const STATUS_TIMEOUT_TICKS: u64 = 5;
 /// Seconds left at which the countdown banner turns red.
@@ -321,10 +325,19 @@ pub enum Modal {
         /// The site.
         name: String,
     },
-    /// Traffic and details of one peer.
+    /// Traffic and details of one peer, with its VLANs.
     Peer {
         /// The peer.
         name: String,
+        /// The chosen VLAN of its list (`None`: the first row).
+        vlan: Option<u16>,
+    },
+    /// The live traffic of one VLAN on every port of this site.
+    Vlan {
+        /// The VLAN (shared ID).
+        vid: u16,
+        /// The peer whose details Esc goes back to.
+        back: Option<String>,
     },
     /// Choosing trunk ports from the interfaces of this host.
     Ports(PortPicker),
@@ -361,6 +374,8 @@ pub enum Reply {
     Interfaces(Vec<Interface>),
     /// Answer to `mac_table`.
     Macs(Vec<MacEntry>),
+    /// Answer to `vlan_traffic`.
+    VlanTraffic(VlanTraffic),
     /// Answer to `invite`.
     Invitation(Invitation),
     /// Answer to `invites`.
@@ -427,6 +442,7 @@ struct InFlight {
     config: bool,
     macs: bool,
     interfaces: bool,
+    vlans: bool,
 }
 
 /// Scroll positions of the lists (see [`list::Scroll`]).
@@ -450,6 +466,10 @@ pub struct Scrolls {
     pub invites: list::Scroll,
     /// Interfaces in the trunk port window.
     pub ports: list::Scroll,
+    /// The VLANs in the peer details.
+    pub peer_vlans: list::Scroll,
+    /// The ports in the VLAN window.
+    pub vlan_ports: list::Scroll,
     /// Largest scroll offset of the help screen at its last size.
     pub help_max: std::cell::Cell<u16>,
     /// Keys of the help bar as drawn: first and last column, label.
@@ -469,6 +489,7 @@ enum ListId {
     Macs,
     Invites,
     Ports,
+    PeerVlans,
 }
 
 /// The key a label of the help bar stands for; `None` for labels that
@@ -565,6 +586,12 @@ pub struct App {
     pub invitations: Vec<Invitation>,
     /// Traffic history per peer, oldest first.
     pub history: BTreeMap<String, VecDeque<Sample>>,
+    /// The traffic per VLAN and port, as read last.
+    pub vlan_traffic: Option<VlanTraffic>,
+    /// Why it could not be read.
+    pub vlan_traffic_error: Option<String>,
+    /// Traffic history per VLAN (all ports), oldest first.
+    pub vlan_history: BTreeMap<u16, VecDeque<Sample>>,
     /// Selected row in the settings view.
     pub settings_selected: usize,
     /// Popup, if any.
@@ -616,6 +643,9 @@ impl App {
             invitation: None,
             invitations: Vec::new(),
             history: BTreeMap::new(),
+            vlan_traffic: None,
+            vlan_traffic_error: None,
+            vlan_history: BTreeMap::new(),
             settings_selected: 0,
             modal: None,
             scrolls: Scrolls::default(),
@@ -772,8 +802,16 @@ impl App {
                 if stale {
                     self.request_status(fx);
                 }
-                if self.view == View::Macs && self.ticks.is_multiple_of(MAC_REFRESH_TICKS) {
+                let vlan_open = matches!(self.modal, Some(Modal::Vlan { .. }));
+                if (self.view == View::Macs || vlan_open)
+                    && self.ticks.is_multiple_of(MAC_REFRESH_TICKS)
+                {
                     self.request_macs(fx);
+                }
+                if matches!(self.modal, Some(Modal::Peer { .. } | Modal::Vlan { .. }))
+                    && self.ticks.is_multiple_of(VLAN_REFRESH_TICKS)
+                {
+                    self.request_vlan_traffic(fx);
                 }
             }
             Conn::Connecting => {}
@@ -796,6 +834,13 @@ impl App {
         if self.is_connected() && !self.in_flight.macs {
             self.in_flight.macs = true;
             fx.push(Effect::Request(Request::MacTable));
+        }
+    }
+
+    fn request_vlan_traffic(&mut self, fx: &mut Vec<Effect>) {
+        if self.is_connected() && !self.in_flight.vlans {
+            self.in_flight.vlans = true;
+            fx.push(Effect::Request(Request::VlanTraffic));
         }
     }
 
@@ -828,6 +873,7 @@ impl App {
                 self.in_flight.macs = false;
                 self.macs.set_entries(entries);
             }
+            (_, Ok(Reply::VlanTraffic(traffic))) => self.on_vlan_traffic(traffic),
             (Request::Apply(_), Ok(Reply::Applied(applied))) => self.on_applied(applied, fx),
             (Request::Apply(_), Err(e)) => self.on_apply_failed(e),
             (Request::Confirm, Ok(Reply::Confirmed(c))) => self.on_confirmed(&c, fx),
@@ -886,6 +932,11 @@ impl App {
             Request::MacTable => {
                 self.in_flight.macs = false;
                 self.macs.error = Some(error.to_string());
+                return;
+            }
+            Request::VlanTraffic => {
+                self.in_flight.vlans = false;
+                self.vlan_traffic_error = Some(error.to_string());
                 return;
             }
             Request::Interfaces => {
@@ -1115,6 +1166,33 @@ impl App {
     fn show_invites(&mut self, fx: &mut Vec<Effect>) {
         self.modal = Some(Modal::Invites { selected: 0 });
         fx.push(Effect::Request(Request::Invites));
+    }
+
+    /// Stores the traffic per VLAN and records one sample per VLAN.
+    fn on_vlan_traffic(&mut self, traffic: VlanTraffic) {
+        self.in_flight.vlans = false;
+        self.vlan_traffic_error = None;
+        let ids = traffic::vlan_ids(&traffic);
+        for &vid in &ids {
+            let (rx_bps, tx_bps) = traffic::vlan_total(&traffic, vid);
+            let samples = self.vlan_history.entry(vid).or_default();
+            samples.push_back(Sample {
+                rx_bps,
+                tx_bps,
+                rtt_ms: None,
+            });
+            while samples.len() > HISTORY_LEN {
+                samples.pop_front();
+            }
+        }
+        self.vlan_history.retain(|vid, _| ids.contains(vid));
+        self.vlan_traffic = Some(traffic);
+    }
+
+    /// Opens the details of a peer and reads its VLANs.
+    fn open_peer(&mut self, name: String, fx: &mut Vec<Effect>) {
+        self.modal = Some(Modal::Peer { name, vlan: None });
+        self.request_vlan_traffic(fx);
     }
 
     /// Records one traffic sample per peer from a status answer.
@@ -1351,6 +1429,7 @@ impl App {
                 Modal::Help { .. }
                     | Modal::Messages { .. }
                     | Modal::Peer { .. }
+                    | Modal::Vlan { .. }
                     | Modal::Site { .. }
                     | Modal::Invites { .. }
             )
@@ -1482,6 +1561,7 @@ impl App {
                                 | Modal::Messages { .. }
                                 | Modal::Review(_)
                                 | Modal::Peer { .. }
+                                | Modal::Vlan { .. }
                                 | Modal::Site { .. }
                         )
                     ) || (self.modal.is_none() && self.view == View::Log) =>
@@ -1500,6 +1580,7 @@ impl App {
         match (&self.modal, self.view) {
             (Some(Modal::Invites { .. }), _) => vec![(ListId::Invites, &self.scrolls.invites)],
             (Some(Modal::Ports(_)), _) => vec![(ListId::Ports, &self.scrolls.ports)],
+            (Some(Modal::Peer { .. }), _) => vec![(ListId::PeerVlans, &self.scrolls.peer_vlans)],
             (Some(_), _) => Vec::new(),
             (None, View::Overview) => vec![
                 (ListId::Peers, &self.scrolls.peers),
@@ -1574,6 +1655,21 @@ impl App {
             ListId::Invites => {
                 self.modal = Some(Modal::Invites { selected: index });
                 false
+            }
+            // A click on a VLAN chooses it, a second one opens it.
+            ListId::PeerVlans => {
+                let Some(Modal::Peer { name, vlan }) = &mut self.modal else {
+                    return;
+                };
+                let vid = self
+                    .vlan_traffic
+                    .as_ref()
+                    .and_then(|t| traffic::peer_vlans(t, name).get(index).map(|p| p.vid));
+                let again = vid.is_some() && (*vlan == vid || (vlan.is_none() && index == 0));
+                if vid.is_some() {
+                    *vlan = vid;
+                }
+                again
             }
             // A click on the row under the cursor ticks it.
             ListId::Ports => {
@@ -1826,28 +1922,112 @@ impl App {
                 }),
                 _ => Some(Modal::Messages { scroll }),
             },
-            Modal::Peer { name } => {
-                // Up/Down: the previous or next peer.
-                let peers: Vec<String> = self
-                    .status
-                    .as_ref()
-                    .map(|s| s.peers.iter().map(|p| p.name.clone()).collect())
-                    .unwrap_or_default();
-                match key.code {
-                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
-                    code => {
-                        let at = peers.iter().position(|p| *p == name).unwrap_or_default();
-                        let name = nav(code, at, peers.len(), 1)
-                            .and_then(|i| peers.get(i).cloned())
-                            .unwrap_or(name);
-                        Some(Modal::Peer { name })
-                    }
-                }
-            }
+            Modal::Peer { name, vlan } => self.on_peer_key(name, vlan, key, fx),
+            Modal::Vlan { vid, back } => self.on_vlan_key(vid, back, key, fx),
             Modal::Site { name } => self.on_site_key(name, key),
             Modal::Review(review) => self.on_review_key(review, key, fx),
             Modal::Ports(picker) => self.on_ports_key(picker, key),
         }
+    }
+
+    /// Peer details: Left/Right the previous or next peer, Up/Down a VLAN
+    /// of its tunnel, Enter opens it.
+    fn on_peer_key(
+        &mut self,
+        name: String,
+        vlan: Option<u16>,
+        key: &KeyEvent,
+        fx: &mut Vec<Effect>,
+    ) -> Option<Modal> {
+        let peers: Vec<String> = self
+            .status
+            .as_ref()
+            .map(|s| s.peers.iter().map(|p| p.name.clone()).collect())
+            .unwrap_or_default();
+        let vids: Vec<u16> = self
+            .vlan_traffic
+            .as_ref()
+            .filter(|t| t.available)
+            .map(|t| {
+                traffic::peer_vlans(t, &name)
+                    .iter()
+                    .map(|p| p.vid)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let at = vlan
+            .and_then(|v| vids.iter().position(|x| *x == v))
+            .unwrap_or_default();
+        if let Some(n) = nav(key.code, at, vids.len(), self.scrolls.peer_vlans.page()) {
+            return Some(Modal::Peer {
+                name,
+                vlan: vids.get(n).copied(),
+            });
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => None,
+            KeyCode::Enter => match vids.get(at) {
+                Some(&vid) => {
+                    self.request_vlan_traffic(fx);
+                    self.request_macs(fx);
+                    Some(Modal::Vlan {
+                        vid,
+                        back: Some(name),
+                    })
+                }
+                None => Some(Modal::Peer { name, vlan }),
+            },
+            KeyCode::Left | KeyCode::Right => {
+                let here = peers.iter().position(|p| *p == name).unwrap_or_default();
+                let next = if key.code == KeyCode::Left {
+                    here.saturating_sub(1)
+                } else {
+                    (here + 1).min(peers.len().saturating_sub(1))
+                };
+                match peers.get(next) {
+                    Some(other) if *other != name => Some(Modal::Peer {
+                        name: other.clone(),
+                        vlan: None,
+                    }),
+                    _ => Some(Modal::Peer { name, vlan }),
+                }
+            }
+            _ => Some(Modal::Peer { name, vlan }),
+        }
+    }
+
+    /// The VLAN window: Up/Down the previous or next VLAN, m its MAC
+    /// addresses, Esc back to the peer.
+    fn on_vlan_key(
+        &mut self,
+        vid: u16,
+        back: Option<String>,
+        key: &KeyEvent,
+        fx: &mut Vec<Effect>,
+    ) -> Option<Modal> {
+        let step = match key.code {
+            KeyCode::Up | KeyCode::Char('k') => -1,
+            KeyCode::Down | KeyCode::Char('j') => 1,
+            KeyCode::Esc => {
+                return back.map(|name| Modal::Peer {
+                    name,
+                    vlan: Some(vid),
+                });
+            }
+            KeyCode::Char('q') => return None,
+            KeyCode::Char('m') => {
+                self.macs.filter.set(format!("vlan:{vid}"));
+                self.macs.selected = 0;
+                self.set_view(View::Macs, fx);
+                return None;
+            }
+            _ => return Some(Modal::Vlan { vid, back }),
+        };
+        let vid = self
+            .vlan_traffic
+            .as_ref()
+            .map_or(vid, |t| traffic::next_vlan(t, vid, step));
+        Some(Modal::Vlan { vid, back })
     }
 
     fn on_invites_key(&mut self, selected: usize, key: &KeyEvent) -> Option<Modal> {
@@ -2318,9 +2498,8 @@ impl App {
             }
             KeyCode::Enter => {
                 if let Some(peer) = self.selected_peer() {
-                    self.modal = Some(Modal::Peer {
-                        name: peer.name.clone(),
-                    });
+                    let name = peer.name.clone();
+                    self.open_peer(name, fx);
                 } else if let Some(name) = self
                     .overview_sites()
                     .get(self.overview_selected.saturating_sub(peers))

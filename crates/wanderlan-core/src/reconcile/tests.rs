@@ -6,7 +6,7 @@ use crate::config::{Config, Loaded, load};
 use crate::desired::{BRIDGE_OPTIONS, Runtime, derive};
 use crate::sys::fake::FakeNet;
 use crate::sys::tc::{IfTc, TcRule};
-use crate::sys::{LinkKind, LinkState, NetOps, VlanFlags};
+use crate::sys::{BridgeOptions, LinkKind, LinkState, NetOps, VlanFlags};
 
 const NETWORK: &str = include_str!("../../../../packaging/examples/network.toml");
 
@@ -313,6 +313,86 @@ async fn existing_bridge_with_default_vlan_is_corrected() {
         net.link("br0").unwrap().kind,
         LinkKind::Bridge(BRIDGE_OPTIONS)
     );
+}
+
+/// A bridge of an older version, without the per-VLAN counters, with the
+/// trunk and its VLANs.
+async fn old_bridge(net: &FakeNet) {
+    run(net, &desired("heim")).await;
+    let br = net.link("br0").unwrap();
+    let old = BridgeOptions {
+        vlan_stats: false,
+        ..BRIDGE_OPTIONS
+    };
+    net.insert_link(LinkState {
+        kind: LinkKind::Bridge(old),
+        ..br.clone()
+    });
+    // Move every port over to the old bridge (same name, new index).
+    net.delete_link(br.index).await.unwrap();
+    let old_br = net.link("br0").unwrap();
+    for name in ["ens19", "gt-buero", "gt-haus2"] {
+        let link = net.link(name).unwrap();
+        net.update_link(
+            link.index,
+            &LinkUpdate {
+                master: Some(Some(old_br.index)),
+                ..LinkUpdate::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+    run(net, &desired_without_counters()).await;
+    assert_eq!(
+        net.link("br0").unwrap().kind,
+        LinkKind::Bridge(old),
+        "set up without counters"
+    );
+    assert_eq!(net.vlans("ens19").len(), 41);
+}
+
+fn desired_without_counters() -> Desired {
+    let mut d = desired("heim");
+    d.bridge_options.vlan_stats = false;
+    d
+}
+
+#[tokio::test]
+async fn a_bridge_without_vlan_counters_is_built_anew_once() {
+    let net = fresh();
+    old_bridge(&net).await;
+    let changes = run(&net, &desired("heim")).await;
+    assert!(
+        matches!(&changes[..2], [Change::DeleteLink { name, .. }, Change::CreateBridge { name: created, .. }] if name == "br0" && created == "br0"),
+        "{changes:?}"
+    );
+    let br = net.link("br0").unwrap();
+    assert_eq!(br.kind, LinkKind::Bridge(BRIDGE_OPTIONS));
+    // The ports are back, with their VLANs.
+    assert_eq!(net.link("ens19").unwrap().master, Some(br.index));
+    assert_eq!(net.link("gt-buero").unwrap().master, Some(br.index));
+    assert_eq!(net.link("gt-buero").unwrap().isolated, Some(true));
+    assert_eq!(net.vlans("ens19").len(), 41);
+    assert!(run(&net, &desired("heim")).await.is_empty(), "only once");
+}
+
+#[tokio::test]
+async fn a_kernel_without_vlan_counters_does_not_rebuild_forever() {
+    let net = fresh();
+    net.without_vlan_stats();
+    let changes = run(&net, &desired("heim")).await;
+    assert!(!changes.is_empty());
+    let br = net.link("br0").unwrap();
+    assert_eq!(
+        br.kind,
+        LinkKind::Bridge(BridgeOptions {
+            vlan_stats: false,
+            ..BRIDGE_OPTIONS
+        })
+    );
+    assert!(!net.vlan_stats_supported());
+    assert!(run(&net, &desired("heim")).await.is_empty(), "stable");
 }
 
 #[test]

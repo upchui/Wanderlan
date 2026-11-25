@@ -3,7 +3,7 @@
 
 use wanderlan_core::api::{
     ConfigTexts, Event, Interface, Level, MacEntry, PeerStatus, PortState, SiteState, SiteSummary,
-    Status,
+    Status, VlanPortTraffic, VlanTraffic,
 };
 use wanderlan_core::config::{Local, fingerprint, parse_network, render_local, render_network};
 
@@ -258,6 +258,36 @@ pub fn interfaces() -> Vec<Interface> {
         iface("br0", "bridge", true, None, true),
         iface("gt-buero", "gretap", true, Some("br0"), true),
     ]
+}
+
+/// The traffic per VLAN: buero carries 10, 20 and 30, haus2 20 and 30,
+/// the trunk ens19 all three.
+pub fn vlan_traffic() -> VlanTraffic {
+    let port = |port: &str, vid: u16, rx_bps: u64, tx_bps: u64| VlanPortTraffic {
+        port: port.into(),
+        peer: port.strip_prefix("gt-").map(str::to_string),
+        vid,
+        rx_bps,
+        tx_bps,
+        rx_bytes: rx_bps * 300,
+        tx_bytes: tx_bps * 300,
+        rx_packets: rx_bps / 4,
+        tx_packets: tx_bps / 4,
+    };
+    VlanTraffic {
+        available: true,
+        note: None,
+        ports: vec![
+            port("ens19", 10, 64_000, 120_000),
+            port("ens19", 20, 2_100_000, 2_700_000),
+            port("ens19", 30, 0, 9_000),
+            port("gt-buero", 10, 56_000, 64_000),
+            port("gt-buero", 20, 2_400_000, 1_800_000),
+            port("gt-buero", 30, 0, 0),
+            port("gt-haus2", 20, 300_000, 300_000),
+            port("gt-haus2", 30, 9_000, 0),
+        ],
+    }
 }
 
 fn mac(mac: &str, vlan: Option<u16>, port: &str, age: Option<u64>) -> MacEntry {

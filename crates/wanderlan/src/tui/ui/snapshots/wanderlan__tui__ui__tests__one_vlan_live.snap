@@ -1,0 +1,29 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+assertion_line: 610
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+"┌ VLAN 20 live   Up/Down: other VLAN  m: MACs  Esc: back ──────────────────────┐"
+"│ Here        on the trunk, tagged                                             │"
+"│ Tunnels     buero, haus2, haus3, haus5, haus6                                │"
+"│                                                                              │"
+"│┌ Ports (in: from the port into the bridge) ─────────────────────────────────┐│"
+"││PORT             IN b/s  OUT b/s RECEIVED  SENT      PACKETS IN/OUT     MACS││"
+"││gt-buero         2.4M    1.8M    720.0 MB  540.0 MB  600000 / 450000    1   ││"
+"││gt-haus2         300.0k  300.0k  90.0 MB   90.0 MB   75000 / 75000      1   ││"
+"││ens19 (trunk)    2.1M    2.7M    630.0 MB  810.0 MB  525000 / 675000    0   ││"
+"│└────────────────────────────────────────────────────────────────────────────┘│"
+"│┌ All ports (bit/s, last samples) ───────────────────────────────────────────┐│"
+"││5.3M│                                                                      ⡀││"
+"││    │                                                                       ││"
+"││    │                                                                       ││"
+"││    │                                                                       ││"
+"││    │                                                                       ││"
+"││    │                                                                       ││"
+"││    │                                                                       ││"
+"││0   │                                                                       ││"
+"│└────────────────────────────────────────────────────────────────────────────┘│"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                  1 blocked (see 1)  draft: no changes  heim r7 "
+" Up/Down  other VLAN   m  its MACs   Esc  back                                  "

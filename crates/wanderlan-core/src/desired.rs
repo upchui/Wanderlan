@@ -30,6 +30,7 @@ pub const BRIDGE_OPTIONS: BridgeOptions = BridgeOptions {
     stp: false,
     default_pvid: 0,
     nf_call: false,
+    vlan_stats: true,
 };
 
 /// A trunk port and its bridge: one segment of this site.
