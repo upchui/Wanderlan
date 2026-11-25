@@ -26,6 +26,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.v.outputs.version }}
+      commit: ${{ steps.v.outputs.commit }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -36,8 +37,10 @@ jobs:
         # since it was set: every commit on main has a higher one.
         run: |
           version=$(scripts/version.sh)
+          commit="${GITHUB_SHA::7}"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "### wanderlan $version" >> "$GITHUB_STEP_SUMMARY"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "### wanderlan $version ($commit)" >> "$GITHUB_STEP_SUMMARY"
 
   check:
     name: fmt, clippy, tests
@@ -61,14 +64,15 @@ jobs:
         run: scripts/test-version.sh
 
   build:
-    name: build
+    name: build ${{ needs.version.outputs.version }} (${{ needs.version.outputs.commit }})
     needs: version
     uses: ./.github/workflows/build.yml
     with:
       version: ${{ needs.version.outputs.version }}
+      commit: ${{ needs.version.outputs.commit }}
 
   integration:
-    name: integration tests
+    name: integration tests ${{ needs.version.outputs.version }} (${{ needs.version.outputs.commit }})
     needs: version
     runs-on: ubuntu-24.04
     steps:
@@ -82,7 +86,9 @@ jobs:
           context: .
           file: docker/Dockerfile
           target: testnode
-          build-args: WANDERLAN_VERSION=${{ needs.version.outputs.version }}
+          build-args: |
+            WANDERLAN_VERSION=${{ needs.version.outputs.version }}
+            WANDERLAN_COMMIT=${{ needs.version.outputs.commit }}
           load: true
           tags: wanderlan-testnode
           provenance: false
@@ -91,7 +97,7 @@ jobs:
         run: tests/integration/run.sh
 
   systemd:
-    name: systemd (hardened unit, user flows)
+    name: systemd ${{ needs.version.outputs.version }} (${{ needs.version.outputs.commit }})
     needs: version
     runs-on: ubuntu-24.04
     steps:
@@ -105,7 +111,9 @@ jobs:
           context: .
           file: docker/Dockerfile
           target: systemdnode
-          build-args: WANDERLAN_VERSION=${{ needs.version.outputs.version }}
+          build-args: |
+            WANDERLAN_VERSION=${{ needs.version.outputs.version }}
+            WANDERLAN_COMMIT=${{ needs.version.outputs.commit }}
           load: true
           tags: wanderlan-systemdnode
           provenance: false

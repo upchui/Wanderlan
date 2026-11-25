@@ -23,6 +23,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
       deb_version: ${{ steps.v.outputs.deb_version }}
+      commit: ${{ steps.v.outputs.commit }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -36,7 +37,8 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "deb_version=$version-1" >> "$GITHUB_OUTPUT"
+          echo "deb_version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
   build:
     name: build
@@ -44,6 +46,7 @@ jobs:
     uses: ./.github/workflows/build.yml
     with:
       version: ${{ needs.version.outputs.version }}
+      commit: ${{ needs.version.outputs.commit }}
 
   release:
     name: GitHub release
@@ -62,6 +65,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.version.outputs.version }}
+          COMMIT: ${{ needs.version.outputs.commit }}
         run: |
           cd dist
           sha256sum wanderlan* > SHA256SUMS
@@ -70,7 +74,7 @@ jobs:
           else
             notes=$(awk '/^## /{n++} n==1' ../CHANGELOG.md | tail -n +2)
             gh release create "$GITHUB_REF_NAME" wanderlan* SHA256SUMS \
-              --title "wanderlan $VERSION" \
+              --title "wanderlan $VERSION ($COMMIT)" \
               --notes "${notes:-See CHANGELOG.md}"
           fi
 

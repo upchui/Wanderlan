@@ -47,11 +47,14 @@ RUN --mount=type=cache,target=/src/target,id=wanderlan-target-check \
 # Release build and .deb package. RUST_TARGET defaults to the musl target of
 # the platform being built; set it to cross-compile (e.g. arm64 on amd64).
 # WANDERLAN_VERSION overrides the version from Cargo.toml (binaries, package
-# version "<version>-1" and file names); CI sets it for every commit on main.
+# version and file names: the package is named exactly like the version);
+# WANDERLAN_COMMIT is the commit `--version` names. Both come from
+# scripts/version.sh, in CI and in the local scripts.
 FROM deps AS build
 ARG TARGETARCH
 ARG RUST_TARGET=""
 ARG WANDERLAN_VERSION=""
+ARG WANDERLAN_COMMIT=""
 COPY . .
 RUN --mount=type=cache,target=/src/target,id=wanderlan-target-build \
     set -eu; \
@@ -67,11 +70,11 @@ RUN --mount=type=cache,target=/src/target,id=wanderlan-target-build \
     if [ -z "$version" ]; then \
       version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1); \
     fi; \
-    export WANDERLAN_VERSION="$version"; \
+    export WANDERLAN_VERSION="$version" WANDERLAN_COMMIT="${WANDERLAN_COMMIT}"; \
     cargo build --release --locked --offline --target "$target" -p wanderland -p wanderlan; \
     mkdir -p /out; \
     cargo deb --no-build --locked --offline --target "$target" -p wanderlan \
-      --deb-version "${version}-1" --output /out/; \
+      --deb-version "${version}" --output /out/; \
     case "$target" in x86_64*) arch=amd64 ;; aarch64*) arch=arm64 ;; esac; \
     cp "target/$target/release/wanderland" "/out/wanderland-${version}-linux-${arch}"; \
     cp "target/$target/release/wanderlan" "/out/wanderlan-${version}-linux-${arch}"; \

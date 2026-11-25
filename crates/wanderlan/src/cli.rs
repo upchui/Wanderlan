@@ -26,7 +26,7 @@ const EXAMPLE_LOCAL: &str = include_str!("../../../packaging/examples/local.toml
 /// Command line of `wanderlan`. Without a subcommand the interactive
 /// terminal UI starts.
 #[derive(Debug, Parser)]
-#[command(name = "wanderlan", version = wanderlan_core::VERSION, about)]
+#[command(name = "wanderlan", version = wanderlan_core::version_line(), about)]
 pub struct Args {
     /// Socket of the daemon.
     #[arg(long, global = true, env = api::SOCKET_ENV, default_value = api::SOCKET_PATH)]

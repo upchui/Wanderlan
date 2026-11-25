@@ -218,7 +218,7 @@ struct Controller {
 
 /// Runs the daemon until SIGTERM or SIGINT.
 pub async fn run(args: Args) -> Result<()> {
-    info!("wanderland {} starting", wanderlan_core::VERSION);
+    info!("wanderland {} starting", wanderlan_core::version_line());
     let sys = LinuxSystem::connect().context("cannot open a netlink connection")?;
     let mut sigterm = signal(SignalKind::terminate()).context("cannot handle SIGTERM")?;
     let mut sigint = signal(SignalKind::interrupt()).context("cannot handle SIGINT")?;
@@ -1167,7 +1167,7 @@ impl Controller {
         if request.protocol != join::PROTOCOL {
             return error(format!(
                 "this site (wanderland {}) speaks join protocol {}, not {}; update both sites",
-                wanderlan_core::VERSION,
+                wanderlan_core::version_line(),
                 join::PROTOCOL,
                 request.protocol
             ));
@@ -1288,7 +1288,7 @@ impl Controller {
             code: params.code.clone(),
             name: params.name.clone(),
             name_is_default: params.name_is_default,
-            version: wanderlan_core::VERSION.into(),
+            version: wanderlan_core::version_line().into(),
         };
         let inputs = self.inputs.clone();
         tokio::spawn(async move {
@@ -1954,7 +1954,7 @@ impl Controller {
         let blocked: Vec<String> = self.runtime.blocked.iter().cloned().collect();
         let Some(cfg) = &self.config else {
             return Status {
-                version: wanderlan_core::VERSION.into(),
+                version: wanderlan_core::version_line().into(),
                 state: SiteState::Unconfigured,
                 site: None,
                 address: None,
@@ -2096,7 +2096,7 @@ impl Controller {
             })
             .collect();
         Status {
-            version: wanderlan_core::VERSION.into(),
+            version: wanderlan_core::version_line().into(),
             state: if self.last_error.is_some() {
                 SiteState::Error
             } else {

@@ -4,5 +4,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 scripts/load-modules.sh
-docker build -f docker/Dockerfile --target testnode -t "${TESTNODE_IMAGE:-wanderlan-testnode}" "$@" .
+docker build -f docker/Dockerfile --target testnode -t "${TESTNODE_IMAGE:-wanderlan-testnode}" \
+  --build-arg WANDERLAN_VERSION="$(scripts/version.sh)" \
+  --build-arg WANDERLAN_COMMIT="$(scripts/version.sh --commit)" "$@" .
 exec tests/integration/run.sh

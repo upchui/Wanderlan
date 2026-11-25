@@ -25,7 +25,7 @@ use clap::Parser;
 
 /// Command line of the daemon.
 #[derive(Debug, Parser)]
-#[command(name = "wanderland", version = wanderlan_core::VERSION, about)]
+#[command(name = "wanderland", version = wanderlan_core::version_line(), about)]
 pub struct Args {
     /// Directory containing network.toml and local.toml.
     #[arg(long, default_value = "/etc/wanderlan")]

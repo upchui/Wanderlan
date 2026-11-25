@@ -28,6 +28,9 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
   1.0.1, 1.0.2, ... (`scripts/version.sh` counts the commits since the
   version in `Cargo.toml` was set; CI, packages and `--version` show it).
   The APT repository keeps the newest 20 and every tagged release.
+- Packages are named exactly like the version (`1.0.2`, no `-1`), and
+  `wanderlan --version`, the daemon's log and status, the CI job names and
+  summaries name the commit too: `wanderlan 1.0.2 (c463aa1)`.
 
 ### network.toml
 

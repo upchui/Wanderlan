@@ -1,8 +1,9 @@
 name: Publish
 
 # Every commit on main whose CI run is green goes into the APT repository on
-# GitHub Pages (suite stable) with the version CI built, e.g.
-# 0.1.0+57.gc256ea5-1; then the installation from the repository is tested.
+# GitHub Pages (suite stable) with the version CI built, e.g. 1.0.2 (the
+# package is named like the version); then the installation from the
+# repository is tested.
 # Nothing to do by hand: committing to main is enough.
 on:
   workflow_run:
@@ -46,15 +47,19 @@ jobs:
           github-token: ${{ github.token }}
       - id: v
         name: Package version
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           ls -l dist
           deb_version=$(dpkg-deb -f dist/wanderlan_*_amd64.deb Version)
+          commit="${HEAD_SHA::7}"
           echo "deb_version=$deb_version" >> "$GITHUB_OUTPUT"
-          echo "### wanderlan $deb_version" >> "$GITHUB_STEP_SUMMARY"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "### wanderlan $deb_version ($commit)" >> "$GITHUB_STEP_SUMMARY"
       - uses: ./.github/actions/apt-publish
         with:
           dist: dist
-          message: "APT repository: wanderlan ${{ steps.v.outputs.deb_version }}"
+          message: "APT repository: wanderlan ${{ steps.v.outputs.deb_version }} (${{ steps.v.outputs.commit }})"
           signing-key: ${{ secrets.APT_GPG_PRIVATE_KEY }}
           passphrase: ${{ secrets.APT_GPG_PASSPHRASE }}
 

@@ -11,11 +11,12 @@
 # <pages>/apt/pool/main/w/wanderlan/*.deb. Older packages stay in the pool,
 # so `apt install wanderlan=<version>` can downgrade.
 #
-# Retention: every commit on main is a version of its own (1.0.7-1, see
-# scripts/version.sh); per architecture only the newest KEEP of them
-# (default 20) stay. Tagged releases, listed in KEEP_FOREVER without the
-# Debian revision ("0.1.0 1.0.7"), stay forever. Builds of the old scheme
-# (0.2.0+57.gc256ea5-1) are older than every 1.x and go first.
+# Retention: every commit on main is a version of its own (1.0.7, named
+# exactly like the version, see scripts/version.sh); per architecture only
+# the newest KEEP of them (default 20) stay. Tagged releases, listed in
+# KEEP_FOREVER ("0.1.0 1.0.7"; a Debian revision like the old 0.1.0-1 is
+# ignored), stay forever. Builds of the old scheme (0.2.0+57.gc256ea5-1) are
+# older than every 1.x and go first.
 set -euo pipefail
 
 pages="${1:?usage: apt-repo.sh <pages-dir> <deb>...}"

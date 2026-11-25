@@ -36,4 +36,8 @@ commit "1.1.0"
 expect 1.1.0
 commit "next"
 expect 1.1.1
+# --commit: the short hash, "-modified" with changes to tracked files.
+[ "$(scripts/version.sh --commit)" = "$(git rev-parse --short=7 HEAD)" ] || fail "--commit"
+echo change >> notes
+[ "$(scripts/version.sh --commit)" = "$(git rev-parse --short=7 HEAD)-modified" ] || fail "--commit with changes"
 echo "version test passed"

@@ -8,7 +8,7 @@ on:
   workflow_call:
     inputs:
       deb_version:
-        description: Published package version, e.g. 1.0.7-1
+        description: Published package version, e.g. 1.0.7
         required: true
         type: string
 
@@ -21,7 +21,7 @@ env:
 
 jobs:
   served:
-    name: GitHub Pages serves the version
+    name: GitHub Pages serves ${{ inputs.deb_version }}
     runs-on: ubuntu-24.04
     steps:
       - name: Wait for Pages (index and signature consistent)
@@ -41,7 +41,7 @@ jobs:
           exit 1
 
   install:
-    name: install (${{ matrix.base }})
+    name: install ${{ inputs.deb_version }} (${{ matrix.base }})
     needs: served
     runs-on: ubuntu-24.04
     strategy:
@@ -79,7 +79,7 @@ jobs:
             fi'
 
   acceptance:
-    name: two hosts with the example configuration (Debian 13)
+    name: two hosts with ${{ inputs.deb_version }} (Debian 13)
     needs: install
     runs-on: ubuntu-24.04
     steps:

@@ -23,7 +23,7 @@ export GNUPGHOME="$work/gnupg"
 mkdir -m 700 "$GNUPGHOME"
 gpg --batch --quiet --passphrase '' --quick-gen-key 'wanderlan test <test@example.invalid>' ed25519 sign never
 APT_GPG_PRIVATE_KEY=$(gpg --batch --armor --export-secret-keys)
-export APT_GPG_PRIVATE_KEY KEEP=3 KEEP_FOREVER="0.1.0 1.0.0"
+export APT_GPG_PRIVATE_KEY KEEP=3 KEEP_FOREVER="0.1.0 1.0.5"
 
 # Builds a minimal package wanderlan_<version>_<arch>.deb.
 mkdeb() {
@@ -55,12 +55,15 @@ for arch in amd64 arm64; do
   for i in $(seq 1 12); do round+=("$(mkdeb "$(commit_version 0.2.0 "$i")" "$arch")"); done
 done
 publish "${round[@]}"
-# The new scheme: every commit a version, 1.0.0 tagged; 1.0.9 < 1.0.10.
-for i in $(seq 0 12); do
-  publish "$(mkdeb "1.0.$i-1" amd64)" "$(mkdeb "1.0.$i-1" arm64)"
+# 1.0.0 was published with a Debian revision (1.0.0-1), every commit after
+# it as the plain version (1.0.1 < ... < 1.0.12; 1.0.9 < 1.0.10); 1.0.5
+# is tagged.
+publish "$(mkdeb 1.0.0-1 amd64)" "$(mkdeb 1.0.0-1 arm64)"
+for i in $(seq 1 12); do
+  publish "$(mkdeb "1.0.$i" amd64)" "$(mkdeb "1.0.$i" arm64)"
 done
 
-expected=$(printf '%s\n' 0.1.0-1 1.0.0-1 1.0.10-1 1.0.11-1 1.0.12-1 | sort)
+expected=$(printf '%s\n' 0.1.0-1 1.0.5 1.0.10 1.0.11 1.0.12 | sort)
 pool="$pages/apt/pool/main/w/wanderlan"
 for arch in amd64 arm64; do
   in_pool=$(find "$pool" -name "*_${arch}.deb" -printf '%f\n' | sed "s/^wanderlan_\(.*\)_${arch}\.deb\$/\1/" | sort)
@@ -75,15 +78,15 @@ echo "retention OK: tags kept, newest $KEEP versions per architecture, old build
 # Publishing the same version again changes nothing, even if the new file
 # differs (a re-run builds the same version again).
 before=$(cd "$pool" && sha256sum ./*)
-publish "$debs/wanderlan_1.0.12-1_amd64.deb"
+publish "$debs/wanderlan_1.0.12_amd64.deb"
 [ "$before" = "$(cd "$pool" && sha256sum ./*)" ] || fail "republishing changed the pool"
 mkdir -p "$work/rebuilt"
-cp "$(mkdeb "1.0.12-1" amd64)" "$work/rebuilt/"
+cp "$(mkdeb "1.0.12" amd64)" "$work/rebuilt/"
 echo "rebuilt" > "$work/build/rebuilt"
-dpkg-deb --root-owner-group -b "$work/build" "$work/rebuilt/wanderlan_1.0.12-1_amd64.deb" >/dev/null
-cmp -s "$work/rebuilt/wanderlan_1.0.12-1_amd64.deb" "$pool/wanderlan_1.0.12-1_amd64.deb" \
+dpkg-deb --root-owner-group -b "$work/build" "$work/rebuilt/wanderlan_1.0.12_amd64.deb" >/dev/null
+cmp -s "$work/rebuilt/wanderlan_1.0.12_amd64.deb" "$pool/wanderlan_1.0.12_amd64.deb" \
   && fail "the rebuilt test package should differ"
-publish "$work/rebuilt/wanderlan_1.0.12-1_amd64.deb"
+publish "$work/rebuilt/wanderlan_1.0.12_amd64.deb"
 [ "$before" = "$(cd "$pool" && sha256sum ./*)" ] || fail "a rebuilt package replaced the published one"
 echo "republishing OK: published files never change"
 

@@ -5,5 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 scripts/load-modules.sh
-docker build -f docker/Dockerfile --target systemdnode -t "${SYSTEMDNODE_IMAGE:-wanderlan-systemdnode}" "$@" .
+docker build -f docker/Dockerfile --target systemdnode -t "${SYSTEMDNODE_IMAGE:-wanderlan-systemdnode}" \
+  --build-arg WANDERLAN_VERSION="$(scripts/version.sh)" \
+  --build-arg WANDERLAN_COMMIT="$(scripts/version.sh --commit)" "$@" .
 exec tests/systemd/run.sh

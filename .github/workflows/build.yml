@@ -8,9 +8,14 @@ on:
   workflow_call:
     inputs:
       version:
-        description: Version without Debian revision, e.g. 0.1.0+57.gc256ea5
+        description: Version of the commit (scripts/version.sh), e.g. 1.0.2; also the package version
         required: true
         type: string
+      commit:
+        description: Short commit, e.g. c463aa1 (shown by --version)
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -42,7 +47,9 @@ jobs:
           context: .
           file: docker/Dockerfile
           target: artifacts
-          build-args: WANDERLAN_VERSION=${{ inputs.version }}
+          build-args: |
+            WANDERLAN_VERSION=${{ inputs.version }}
+            WANDERLAN_COMMIT=${{ inputs.commit }}
           outputs: type=local,dest=dist
           provenance: false
           cache-from: type=gha,scope=build-${{ matrix.arch }}
@@ -53,7 +60,9 @@ jobs:
           context: .
           file: docker/Dockerfile
           target: testnode
-          build-args: WANDERLAN_VERSION=${{ inputs.version }}
+          build-args: |
+            WANDERLAN_VERSION=${{ inputs.version }}
+            WANDERLAN_COMMIT=${{ inputs.commit }}
           load: true
           tags: wanderlan-testnode
           provenance: false
@@ -61,7 +70,8 @@ jobs:
       - name: Smoke test of the package
         env:
           VERSION: ${{ inputs.version }}
-        run: scripts/smoke-test.sh dist "${VERSION}-1" wanderlan-testnode
+          WANDERLAN_COMMIT: ${{ inputs.commit }}
+        run: scripts/smoke-test.sh dist "${VERSION}" wanderlan-testnode
       - uses: actions/upload-artifact@v7
         with:
           name: dist-${{ matrix.arch }}

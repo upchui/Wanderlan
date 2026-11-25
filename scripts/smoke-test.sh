@@ -9,9 +9,11 @@
 #      group, systemd unit, `wanderlan init`.
 #
 # Usage: scripts/smoke-test.sh <dist-dir> <deb-version> [testnode-image]
-# <deb-version> is the full package version, e.g. 1.0.7-1. The
-# package for the native architecture is tested. Without [testnode-image]
-# the testnode image is built here with the matching WANDERLAN_VERSION.
+# <deb-version> is the package version, the same as the version, e.g.
+# 1.0.7. The package for the native architecture is tested. Without
+# [testnode-image] the testnode image is built here with the matching
+# WANDERLAN_VERSION. With WANDERLAN_COMMIT set, `--version` must name exactly
+# that commit ("wanderlan 1.0.7 (c463aa1)").
 set -euo pipefail
 cd "$(dirname "$0")/.."
 dist="$(cd "${1:?usage: smoke-test.sh <dist-dir> <deb-version> [testnode-image]}" && pwd)"
@@ -21,7 +23,8 @@ image="${3:-}"
 slim_image="${DEBIAN_IMAGE:-debian:trixie-slim}"
 
 echo "== package wanderlan ${deb_version} in ${dist}"
-docker run --rm -v "$dist:/dist:ro" -e DEB_VERSION="$deb_version" -e VERSION="$version" \
+commit="${WANDERLAN_COMMIT:-}"
+docker run --rm -v "$dist:/dist:ro" -e DEB_VERSION="$deb_version" -e VERSION="$version" -e COMMIT="$commit" \
   "$slim_image" sh -euc '
     arch=$(dpkg --print-architecture)
     deb="/dist/wanderlan_${DEB_VERSION}_${arch}.deb"
@@ -34,7 +37,11 @@ docker run --rm -v "$dist:/dist:ro" -e DEB_VERSION="$deb_version" -e VERSION="$v
     for bin in wanderland wanderlan; do
       out=$(/pkg/usr/bin/$bin --version)
       echo "$out"
-      [ "$out" = "$bin $VERSION" ] || { echo "$bin reports \"$out\", expected \"$bin $VERSION\"" >&2; exit 1; }
+      case "$out" in
+        "$bin $VERSION ($COMMIT)") ;;
+        "$bin $VERSION" | "$bin $VERSION ("*")") [ -z "$COMMIT" ] || { echo "$bin reports \"$out\", expected commit $COMMIT" >&2; exit 1; } ;;
+        *) echo "$bin reports \"$out\", expected \"$bin $VERSION\"" >&2; exit 1 ;;
+      esac
     done
     ex=/pkg/usr/share/doc/wanderlan/examples
     /pkg/usr/bin/wanderlan validate "$ex/network.toml" --local "$ex/local.toml"
@@ -44,15 +51,21 @@ docker run --rm -v "$dist:/dist:ro" -e DEB_VERSION="$deb_version" -e VERSION="$v
 if [ -z "$image" ]; then
   image=wanderlan-testnode
   docker build -f docker/Dockerfile --target testnode -t "$image" \
-    --build-arg WANDERLAN_VERSION="$version" .
+    --build-arg WANDERLAN_VERSION="$version" --build-arg WANDERLAN_COMMIT="$commit" .
 fi
 
 echo "== installed with apt on Debian 13 (${image})"
-docker run --rm --entrypoint sh -e DEB_VERSION="$deb_version" -e VERSION="$version" "$image" -euc '
+docker run --rm --entrypoint sh -e DEB_VERSION="$deb_version" -e VERSION="$version" -e COMMIT="$commit" "$image" -euc '
   got=$(dpkg-query -W -f "\${Version}" wanderlan)
   [ "$got" = "$DEB_VERSION" ] || { echo "installed version is $got, expected $DEB_VERSION" >&2; exit 1; }
-  [ "$(wanderland --version)" = "wanderland $VERSION" ]
-  [ "$(wanderlan --version)" = "wanderlan $VERSION" ]
+  for bin in wanderland wanderlan; do
+    out=$($bin --version)
+    case "$out" in
+      "$bin $VERSION ($COMMIT)") ;;
+      "$bin $VERSION" | "$bin $VERSION ("*")") [ -z "$COMMIT" ] ;;
+      *) echo "$bin reports \"$out\"" >&2; exit 1 ;;
+    esac
+  done
   getent group wanderlan >/dev/null
   test -f /usr/lib/systemd/system/wanderland.service -o -f /lib/systemd/system/wanderland.service
   wanderlan init | grep -q "^\[network\]"
