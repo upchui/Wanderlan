@@ -102,6 +102,9 @@ pub fn render_network(network: &Network) -> String {
         let _ = writeln!(out, "\n[site.{}]", key(name));
         if let Some(site) = network.site(name) {
             let _ = writeln!(out, "address = {}", quote(&site.address.to_string()));
+            if let Some(id) = &site.id {
+                let _ = writeln!(out, "id = {}", quote(&id.to_string()));
+            }
             if let Some(up) = &site.uplink {
                 let _ = writeln!(out, "server = {}", quote(up));
             }
@@ -200,6 +203,9 @@ fn render_network_inner(network: &Network, with_revision: bool) -> String {
         out.push_str("\n[[site]]\n");
         let _ = writeln!(out, "name = {}", quote(&site.name));
         let _ = writeln!(out, "address = {}", quote(&site.address.to_string()));
+        if let Some(id) = &site.id {
+            let _ = writeln!(out, "id = {}", quote(&id.to_string()));
+        }
         if let Some(vlans) = &site.vlans {
             let _ = writeln!(out, "vlans = {}", quote(&vlans.to_string()));
         }

@@ -18,6 +18,7 @@ const OLD_NAME: &str = "mesh";
 
 use anyhow::{Context as _, Result};
 use wanderlan_core::config::{Config, render_local, render_network};
+use wanderlan_core::identity::Identity;
 
 /// File locations.
 #[derive(Debug, Clone)]
@@ -173,6 +174,33 @@ impl Paths {
         self.state_dir.join("invites.json")
     }
 
+    /// The private key of this box (its identity).
+    pub fn identity(&self) -> PathBuf {
+        self.state_dir.join("identity")
+    }
+
+    /// Reads the identity of this box, if it has one.
+    pub fn load_identity(&self) -> Result<Option<Identity>> {
+        let path = self.identity();
+        let text = read_optional(&path)?;
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        Identity::from_secret_text(&text)
+            .map(Some)
+            .with_context(|| format!("{} does not hold a wanderlan identity", path.display()))
+    }
+
+    /// Creates a new identity for this box and stores it (readable by root
+    /// only).
+    pub fn create_identity(&self) -> Result<Identity> {
+        let secret = crate::random::bytes::<{ wanderlan_core::identity::KEY_LEN }>()
+            .context("cannot create the identity of this box")?;
+        let identity = Identity::from_secret(secret);
+        write_private(&self.identity(), &identity.secret_text())?;
+        Ok(identity)
+    }
+
     /// Back to the state after installation: the configuration files become
     /// the package templates again; the contents of the state directory
     /// (confirmed copies, marker, invitations) and rejected files are
@@ -295,6 +323,16 @@ pub fn read_optional(path: &Path) -> Result<String> {
 
 /// Writes a file via a temporary file and rename.
 pub fn write_atomic(path: &Path, content: &str) -> Result<()> {
+    write_file(path, content, None)
+}
+
+/// [`write_atomic`] for a secret: only its owner may read it (mode 0600,
+/// whatever the umask).
+pub fn write_private(path: &Path, content: &str) -> Result<()> {
+    write_file(path, content, Some(0o600))
+}
+
+fn write_file(path: &Path, content: &str, mode: Option<u32>) -> Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
     let name = path
@@ -306,8 +344,20 @@ pub fn write_atomic(path: &Path, content: &str) -> Result<()> {
     // power loss the old or the new file, never an empty one.
     {
         use std::io::Write as _;
-        let mut file = std::fs::File::create(&tmp)
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let _ = std::fs::remove_file(&tmp);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        if let Some(mode) = mode {
+            options.mode(mode);
+        }
+        let mut file = options
+            .open(&tmp)
             .with_context(|| format!("cannot write {}", tmp.display()))?;
+        if let Some(mode) = mode {
+            file.set_permissions(std::fs::Permissions::from_mode(mode))
+                .with_context(|| format!("cannot protect {}", tmp.display()))?;
+        }
         file.write_all(content.as_bytes())
             .and_then(|()| file.sync_all())
             .with_context(|| format!("cannot write {}", tmp.display()))?;
@@ -477,6 +527,24 @@ mod tests {
     }
 
     #[test]
+    fn the_identity_is_kept_private_and_read_back() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let (base, paths) = temp_paths("identity");
+        assert!(paths.load_identity().unwrap().is_none(), "none yet");
+        let created = paths.create_identity().unwrap();
+        let mode = std::fs::metadata(paths.identity())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        let loaded = paths.load_identity().unwrap().unwrap();
+        assert_eq!(loaded.id(), created.id());
+        std::fs::write(paths.identity(), "garbage").unwrap();
+        assert!(paths.load_identity().is_err());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
     fn reset_restores_the_templates_and_clears_the_state() {
         let base = std::env::temp_dir().join(format!("wl-reset-{}", std::process::id()));
         let paths = Paths {
@@ -491,6 +559,7 @@ mod tests {
         paths.save_copy().unwrap();
         paths.set_marker().unwrap();
         std::fs::write(paths.invites(), "[]").unwrap();
+        paths.create_identity().unwrap();
         paths.reset().unwrap();
         assert_eq!(
             std::fs::read_to_string(paths.network()).unwrap(),

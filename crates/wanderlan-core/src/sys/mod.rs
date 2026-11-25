@@ -75,6 +75,9 @@ pub struct GretapParams {
     pub ignore_df: bool,
     /// Path MTU discovery (DF on the outer header).
     pub pmtudisc: bool,
+    /// GRE key (the same in both directions); `None` for a tunnel to a
+    /// site without identity.
+    pub key: Option<u32>,
 }
 
 /// Kind of a link as far as wanderlan cares.
@@ -199,6 +202,16 @@ pub trait NetOps: Send + Sync {
     /// Creates a GRETAP interface.
     fn create_gretap(
         &self,
+        name: &str,
+        params: &GretapParams,
+        mtu: u32,
+    ) -> impl Future<Output = SysResult<()>> + Send;
+
+    /// Changes the parameters of a GRETAP interface in place (endpoints,
+    /// key, encapsulation): the interface and its bridge port stay.
+    fn change_gretap(
+        &self,
+        index: u32,
         name: &str,
         params: &GretapParams,
         mtu: u32,

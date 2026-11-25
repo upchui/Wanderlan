@@ -25,6 +25,7 @@ use super::model::{
     Network, Site, TunnelVlans, VlanMap, site_pair,
 };
 use super::vlan::{VID_MAX, VID_MIN, VlanSet};
+use crate::identity::SiteId;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -70,6 +71,7 @@ enum RawVlanItem {
 struct RawSite {
     name: Option<Spanned<String>>,
     address: Option<Spanned<String>>,
+    id: Option<Spanned<String>>,
     vlans: Option<Spanned<RawVlans>>,
     own_vlans: Option<Spanned<RawVlans>>,
     online: Option<Spanned<bool>>,
@@ -151,6 +153,7 @@ struct RawNetworkFile2 {
 #[serde(deny_unknown_fields)]
 struct RawSite2 {
     address: Option<Spanned<String>>,
+    id: Option<Spanned<String>>,
     server: Option<Spanned<String>>,
     managed_by: Option<Spanned<String>>,
     self_managed: Option<Spanned<bool>>,
@@ -466,6 +469,7 @@ fn parse_network_2(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
         let site = RawSite {
             name: Some(name),
             address: raw_site.address,
+            id: raw_site.id,
             vlans: raw_site.vlans,
             own_vlans: raw_site.own_vlans,
             online: raw_site.online,
@@ -706,6 +710,8 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
     let name = lw.take(&name_path, s.name);
     let addr_path = FieldPath::site_field(i, "address");
     let address = lw.take(&addr_path, s.address);
+    let id_path = FieldPath::site_field(i, "id");
+    let id_text = lw.take(&id_path, s.id);
     let vlans_path = FieldPath::site_field(i, "vlans");
     let vlans = lw.take(&vlans_path, s.vlans);
     let own_path = FieldPath::site_field(i, "own_vlans");
@@ -783,11 +789,19 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
                 None
             }
         });
+    let id = id_text.and_then(|text| match text.parse::<SiteId>() {
+        Ok(id) => Some(id),
+        Err(e) => {
+            lw.error(id_path, format!("{label}: id \"{text}\" is {e}"));
+            None
+        }
+    });
 
     Some((
         Site {
             name: name?,
             address: address?,
+            id,
             vlans,
             own_vlans,
             online,

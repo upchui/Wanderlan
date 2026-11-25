@@ -297,17 +297,56 @@ A site that joined and was not released is **restricted**: it cannot change
 the VLANs its server gave it, only those of sites it invited itself. Its own
 VLANs (see above) are always its own business. A client may in any case only
 change itself and its own clients, never its server. The daemons enforce
-this among themselves; it is not a cryptographic protection.
+these rules among themselves (someone with root on a site could bypass
+them); which box is behind a site, however, is protected by its key (see
+[Identities and keys](#identities-and-keys)).
 
 **Renaming a site.** Sites (`2`), `N` (only the new name), or `wanderlan
 rename <site> <new-name>`. A site may always rename itself, also a
 restricted one; its manager (`managed_by`, "Changes") may rename it too; a
-client never renames its server. The address stays, so every site
+client never renames its server. Its identity stays, so every site
 recognises the renamed one: the network, `self` in its own
 `local.toml` and the trunks per tunnel of the others follow, and the
 tunnels to it are built anew (about a second without traffic on them).
 Older sites do not understand a rename made by their client; update them
 first.
+
+### Identities and keys
+
+Every box has an **identity**: a key pair it creates the first time it is
+configured or joins (`/var/lib/wanderlan/identity`, readable by root only).
+The public half is the site's `id` in `network.toml`, like a WireGuard
+public key; `wanderlan status` shows it, the terminal UI its first
+characters. The two sites of a tunnel derive the keys of that tunnel from
+their identities; no key travels over the network or is written to a file:
+
+* the **GRE key** of the tunnel: the kernel drops tunnel packets with
+  another key, so a second box at the same address (behind the same NAT)
+  or a cloned machine does not get into the network;
+* the **probe key**: every control probe carries a tag, and a tunnel comes
+  up only once the other site has answered with its key ("identity
+  confirmed"). A box at its address that answers with another key keeps the
+  tunnel down ("wrong key");
+* the **sync key**: a site takes a network only from the neighbour that
+  holds the key, and gives its own only to it.
+
+Joins tell boxes apart the same way. The same box joins again (also from a
+new address). A box that was reset (`wanderlan reset` deletes the identity:
+it is a new box afterwards) takes over its old entry, with all its rules,
+only if the old box does not answer any more; a second box at the address
+of a site that is still running is refused. A box with the identity of a
+site that runs elsewhere (a cloned machine) is refused too: run `wanderlan
+reset` on it first. Identities are never edited by hand: a `network.toml`
+written without the `id` lines keeps them.
+
+The keys **authenticate, they do not encrypt**: the traffic between the
+sites is only as private as the transport network (the VPN). The GRE key is
+visible in every packet; it tells boxes apart but does not stop someone who
+can see the traffic.
+
+Sites of older versions have no identity: tunnels to them have no key and
+their probes and sync are not authenticated until they are updated (update
+all sites; an older version cannot read a `network.toml` with identities).
 
 ### Online, offline and confirmed changes
 
@@ -539,7 +578,8 @@ the kernel module `ip_gre` and with it its devices `gre0`, `gretap0` and
   anew once (a short interruption); on a kernel without them the bridge
   stays as it is and the traffic per VLAN is not shown;
 * `wl-<interface>`: the same for every further trunk ("trunk per tunnel");
-* `gt-<peer>`: a GRETAP tunnel (`ignore-df`, `nopmtudisc`, MTU 1500) to its
+* `gt-<peer>`: a GRETAP tunnel (`ignore-df`, `nopmtudisc`, MTU 1500, with
+  the GRE key of the two identities) to its
   server, to each of its clients and, on a server, to every other server. The
   ports between servers are `isolated` (split horizon: a frame from one
   server is never forwarded to another server); the ports of clients and
@@ -564,7 +604,12 @@ addresses, again after 10 s and 30 s while the other sites follow.
 
 The daemons talk to their tunnel neighbours over UDP on the control port
 every 5 s: reachability, round trip, path MTU and the revision and
-fingerprint of their configuration. Each neighbour is told the version it
+fingerprint of their configuration. Every probe carries a tag of the probe
+key and every answer one over the nonce of its request, so an answer proves
+that the neighbour holds its key now; between sites that know each other's
+identity the configuration is fetched with an authenticated exchange
+(`SYNC`), otherwise (a site of an older version, or one that does not know
+the other's identity yet) as before. Each neighbour is told the version it
 should have: servers and the uplink the whole configuration of this site, a
 client only its own part. A site that sees a newer version fetches it over
 TCP and applies it; a server that sees changes of one of its clients fetches
@@ -593,10 +638,10 @@ probes that have the DF bit set: at start, every `mtu_probe_interval` and
 when a neighbour becomes reachable again. TCP SYNs entering or leaving a
 tunnel port are clamped to
 
-`MSS = path MTU − 20 (outer IP) − 4 (GRE) − 18 (Ethernet + VLAN tag) − 40 (inner IP + TCP)`
+`MSS = path MTU − 20 (outer IP) − 4 (GRE) − 4 (GRE key) − 18 (Ethernet + VLAN tag) − 40 (inner IP + TCP)`
 
-(IPv6: 20 bytes less; ports without a measurement use the smallest measured
-value). GRE fragmentation stays on as a safety net, so non-TCP packets larger
+(a tunnel to a site without identity has no key: 4 bytes more; IPv6: 20
+bytes less; ports without a measurement use the smallest measured path). GRE fragmentation stays on as a safety net, so non-TCP packets larger
 than the path still arrive.
 
 ### Loops
@@ -720,6 +765,16 @@ or `WANDERLAN_SOCKET`.
   come up within the commit timeout is removed again; its code works again.
 * **A neighbour "does not answer control probes"**: allow UDP and TCP on the
   control port between the site addresses.
+* **"identity not confirmed yet"**: the tunnel waits for an answer to the
+  control probes with the neighbour's key; the probes do not get through
+  (see above), or the neighbour runs an older version (update it).
+* **"answers with another key"** / **"wrong key"**: another box answers at
+  the neighbour's address, e.g. one that was reset or a second box behind
+  the same NAT. A reset box joins again with an invitation; every box needs
+  its own address in the transport network.
+* **"another box joined as …"** on a site: its entry now belongs to another
+  box (a reset copy, a cloned machine). Reset this box and join again, or
+  remove the other one.
 * **Large transfers stall**: compare the path MTU in `wanderlan status` with
   the MTU of the VPN; set `mss` if probes are filtered.
 * **A port is BLOCKED**: the loop guard found a loop through another layer-2
@@ -739,8 +794,13 @@ or `WANDERLAN_SOCKET`.
 ## Project decisions
 
 * **No VPN inside wanderlan.** Transport and encryption belong to the existing
-  VPN; wanderlan only does layer 2 and VLANs. Sites are identified by their
-  transport address, and GRE runs unencrypted on top of that trusted network.
+  VPN; wanderlan only does layer 2 and VLANs, and GRE runs unencrypted on top
+  of that trusted network.
+* **A site is a box with a key, not an address.** Every box has an X25519
+  identity; the keys of a tunnel are derived from the two identities
+  (Diffie-Hellman, HKDF-SHA256), so they never travel and no third site knows
+  them. They authenticate the probes, the sync and (as GRE key) the tunnel
+  packets; they cost nothing per packet but the kernel's key compare.
 * **Servers and clients, like plugging switches together.** Roles are not
   configured up front: a site that joins is a client of the site that invited
   it and only has to reach it; servers are all connected with each other,

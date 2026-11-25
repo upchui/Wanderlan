@@ -9,6 +9,7 @@ pub mod api;
 pub mod config;
 pub mod desired;
 pub mod forwarding;
+pub mod identity;
 pub mod join;
 pub mod kernel;
 pub mod loopguard;

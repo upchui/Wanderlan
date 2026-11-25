@@ -14,6 +14,7 @@ mod files;
 mod invites;
 mod logging;
 mod probe;
+mod random;
 mod sockopt;
 mod stats;
 mod sync_net;

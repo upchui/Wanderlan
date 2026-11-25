@@ -2,16 +2,19 @@
 //!
 //! A site is known by its name everywhere: the other sites' `uplink` and
 //! `managed_by`, the mappings, the tunnel limits, `self` and the trunks per
-//! tunnel in `local.toml`, the interfaces `gt-<name>`. Its address is
-//! unique too and stays when it is renamed, so a rename is recognised as the
-//! same address under a new name. Who may rename whom is in [`crate::policy`].
+//! tunnel in `local.toml`, the interfaces `gt-<name>`. Its identity (`id`)
+//! stays when it is renamed, so a rename is recognised as the same identity
+//! under a new name; sites without an identity (older versions) by their
+//! address, which is unique among them. Who may rename whom is in
+//! [`crate::policy`].
 
-use crate::config::{Local, Network, site_pair};
+use crate::config::{Local, Network, Site, site_pair};
 
 /// The renames from `old` to `new`, as (old name, new name): a site of `new`
-/// whose address belongs in `old` to a site that `new` no longer has, while
-/// its own name is new. A site that changes its name and its address at once
-/// is a removed and an added site.
+/// that is the same box as a site of `old` which `new` no longer has, while
+/// its own name is new. The same box: the same identity, or the same address
+/// where one of the two has no identity. A site without an identity that
+/// changes its name and its address at once is a removed and an added site.
 pub fn renames(old: &Network, new: &Network) -> Vec<(String, String)> {
     new.sites
         .iter()
@@ -19,10 +22,18 @@ pub fn renames(old: &Network, new: &Network) -> Vec<(String, String)> {
         .filter_map(|s| {
             old.sites
                 .iter()
-                .find(|o| o.address == s.address && new.site(&o.name).is_none())
+                .find(|o| same_box(o, s) && new.site(&o.name).is_none())
                 .map(|o| (o.name.clone(), s.name.clone()))
         })
         .collect()
+}
+
+/// True if the two entries describe the same box.
+fn same_box(a: &Site, b: &Site) -> bool {
+    match (a.id, b.id) {
+        (Some(x), Some(y)) => x == y,
+        _ => a.address == b.address,
+    }
 }
 
 impl Network {
@@ -95,6 +106,7 @@ mod tests {
         Site {
             name: name.into(),
             address: Ipv4Addr::new(10, 0, 0, last),
+            id: None,
             vlans: None,
             own_vlans: None,
             online: true,
@@ -162,9 +174,30 @@ mod tests {
         let mut added = old.clone();
         added.sites.push(Site {
             address: Ipv4Addr::new(10, 0, 0, 3),
+            id: None,
             ..site("y", 0, None)
         });
         assert!(renames(&old, &added).is_empty());
+    }
+
+    #[test]
+    fn with_identities_a_rename_is_the_same_identity() {
+        let id = |n: u8| Some(crate::identity::SiteId::from_bytes([n; 32]));
+        let mut old = network();
+        for (i, site) in old.sites.iter_mut().enumerate() {
+            site.id = id(i as u8 + 1);
+        }
+        // Renamed and moved at once: still the same box.
+        let mut moved = old.clone();
+        moved.rename_site("x", "y");
+        moved.sites[2].address = Ipv4Addr::new(10, 0, 0, 9);
+        assert_eq!(renames(&old, &moved), [("x".to_string(), "y".to_string())]);
+        // Another box at the address of a site that left (behind the same
+        // NAT): no rename.
+        let mut other = old.clone();
+        other.sites[2].name = "z".into();
+        other.sites[2].id = id(9);
+        assert!(renames(&old, &other).is_empty());
     }
 
     #[test]

@@ -5,7 +5,6 @@
 //! site joins with it (the change waits for the new site to come up), it is
 //! reserved; if the join is rolled back it becomes usable again.
 
-use std::io::Read as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 
@@ -60,10 +59,8 @@ impl Invites {
 
     /// Creates and stores a new invitation.
     pub fn create(&mut self, now_secs: u64, rules: SiteRules) -> Result<Invite> {
-        let mut bytes = [0u8; CODE_LEN];
-        std::fs::File::open("/dev/urandom")
-            .and_then(|mut f| f.read_exact(&mut bytes))
-            .context("cannot read random bytes for the invitation code")?;
+        let bytes =
+            crate::random::bytes::<CODE_LEN>().context("cannot create the invitation code")?;
         let invite = Invite {
             code: code_from_bytes(&bytes),
             created_secs: now_secs,

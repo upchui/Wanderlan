@@ -136,6 +136,24 @@ fn peer_vlans(frame: &mut Frame, app: &App, peer: &str, vlan: Option<u16>, area:
     );
 }
 
+/// The peer's identity and how its tunnel is built.
+fn identity_line(peer: &PeerStatus) -> Line<'static> {
+    use wanderlan_core::api::IdentityState;
+    let id = peer.identity.clone().unwrap_or_else(|| "none".into());
+    let (state, style) = match peer.identity_state {
+        Some(IdentityState::Confirmed) => ("confirmed", theme::ok()),
+        Some(IdentityState::Waiting) => ("not confirmed yet", theme::warn()),
+        Some(IdentityState::WrongKey) => ("WRONG KEY at its address", theme::bad()),
+        None => ("no key (older version)", theme::dim()),
+    };
+    Line::from(vec![
+        label("Identity"),
+        Span::raw(format!("{id}   ")),
+        Span::styled(state, style),
+        Span::styled(format!("   tunnel {}", peer.tunnel.label()), theme::dim()),
+    ])
+}
+
 pub fn peer(frame: &mut Frame, app: &App, name: &str, vlan: Option<u16>, area: Rect) {
     frame.render_widget(Clear, area);
     let Some(peer) = app
@@ -185,6 +203,7 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, vlan: Option<u16>, area: R
         ]),
         rtt_line(peer),
         quality_line(peer),
+        identity_line(peer),
         Line::from(vec![
             label("Path MTU"),
             Span::raw(format!(
@@ -353,6 +372,13 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, area: Rect) {
             } else {
                 Span::styled("   OFFLINE", theme::warn())
             },
+        ]),
+        Line::from(vec![
+            label("Identity"),
+            Span::raw(
+                site.id
+                    .map_or_else(|| "none yet (older version)".into(), |id| id.to_string()),
+            ),
         ]),
         Line::from(vec![
             label("VLANs"),

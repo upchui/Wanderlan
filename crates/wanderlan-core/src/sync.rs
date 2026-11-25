@@ -12,6 +12,7 @@
 use std::collections::BTreeSet;
 
 use crate::config::{Config, Local, Network, fingerprint, validate};
+use crate::identity::SiteId;
 
 /// Revision and fingerprint of a network.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -65,6 +66,27 @@ pub enum Rejection {
         "the received configuration renames this site (\"{0}\") to \"{1}\", but only it and its manager may rename it, and it has none"
     )]
     RenamedWithoutConsent(String, String),
+    /// The entry of this site belongs to another box now: it joined again
+    /// with this name (after a reset there, or a cloned machine).
+    #[error(
+        "the received configuration gives this site (\"{0}\") another identity ({1}): another box joined as \"{0}\"; run `wanderlan reset` here and join again, or remove the other box"
+    )]
+    IdentityTakenOver(String, String),
+}
+
+/// Writes this site's identity into its own entry if it has none yet (a
+/// network of an older version, or one the uplink has not received the
+/// claim for yet), with a new revision so that it spreads. Returns true if
+/// it changed the network.
+pub fn claim_own_id(network: &mut Network, me: &str, id: SiteId) -> bool {
+    match network.sites.iter_mut().find(|s| s.name == me) {
+        Some(site) if site.id.is_none() => {
+            site.id = Some(id);
+            network.revision += 1;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Checks a received network against the local configuration and returns the
@@ -76,11 +98,16 @@ pub enum Rejection {
 /// another only if it allows it, or if `taken_back`: its server refused a
 /// change of this site, its new name included, and its network applies
 /// again.
+///
+/// With `own_id`, the entry of this site must carry that identity: one it
+/// lacks is claimed again ([`claim_own_id`]), another one means another box
+/// took this site over.
 pub fn accept(
-    received: Network,
+    mut received: Network,
     local: &Local,
     previous: Option<&Network>,
     taken_back: bool,
+    own_id: Option<SiteId>,
 ) -> Result<Config, Rejection> {
     let mut local = local.clone();
     if let Some(previous) = previous {
@@ -102,8 +129,16 @@ pub fn accept(
         }
     }
     let me = local.self_name.clone().unwrap_or_default();
-    if received.site(&me).is_none() {
+    let Some(entry) = received.site(&me) else {
         return Err(Rejection::SelfMissing(me));
+    };
+    if let (Some(theirs), Some(mine)) = (entry.id, own_id)
+        && theirs != mine
+    {
+        return Err(Rejection::IdentityTakenOver(me, theirs.fingerprint()));
+    }
+    if let Some(mine) = own_id {
+        claim_own_id(&mut received, &me, mine);
     }
     let diags = validate(&received, Some(&local));
     if let Some(err) = diags.iter().find(|d| d.is_error()) {
@@ -171,14 +206,14 @@ mod tests {
             trunk: vec!["ens19".into()],
             ..Default::default()
         };
-        assert!(accept(network.clone(), &local, None, false).is_ok());
+        assert!(accept(network.clone(), &local, None, false, None).is_ok());
         let stranger = Local {
             self_name: Some("haus9".into()),
             trunk: vec!["ens19".into()],
             ..Default::default()
         };
         assert_eq!(
-            accept(network, &stranger, None, false).unwrap_err(),
+            accept(network, &stranger, None, false, None).unwrap_err(),
             Rejection::SelfMissing("haus9".into())
         );
     }
@@ -197,7 +232,7 @@ mod tests {
         // A peer renamed: the trunk of the tunnel to it follows.
         let mut received = previous.clone();
         received.rename_site("heim", "home");
-        let cfg = accept(received, &local, Some(&previous), false).unwrap();
+        let cfg = accept(received, &local, Some(&previous), false, None).unwrap();
         assert!(cfg.local.tunnel_trunks.contains_key("home"));
         assert!(!cfg.local.tunnel_trunks.contains_key("heim"));
         // This site renamed by another: only if it has a manager (haus2 has
@@ -205,10 +240,10 @@ mod tests {
         let mut received = previous.clone();
         received.rename_site("haus2", "h2");
         assert_eq!(
-            accept(received.clone(), &local, Some(&previous), false).unwrap_err(),
+            accept(received.clone(), &local, Some(&previous), false, None).unwrap_err(),
             Rejection::RenamedWithoutConsent("haus2".into(), "h2".into())
         );
-        let cfg = accept(received.clone(), &local, Some(&previous), true).unwrap();
+        let cfg = accept(received.clone(), &local, Some(&previous), true, None).unwrap();
         assert_eq!(cfg.local.self_name.as_deref(), Some("h2"), "taken back");
         let mut managed = previous.clone();
         managed
@@ -217,11 +252,44 @@ mod tests {
             .find(|s| s.name == "haus2")
             .unwrap()
             .managed_by = Some("heim".into());
-        let cfg = accept(received, &local, Some(&managed), false).unwrap();
+        let cfg = accept(received, &local, Some(&managed), false, None).unwrap();
         assert_eq!(
             cfg.local.self_name.as_deref(),
             Some("h2"),
             "managed by heim"
         );
+    }
+
+    #[test]
+    fn the_own_identity_is_claimed_again_and_another_is_refused() {
+        let me = crate::identity::SiteId::from_bytes([1; 32]);
+        let other = crate::identity::SiteId::from_bytes([2; 32]);
+        let mut network = parse_network(include_str!("config/testdata/network-v1.toml"))
+            .unwrap()
+            .network
+            .unwrap();
+        let local = Local {
+            self_name: Some("haus2".into()),
+            trunk: vec!["ens19".into()],
+            ..Local::default()
+        };
+        let revision = network.revision;
+        let cfg = accept(network.clone(), &local, None, false, Some(me)).unwrap();
+        assert_eq!(
+            cfg.network.site("haus2").unwrap().id,
+            Some(me),
+            "claimed again"
+        );
+        assert_eq!(cfg.network.revision, revision + 1, "so that it spreads");
+        // Already there: unchanged.
+        let again = accept(cfg.network.clone(), &local, None, false, Some(me)).unwrap();
+        assert_eq!(again.network, cfg.network);
+        // Another box has this site now.
+        if let Some(site) = network.sites.iter_mut().find(|s| s.name == "haus2") {
+            site.id = Some(other);
+        }
+        let err = accept(network, &local, None, false, Some(me)).unwrap_err();
+        assert!(matches!(err, Rejection::IdentityTakenOver(..)), "{err}");
+        assert!(err.to_string().contains(&other.fingerprint()), "{err}");
     }
 }

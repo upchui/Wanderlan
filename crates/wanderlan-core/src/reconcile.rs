@@ -100,6 +100,12 @@ pub enum Change {
         peer: String,
         params: GretapParams,
     },
+    /// Change a GRETAP tunnel in place (endpoints, key, encapsulation).
+    ChangeGretap {
+        name: String,
+        params: GretapParams,
+        reason: String,
+    },
     /// Delete a link created by wanderlan.
     DeleteLink { name: String, reason: String },
     /// Set the MTU of a link.
@@ -171,9 +177,18 @@ impl fmt::Display for Change {
             ),
             Self::CreateGretap { name, peer, params } => write!(
                 f,
-                "Creating GRETAP tunnel {name} to site \"{peer}\" ({} -> {})",
-                params.local, params.remote
+                "Creating GRETAP tunnel {name} to site \"{peer}\" ({} -> {}{})",
+                params.local,
+                params.remote,
+                if params.key.is_some() {
+                    ", with a key"
+                } else {
+                    ""
+                }
             ),
+            Self::ChangeGretap { name, reason, .. } => {
+                write!(f, "Changing GRETAP tunnel {name} ({reason})")
+            }
             Self::DeleteLink { name, reason } => write!(f, "Deleting interface {name} ({reason})"),
             Self::SetMtu { name, mtu } => write!(f, "Setting MTU of {name} to {mtu}"),
             Self::Attach { name, bridge } => write!(f, "Attaching {name} to bridge {bridge}"),
@@ -279,6 +294,7 @@ pub enum PlanError {
 /// Computes the changes needed to get from `actual` to `desired`.
 pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError> {
     let mut deletes = Vec::new();
+    let mut tunnel_changes = Vec::new();
     let mut bridge_changes = Vec::new();
     let mut creates = Vec::new();
     let mut settings = Vec::new();
@@ -376,13 +392,22 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
                 name: link.name.clone(),
                 reason: "the site is no longer a peer".into(),
             }),
+            // Changed in place: the port, its VLANs and counters stay.
             (Some(spec), LinkKind::Gretap(params)) if *params != spec.params => {
-                deletes.push(Change::DeleteLink {
-                    name: link.name.clone(),
-                    reason: format!(
-                        "tunnel endpoints changed to {} -> {}",
+                let reason = if params.key == spec.params.key {
+                    format!(
+                        "tunnel endpoints change to {} -> {}",
                         spec.params.local, spec.params.remote
-                    ),
+                    )
+                } else if spec.params.key.is_some() {
+                    "it gets the key of the two sites' identities".to_string()
+                } else {
+                    "it has no key any more (a site without identity)".to_string()
+                };
+                tunnel_changes.push(Change::ChangeGretap {
+                    name: link.name.clone(),
+                    params: spec.params,
+                    reason,
                 });
             }
             (Some(_), LinkKind::Gretap(_)) => {}
@@ -532,6 +557,7 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
     });
 
     let mut out = deletes;
+    out.extend(tunnel_changes);
     out.extend(bridge_changes);
     out.extend(creates);
     out.extend(settings);
@@ -782,6 +808,10 @@ pub async fn apply<N: System>(net: &N, actual: &Actual, change: &Change) -> Resu
         }
         Change::CreateGretap { name, params, .. } => {
             net.create_gretap(name, params, GRETAP_MTU).await?;
+        }
+        Change::ChangeGretap { name, params, .. } => {
+            net.change_gretap(index_of(name)?, name, params, GRETAP_MTU)
+                .await?;
         }
         Change::DeleteLink { name, .. } => net.delete_link(index_of(name)?).await?,
         Change::SetMtu { name, mtu } => {

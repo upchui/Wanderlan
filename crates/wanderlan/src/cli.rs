@@ -9,8 +9,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use wanderlan_core::api::{
     self, Applied, ApplyFilesParams, ApplyParams, ChangeSource, ConfigInput, ConfigTexts,
-    Confirmed, Done, Event, Interface, Invitation, InviteParams, JoinParams, Joined, Level,
-    MacEntry, PortState, Request, ResetReport, SiteRules, SiteState, Status, UnblockParams,
+    Confirmed, Done, Event, IdentityState, Interface, Invitation, InviteParams, JoinParams, Joined,
+    Level, MacEntry, PortState, Request, ResetReport, SiteRules, SiteState, Status, UnblockParams,
     VlanPortTraffic, VlanTraffic,
 };
 use wanderlan_core::config::{self, ConfigFile, Severity};
@@ -1143,6 +1143,9 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
             "This site is not configured yet: run `wanderlan` to start a new network, or `wanderlan join <address> <code>` with an invitation."
         ),
     }
+    if let Some(id) = &st.site_id {
+        println!("Identity of this box: {id}");
+    }
     println!(
         "Network revision {} ({})",
         st.revision,
@@ -1167,7 +1170,10 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
         );
     }
     if !st.sites.is_empty() {
-        println!("\n{:<12} {:<15} {:<18} LINK", "SITE", "ADDRESS", "ROLE");
+        println!(
+            "\n{:<12} {:<15} {:<9} {:<18} LINK",
+            "SITE", "ADDRESS", "ID", "ROLE"
+        );
         // Servers, each with its clients below.
         let pairs: Vec<(&str, Option<&str>)> = st
             .sites
@@ -1186,9 +1192,10 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
                 "-".to_string()
             };
             println!(
-                "{:<12} {:<15} {:<18} {link}",
+                "{:<12} {:<15} {:<9} {:<18} {link}",
                 wanderlan_core::topology::tree_name(&s.name, depth),
                 s.address,
+                s.id.as_deref().unwrap_or("-"),
                 role_text(s.uplink.as_deref())
             );
         }
@@ -1222,6 +1229,19 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
             p.name,
             p.refused.as_deref().unwrap_or_default()
         );
+    }
+    for p in &st.peers {
+        match p.identity_state {
+            Some(IdentityState::Waiting) => println!(
+                "Tunnel to {} waits: its identity is not confirmed yet (no authenticated answer to the control probes)",
+                p.name
+            ),
+            Some(IdentityState::WrongKey) => println!(
+                "Tunnel to {} is down: the box at {} answers with another key (another box at that address, or one that was reset?)",
+                p.name, p.address
+            ),
+            Some(IdentityState::Confirmed) | None => {}
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -10,6 +10,8 @@ authors.workspace = true
 
 [dependencies]
 futures-util.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
 humantime.workspace = true
 ipnet.workspace = true
 nftables.workspace = true
@@ -23,6 +25,7 @@ thiserror.workspace = true
 toml.workspace = true
 tokio = { workspace = true, features = ["rt", "sync"] }
 tracing.workspace = true
+x25519-dalek.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

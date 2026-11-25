@@ -7,6 +7,34 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
+### Identities and keyed tunnels
+
+Update all sites: an older version cannot read a `network.toml` with
+identities, and joins need the new join protocol (2) on both sides.
+
+- Every box has an identity, an X25519 key pair created when it is first
+  configured or joins (`/var/lib/wanderlan/identity`); its public key is the
+  site's `id` in `network.toml`. A site of an older version claims its
+  identity at its first start.
+- The keys of a tunnel derive from the two identities and never travel: the
+  GRE key of the tunnel (the kernel drops packets of another box), the key of
+  the control probes (version 2, `WLP2`: every probe and answer carries a
+  tag) and the key of the configuration sync (`SYNC`, both sides prove their
+  key over fresh nonces).
+- A tunnel to a site with an identity comes up only once that site has
+  answered the probes with its key. Something at its address that answers
+  with another key keeps it down ("wrong key"); `wanderlan status`, the TUI
+  (peer details) and the log say so.
+- Joins tell boxes apart by their identity: the same box joins again (also
+  from a new address); a reset box takes over its old entry only if the old
+  box does not answer any more; a second box at the address of a running
+  site, or a cloned machine with the identity of a running site, is refused.
+  Before, a second box at the same address (behind the same NAT) took over
+  the first one's site silently when it joined with its host name.
+- Renames are recognised by the identity; a `network.toml` written without
+  the `id` lines keeps the identities.
+- The MSS of a tunnel with a key is 4 bytes smaller (the GRE key).
+
 ### Several trunk ports
 
 - `trunk = ["ens19", "ens22"]` in `local.toml`: several interfaces form the

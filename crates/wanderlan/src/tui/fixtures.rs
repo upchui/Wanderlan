@@ -116,6 +116,9 @@ fn peer(name: &str, address: &str) -> PeerStatus {
         revision: Some(7),
         in_sync: Some(true),
         refused: None,
+        identity: Some(format!("{}Ab3dE", &name[..name.len().min(3)])),
+        identity_state: Some(wanderlan_core::api::IdentityState::Confirmed),
+        tunnel: wanderlan_core::api::TunnelKindLabel::GreKey,
     }
 }
 
@@ -129,6 +132,7 @@ pub fn summary(name: &str, address: &str, vlans: &str) -> SiteSummary {
         direct: name != "heim",
         uplink: (name == "haus6").then(|| "heim".to_string()),
         via: None,
+        id: None,
     }
 }
 
@@ -150,6 +154,7 @@ pub fn status() -> Status {
         sync_problem: None,
         trunk_ports: Vec::new(),
         missing_ports: Vec::new(),
+        site_id: Some("hEiM1x2y3z4w5v6u7t8s9r0qPoNmLkJiHgFeDcBa0Q8=".into()),
         peers: vec![
             PeerStatus {
                 macs: 12,
@@ -227,6 +232,7 @@ pub fn unconfigured_status() -> Status {
         sync_problem: None,
         trunk_ports: Vec::new(),
         missing_ports: Vec::new(),
+        site_id: None,
         peers: Vec::new(),
         sites: Vec::new(),
         blocked: Vec::new(),

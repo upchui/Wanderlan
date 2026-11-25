@@ -245,6 +245,7 @@ mod tests {
         Site {
             name: name.into(),
             address: Ipv4Addr::new(10, 0, 0, last),
+            id: None,
             vlans: None,
             own_vlans: None,
             online: true,

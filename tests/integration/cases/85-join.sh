@@ -4,8 +4,10 @@
 # starts offline, is taken online by the inviting site; codes work once.
 
 code_of() { awk '$1 == "wanderlan" && $2 == "join" {print $4; exit}'; }
+# Any identity (the router never answers probes with it).
+GHOST_ID="AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
 raw_join() { # raw_join <from> <target> <code> <name>: one JOIN request
-  x "$1" "printf 'JOIN {\"protocol\":1,\"code\":\"%s\",\"name\":\"%s\"}\n' '$3' '$4' | timeout 10 nc -N $2 51821"
+  x "$1" "printf 'JOIN {\"protocol\":2,\"code\":\"%s\",\"name\":\"%s\",\"id\":\"%s\"}\n' '$3' '$4' '$GHOST_ID' | timeout 10 nc -N $2 51821"
 }
 
 begin "Invitations: created on any site, kept across restarts"
@@ -29,6 +31,10 @@ check "the invitations are stored readable for root only" \
 begin "Reset: everything wanderlan set up is removed"
 
 client_native_del c-site5
+old_id=$(jqs site5 .site_id)
+check "site5 has an identity" grep -qE '^[A-Za-z0-9+/]{43}=$' <<<"$old_id"
+check "its key is readable for root only" \
+  x site5 "[ \"\$(stat -c %a /var/lib/wanderlan/identity)\" = 600 ]"
 check "wanderlan reset needs a confirmation" x site5 "echo no | wanderlan reset | grep -q 'Nothing was changed'"
 check "wanderlan reset --yes" x site5 "wanderlan reset --yes"
 check "site5 is unconfigured" x site5 "wanderlan status --json | jq -e '.state == \"unconfigured\"'"
@@ -38,6 +44,7 @@ check "no tc rules are left on the trunk" x site5 "[ -z \"\$(tc filter show dev 
 check "the configuration files are the package templates again" \
   x site5 "grep -q 'This site is not configured yet' /etc/wanderlan/network.toml && grep -q 'not configured yet' /etc/wanderlan/local.toml && ! grep -q '^self' /etc/wanderlan/local.toml"
 check "the state is gone" x site5 "[ ! -e /var/lib/wanderlan/confirmed ]"
+check "the identity is gone (the box is a new box now)" x site5 "[ ! -e /var/lib/wanderlan/identity ]"
 check "the state directory itself stays (systemd's StateDirectory)" x site5 "[ -d /var/lib/wanderlan ]"
 check "a second reset changes nothing and succeeds" x site5 "wanderlan reset --yes"
 
@@ -93,6 +100,10 @@ check "site5 sees site2 as its server" \
 check "site2 confirmed the new site automatically" test "$(jqs site2 .pending)" = null
 check "site5 has its address from the connection" \
   test "$(jqs site2 '.sites[] | select(.name == "site5") | .address')" = 10.100.13.10
+new_id=$(jqs site5 .site_id)
+check "site5 has a new identity" test -n "$new_id" -a "$new_id" != "$old_id"
+check "site2 knows site5 by its new identity" \
+  test "$(jqs site2 '.sites[] | select(.name == "site5") | .id')" = "${new_id:0:8}"
 check "the invitation is used up" x site2 "! wanderlan invite list | grep -q '$code1'"
 check "site2's log tells who joined" x site2 "wanderlan log | grep -q 'Site \"site5\" joined the network'"
 wait_for 30 "site5 is a client of site2: its only tunnel leads there" \
@@ -308,3 +319,32 @@ check "site5 is still online (the state is kept)" \
   test "$(jqs site1 '.sites[] | select(.name == "site5") | .online')" = true
 expect_ping c-site5 10.20.0.1 "VLAN 20: site5 reaches site1's client again"
 wait_eq 30 "site5 has its native mapping again" "10-19,20:pu,21-50" vlan_summary site5 trunk0
+
+begin "Join: a copy of a running machine is refused"
+
+# site5 gets the key of site4, which runs (a cloned VM).
+check "reset site5" x site5 "wanderlan reset --yes"
+x site4 "cat /var/lib/wanderlan/identity" | put site5 /var/lib/wanderlan/identity
+x site5 "chmod 600 /var/lib/wanderlan/identity"
+code4=$(x site1 "wanderlan invite" | code_of)
+out=$(x site5 "wanderlan join 10.100.1.10 $code4" 2>&1)
+if grep -q 'has the identity of site "site4", which is still running' <<<"$out"; then
+  pass "a box with the identity of the running site4 is refused"
+else
+  fail "unexpected join output: $out"
+fi
+check "site5 is still unconfigured" x site5 "wanderlan status --json | jq -e '.state == \"unconfigured\"'"
+check "site4 is untouched" \
+  test "$(jqs site1 '.sites[] | select(.name == "site4") | .address')" = 10.100.12.10
+check "a reset gives site5 its own identity" x site5 "wanderlan reset --yes"
+out=$(x site5 "wanderlan join 10.100.1.10 $code4" 2>&1)
+if grep -q 'Done: "site5" is part of the network' <<<"$out"; then
+  pass "with its own identity site5 joins again (the code still works)"
+else
+  fail "unexpected join output: $out"
+fi
+check "site1 says that a new box took over site5" \
+  x site1 "wanderlan log | grep -q 'takes over site \"site5\"'"
+wait_for 30 "site5's tunnel to site1 is up again" \
+  x site5 "wanderlan status --json | jq -e '.peers[] | select(.name == \"site1\") | .identity_state == \"confirmed\" and .port_state == \"up\"'"
+expect_ping c-site5 10.20.0.1 "VLAN 20: site5 reaches site1's client again"

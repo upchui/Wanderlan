@@ -6,6 +6,7 @@ use std::net::Ipv4Addr;
 use crate::BRIDGE_NAME;
 use crate::config::{Config, LocalVid, NATIVE_VID};
 use crate::forwarding;
+use crate::identity::PeerIdentity;
 use crate::mtu;
 use crate::sys::nft::{MssRule, PortDir, SplitRule};
 use crate::sys::tc::{Direction, TcAction, TcRule};
@@ -136,6 +137,12 @@ pub struct Runtime {
     /// MTU of the interface the tunnel to a peer site leaves by: the path
     /// MTU is at most that, so it gives an MSS until the path is measured.
     pub underlay_mtu: BTreeMap<String, u16>,
+    /// GRE keys of the tunnels to peers whose identity is known (both
+    /// sites have one); other tunnels have no key.
+    pub gre_keys: BTreeMap<String, u32>,
+    /// What the probes found about the identity of the peers with a key. A
+    /// tunnel with a key comes up only once its peer is confirmed.
+    pub identity: BTreeMap<String, PeerIdentity>,
 }
 
 /// Computes the desired state.
@@ -183,12 +190,16 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
             let carried = topology::tunnel_vlans(network, me, &t.peer.name).unwrap_or_default();
             // Down while blocked by the loop guard, or while this site or the
             // peer is offline (set up but not taken online yet).
+            let key = runtime.gre_keys.get(&t.peer.name).copied();
+            let identity = runtime.identity.get(&t.peer.name).copied();
             let down_reason = if blocked.contains(&name) {
                 Some("blocked by the loop guard".to_string())
             } else if !self_online {
                 Some("this site is offline".to_string())
             } else if !t.peer.online {
                 Some(format!("site \"{}\" is offline", t.peer.name))
+            } else if key.is_some() {
+                identity_reason(&t.peer.name, t.peer.address, identity.unwrap_or_default())
             } else {
                 None
             };
@@ -203,6 +214,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
                     remote: t.peer.address,
                     ignore_df: true,
                     pmtudisc: false,
+                    key,
                 },
                 isolated: passing.isolated.contains(&t.peer.name),
                 vlans: carried.iter().map(|v| (v, VlanFlags::TAGGED)).collect(),
@@ -259,6 +271,24 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
     }
 }
 
+/// Why a tunnel with a key is down: its peer has not proven its identity.
+fn identity_reason(peer: &str, address: Ipv4Addr, state: PeerIdentity) -> Option<String> {
+    match state {
+        PeerIdentity::Confirmed => None,
+        PeerIdentity::Waiting => Some(format!(
+            "the identity of site \"{peer}\" is not confirmed yet (no authenticated answer to the control probes)"
+        )),
+        PeerIdentity::WrongKey => Some(format!(
+            "the box at {address} answers with another key than site \"{peer}\" has (another box at that address, or one that was reset?)"
+        )),
+    }
+}
+
+/// The overhead between path MTU and MSS of a tunnel.
+fn tunnel_overhead(tunnel: &TunnelSpec) -> u16 {
+    mtu::overhead(tunnel.params.key.is_some(), false)
+}
+
 /// MSS clamping per tunnel port: a fixed value from the configuration, or
 /// the value derived from the measured path MTU of the peer. Ports without a
 /// measurement use the smaller of the smallest measured value and the MTU of
@@ -268,20 +298,18 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
 fn mss_rules(cfg: &Config, tunnels: &[TunnelSpec], runtime: &Runtime) -> BTreeSet<MssRule> {
     let measured: BTreeMap<&str, u16> = tunnels
         .iter()
-        .filter_map(|t| {
-            runtime
-                .pmtu
-                .get(&t.peer)
-                .map(|p| (t.name.as_str(), mtu::mss_for_pmtu(*p)))
-        })
+        .filter_map(|t| runtime.pmtu.get(&t.peer).map(|p| (t.name.as_str(), *p)))
         .collect();
-    let fallback = measured.values().copied().min();
+    // The smallest measured path, for tunnels not measured yet.
+    let smallest = measured.values().copied().min();
     let mut out = BTreeSet::new();
     for t in tunnels {
+        let overhead = tunnel_overhead(t);
+        let fallback = smallest.map(|p| mtu::mss_with(p, overhead));
         let underlay = runtime
             .underlay_mtu
             .get(&t.peer)
-            .map(|m| mtu::mss_for_pmtu(*m));
+            .map(|m| mtu::mss_with(*m, overhead));
         let preliminary = match (fallback, underlay) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -289,7 +317,11 @@ fn mss_rules(cfg: &Config, tunnels: &[TunnelSpec], runtime: &Runtime) -> BTreeSe
         let mss = cfg
             .network
             .mss
-            .or_else(|| measured.get(t.name.as_str()).copied())
+            .or_else(|| {
+                measured
+                    .get(t.name.as_str())
+                    .map(|p| mtu::mss_with(*p, overhead))
+            })
             .or(preliminary);
         let Some(mss) = mss else { continue };
         for dir in [PortDir::In, PortDir::Out] {

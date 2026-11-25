@@ -5,6 +5,12 @@
 //! (`IP_PMTUDISC_PROBE`), so a binary search over the request size finds the
 //! largest packet that reaches the peer unfragmented. Requests and replies
 //! also announce the sender's network revision for the configuration sync.
+//!
+//! Peers whose identity is known are probed with version 2 of the probes
+//! (`WLP2`, see [`wire2`]): every probe carries an HMAC tag of the tunnel's
+//! probe key. The first valid answer confirms the peer (its tunnel may come
+//! up); an answer with a wrong tag means another box answers at its address.
+//! A peer with a key counts as reachable only with valid answers.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -17,7 +23,8 @@ use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
-use wanderlan_core::mtu::{self, wire};
+use wanderlan_core::identity::{Identity, PairKeys, PeerIdentity, SiteId};
+use wanderlan_core::mtu::{self, wire, wire2};
 
 /// Interval between reachability/RTT probes.
 pub const RTT_INTERVAL: Duration = Duration::from_secs(5);
@@ -35,8 +42,41 @@ const MTU_ATTEMPTS: usize = 3;
 const LOST_LIMIT: u32 = 3;
 /// Probes kept for the round-trip statistics (5 minutes at 5 s).
 const RTT_WINDOW: usize = 60;
-/// Size of reachability probes.
-const RTT_SIZE: u16 = 128;
+/// Size of reachability probes (IP packet; larger than a version 2 request).
+const RTT_SIZE: u16 = 160;
+/// Identities claimed in requests whose keys are kept (peers this site has
+/// no identity for yet).
+const CLAIMED_MAX: usize = 64;
+
+/// The keys towards one peer whose identity is known.
+#[derive(Debug, Clone)]
+pub struct PeerKeys {
+    /// The peer's identity.
+    pub id: SiteId,
+    /// The keys of the tunnel to it.
+    pub keys: Arc<PairKeys>,
+}
+
+impl PartialEq for PeerKeys {
+    // The keys follow from the identities.
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for PeerKeys {}
+
+/// The identity of this box, compared by its public key.
+#[derive(Debug, Clone)]
+pub struct Me(pub Arc<Identity>);
+
+impl PartialEq for Me {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.id() == other.0.id()
+    }
+}
+
+impl Eq for Me {}
 
 /// The peers to probe and where to listen.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -57,6 +97,11 @@ pub struct ProbeConfig {
     /// What this site announces to single peers instead: to a client the
     /// version of the client's view of the network.
     pub announce_to: BTreeMap<String, wire::Announce>,
+    /// This box's identity; without it only version 1 probes.
+    pub me: Option<Me>,
+    /// The keys towards the peers whose identity is known: probed with
+    /// version 2; every other peer with version 1.
+    pub keys: BTreeMap<String, PeerKeys>,
 }
 
 impl ProbeConfig {
@@ -89,9 +134,12 @@ pub struct PeerProbe {
     #[serde(skip)]
     pub announce: Option<wire::Announce>,
     /// Last answered probe on the monotonic clock (a clock step at boot
-    /// does not move it).
+    /// does not move it). For a peer with a key only valid answers count.
     #[serde(skip)]
     pub last_reply_at: Option<Instant>,
+    /// What the probes found about the peer's identity (peers with a key).
+    #[serde(skip)]
+    pub identity: Option<PeerIdentity>,
     #[serde(skip)]
     lost: u32,
     /// Recent probes: round trip in ms, or `None` if unanswered.
@@ -145,16 +193,52 @@ pub enum ProbeEvent {
         peer: String,
         announce: wire::Announce,
     },
+    /// The probes found something about the identity of a peer with a key:
+    /// it answered with a valid tag (confirmed), or with a wrong one.
+    Identity { peer: String, state: PeerIdentity },
 }
 
 /// A probe waiting for its reply: from that peer, with that sequence number.
 type PendingKey = (Ipv4Addr, u32);
 
+/// A sent probe: where its answer goes, and how to check it.
+struct Waiter {
+    tx: oneshot::Sender<Answer>,
+    /// For a version 2 probe: the keys and the identity of the peer.
+    keys: Option<(Arc<PairKeys>, SiteId)>,
+}
+
+/// The answer to a probe.
+struct Answer {
+    received: u16,
+    /// The answer proves the peer's identity (always true for version 1).
+    valid: bool,
+}
+
 struct Shared {
     socket: UdpSocket,
-    pending: Mutex<HashMap<PendingKey, oneshot::Sender<(u16, wire::Announce)>>>,
+    pending: Mutex<HashMap<PendingKey, Waiter>>,
     seq: AtomicU32,
     config: watch::Receiver<ProbeConfig>,
+    /// The nonce of this run, in every version 2 request.
+    nonce: wire2::Nonce,
+    /// Keys for identities claimed in requests of peers whose identity this
+    /// site does not know yet (bounded).
+    claimed: Mutex<HashMap<SiteId, Option<Arc<PairKeys>>>>,
+}
+
+impl Shared {
+    /// The keys towards a peer that claims `id`, derived once.
+    fn claimed_keys(&self, me: &Identity, id: SiteId) -> Option<Arc<PairKeys>> {
+        let mut claimed = self.claimed.lock().ok()?;
+        if !claimed.contains_key(&id) && claimed.len() >= CLAIMED_MAX {
+            claimed.clear();
+        }
+        claimed
+            .entry(id)
+            .or_insert_with(|| me.pair(&id).map(Arc::new))
+            .clone()
+    }
 }
 
 /// Starts the probe service. It follows changes of the configuration.
@@ -194,14 +278,20 @@ async fn run(
             }
         };
         info!("Listening for control probes on {bind} (UDP)");
+        let nonce = crate::random::bytes::<{ wire2::NONCE_LEN }>().unwrap_or_else(|e| {
+            warn!("{e:#}; the probes of this run use a fixed nonce");
+            [0; wire2::NONCE_LEN]
+        });
         let shared = Arc::new(Shared {
             socket,
             pending: Mutex::new(HashMap::new()),
             seq: AtomicU32::new(1),
             config: config.clone(),
+            nonce,
+            claimed: Mutex::new(HashMap::new()),
         });
         let receiver = tokio::spawn(receive(shared.clone(), table.clone(), events.clone()));
-        let mut prober: BTreeMap<String, (Ipv4Addr, JoinHandle<()>)> = BTreeMap::new();
+        let mut prober: BTreeMap<String, (Target, JoinHandle<()>)> = BTreeMap::new();
         let mut gone = false;
         loop {
             let current = config.borrow_and_update().clone();
@@ -242,19 +332,32 @@ async fn bind_socket(bind: SocketAddrV4) -> anyhow::Result<UdpSocket> {
     Ok(UdpSocket::from_std(socket)?)
 }
 
-/// Starts and stops the per-peer tasks to match the configured peers.
+/// What a probe task is for: the peer's address and identity.
+type Target = (Ipv4Addr, Option<SiteId>);
+
+/// Starts and stops the per-peer tasks to match the configured peers. A
+/// peer with another address or identity gets a new task and starts over.
 fn sync_probers(
-    probers: &mut BTreeMap<String, (Ipv4Addr, JoinHandle<()>)>,
+    probers: &mut BTreeMap<String, (Target, JoinHandle<()>)>,
     config: &ProbeConfig,
     shared: &Arc<Shared>,
     table: &ProbeTable,
     events: &mpsc::Sender<ProbeEvent>,
 ) {
-    probers.retain(|name, (addr, task)| {
+    let target = |name: &str| {
+        config
+            .peers
+            .get(name)
+            .map(|addr| (*addr, config.keys.get(name).map(|k| k.id)))
+    };
+    probers.retain(|name, (current, task)| {
         // A task that ended (it never should) is started again below.
-        let keep = config.peers.get(name) == Some(addr) && !task.is_finished();
+        let keep = target(name) == Some(*current) && !task.is_finished();
         if !keep {
             task.abort();
+            if let Ok(mut t) = table.write() {
+                t.remove(name);
+            }
         }
         keep
     });
@@ -272,7 +375,9 @@ fn sync_probers(
             table.clone(),
             events.clone(),
         ));
-        probers.insert(name.clone(), (*addr, task));
+        if let Some(current) = target(name) {
+            probers.insert(name.clone(), (current, task));
+        }
     }
 }
 
@@ -290,9 +395,7 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
             }
         };
         let SocketAddr::V4(from) = from else { continue };
-        let Some(msg) = buf.get(..n).and_then(wire::decode) else {
-            continue;
-        };
+        let Some(packet) = buf.get(..n) else { continue };
         let (peer, announce_self) = {
             let cfg = shared.config.borrow();
             let peer = cfg
@@ -312,34 +415,116 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
             debug!("ignoring probe from {from}, not a peer");
             continue;
         };
-        match msg {
-            wire::Probe::Request { seq, len, announce } => {
-                let reply = wire::reply(seq, len, &announce_self);
-                if let Err(e) = shared.socket.send_to(&reply, from).await {
-                    debug!("cannot answer probe from {from}: {e}");
+        if let Some(msg) = wire::decode(packet) {
+            match msg {
+                wire::Probe::Request { seq, len, announce } => {
+                    let reply = wire::reply(seq, len, &announce_self);
+                    if let Err(e) = shared.socket.send_to(&reply, from).await {
+                        debug!("cannot answer probe from {from}: {e}");
+                    }
+                    if direct {
+                        note_announce(&table, &events, &peer, announce).await;
+                    }
                 }
-                if direct {
-                    note_announce(&table, &events, &peer, announce).await;
+                wire::Probe::Reply {
+                    seq,
+                    received,
+                    announce,
+                } => {
+                    // A version 1 answer proves nothing about the identity.
+                    let valid = answer(&shared, *from.ip(), seq, received, |w| w.keys.is_none());
+                    if direct && valid {
+                        note_announce(&table, &events, &peer, announce).await;
+                    }
                 }
             }
-            wire::Probe::Reply {
-                seq,
-                received,
-                announce,
-            } => {
-                let waiter = shared
-                    .pending
-                    .lock()
-                    .ok()
-                    .and_then(|mut p| p.remove(&(*from.ip(), seq)));
-                if let Some(tx) = waiter {
-                    let _ = tx.send((received, announce));
+        } else if let Some(msg) = wire2::decode(packet) {
+            match msg {
+                wire2::Probe::Request(request) => {
+                    let me = shared.config.borrow().me.clone();
+                    let Some(me) = me else { continue };
+                    let Some(keys) = request_keys(&shared, &me.0, &peer, request.sender) else {
+                        continue;
+                    };
+                    // A wrong tag is answered too (the reply is smaller than
+                    // the request): the requester sees that this box has
+                    // another key than it expects here.
+                    let verified = wire2::verify_request(packet, &keys);
+                    let flags = if verified {
+                        0
+                    } else {
+                        debug!("probe from {from} with a tag of another key");
+                        wire2::FLAG_UNVERIFIED
+                    };
+                    let reply = wire2::reply(&request, flags, &announce_self, &me.0.id(), &keys);
+                    if let Err(e) = shared.socket.send_to(&reply, from).await {
+                        debug!("cannot answer probe from {from}: {e}");
+                    }
+                    if direct && verified {
+                        note_announce(&table, &events, &peer, request.announce).await;
+                    }
                 }
-                if direct {
-                    note_announce(&table, &events, &peer, announce).await;
+                wire2::Probe::Reply(reply) => {
+                    let valid = answer(&shared, *from.ip(), reply.seq, reply.received, |w| {
+                        w.keys.as_ref().is_some_and(|(keys, id)| {
+                            reply.responder == *id
+                                && reply.flags & wire2::FLAG_UNVERIFIED == 0
+                                && wire2::verify_reply(packet, &shared.nonce, keys)
+                        })
+                    });
+                    if direct && valid {
+                        note_announce(&table, &events, &peer, reply.announce).await;
+                    }
                 }
             }
         }
+    }
+}
+
+/// Hands an answer to the probe waiting for it; `check` tells whether it
+/// proves the peer's identity. Returns that.
+fn answer(
+    shared: &Shared,
+    from: Ipv4Addr,
+    seq: u32,
+    received: u16,
+    check: impl FnOnce(&Waiter) -> bool,
+) -> bool {
+    let waiter = shared
+        .pending
+        .lock()
+        .ok()
+        .and_then(|mut p| p.remove(&(from, seq)));
+    let Some(waiter) = waiter else {
+        return false;
+    };
+    let valid = check(&waiter);
+    let _ = waiter.tx.send(Answer { received, valid });
+    valid
+}
+
+/// The keys to check and answer a version 2 request of `peer` that claims
+/// the identity `sender`: the keys of its known identity, or (if this site
+/// does not know it yet) those of the claimed one. `None` if the claim
+/// contradicts the known identity.
+fn request_keys(
+    shared: &Shared,
+    me: &Identity,
+    peer: &str,
+    sender: SiteId,
+) -> Option<Arc<PairKeys>> {
+    let known = shared.config.borrow().keys.get(peer).cloned();
+    match known {
+        Some(k) if k.id == sender => Some(k.keys),
+        Some(k) => {
+            debug!(
+                "a probe from the address of \"{peer}\" claims identity {}, not {}",
+                sender.fingerprint(),
+                k.id.fingerprint()
+            );
+            None
+        }
+        None => shared.claimed_keys(me, sender),
     }
 }
 
@@ -368,31 +553,68 @@ async fn note_announce(
     }
 }
 
-/// Sends one probe of `size` bytes (IP packet) and waits for the reply.
-/// Returns the round-trip time if the complete probe arrived.
+/// The outcome of one probe.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Outcome {
+    /// The complete probe arrived and the answer is valid.
+    Answered(Duration),
+    /// An answer came, but not from the box with the peer's key.
+    WrongKey,
+    /// No (complete) answer.
+    Lost,
+}
+
+impl Outcome {
+    fn rtt(self) -> Option<Duration> {
+        match self {
+            Self::Answered(rtt) => Some(rtt),
+            Self::WrongKey | Self::Lost => None,
+        }
+    }
+}
+
+/// Sends one probe of `size` bytes (IP packet) to `name` and waits for the
+/// reply: version 2 if the peer's identity is known, else version 1.
 async fn probe_once(
     shared: &Shared,
+    name: &str,
     peer: SocketAddrV4,
     size: u16,
     timeout: Duration,
-) -> Option<Duration> {
+) -> Outcome {
     let seq = shared.seq.fetch_add(1, Ordering::Relaxed);
-    let announce = shared.config.borrow().announce_for(*peer.ip());
-    let packet = wire::request(seq, size, &announce);
+    let (announce, me, keys) = {
+        let cfg = shared.config.borrow();
+        (
+            cfg.announce_for(*peer.ip()),
+            cfg.me.clone(),
+            cfg.keys.get(name).cloned(),
+        )
+    };
+    let (packet, keys) = match (me, keys) {
+        (Some(me), Some(k)) => (
+            wire2::request(seq, size, &announce, &me.0.id(), &shared.nonce, &k.keys),
+            Some((k.keys, k.id)),
+        ),
+        _ => (wire::request(seq, size, &announce), None),
+    };
     let (tx, rx) = oneshot::channel();
     let key = (*peer.ip(), seq);
     if let Ok(mut p) = shared.pending.lock() {
-        p.insert(key, tx);
+        p.insert(key, Waiter { tx, keys });
     }
     // Removed again also when the prober is aborted while waiting.
     let _pending = PendingGuard { shared, key };
     let start = Instant::now();
     match shared.socket.send_to(&packet, peer).await {
         // EMSGSIZE: larger than the local interface MTU.
-        Err(_) => None,
+        Err(_) => Outcome::Lost,
         Ok(_) => match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok((received, _))) if usize::from(received) == packet.len() => Some(start.elapsed()),
-            _ => None,
+            Ok(Ok(answer)) if !answer.valid => Outcome::WrongKey,
+            Ok(Ok(answer)) if usize::from(answer.received) == packet.len() => {
+                Outcome::Answered(start.elapsed())
+            }
+            _ => Outcome::Lost,
         },
     }
 }
@@ -431,11 +653,30 @@ async fn probe_peer(
             generation = current;
             next_mtu = Some(Instant::now());
         }
-        let rtt = probe_once(&shared, target, RTT_SIZE, RTT_TIMEOUT).await;
+        let outcome = probe_once(&shared, &name, target, RTT_SIZE, RTT_TIMEOUT).await;
+        let rtt = outcome.rtt();
         let became_reachable = update_reachability(&table, &name, rtt);
         if became_reachable {
             info!("Peer \"{name}\" ({addr}) is reachable");
             next_mtu = Some(Instant::now());
+        }
+        let keyed = shared.config.borrow().keys.contains_key(&name);
+        if let Some(state) = identity_change(&table, &name, keyed, outcome) {
+            match state {
+                PeerIdentity::Confirmed => {
+                    info!("Peer \"{name}\" ({addr}) proved its identity");
+                }
+                PeerIdentity::WrongKey => warn!(
+                    "Something at {addr} answers the probes for \"{name}\", but not with its key"
+                ),
+                PeerIdentity::Waiting => {}
+            }
+            let _ = events
+                .send(ProbeEvent::Identity {
+                    peer: name.clone(),
+                    state,
+                })
+                .await;
         }
 
         let mtu_interval = shared.config.borrow().mtu_interval;
@@ -445,9 +686,11 @@ async fn probe_peer(
             let timeout = (rtt * 2).clamp(MTU_TIMEOUT, MTU_TIMEOUT_MAX);
             let measured = mtu::search(mtu::PROBE_MIN, mtu::PROBE_MAX, |size| {
                 let shared = shared.clone();
+                let name = name.clone();
                 async move {
                     for _ in 0..MTU_ATTEMPTS {
-                        if probe_once(&shared, target, size, timeout).await.is_some() {
+                        let outcome = probe_once(&shared, &name, target, size, timeout).await;
+                        if outcome.rtt().is_some() {
                             return true;
                         }
                     }
@@ -473,10 +716,11 @@ async fn probe_peer(
                 entry.pmtu_measured = Some(SystemTime::now());
             }
             if pmtu != last_pmtu {
+                let keyed = shared.config.borrow().keys.contains_key(&name);
                 match pmtu {
                     Some(p) => info!(
                         "Path MTU to \"{name}\" is {p} bytes (TCP MSS {})",
-                        mtu::mss_for_pmtu(p)
+                        mtu::mss_with(p, mtu::overhead(keyed, false))
                     ),
                     None => warn!("Path MTU to \"{name}\" could not be measured"),
                 }
@@ -491,6 +735,35 @@ async fn probe_peer(
         }
         tokio::time::sleep(RTT_INTERVAL).await;
     }
+}
+
+/// Records what a probe found about the identity of a peer with a key.
+/// Returns the new state if it changed: confirmed by the first valid answer
+/// (for good, while the task runs), a wrong key only before that.
+fn identity_change(
+    table: &ProbeTable,
+    name: &str,
+    keyed: bool,
+    outcome: Outcome,
+) -> Option<PeerIdentity> {
+    let Ok(mut t) = table.write() else {
+        return None;
+    };
+    let entry = t.entry(name.to_string()).or_default();
+    if !keyed {
+        entry.identity = None;
+        return None;
+    }
+    let current = entry.identity.unwrap_or_default();
+    let next = match (current, outcome) {
+        (PeerIdentity::Confirmed, _) => PeerIdentity::Confirmed,
+        (_, Outcome::Answered(_)) => PeerIdentity::Confirmed,
+        (_, Outcome::WrongKey) => PeerIdentity::WrongKey,
+        (state, Outcome::Lost) => state,
+    };
+    let changed = entry.identity != Some(next);
+    entry.identity = Some(next);
+    changed.then_some(next)
 }
 
 /// Records the result of a reachability probe. Returns true if the peer
@@ -544,6 +817,107 @@ mod tests {
         assert!((s.jitter_ms - 3.0).abs() < 1e-9);
         assert!((s.loss_percent - 25.0).abs() < 1e-9);
         assert_eq!(s.samples, 4);
+    }
+
+    /// A probe service on 127.0.0.1 with an identity and keys towards the
+    /// peer "other" (with identity `expect`).
+    async fn service(me: &Arc<Identity>, expect: Option<SiteId>) -> (Arc<Shared>, ProbeTable) {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let bind = match socket.local_addr().unwrap() {
+            SocketAddr::V4(a) => a,
+            SocketAddr::V6(_) => unreachable!(),
+        };
+        let mut keys = BTreeMap::new();
+        if let Some(id) = expect {
+            keys.insert(
+                "other".to_string(),
+                PeerKeys {
+                    id,
+                    keys: Arc::new(me.pair(&id).unwrap()),
+                },
+            );
+        }
+        let config = ProbeConfig {
+            bind: Some(bind),
+            peers: [("other".to_string(), Ipv4Addr::LOCALHOST)].into(),
+            me: Some(Me(me.clone())),
+            keys,
+            ..ProbeConfig::default()
+        };
+        let (_tx, rx) = watch::channel(config);
+        // The sender stays alive with the service (leaked for the test).
+        std::mem::forget(_tx);
+        let shared = Arc::new(Shared {
+            socket,
+            pending: Mutex::new(HashMap::new()),
+            seq: AtomicU32::new(1),
+            config: rx,
+            nonce: crate::random::bytes().unwrap(),
+            claimed: Mutex::new(HashMap::new()),
+        });
+        let table: ProbeTable = Arc::new(RwLock::new(BTreeMap::new()));
+        let (events, _) = mpsc::channel(16);
+        tokio::spawn(receive(shared.clone(), table.clone(), events));
+        (shared, table)
+    }
+
+    fn port(shared: &Shared) -> SocketAddrV4 {
+        match shared.socket.local_addr().unwrap() {
+            SocketAddr::V4(a) => a,
+            SocketAddr::V6(_) => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_probes_confirm_the_right_box_only() {
+        let a = Arc::new(Identity::from_secret([1; 32]));
+        let b = Arc::new(Identity::from_secret([2; 32]));
+        let c = Arc::new(Identity::from_secret([3; 32]));
+        let wait = Duration::from_millis(500);
+
+        // Both know each other: answered.
+        let (sa, _) = service(&a, Some(b.id())).await;
+        let (sb, _) = service(&b, Some(a.id())).await;
+        let out = probe_once(&sa, "other", port(&sb), RTT_SIZE, wait).await;
+        assert!(matches!(out, Outcome::Answered(_)), "{out:?}");
+        // A full-size MTU probe too.
+        let out = probe_once(&sa, "other", port(&sb), mtu::PROBE_MAX, wait).await;
+        assert!(matches!(out, Outcome::Answered(_)), "{out:?}");
+
+        // b does not know a's identity yet: it answers with the claimed one.
+        let (sb2, _) = service(&b, None).await;
+        let out = probe_once(&sa, "other", port(&sb2), RTT_SIZE, wait).await;
+        assert!(matches!(out, Outcome::Answered(_)), "{out:?}");
+
+        // Another box (c) at the address a expects b at: a wrong key.
+        let (sc, _) = service(&c, Some(a.id())).await;
+        let out = probe_once(&sa, "other", port(&sc), RTT_SIZE, wait).await;
+        assert_eq!(out, Outcome::WrongKey);
+        let (sc2, _) = service(&c, None).await;
+        let out = probe_once(&sa, "other", port(&sc2), RTT_SIZE, wait).await;
+        assert_eq!(out, Outcome::WrongKey);
+
+        // Without keys: version 1 between the same services.
+        let (sv1, _) = service(&a, None).await;
+        let out = probe_once(&sv1, "other", port(&sb), RTT_SIZE, wait).await;
+        assert!(matches!(out, Outcome::Answered(_)), "{out:?}");
+    }
+
+    #[test]
+    fn a_confirmed_peer_stays_confirmed() {
+        let table: ProbeTable = Arc::new(RwLock::new(BTreeMap::new()));
+        let ok = Outcome::Answered(Duration::from_millis(1));
+        assert_eq!(
+            identity_change(&table, "a", true, Outcome::WrongKey),
+            Some(PeerIdentity::WrongKey)
+        );
+        assert_eq!(identity_change(&table, "a", true, Outcome::Lost), None);
+        assert_eq!(
+            identity_change(&table, "a", true, ok),
+            Some(PeerIdentity::Confirmed)
+        );
+        assert_eq!(identity_change(&table, "a", true, Outcome::WrongKey), None);
+        assert_eq!(identity_change(&table, "a", false, ok), None);
     }
 
     #[test]

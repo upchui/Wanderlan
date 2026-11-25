@@ -103,9 +103,10 @@ async fn native_mapping_sets_pvid_on_trunk() {
 }
 
 #[tokio::test]
-async fn removed_peer_is_deleted_and_changed_address_recreated() {
+async fn removed_peer_is_deleted_and_changed_address_changed_in_place() {
     let net = fresh();
     run(&net, &desired("heim")).await;
+    let index = net.link("gt-buero").unwrap().index;
 
     // haus2 leaves the network, buero gets a new address.
     let network = NETWORK
@@ -125,14 +126,71 @@ async fn removed_peer_is_deleted_and_changed_address_recreated() {
     );
     assert!(
         text.iter()
-            .any(|t| t.contains("Deleting interface gt-buero (tunnel endpoints changed"))
+            .any(|t| t.contains("Changing GRETAP tunnel gt-buero (tunnel endpoints change")),
+        "{text:?}"
     );
     assert!(net.link("gt-haus2").is_none());
-    match net.link("gt-buero").unwrap().kind {
+    let buero = net.link("gt-buero").unwrap();
+    assert_eq!(buero.index, index, "the same interface, its port stays");
+    match buero.kind {
         LinkKind::Gretap(p) => assert_eq!(p.remote, Ipv4Addr::new(10, 8, 0, 22)),
         other => panic!("unexpected {other:?}"),
     }
     assert!(run(&net, &d).await.is_empty());
+
+    // A key (both sites got an identity) also in place, the tunnel waits
+    // for the peer to prove its identity.
+    let mut runtime = Runtime::default();
+    runtime.gre_keys.insert("buero".into(), 0x1234_5678);
+    let keyed = derive(&config_from(&network, "heim"), &runtime);
+    let tunnel = keyed.tunnels.iter().find(|t| t.peer == "buero").unwrap();
+    assert!(!tunnel.enabled);
+    assert!(
+        tunnel
+            .down_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("not confirmed yet")),
+        "{:?}",
+        tunnel.down_reason
+    );
+    let text: Vec<String> = run(&net, &keyed)
+        .await
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        text.iter()
+            .any(|t| t.contains("Changing GRETAP tunnel gt-buero (it gets the key")),
+        "{text:?}"
+    );
+    let buero = net.link("gt-buero").unwrap();
+    assert_eq!(buero.index, index);
+    assert!(matches!(buero.kind, LinkKind::Gretap(p) if p.key == Some(0x1234_5678)));
+    runtime
+        .identity
+        .insert("buero".into(), crate::identity::PeerIdentity::Confirmed);
+    let confirmed = derive(&config_from(&network, "heim"), &runtime);
+    assert!(
+        confirmed
+            .tunnels
+            .iter()
+            .find(|t| t.peer == "buero")
+            .unwrap()
+            .enabled
+    );
+    let mut wrong = runtime.clone();
+    wrong
+        .identity
+        .insert("buero".into(), crate::identity::PeerIdentity::WrongKey);
+    let wrong = derive(&config_from(&network, "heim"), &wrong);
+    let tunnel = wrong.tunnels.iter().find(|t| t.peer == "buero").unwrap();
+    assert!(!tunnel.enabled);
+    assert!(
+        tunnel
+            .down_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("another key"))
+    );
 }
 
 #[tokio::test]

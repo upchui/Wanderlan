@@ -306,6 +306,29 @@ impl NetOps for FakeNet {
         Ok(())
     }
 
+    async fn change_gretap(
+        &self,
+        index: u32,
+        name: &str,
+        params: &GretapParams,
+        mtu: u32,
+    ) -> SysResult<()> {
+        let mut s = self.lock();
+        s.calls.push(format!(
+            "change_gretap {name} {}->{}",
+            params.local, params.remote
+        ));
+        match s.links.get_mut(&index) {
+            Some(link) if matches!(link.kind, LinkKind::Gretap(_)) => {
+                link.kind = LinkKind::Gretap(*params);
+                link.mtu = mtu;
+                Ok(())
+            }
+            Some(_) => Err(err("change gretap", "not a GRETAP interface")),
+            None => Err(err("change gretap", "No such device")),
+        }
+    }
+
     async fn delete_link(&self, index: u32) -> SysResult<()> {
         let mut s = self.lock();
         let Some(link) = s.links.remove(&index) else {

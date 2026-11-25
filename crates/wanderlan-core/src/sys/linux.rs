@@ -55,6 +55,15 @@ impl NetOps for LinuxSystem {
     async fn create_gretap(&self, name: &str, params: &GretapParams, mtu: u32) -> SysResult<()> {
         self.net.create_gretap(name, params, mtu).await
     }
+    async fn change_gretap(
+        &self,
+        index: u32,
+        name: &str,
+        params: &GretapParams,
+        mtu: u32,
+    ) -> SysResult<()> {
+        self.net.change_gretap(index, name, params, mtu).await
+    }
     async fn delete_link(&self, index: u32) -> SysResult<()> {
         self.net.delete_link(index).await
     }

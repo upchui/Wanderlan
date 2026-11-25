@@ -147,6 +147,7 @@ impl Validator {
         }
         let mut names: BTreeMap<&str, usize> = BTreeMap::new();
         let mut addresses: BTreeMap<std::net::Ipv4Addr, &str> = BTreeMap::new();
+        let mut ids: BTreeMap<crate::identity::SiteId, &str> = BTreeMap::new();
         for (i, site) in network.sites.iter().enumerate() {
             let name = site.name.as_str();
             if let Some(msg) = site_name_error(name) {
@@ -177,6 +178,17 @@ impl Validator {
                 self.error(
                     FieldPath::site_field(i, "address"),
                     format!("site \"{name}\": address {addr} is already used by site \"{other}\""),
+                );
+            }
+            if let Some(id) = site.id
+                && let Some(other) = ids.insert(id, name)
+            {
+                self.error(
+                    FieldPath::site_field(i, "id"),
+                    format!(
+                        "sites \"{other}\" and \"{name}\" have the same identity {} (one box cannot be two sites; on a cloned machine run `wanderlan reset` and join again)",
+                        id.fingerprint()
+                    ),
                 );
             }
 

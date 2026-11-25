@@ -6,7 +6,7 @@ use futures_util::TryStreamExt as _;
 use rtnetlink::packet_core::{DefaultNla, Nla as _};
 use rtnetlink::packet_route::AddressFamily;
 use rtnetlink::packet_route::link::{
-    BridgeStpState, BridgeVlanInfoFlags, InfoBridge, InfoBridgePort, InfoData, InfoGre,
+    BridgeStpState, BridgeVlanInfoFlags, GreIOFlags, InfoBridge, InfoBridgePort, InfoData, InfoGre,
     InfoPortData, LinkAttribute, LinkExtentMask, LinkFlags, LinkInfo, LinkMessage, State,
 };
 use rtnetlink::{Handle, LinkBridge, LinkBridgePort, LinkBridgeVlan, LinkGre, LinkUnspec};
@@ -179,12 +179,17 @@ fn parse_gretap(opts: &[InfoGre]) -> GretapParams {
         remote: std::net::Ipv4Addr::UNSPECIFIED,
         ignore_df: false,
         pmtudisc: true,
+        key: None,
     };
+    let mut keyed = false;
+    let mut ikey = 0;
     for opt in opts {
         match opt {
             InfoGre::Local(a) => out.local = *a,
             InfoGre::Remote(a) => out.remote = *a,
             InfoGre::PathMTUDiscovery(v) => out.pmtudisc = *v,
+            InfoGre::IFlags(flags) => keyed = flags.contains(GreIOFlags::Key),
+            InfoGre::IKey(k) => ikey = *k,
             InfoGre::Other(nla) if nla.kind() == IFLA_GRE_IGNORE_DF => {
                 let mut buf = vec![0u8; nla.value_len()];
                 nla.emit_value(&mut buf);
@@ -193,7 +198,31 @@ fn parse_gretap(opts: &[InfoGre]) -> GretapParams {
             _ => {}
         }
     }
+    out.key = keyed.then_some(ikey);
     out
+}
+
+/// The GRETAP attributes for `params`; a change sends all of them again.
+fn gretap_info(params: &GretapParams) -> Vec<InfoGre> {
+    let mut info = vec![
+        InfoGre::Local(params.local),
+        InfoGre::Remote(params.remote),
+        InfoGre::Ttl(0),
+        InfoGre::PathMTUDiscovery(params.pmtudisc),
+        InfoGre::Other(DefaultNla::new(
+            IFLA_GRE_IGNORE_DF,
+            vec![u8::from(params.ignore_df)],
+        )),
+    ];
+    if let Some(key) = params.key {
+        info.extend([
+            InfoGre::IFlags(GreIOFlags::Key),
+            InfoGre::OFlags(GreIOFlags::Key),
+            InfoGre::IKey(key),
+            InfoGre::OKey(key),
+        ]);
+    }
+    info
 }
 
 /// The bridge attributes for `options`. The per-port counters go only into
@@ -373,16 +402,7 @@ impl NetOps for Netlink {
     }
 
     async fn create_gretap(&self, name: &str, params: &GretapParams, mtu: u32) -> SysResult<()> {
-        let data = InfoData::GreTap(vec![
-            InfoGre::Local(params.local),
-            InfoGre::Remote(params.remote),
-            InfoGre::Ttl(0),
-            InfoGre::PathMTUDiscovery(params.pmtudisc),
-            InfoGre::Other(DefaultNla::new(
-                IFLA_GRE_IGNORE_DF,
-                vec![u8::from(params.ignore_df)],
-            )),
-        ]);
+        let data = InfoData::GreTap(gretap_info(params));
         let msg = LinkGre::new_gretap(name)
             .set_info_data(data)
             .mtu(mtu)
@@ -393,6 +413,28 @@ impl NetOps for Netlink {
             .execute()
             .await
             .map_err(|e| SysError::new(format!("create GRETAP interface {name}"), e))
+    }
+
+    async fn change_gretap(
+        &self,
+        index: u32,
+        name: &str,
+        params: &GretapParams,
+        mtu: u32,
+    ) -> SysResult<()> {
+        // A change sets every parameter anew (the kernel zeroes what is
+        // missing) and keeps the MTU (else it follows the new headers).
+        let msg = LinkGre::new_gretap(name)
+            .index(index)
+            .set_info_data(InfoData::GreTap(gretap_info(params)))
+            .mtu(mtu)
+            .build();
+        self.handle
+            .link()
+            .change(msg)
+            .execute()
+            .await
+            .map_err(|e| SysError::new(format!("change GRETAP interface {name}"), e))
     }
 
     async fn delete_link(&self, index: u32) -> SysResult<()> {

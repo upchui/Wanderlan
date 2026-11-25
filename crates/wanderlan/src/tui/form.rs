@@ -700,6 +700,8 @@ impl Form {
                         site.self_managed = self_managed;
                         // Its role stays (`wanderlan role` changes it).
                         site.uplink = slot.uplink.clone();
+                        // Its identity is the box's, never edited here.
+                        site.id = slot.id;
                         site.own_vlans = own_vlans;
                         let old = std::mem::replace(slot, site.clone());
                         if old.name != site.name {
@@ -853,6 +855,7 @@ impl Form {
         candidate.network.sites.push(Site {
             name: site_name.clone(),
             address,
+            id: None,
             vlans,
             own_vlans: None,
             online: false,
@@ -916,6 +919,7 @@ impl Form {
         name_ok.then_some(Site {
             name,
             address,
+            id: None,
             vlans,
             own_vlans: None,
             online: true,

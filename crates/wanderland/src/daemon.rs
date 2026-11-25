@@ -20,14 +20,15 @@ use tracing::{debug, info, warn};
 use wanderlan_core::api::{
     ApiError, Applied, ChangeSource, ConfigInput, ConfigTexts, Confirmed, Done, Interface,
     Invitation, JoinParams, Joined, Level, MacEntry, PeerStatus, PendingChange, PortState,
-    PortTraffic, Request, ResetReport, SiteState, SiteSummary, Status, Validation, VlanPortTraffic,
-    VlanTraffic,
+    PortTraffic, Request, ResetReport, SiteState, SiteSummary, Status, TunnelKindLabel, Validation,
+    VlanPortTraffic, VlanTraffic,
 };
 use wanderlan_core::config::{
     self, Config, ConfigFile, Diagnostic, Loaded, Network, render_local, render_network,
     render_network_wire, unified_diff,
 };
 use wanderlan_core::desired::{self, OWNER_ALIAS, Runtime};
+use wanderlan_core::identity::{Identity, Keyring, PeerIdentity, SiteId};
 use wanderlan_core::join::{self, JoinReply, JoinRequest};
 use wanderlan_core::loopguard::format_mac;
 use wanderlan_core::mtu::wire::Announce;
@@ -48,7 +49,7 @@ use crate::events::EventLog;
 use crate::fdb_guard::{self, LoopReport, PortMap};
 use crate::files::Paths;
 use crate::invites::{Invite, Invites};
-use crate::probe::{self, ProbeConfig, ProbeEvent, ProbeTable};
+use crate::probe::{self, Me, PeerKeys, ProbeConfig, ProbeEvent, ProbeTable};
 use crate::stats::{self, Rates, VlanRates};
 use crate::sync_net::{self, Offer};
 
@@ -164,6 +165,12 @@ pub enum Input {
     },
 }
 
+/// A site that answered probes within this time (three probe rounds)
+/// counts as running: a join does not take over its entry.
+const ALIVE_WINDOW: Duration = Duration::from_secs(15);
+/// How long a joining site asks again while the site it takes over still
+/// answered a moment ago (it was just reset): longer than [`ALIVE_WINDOW`].
+const JOIN_TAKEOVER_RETRY: Duration = Duration::from_secs(30);
 /// How long a joining site retries while the inviting site is busy.
 const JOIN_BUSY_RETRY: Duration = Duration::from_secs(60);
 /// Wrong invitation codes allowed per address within [`JOIN_FAILURE_WINDOW`].
@@ -253,6 +260,13 @@ struct Controller {
     joining: bool,
     /// The last error of a step retried every second, logged once.
     last_repeated: Option<String>,
+    /// The identity of this box, once it has one (created when first
+    /// needed: configured, joining, or the first change applied).
+    identity: Option<Arc<Identity>>,
+    /// The keys derived from this box's identity and those of its peers.
+    keyring: Option<Keyring>,
+    /// The keys towards the direct peers whose identity is known.
+    peer_keys: BTreeMap<String, PeerKeys>,
 }
 
 /// Runs the daemon until SIGTERM or SIGINT.
@@ -339,9 +353,13 @@ pub async fn run(args: Args) -> Result<()> {
         join_failures: BTreeMap::new(),
         joining: false,
         last_repeated: None,
+        identity: None,
+        keyring: None,
+        peer_keys: BTreeMap::new(),
     };
     ctl.startup();
     ctl.seed_measurements().await;
+    ctl.seed_identities().await;
     if let Some(warning) = bridge_netfilter_warning() {
         warn!("{warning}");
         ctl.events.warn(warning);
@@ -580,6 +598,23 @@ fn fingerprint_hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Gives the sites of `new` without an identity the one they have in `old`:
+/// the same name, or (renamed) the same address under a name `new` does not
+/// have any more. A file written without the `id` lines changes no identity.
+fn keep_ids(old: &Network, new: &mut Network) {
+    let names: BTreeSet<String> = new.sites.iter().map(|s| s.name.clone()).collect();
+    for site in new.sites.iter_mut().filter(|s| s.id.is_none()) {
+        site.id = old
+            .site(&site.name)
+            .or_else(|| {
+                old.sites
+                    .iter()
+                    .find(|o| o.address == site.address && !names.contains(&o.name))
+            })
+            .and_then(|o| o.id);
+    }
+}
+
 fn api_err(e: impl std::fmt::Display) -> ApiError {
     ApiError::new(e.to_string())
 }
@@ -618,6 +653,10 @@ impl Controller {
                 Err(e) => self.events.error(format!("{e:#}")),
             }
         }
+        match self.paths.load_identity() {
+            Ok(identity) => self.identity = identity.map(Arc::new),
+            Err(e) => self.events.error(format!("{e:#}")),
+        }
         let cfg = self.load_files();
         if cfg.is_some()
             && let Err(e) = self.paths.save_copy()
@@ -626,6 +665,83 @@ impl Controller {
         }
         self.confirmed = cfg.clone();
         self.set_config(cfg);
+        self.claim_identity();
+    }
+
+    /// The identity of this box: the one in the state directory, created
+    /// if there is none yet.
+    fn ensure_identity(&mut self) -> Option<Arc<Identity>> {
+        if self.identity.is_none() {
+            match self.paths.load_identity() {
+                Ok(identity) => self.identity = identity.map(Arc::new),
+                Err(e) => {
+                    self.events.error(format!("{e:#}"));
+                    return None;
+                }
+            }
+        }
+        if self.identity.is_none() {
+            match self.paths.create_identity() {
+                Ok(identity) => {
+                    self.events.info(format!(
+                        "Created the identity of this box: {}",
+                        identity.id().fingerprint()
+                    ));
+                    self.identity = Some(Arc::new(identity));
+                }
+                Err(e) => self.events.error(format!("{e:#}")),
+            }
+        }
+        self.identity.clone()
+    }
+
+    /// The identity of this box, if it has one.
+    fn own_id(&self) -> Option<SiteId> {
+        self.identity.as_ref().map(|i| i.id())
+    }
+
+    /// Writes the identity of this box into its entry of the confirmed
+    /// network if the entry has none (a network of an older version): like
+    /// a revision taken over, written directly and spread by the sync. An
+    /// entry with another identity belongs to another box.
+    fn claim_identity(&mut self) {
+        let Some(mut cfg) = self.confirmed.clone() else {
+            return;
+        };
+        if self.pending.is_some() {
+            return;
+        }
+        let Some(id) = self.ensure_identity().map(|i| i.id()) else {
+            return;
+        };
+        let me = cfg.self_name().to_string();
+        match cfg.self_site().and_then(|s| s.id) {
+            Some(theirs) if theirs != id => {
+                self.events.error(format!(
+                    "network.toml lists another identity ({}) for this site (\"{me}\") than this box has ({}): another box joined as \"{me}\". The tunnels to sites with identities stay down; run `wanderlan reset` here and join again.",
+                    theirs.fingerprint(),
+                    id.fingerprint()
+                ));
+                return;
+            }
+            Some(_) => return,
+            None => {}
+        }
+        if !sync::claim_own_id(&mut cfg.network, &me, id) {
+            return;
+        }
+        if let Err(e) = self.paths.write_confirmed(&cfg) {
+            self.events
+                .error(format!("cannot write the configuration files: {e:#}"));
+            return;
+        }
+        self.events.info(format!(
+            "This site claims its identity {} in the network (revision {})",
+            id.fingerprint(),
+            cfg.network.revision
+        ));
+        self.confirmed = Some(cfg.clone());
+        self.set_config(Some(cfg));
     }
 
     /// Takes the MSS rules left by a previous run as preliminary
@@ -643,10 +759,36 @@ impl Controller {
             if let Some(peer) = rule.port.strip_prefix(GRETAP_PREFIX)
                 && peers.contains_key(peer)
             {
+                let keyed = self.runtime.gre_keys.contains_key(peer);
                 self.runtime.pmtu.insert(
                     peer.to_string(),
-                    rule.mss.saturating_add(wanderlan_core::mtu::MSS_OVERHEAD),
+                    rule.mss
+                        .saturating_add(wanderlan_core::mtu::overhead(keyed, false)),
                 );
+            }
+        }
+    }
+
+    /// Takes the tunnels left by a previous run with the key they should
+    /// have as confirmed, so that a restart does not take them down until
+    /// the peers answer again (the kernel checks the key on every packet).
+    async fn seed_identities(&mut self) {
+        let Ok(actual) = reconcile::Actual::observe(&self.sys).await else {
+            return;
+        };
+        for (peer, key) in &self.runtime.gre_keys {
+            let adopted = actual
+                .links
+                .get(&topology::gretap_name(peer))
+                .is_some_and(|l| {
+                    l.alias.as_deref() == Some(OWNER_ALIAS)
+                        && l.admin_up
+                        && matches!(l.kind, LinkKind::Gretap(p) if p.key == Some(*key))
+                });
+            if adopted {
+                self.runtime
+                    .identity
+                    .insert(peer.clone(), PeerIdentity::Confirmed);
             }
         }
     }
@@ -708,10 +850,21 @@ impl Controller {
                 .warn("Ignoring SIGHUP while a change is waiting for confirmation");
             return;
         }
-        if let Some(cfg) = self.load_files() {
+        if let Some(mut cfg) = self.load_files() {
+            // Files written without the `id` lines keep the identities.
+            if let Some(old) = &self.confirmed {
+                let before = cfg.network.clone();
+                keep_ids(&old.network, &mut cfg.network);
+                if cfg.network != before
+                    && let Err(e) = self.paths.write_confirmed(&cfg)
+                {
+                    warn!("{e:#}");
+                }
+            }
             let _ = self.paths.save_copy();
             self.confirmed = Some(cfg.clone());
             self.set_config(Some(cfg));
+            self.claim_identity();
             self.last_error = None;
             self.reconcile().await;
         }
@@ -762,7 +915,48 @@ impl Controller {
             new_peers.keys().any(|p| topology::gretap_name(p) == *port)
                 || trunk_ports.contains(port)
         });
+        self.update_keys();
         self.publish();
+    }
+
+    /// The keys towards the direct peers whose identity is known, if the
+    /// own entry carries this box's identity; the GRE keys of their tunnels.
+    /// A peer with another identity than before starts unconfirmed.
+    fn update_keys(&mut self) {
+        let mut keys = BTreeMap::new();
+        if let (Some(identity), Some(cfg)) = (self.identity.clone(), self.config.as_ref()) {
+            let ring = match &mut self.keyring {
+                Some(ring) if ring.me().id() == identity.id() => ring,
+                slot => slot.insert(Keyring::new(identity.clone())),
+            };
+            let own = cfg.self_site().and_then(|s| s.id) == Some(identity.id());
+            let peers: Vec<(String, SiteId)> = if own {
+                topology::tunnels_for(&cfg.network, cfg.self_name())
+                    .into_iter()
+                    .filter_map(|t| t.peer.id.map(|id| (t.peer.name.clone(), id)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            ring.update(peers.iter().map(|(_, id)| id));
+            for (name, id) in peers {
+                if let Some(k) = ring.get(&id) {
+                    keys.insert(name, PeerKeys { id, keys: k });
+                }
+            }
+        } else {
+            self.keyring = None;
+        }
+        let before = std::mem::take(&mut self.peer_keys);
+        self.runtime.identity.retain(|peer, _| {
+            keys.get(peer).map(|k| k.id) == before.get(peer).map(|k| k.id)
+                && keys.contains_key(peer)
+        });
+        self.runtime.gre_keys = keys
+            .iter()
+            .map(|(name, k)| (name.clone(), k.keys.gre_key()))
+            .collect();
+        self.peer_keys = keys;
     }
 
     /// Carries what is known per peer over to its new name: refusals,
@@ -869,10 +1063,29 @@ impl Controller {
             mtu_interval,
             announce,
             announce_to,
+            me: self.identity.clone().map(Me),
+            keys: self.peer_keys.clone(),
         });
+        let addresses = self.direct_peers();
+        let keyed = self
+            .peer_keys
+            .iter()
+            .filter_map(|(name, k)| {
+                let address = *addresses.get(name)?;
+                Some((
+                    k.id,
+                    sync_net::Keyed {
+                        address,
+                        keys: k.keys.clone(),
+                    },
+                ))
+            })
+            .collect();
         self.offer.send_replace(Offer {
             bind,
             views: Arc::new(views),
+            me: self.own_id(),
+            keyed: Arc::new(keyed),
         });
     }
 
@@ -916,6 +1129,9 @@ impl Controller {
                     self.reconcile().await;
                 }
             }
+            Input::Probe(ProbeEvent::Identity { peer, state }) => {
+                self.peer_identity(&peer, state).await;
+            }
             Input::Probe(ProbeEvent::Announce { peer, announce }) => {
                 debug!(
                     "Peer \"{peer}\" announces network revision {}",
@@ -933,6 +1149,40 @@ impl Controller {
                 }
             }
         }
+    }
+
+    /// What the probes found about the identity of a peer with a key. A
+    /// confirmed peer stays confirmed until its identity changes (an answer
+    /// with a wrong tag can come from anybody).
+    async fn peer_identity(&mut self, peer: &str, state: PeerIdentity) {
+        if !self.peer_keys.contains_key(peer) {
+            return;
+        }
+        let current = self.runtime.identity.get(peer).copied().unwrap_or_default();
+        if current == PeerIdentity::Confirmed || current == state {
+            return;
+        }
+        self.runtime.identity.insert(peer.to_string(), state);
+        let address = self
+            .direct_peers()
+            .get(peer)
+            .map_or_else(String::new, ToString::to_string);
+        match state {
+            PeerIdentity::Confirmed => self.events.emit(
+                Level::Info,
+                Some(peer),
+                format!("Site \"{peer}\" proved its identity; its tunnel may come up"),
+            ),
+            PeerIdentity::WrongKey => self.events.emit(
+                Level::Warn,
+                Some(peer),
+                format!(
+                    "The box at {address} answers for site \"{peer}\" with another key: another box at that address, or one that was reset? Its tunnel stays down."
+                ),
+            ),
+            PeerIdentity::Waiting => {}
+        }
+        self.reconcile().await;
     }
 
     /// An error of a step that is retried every second: logged when it is
@@ -1138,8 +1388,14 @@ impl Controller {
         }
         self.fetching = true;
         let inputs = self.inputs.clone();
+        // Authenticated where both know each other's identity.
+        let keyed = self.own_id().zip(self.peer_keys.get(&peer).cloned());
         tokio::spawn(async move {
-            let result = sync_net::fetch(target).await.map_err(|e| format!("{e:#}"));
+            let result = match keyed {
+                Some((me, k)) => sync_net::fetch_sync(target, me, k.id, &k.keys).await,
+                None => sync_net::fetch(target).await,
+            }
+            .map_err(|e| format!("{e:#}"));
             let _ = inputs.send(Input::Fetched { peer, mode, result }).await;
         });
     }
@@ -1262,18 +1518,25 @@ impl Controller {
         let previous = self.confirmed.as_ref().map(|c| c.network.clone());
         // This site's own name back: its change was refused (Resync), or the
         // uplink's newer network does not have the rename yet.
-        let own_address = self
-            .confirmed
-            .as_ref()
-            .and_then(|c| c.self_site())
-            .map(|s| s.address);
+        let own = self.confirmed.as_ref().and_then(|c| c.self_site());
+        let (own_address, own_id) = (own.map(|s| s.address), own.and_then(|s| s.id));
+        // The old name back: the same box, by its identity (or address).
         let taken_back = mode == FetchMode::Resync
             || self
                 .renamed_from
                 .as_deref()
                 .and_then(|old| network.site(old))
-                .is_some_and(|s| Some(s.address) == own_address);
-        match sync::accept(network, &local, previous.as_ref(), taken_back) {
+                .is_some_and(|s| match (s.id, own_id) {
+                    (Some(a), Some(b)) => a == b,
+                    _ => Some(s.address) == own_address,
+                });
+        match sync::accept(
+            network,
+            &local,
+            previous.as_ref(),
+            taken_back,
+            self.own_id(),
+        ) {
             Err(e) => {
                 self.reject(fingerprint);
                 self.events.emit(
@@ -1476,21 +1739,54 @@ impl Controller {
         if self.pending.is_some() {
             return JoinReply::Busy;
         }
+        let Ok(id) = request.id.parse::<SiteId>() else {
+            return error(format!(
+                "the joining site sent no valid identity (wanderland {}); update it",
+                request.version
+            ));
+        };
+        let joiner = join::Joiner {
+            name: &request.name,
+            name_is_default: request.name_is_default,
+            address: from,
+            id,
+        };
+        let alive = self.running_peers();
         let admission = match join::add_site(
             &confirmed.network,
             confirmed.self_name(),
-            &request.name,
-            request.name_is_default,
-            from,
+            joiner,
+            &alive,
             &invite.rules,
         ) {
             Ok(a) => a,
+            // Perhaps just reset: the joiner asks again shortly.
+            Err(
+                e @ (join::JoinError::StillRunning { .. } | join::JoinError::IdentityInUse { .. }),
+            ) => {
+                debug!("The site at {from} cannot join yet: {e}");
+                return JoinReply::Retry {
+                    message: e.to_string(),
+                };
+            }
             Err(e) => {
                 self.events
                     .warn(format!("The site at {from} cannot join: {e}"));
                 return error(e.to_string());
             }
         };
+        if let Some(old) = admission.took_over {
+            self.events.emit(
+                Level::Warn,
+                Some(&admission.name),
+                format!(
+                    "A new box ({}) at {from} takes over site \"{}\" from the box that does not answer any more ({})",
+                    id.fingerprint(),
+                    admission.name,
+                    old.fingerprint()
+                ),
+            );
+        }
         let via = confirmed.self_name().to_string();
         if !admission.changed {
             if let Err(e) = self.invites.remove(&invite.code) {
@@ -1544,6 +1840,27 @@ impl Controller {
         }
     }
 
+    /// The peers that answered within the last half minute (for a peer with
+    /// a key: with its key), for joins: a join does not take over the entry
+    /// of a site that still runs. A site this one does not probe (a client of
+    /// another server) counts as gone: a reset box may join again anywhere.
+    fn running_peers(&self) -> BTreeSet<String> {
+        let now = std::time::Instant::now();
+        self.probes.read().map_or_else(
+            |_| BTreeSet::new(),
+            |table| {
+                table
+                    .iter()
+                    .filter(|(_, p)| {
+                        p.last_reply_at
+                            .is_some_and(|t| now.duration_since(t) < ALIVE_WINDOW)
+                    })
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            },
+        )
+    }
+
     /// Starts joining a network. The connection to the inviting site runs in
     /// the background; its answer comes back as [`Input::JoinAnswer`].
     fn start_join(
@@ -1570,6 +1887,12 @@ impl Controller {
             }
         };
         let target = SocketAddrV4::new(address, port);
+        let Some(identity) = self.ensure_identity() else {
+            let _ = reply.send(Err(ApiError::new(
+                "this box has no identity (see the log); cannot join",
+            )));
+            return;
+        };
         self.joining = true;
         self.events.info(format!(
             "Asking {target} to let this site join as \"{}\"",
@@ -1581,13 +1904,17 @@ impl Controller {
             name: params.name.clone(),
             name_is_default: params.name_is_default,
             version: wanderlan_core::version_line().into(),
+            id: identity.id().to_string(),
         };
         let inputs = self.inputs.clone();
         tokio::spawn(async move {
-            let give_up = Instant::now() + JOIN_BUSY_RETRY;
+            let start = Instant::now();
             let result = loop {
                 match sync_net::join(target, &request).await {
-                    Ok(JoinReply::Busy) if Instant::now() < give_up => {
+                    Ok(JoinReply::Busy) if start.elapsed() < JOIN_BUSY_RETRY => {
+                        tokio::time::sleep(Duration::from_secs(3)).await;
+                    }
+                    Ok(JoinReply::Retry { .. }) if start.elapsed() < JOIN_TAKEOVER_RETRY => {
                         tokio::time::sleep(Duration::from_secs(3)).await;
                     }
                     Ok(answer) => break Ok(answer),
@@ -1623,7 +1950,7 @@ impl Controller {
                     "the inviting site is busy with another change; try again in a minute",
                 ));
             }
-            JoinReply::Error { message } => {
+            JoinReply::Error { message } | JoinReply::Retry { message } => {
                 self.events.warn(format!("Joining was refused: {message}"));
                 return Err(ApiError::new(format!(
                     "the inviting site refused: {message}"
@@ -1648,7 +1975,7 @@ impl Controller {
             trunk: vec![params.trunk.clone()],
             ..Default::default()
         };
-        let cfg = sync::accept(network, &local, None, false).map_err(|e| {
+        let cfg = sync::accept(network, &local, None, false, self.own_id()).map_err(|e| {
             ApiError::new(format!(
                 "the configuration from \"{via}\" cannot be used: {e}"
             ))
@@ -1716,6 +2043,8 @@ impl Controller {
                 0
             }
         };
+        // The box becomes a new box: a join afterwards gets a new identity.
+        self.identity = None;
         if let Err(e) = self.paths.reset() {
             problems.push(format!("{e:#}"));
         }
@@ -1815,7 +2144,7 @@ impl Controller {
     /// Applies a configuration and starts the confirmation timer.
     async fn apply(
         &mut self,
-        cfg: Config,
+        mut cfg: Config,
         source: ChangeSource,
         timeout: Option<Duration>,
         base_revision: Option<u64>,
@@ -1825,6 +2154,22 @@ impl Controller {
             return Err(ApiError::new(
                 "another change is waiting for confirmation; confirm or roll it back first",
             ));
+        }
+        // Identities are not edited by hand: a local change (also the first
+        // configuration) keeps those of the confirmed network and carries the
+        // identity of this box in its own entry, whatever the editor wrote.
+        if source == ChangeSource::Local {
+            if let Some(confirmed) = &self.confirmed {
+                keep_ids(&confirmed.network, &mut cfg.network);
+            }
+            if let Some(identity) = self.ensure_identity() {
+                let me = cfg.self_name().to_string();
+                if let Some(site) = cfg.network.sites.iter_mut().find(|s| s.name == me)
+                    && site.id.is_none()
+                {
+                    site.id = Some(identity.id());
+                }
+            }
         }
         if let Some(base) = base_revision {
             self.check_base(base, &cfg)?;
@@ -2454,6 +2799,7 @@ impl Controller {
                 trunk_ports: Vec::new(),
                 missing_ports: Vec::new(),
                 sync_problem: None,
+                site_id: self.own_id().map(|id| id.to_string()),
             };
         };
         let desired = derived
@@ -2533,6 +2879,20 @@ impl Controller {
                         }
                     }),
                     refused: self.refused.get(&t.peer.name).cloned(),
+                    identity: t.peer.id.map(|id| id.fingerprint()),
+                    identity_state: self.peer_keys.contains_key(&t.peer.name).then(|| {
+                        self.runtime
+                            .identity
+                            .get(&t.peer.name)
+                            .copied()
+                            .unwrap_or_default()
+                            .into()
+                    }),
+                    tunnel: if self.runtime.gre_keys.contains_key(&t.peer.name) {
+                        TunnelKindLabel::GreKey
+                    } else {
+                        TunnelKindLabel::Gre
+                    },
                 }
             })
             .collect();
@@ -2557,6 +2917,7 @@ impl Controller {
                 is_self: s.name == cfg.self_name(),
                 direct: direct.contains(s.name.as_str()),
                 uplink: s.uplink.clone(),
+                id: s.id.map(|id| id.fingerprint()),
                 via: topology::via(&cfg.network, cfg.self_name(), &s.name).map(str::to_string),
             })
             .collect();
@@ -2604,6 +2965,7 @@ impl Controller {
                 .filter(|t| !links.iter().any(|l| l.name == t.name))
                 .map(|t| t.name.clone())
                 .collect(),
+            site_id: self.own_id().map(|id| id.to_string()),
         }
     }
 }
@@ -2611,6 +2973,27 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_file_without_ids_keeps_the_identities() {
+        let text = "[network]\nvlans = \"10\"\n\n[site.a]\naddress = \"10.0.0.1\"\nid = \"AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=\"\n\n[site.b]\naddress = \"10.0.0.2\"\nid = \"ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=\"\n";
+        let old = config::parse_network(text).unwrap().network.unwrap();
+        // Written by hand without the id lines, b renamed to c.
+        let mut new = old.clone();
+        for site in &mut new.sites {
+            site.id = None;
+        }
+        new.sites[1].name = "c".into();
+        new.sites.push(config::Site {
+            name: "d".into(),
+            address: Ipv4Addr::new(10, 0, 0, 4),
+            ..new.sites[0].clone()
+        });
+        keep_ids(&old, &mut new);
+        assert_eq!(new.sites[0].id, old.sites[0].id);
+        assert_eq!(new.sites[1].id, old.sites[1].id, "renamed: by its address");
+        assert_eq!(new.sites[2].id, None, "a new site has none");
+    }
 
     #[test]
     fn a_refused_view_carries_its_reason_in_the_first_line() {

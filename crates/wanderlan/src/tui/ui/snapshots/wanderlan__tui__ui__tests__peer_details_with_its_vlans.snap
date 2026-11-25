@@ -1,6 +1,5 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 595
 expression: render(&app)
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
@@ -8,6 +7,7 @@ expression: render(&app)
 "│ Tunnel       up   reachable   config revision 7, same as here                │"
 "│ Round trip   12ms  min 11ms avg 13ms max 16ms  jitter 0.7ms                  │"
 "│ Probe loss   0 % of 60 probes   latency ~6.3ms one way (round trip / 2)      │"
+"│ Identity     bueAb3dE   confirmed   tunnel GRE with key                      │"
 "│ Path MTU     1420   TCP MSS 1338   MACs behind it 12                         │"
 "│ VLANs        10-50   trunk ens19                                             │"
 "│ Received     1.2Mbit/s now, 1.2 GB in 1000000 pkts, 0 err, 0 drop            │"
@@ -18,8 +18,7 @@ expression: render(&app)
 "││    │                                           ││20    2.4M     1.8M       ││"
 "││    │                                           ││10    56.0k    64.0k      ││"
 "││    │                                           ││30    0        0          ││"
-"││    │                                           ││                          ││"
-"││    │                                          ⠁││                          ││"
+"││    │                                          ⠂││                          ││"
 "││0   │                                           ││                          ││"
 "│└────────────────────────────────────────────────┘└──────────────────────────┘│"
 "│ Round trip   █                                                               │"

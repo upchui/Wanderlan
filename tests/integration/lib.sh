@@ -107,12 +107,26 @@ check_not() {
 # revision so the sync between the daemons never prefers an older one.
 NETWORK_REVISION=${NETWORK_REVISION:-100}
 
+# Raises NETWORK_REVISION above the revision of every running site: the
+# daemons raise it themselves too (a site claims its identity in the network
+# at its first start), so a counter of our own would fall behind.
+next_revision() {
+  local s r
+  for s in "${!ADDR[@]}"; do
+    r=$(jqs "$s" .revision 2>/dev/null) || continue
+    if [[ "$r" =~ ^[0-9]+$ ]] && [ "$r" -gt "$NETWORK_REVISION" ]; then
+      NETWORK_REVISION=$r
+    fi
+  done
+  NETWORK_REVISION=$((NETWORK_REVISION + 1))
+}
+
 # network_toml <vlans> <site[=vlans]>... prints a network.toml; `site=20,30`
 # limits a site to some of the VLANs.
 network_toml() {
   local vlans="$1"
   shift
-  NETWORK_REVISION=$((NETWORK_REVISION + 1))
+  next_revision
   printf '[network]\nrevision = %s\nvlans = "%s"\nmtu_probe_interval = "%s"\ncommit_timeout = "%s"\n' \
     "${REVISION:-$NETWORK_REVISION}" "$vlans" "${PROBE_INTERVAL:-15s}" "${COMMIT_TIMEOUT:-60s}"
   local spec name site_vlans
@@ -133,7 +147,7 @@ network_toml() {
 # renew <network-file>: gives a previously generated network a new, higher revision
 # (reusing an old file would let the sync bring back a newer configuration).
 renew() {
-  NETWORK_REVISION=$((NETWORK_REVISION + 1))
+  next_revision
   sed -i "s/^revision = .*/revision = $NETWORK_REVISION/" "$1"
 }
 

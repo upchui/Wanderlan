@@ -5,21 +5,21 @@
 begin "MTU: measured path MTU, MSS clamping and a large TCP transfer"
 
 wait_for 90 "site5 measured a path MTU of 1400 to site2" \
-  x site5 "grep -q 'Path MTU to \"site2\" is 1400 bytes (TCP MSS 1318)' /var/log/wanderland.log"
+  x site5 "grep -q 'Path MTU to \"site2\" is 1400 bytes (TCP MSS 1314)' /var/log/wanderland.log"
 wait_for 90 "site2 measured a path MTU of 1400 to site5" \
   x site2 "grep -q 'Path MTU to \"site5\" is 1400 bytes' /var/log/wanderland.log"
 wait_for 90 "site1 measured a path MTU of 1400 to site5 (direct tunnel)" \
   x site1 "grep -q 'Path MTU to \"site5\" is 1400 bytes' /var/log/wanderland.log"
 wait_for 90 "site1 measured the full 1500-byte underlay MTU to site2" \
-  x site1 "grep -q 'Path MTU to \"site2\" is 1500 bytes (TCP MSS 1418)' /var/log/wanderland.log"
-wait_for 30 "site5 clamps the MSS to 1318 on gt-site2" \
-  x site5 "nft list table bridge wanderlan | grep -q 'oifname \"gt-site2\" .*maxseg size set 1318'"
-check "site5 clamps IPv6 TCP to 1298" \
-  x site5 "nft list table bridge wanderlan | grep -q 'meta protocol ip6 oifname \"gt-site2\" .*maxseg size set 1298'"
-check "site2 clamps SYNs from site5 to 1318 as well" \
-  x site2 "nft list table bridge wanderlan | grep -q 'iifname \"gt-site5\" .*maxseg size set 1318'"
+  x site1 "grep -q 'Path MTU to \"site2\" is 1500 bytes (TCP MSS 1414)' /var/log/wanderland.log"
+wait_for 30 "site5 clamps the MSS to 1314 on gt-site2" \
+  x site5 "nft list table bridge wanderlan | grep -q 'oifname \"gt-site2\" .*maxseg size set 1314'"
+check "site5 clamps IPv6 TCP to 1294" \
+  x site5 "nft list table bridge wanderlan | grep -q 'meta protocol ip6 oifname \"gt-site2\" .*maxseg size set 1294'"
+check "site2 clamps SYNs from site5 to 1314 as well" \
+  x site2 "nft list table bridge wanderlan | grep -q 'iifname \"gt-site5\" .*maxseg size set 1314'"
 check "every bridged frame passes one rule: only TCP SYNs go on to the MSS rules" \
-  x site5 "nft list chain bridge wanderlan forward | grep -q 'tcp flags.*jump wl-mss' && ! nft list chain bridge wanderlan forward | grep -q maxseg && nft list chain bridge wanderlan wl-mss | grep -q 'maxseg size set 1318'"
+  x site5 "nft list chain bridge wanderlan forward | grep -q 'tcp flags.*jump wl-mss' && ! nft list chain bridge wanderlan forward | grep -q maxseg && nft list chain bridge wanderlan wl-mss | grep -q 'maxseg size set 1314'"
 
 # Large TCP transfer between the untagged client at site5 (VLAN 20) and site1's client.
 x c-site5 "head -c 100M /dev/urandom > /tmp/data && sha256sum < /tmp/data | cut -d' ' -f1 > /tmp/data.sha"
@@ -39,7 +39,7 @@ if [ -n "$sent" ] && [ "$sent" = "$got" ]; then
 else
   fail "the transferred data differs (sent $sent, received $got)"
 fi
-check "the SYN arrives at site1 with MSS 1318" x c-site1 "grep -q 'mss 1318' /tmp/syn.txt"
+check "the SYN arrives at site1 with MSS 1314" x c-site1 "grep -q 'mss 1314' /tmp/syn.txt"
 
 begin "Fragmentation: inner packets larger than the path still arrive"
 

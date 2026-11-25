@@ -1040,3 +1040,68 @@ fn rename_by_manager_of_1_0_22_is_read_and_ignored() {
     let network = parse_network(&text).unwrap().network.unwrap();
     assert!(!render_network(&network).contains("rename_by_manager"));
 }
+
+const ID_A: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
+const ID_B: &str = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8=";
+
+#[test]
+fn site_ids_are_read_and_written_in_both_formats() {
+    let network = EXAMPLE_NETWORK.replacen(
+        "address = \"10.8.0.11\"",
+        &format!("address = \"10.8.0.11\"\nid = \"{ID_A}\""),
+        1,
+    );
+    let parsed = parse_network(&network).unwrap().network.unwrap();
+    let site = parsed.site("haus2").unwrap();
+    assert_eq!(site.id.unwrap().to_string(), ID_A);
+    assert!(parsed.sites.iter().filter(|s| s.id.is_some()).count() == 1);
+    for text in [
+        render_network(&parsed),
+        crate::config::render_network_wire(&parsed),
+    ] {
+        assert!(text.contains(&format!("id = \"{ID_A}\"")), "{text}");
+        assert_eq!(parse_network(&text).unwrap().network.unwrap(), parsed);
+    }
+}
+
+#[test]
+fn without_ids_the_wire_form_and_fingerprint_stay_as_before() {
+    // The bytes older versions exchange and hash: no `id` line appears.
+    let network = parse_network(EXAMPLE_NETWORK).unwrap().network.unwrap();
+    let wire = crate::config::render_network_wire(&network);
+    assert!(!wire.contains("id ="), "{wire}");
+    assert!(!render_network(&network).contains("id ="));
+    let mut with_id = network.clone();
+    with_id.sites[0].id = Some(ID_A.parse().unwrap());
+    assert_ne!(fingerprint(&network), fingerprint(&with_id));
+}
+
+#[test]
+fn an_invalid_id_has_a_line() {
+    let network = EXAMPLE_NETWORK.replacen(
+        "address = \"10.8.0.11\"",
+        "address = \"10.8.0.11\"\nid = \"not-a-key\"",
+        1,
+    );
+    let line = line_of(&network, "", "not-a-key");
+    assert_error(&network, line, "is not a wanderlan identity");
+}
+
+#[test]
+fn two_sites_with_the_same_id() {
+    let network = EXAMPLE_NETWORK
+        .replacen(
+            "address = \"10.8.0.11\"",
+            &format!("address = \"10.8.0.11\"\nid = \"{ID_A}\""),
+            1,
+        )
+        .replacen(
+            "address = \"10.8.0.12\"",
+            &format!("address = \"10.8.0.12\"\nid = \"{ID_A}\""),
+            1,
+        );
+    let line = line_of(&network, "10.8.0.12", "id = ");
+    assert_error(&network, line, "have the same identity");
+    let fine = network.replacen(ID_A, ID_B, 2).replacen(ID_B, ID_A, 1);
+    assert!(load(&fine, LOCAL).is_ok());
+}

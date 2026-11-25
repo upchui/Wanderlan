@@ -496,6 +496,69 @@ pub struct PeerStatus {
     pub revision: Option<u64>,
     /// Whether the peer runs the same network configuration.
     pub in_sync: Option<bool>,
+    /// The short form of the peer's identity, if it has one.
+    #[serde(default)]
+    pub identity: Option<String>,
+    /// For a tunnel with a key: whether the peer proved its identity.
+    #[serde(default)]
+    pub identity_state: Option<IdentityState>,
+    /// How the tunnel is built.
+    #[serde(default)]
+    pub tunnel: TunnelKindLabel,
+}
+
+/// Whether a peer proved its identity (tunnels with a key).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IdentityState {
+    /// No authenticated answer yet: the tunnel waits.
+    Waiting,
+    /// The peer answered with its key.
+    Confirmed,
+    /// Something at its address answers with another key.
+    WrongKey,
+}
+
+impl IdentityState {
+    /// The state as shown in the UI.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Waiting => "waiting",
+            Self::Confirmed => "confirmed",
+            Self::WrongKey => "wrong key",
+        }
+    }
+}
+
+impl From<crate::identity::PeerIdentity> for IdentityState {
+    fn from(state: crate::identity::PeerIdentity) -> Self {
+        match state {
+            crate::identity::PeerIdentity::Waiting => Self::Waiting,
+            crate::identity::PeerIdentity::Confirmed => Self::Confirmed,
+            crate::identity::PeerIdentity::WrongKey => Self::WrongKey,
+        }
+    }
+}
+
+/// How a tunnel is built.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TunnelKindLabel {
+    /// GRETAP without key (a site without identity).
+    #[default]
+    Gre,
+    /// GRETAP with the key of both identities.
+    GreKey,
+}
+
+impl TunnelKindLabel {
+    /// The kind as shown in the UI.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Gre => "GRE",
+            Self::GreKey => "GRE with key",
+        }
+    }
 }
 
 /// One site of the network (for the overview).
@@ -522,6 +585,9 @@ pub struct SiteSummary {
     /// passes ("via alex").
     #[serde(default)]
     pub via: Option<String>,
+    /// The short form of its identity, if it has one.
+    #[serde(default)]
+    pub id: Option<String>,
 }
 
 /// Result of [`Request::Status`].
@@ -576,6 +642,9 @@ pub struct Status {
     /// Configured trunk ports that do not exist (e.g. unplugged).
     #[serde(default)]
     pub missing_ports: Vec<String>,
+    /// The identity of this box (its public key), once it has one.
+    #[serde(default)]
+    pub site_id: Option<String>,
 }
 
 fn online_default() -> bool {

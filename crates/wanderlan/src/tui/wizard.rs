@@ -440,6 +440,7 @@ impl Wizard {
         network.sites.push(Site {
             name: name.clone(),
             address: parse_address(self.address.value())?,
+            id: None,
             vlans: None,
             own_vlans: None,
             online: true,

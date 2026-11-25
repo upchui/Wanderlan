@@ -293,6 +293,7 @@ fn check_changes(old: &Network, new: &Network, editor: &str) -> Result<(), Strin
             return Err(why_not_tunnel(old, a, b, editor));
         }
     }
+    check_ids(old, new, editor)?;
     // A client only adds clients of its own.
     if let Some(up) = client_of(old, editor)
         && let Some(added) = new
@@ -308,6 +309,35 @@ fn check_changes(old: &Network, new: &Network, editor: &str) -> Result<(), Strin
     Ok(())
 }
 
+/// The identities of the sites of `old` in `new`: a site claims its own once
+/// (a site of an older version that had none), its server passes the claim
+/// on. Another identity for a known site comes only with a join, decided by
+/// the site that invited it; when that is a client, its server gets the
+/// change from it. Nobody removes an identity.
+fn check_ids(old: &Network, new: &Network, editor: &str) -> Result<(), String> {
+    for site in &old.sites {
+        let Some(now) = new.site(&site.name) else {
+            continue;
+        };
+        if now.id == site.id {
+            continue;
+        }
+        let its_server = site.uplink.as_deref() == Some(editor);
+        let allowed = match (site.id, now.id) {
+            (None, Some(_)) => editor == site.name || its_server,
+            (Some(_), Some(_)) => its_server,
+            (_, None) => false,
+        };
+        if !allowed {
+            return Err(format!(
+                "this site (\"{editor}\") may not change the identity of site \"{}\": it changes only when that box joins again with an invitation (`wanderlan reset` there, then `wanderlan join`)",
+                site.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::Ipv4Addr;
@@ -319,6 +349,7 @@ mod tests {
         Site {
             name: name.into(),
             address: Ipv4Addr::new(10, 0, 0, last),
+            id: None,
             vlans: None,
             own_vlans: None,
             online: true,
@@ -594,5 +625,55 @@ mod tests {
         both.rename_site("c", "c2");
         both.sites[2].vlans = Some(VlanSet::from_range(10, 20));
         assert!(check_edit(&old, &both, "c").is_err(), "c is restricted");
+    }
+
+    #[test]
+    fn a_site_claims_its_identity_its_server_passes_it_on() {
+        let id = |n: u8| Some(crate::identity::SiteId::from_bytes([n; 32]));
+        let mut old = network();
+        // e is a client of c, c a client of a.
+        old.sites.push(Site {
+            uplink: Some("c".into()),
+            managed_by: Some("c".into()),
+            ..site("e", 5, None, false)
+        });
+        old.sites[2].uplink = Some("a".into());
+        let mut claimed = old.clone();
+        claimed.sites[2].id = id(3);
+        assert!(
+            check_edit(&old, &claimed, "c").is_ok(),
+            "its own, also restricted"
+        );
+        assert!(
+            check_edit(&old, &claimed, "a").is_ok(),
+            "its server passes it on"
+        );
+        let err = check_edit(&old, &claimed, "b").unwrap_err();
+        assert!(
+            err.contains("may not change the identity of site \"c\""),
+            "{err}"
+        );
+        // Another identity for a known site: only by the site that invited
+        // it, through a join.
+        let mut other = claimed.clone();
+        other.sites[2].id = id(9);
+        assert!(check_edit(&claimed, &other, "c").is_err());
+        assert!(check_edit(&claimed, &other, "b").is_err());
+        assert!(check_edit(&claimed, &other, "a").is_ok());
+        let mut client = claimed.clone();
+        client.sites[4].id = id(5);
+        let mut took_over = client.clone();
+        took_over.sites[4].id = id(6);
+        assert!(check_edit(&client, &took_over, "c").is_ok(), "c invited e");
+        assert!(check_edit(&client, &took_over, "e").is_err());
+        // Nobody removes an identity.
+        let mut gone = claimed.clone();
+        gone.sites[2].id = None;
+        assert!(check_edit(&claimed, &gone, "c").is_err());
+        assert!(check_edit(&claimed, &gone, "a").is_err());
+        // A rename keeps the identity and is no identity change.
+        let mut renamed = claimed.clone();
+        renamed.rename_site("c", "c2");
+        assert!(check_edit(&claimed, &renamed, "c").is_ok());
     }
 }

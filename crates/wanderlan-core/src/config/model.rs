@@ -15,6 +15,7 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 use super::vlan::VlanSet;
+use crate::identity::SiteId;
 
 /// Default port of the daemon-to-daemon control channel (UDP probes, TCP sync).
 pub const DEFAULT_CONTROL_PORT: u16 = 51821;
@@ -133,6 +134,10 @@ pub struct Site {
     /// Address of the site in the existing transport network (e.g. its VPN
     /// address). GRETAP tunnels run between these addresses.
     pub address: Ipv4Addr,
+    /// Identity of the box (its public key, see [`crate::identity`]); the
+    /// keys of its tunnels derive from it. `None` for a site of an older
+    /// version that has not claimed one yet: its tunnels have no keys.
+    pub id: Option<SiteId>,
     /// Shared VLANs this site takes part in, like the allowed VLANs of a
     /// switch port; `None` means the network default (`network.vlans`).
     pub vlans: Option<VlanSet>,
@@ -443,6 +448,7 @@ mod tests {
         network.sites.push(Site {
             name: "a".into(),
             address: Ipv4Addr::new(10, 0, 0, 1),
+            id: None,
             vlans: None,
             own_vlans: None,
             online: true,
@@ -453,6 +459,7 @@ mod tests {
         network.sites.push(Site {
             name: "b".into(),
             address: Ipv4Addr::new(10, 0, 0, 2),
+            id: None,
             vlans: Some(VlanSet::from_range(14, 14)),
             own_vlans: None,
             online: true,
