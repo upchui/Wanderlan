@@ -101,7 +101,7 @@ UI (`wanderlan`) to set it up and watch it; see [Concepts](#concepts) and
     sync, joining.
 * The kernel modules `bridge`, `ip_gre`, `sch_ingress`, `cls_flower`,
   `act_vlan`, `act_gact` and `nf_tables` (standard kernels have them; the
-  package loads them at boot).
+  service loads them when it starts).
 
 ## Installation
 
@@ -131,6 +131,12 @@ and the group `wanderlan`. Its members can use `wanderlan` without root:
 ```
 sudo usermod -aG wanderlan $USER    # then log in again
 ```
+
+The system stays clean: when the service stops, for whatever reason (a
+stop, an update, a crash), everything wanderlan set up is removed, and a
+start builds it anew; an update restarts the service. `sudo apt remove
+wanderlan` removes everything as well and keeps the configuration for a
+later installation; `sudo apt purge wanderlan` removes that too.
 
 ## Quick start: a second site in your network
 
@@ -500,7 +506,11 @@ with `managed_by` but without `uplink` is a client of its manager.
 
 ### On each site
 
-The daemon creates, and removes again when it stops:
+The daemon creates, and removes again whenever the service ends (a stop,
+an update, a crash or a kill: systemd then runs `wanderland --cleanup`,
+which also unloads the kernel module `ip_gre` and with it its devices
+`gre0`, `gretap0` and `erspan0`, unless another GRE tunnel uses it or this
+is a container):
 
 * `br0`: a bridge with VLAN filtering, STP off, no default VLAN and no
   netfilter calls of its own (if `br_netfilter` is loaded, e.g. by Docker,
@@ -591,8 +601,10 @@ the TUI) or the configuration changes.
 ### Operation
 
 `wanderland` runs as the systemd service `wanderland`, as root with
-`CAP_NET_ADMIN` as its only capability and a hardened unit; systemd restarts
-it after a crash, and the network keeps running meanwhile. Only one daemon
+`CAP_NET_ADMIN` as its only capability and a hardened unit. systemd restarts
+it after a crash: the cleanup removes what the crashed daemon left, the new
+one builds the network again within seconds. An update restarts it the
+same way. Only one daemon
 runs at a time: `wanderland` started from a shell only explains that it is
 the daemon. Logs go to the journal (`journalctl -u wanderland`) and to the
 event log (`wanderlan log`).

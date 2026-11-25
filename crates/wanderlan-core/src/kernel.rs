@@ -10,7 +10,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use wanderlan_core::api::Interface;
+use crate::api::Interface;
 
 /// The module that owns the fallback devices.
 pub const GRE_MODULE: &str = "ip_gre";

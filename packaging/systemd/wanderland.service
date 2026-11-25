@@ -8,8 +8,15 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# The kernel modules only while wanderlan runs ("+": with full rights, the
+# daemon itself may not load modules; "-": not possible in a container).
+ExecStartPre=-+/sbin/modprobe -a bridge ip_gre sch_ingress cls_flower act_vlan act_gact nf_tables
 ExecStart=/usr/bin/wanderland
 ExecReload=/bin/kill -HUP $MAINPID
+# After every end of the service (stop, restart, update, crash, kill):
+# nothing of wanderlan stays, also not the kernel's gre0/gretap0/erspan0
+# when nothing else needs ip_gre. A start builds everything anew.
+ExecStopPost=-+/usr/bin/wanderland --cleanup
 # Also after a crash or a kill; `systemctl stop` stops it for good.
 Restart=always
 RestartSec=2s

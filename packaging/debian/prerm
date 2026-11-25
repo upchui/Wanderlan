@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+
+#DEBHELPER#
+
+if [ "$1" = "remove" ]; then
+    # The service is stopped above (and cleans up after itself). Whatever is
+    # still there, e.g. from a daemon that ran without systemd, goes too.
+    if [ -x /usr/bin/wanderland ]; then
+        /usr/bin/wanderland --cleanup || true
+    fi
+fi
+
+exit 0

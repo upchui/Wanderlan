@@ -2,7 +2,8 @@
 # wanderland under systemd with the hardened unit of the package, driven
 # through what users do: start a network, invite, join, type `wanderland` by
 # mistake, delete the socket, reset, start a new network while the old one
-# still lists the site, join again, crash, restart, stop. After every step
+# still lists the site, join again, crash, restart, stop, update, remove and
+# install again. After every step
 # both services must be active, restarted only as expected, and their
 # journals free of internal errors.
 #   SYSTEMDNODE_IMAGE  image (default wanderlan-systemdnode)
@@ -63,6 +64,15 @@ join() { # join <host> <code>
   expect_output "$1 joined alpha's network" 'is part of the network' "$out"
 }
 ping_ok() { x c-alpha "ping -c 2 -i 0.2 -W 1 10.20.0.2"; }
+# Nothing of wanderlan is left on a host: no bridge, tunnel or segment, no
+# nftables table, no tc filter on the trunk, no API socket.
+nothing_left() {
+  x "$1" "! ip link show br0 2>/dev/null && ! ip -o link show | grep -qE ' (gt|wl)-' \
+    && ! nft list table bridge wanderlan 2>/dev/null \
+    && [ -z \"\$(tc filter show dev trunk0 ingress 2>/dev/null)\" ] \
+    && ! test -e /run/wanderlan/wanderlan.sock"
+}
+br0_index() { x alpha "ip -j link show br0 | jq -r '.[0].ifindex'"; }
 
 cleanup() {
   if [ "$failures" -gt 0 ]; then
@@ -154,13 +164,16 @@ expect_output "alpha takes beta online right after the join" 'beta is online' "$
 wait_for 30 "VLAN 20: the clients reach each other again" ping_ok
 healthy
 
-begin "A crash: systemd restarts the daemon, the network keeps running"
+begin "A crash: the cleanup removes what is left, the restart builds it anew"
+before=$(br0_index)
 x alpha "systemctl kill -s KILL wanderland"
 RESTARTS[alpha]=1
-check "the tunnel survives the crash" x alpha "ip link show gt-beta"
 wait_for 20 "systemd restarted wanderland" \
   x alpha "systemctl is-active wanderland | grep -qx active && wanderlan status --json | jq -e '.state == \"running\"'"
-check "VLAN 20 works" ping_ok
+check "the cleanup after the crash removed the interfaces of the dead daemon" \
+  x alpha "journalctl -u wanderland -b --no-pager -o cat | grep -q 'Cleanup: .* changes undone'"
+wait_for 30 "the new daemon built br0 anew" eval '[ -n "$(br0_index)" ] && [ "$(br0_index)" != "'"$before"'" ]'
+wait_for 30 "VLAN 20 works" ping_ok
 healthy
 
 begin "systemctl restart and stop/start"
@@ -169,11 +182,34 @@ RESTARTS[alpha]=0 # an explicit start resets systemd's counter
 wait_for 20 "alpha runs again after a restart" x alpha "wanderlan status --json | jq -e '.state == \"running\"'"
 wait_for 30 "VLAN 20 works after the restart" ping_ok
 x alpha "systemctl stop wanderland"
-check "stopping removes the bridge and the tunnels" \
-  x alpha "! ip link show br0 2>/dev/null && ! ip -o link show | grep -q ' gt-'"
+check "stopping removes everything: interfaces, nftables, tc, socket" nothing_left alpha
+check "the cleanup leaves the kernel's GRE devices of the host alone (a container)" \
+  x alpha "journalctl -u wanderland -b --no-pager -o cat | grep -q 'belong to the kernel module ip_gre of the host'"
 x alpha "systemctl start wanderland"
 wait_for 20 "alpha runs again after a start" x alpha "wanderlan status --json | jq -e '.state == \"running\"'"
 wait_for 30 "VLAN 20 works after the start" ping_ok
+healthy
+
+begin "An update restarts the daemon"
+pid=$(x alpha "systemctl show -p MainPID --value wanderland")
+x alpha "dpkg -i /var/cache/wanderlan-test/wanderlan.deb >/dev/null 2>&1"
+RESTARTS[alpha]=0
+wait_for 20 "a new daemon runs after the update" \
+  x alpha "[ \"\$(systemctl show -p MainPID --value wanderland)\" != '$pid' ] && wanderlan status --json | jq -e '.state == \"running\"'"
+check "the old one removed everything first" \
+  x alpha "journalctl -u wanderland -b --no-pager -o cat | grep -q 'Stopping; removing everything wanderlan created'"
+wait_for 30 "VLAN 20 works after the update" ping_ok
+healthy
+
+begin "Removing the package removes everything, installing it again brings it back"
+x alpha "dpkg -r wanderlan >/dev/null 2>&1"
+check "the package is removed" x alpha "! test -x /usr/bin/wanderland"
+check "nothing of wanderlan is left" nothing_left alpha
+check "the configuration is kept" x alpha "grep -q 'name = \"alpha\"' /etc/wanderlan/network.toml"
+x alpha "dpkg -i /var/cache/wanderlan-test/wanderlan.deb >/dev/null 2>&1"
+wait_for 20 "alpha runs again with its configuration" \
+  x alpha "systemctl is-active wanderland | grep -qx active && wanderlan status --json | jq -e '.state == \"running\"'"
+wait_for 30 "VLAN 20 works again" ping_ok
 healthy
 
 echo

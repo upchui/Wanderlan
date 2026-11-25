@@ -2,7 +2,9 @@
 //!
 //! It reads `/etc/wanderlan/{network,local}.toml`, derives the desired layer-2
 //! setup of this site (bridge, GRETAP tunnels, VLANs) and keeps the system in
-//! that state. On SIGTERM/SIGINT it removes everything it created.
+//! that state. On SIGTERM/SIGINT it removes everything it created;
+//! `wanderland --cleanup` (systemd runs it after every end of the service)
+//! removes whatever a crashed or killed daemon left.
 
 mod api_server;
 mod daemon;
@@ -43,6 +45,11 @@ pub struct Args {
     /// only prints a hint: the daemon normally runs as a systemd service.
     #[arg(long)]
     pub foreground: bool,
+    /// Remove everything a daemon left behind (bridges, tunnels, rules, the
+    /// kernel's GRE fallback devices) and exit. systemd runs it after every
+    /// end of the service; refused while a daemon runs.
+    #[arg(long)]
+    pub cleanup: bool,
 }
 
 /// Printed when the daemon is started from a shell, usually by mistake.
@@ -58,7 +65,7 @@ stopped), use `wanderland --foreground`.";
 fn main() -> ExitCode {
     let args = Args::parse();
     let under_systemd = std::env::var_os("INVOCATION_ID").is_some();
-    if !args.foreground && !under_systemd && std::io::stdin().is_terminal() {
+    if !args.foreground && !args.cleanup && !under_systemd && std::io::stdin().is_terminal() {
         eprintln!("{TERMINAL_HINT}");
         return ExitCode::from(2);
     }
@@ -85,6 +92,16 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if args.cleanup {
+        return match runtime.block_on(daemon::cleanup(&args)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                tracing::error!("{e:#}");
+                eprintln!("{e:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match runtime.block_on(daemon::run(args)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

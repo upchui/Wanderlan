@@ -35,6 +35,19 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 - Fix: an interface that is no longer a trunk port is taken off the bridge;
   before, it stayed bridged after the trunk was changed.
 
+### The system stays clean
+
+- Whenever the service ends (stop, update, crash, kill), systemd runs
+  `wanderland --cleanup`: bridges, tunnels, tc rules and the nftables
+  table go, also what a crashed daemon left, and the kernel's `gre0`,
+  `gretap0` and `erspan0` when nothing else needs `ip_gre`. A start
+  builds everything anew; before, a crash left the network running.
+- An internal error removes everything before the daemon exits.
+- The kernel modules are loaded when the service starts, not at every
+  boot (no `gre0` while wanderlan does not run).
+- `apt remove` runs the cleanup also when the daemon was not running.
+- An update restarts the daemon (as before; now tested).
+
 ### Faster and more robust
 
 - Forwarding: every bridged frame of the host passes one nftables rule;

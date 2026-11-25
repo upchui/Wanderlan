@@ -18,8 +18,8 @@ use wanderlan_core::join;
 
 use crate::client::Client;
 use crate::hostinfo;
-use crate::kernel;
 use crate::tui::{self, TuiOptions};
+use wanderlan_core::kernel;
 
 const EXAMPLE_NETWORK: &str = include_str!("../../../packaging/examples/network.toml");
 const EXAMPLE_LOCAL: &str = include_str!("../../../packaging/examples/local.toml");

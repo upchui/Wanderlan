@@ -168,7 +168,7 @@ async fn event_loop(terminal: &mut Term, socket: &Path, mouse: bool) -> Result<(
                 Effect::KernelCleanup(interfaces) => {
                     let tx = local_tx.clone();
                     tokio::task::spawn_blocking(move || {
-                        let result = crate::kernel::remove_gre_fallback(&interfaces);
+                        let result = wanderlan_core::kernel::remove_gre_fallback(&interfaces);
                         let _ = tx.send(Msg::KernelCleaned(result.message()));
                     });
                 }

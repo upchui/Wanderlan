@@ -3,7 +3,6 @@
 mod cli;
 mod client;
 mod hostinfo;
-mod kernel;
 mod service;
 mod tui;
 

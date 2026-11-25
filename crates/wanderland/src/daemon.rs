@@ -371,8 +371,17 @@ pub async fn run(args: Args) -> Result<()> {
                 ctl.reload_files().await;
             }
             (name, why) = first_finished(&mut tasks) => {
-                // Exit without tearing anything down: systemd starts the
-                // daemon again, which adopts the existing interfaces.
+                // Clean up as far as possible (systemd's ExecStopPost does
+                // the rest), then exit: systemd starts the daemon again,
+                // which builds everything anew.
+                for (task_name, task) in &tasks {
+                    if *task_name != NETLINK_TASK {
+                        task.abort();
+                    }
+                }
+                if let Err(e) = teardown_for_exit(&ctl.sys, STOP_TEARDOWN).await {
+                    warn!("{e:#}");
+                }
                 for (_, task) in &tasks {
                     task.abort();
                 }
@@ -395,15 +404,87 @@ pub async fn run(args: Args) -> Result<()> {
         }
     }
     info!("Stopping; removing everything wanderlan created");
-    let removed = reconcile::teardown(&ctl.sys, |c| info!("{c}"))
-        .await
-        .context("cleanup failed")?;
+    let removed = teardown_for_exit(&ctl.sys, STOP_TEARDOWN).await?;
     if let Some(task) = connection {
         task.abort();
     }
     let _ = std::fs::remove_file(&args.socket);
     info!("Stopped ({} changes undone)", removed.len());
     Ok(())
+}
+
+/// The interfaces of the host for the API; `carries` maps an index to the
+/// peers whose tunnel leaves through it.
+fn interface_list(
+    links: &[wanderlan_core::sys::LinkState],
+    carries: &BTreeMap<u32, Vec<String>>,
+) -> Vec<Interface> {
+    let name_of = |i: u32| links.iter().find(|l| l.index == i).map(|l| l.name.clone());
+    links
+        .iter()
+        .map(|l| Interface {
+            name: l.name.clone(),
+            kind: match &l.kind {
+                LinkKind::Bridge(_) => "bridge".into(),
+                LinkKind::Gretap(_) => "gretap".into(),
+                LinkKind::Other(k) => k.clone(),
+            },
+            up: l.admin_up,
+            master: l.master.and_then(name_of),
+            mtu: l.mtu,
+            managed: l.alias.as_deref() == Some(OWNER_ALIAS),
+            carries: carries.get(&l.index).cloned().unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// How long the teardown at a stop may take (below systemd's 30 s).
+const STOP_TEARDOWN: Duration = Duration::from_secs(25);
+/// How long `wanderland --cleanup` may take.
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Removes everything a daemon of this host created; also the kernel's GRE
+/// fallback devices when nothing else needs their module. Run by systemd
+/// after every end of the service (also a crash or a kill) and when the
+/// package is removed, so nothing stays behind. Does nothing if nothing is
+/// there.
+pub async fn cleanup(args: &Args) -> Result<()> {
+    let sys = LinuxSystem::connect().context("cannot open a netlink connection")?;
+    let removed = tokio::time::timeout(
+        CLEANUP_TIMEOUT,
+        reconcile::teardown(&sys, |c| info!("Cleanup: {c}")),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "the cleanup did not finish within {} s",
+            CLEANUP_TIMEOUT.as_secs()
+        )
+    })?
+    .context("cleanup failed")?;
+    let _ = std::fs::remove_file(&args.socket);
+    if removed.is_empty() {
+        debug!("Cleanup: nothing of wanderlan left");
+    } else {
+        info!("Cleanup: {} changes undone", removed.len());
+    }
+    // gre0, gretap0 and erspan0 of the kernel module ip_gre.
+    let links = sys.links().await.unwrap_or_default();
+    if let Some(message) =
+        wanderlan_core::kernel::remove_gre_fallback(&interface_list(&links, &BTreeMap::new()))
+            .message()
+    {
+        info!("Cleanup: {message}");
+    }
+    Ok(())
+}
+
+/// Removes everything at an end of the daemon, at most `limit` long.
+async fn teardown_for_exit(sys: &LinuxSystem, limit: Duration) -> Result<Vec<Change>> {
+    tokio::time::timeout(limit, reconcile::teardown(sys, |c| info!("{c}")))
+        .await
+        .map_err(|_| anyhow::anyhow!("did not finish within {} s", limit.as_secs()))?
+        .context("cleanup failed")
 }
 
 /// wanderlan's bridges (index, name): br0 and those of further trunks.
@@ -2046,24 +2127,8 @@ impl Controller {
 
     async fn interfaces(&self) -> Result<Vec<Interface>, ApiError> {
         let links = self.sys.links().await.map_err(api_err)?;
-        let name_of = |i: u32| links.iter().find(|l| l.index == i).map(|l| l.name.clone());
         let carries = self.tunnel_interfaces().await;
-        Ok(links
-            .iter()
-            .map(|l| Interface {
-                name: l.name.clone(),
-                kind: match &l.kind {
-                    LinkKind::Bridge(_) => "bridge".into(),
-                    LinkKind::Gretap(_) => "gretap".into(),
-                    LinkKind::Other(k) => k.clone(),
-                },
-                up: l.admin_up,
-                master: l.master.and_then(name_of),
-                mtu: l.mtu,
-                managed: l.alias.as_deref() == Some(OWNER_ALIAS),
-                carries: carries.get(&l.index).cloned().unwrap_or_default(),
-            })
-            .collect())
+        Ok(interface_list(&links, &carries))
     }
 
     /// Peer → MTU of the interface its tunnel leaves by (an upper bound of the

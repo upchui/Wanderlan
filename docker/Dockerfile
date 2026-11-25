@@ -110,7 +110,12 @@ COPY --from=build /out/ /tmp/out/
 RUN cd /tmp/out \
  && apt-get update \
  && apt-get install -y ./wanderlan_*.deb \
- && rm -rf /var/lib/apt/lists/* /tmp/out
+ && mkdir -p /var/cache/wanderlan-test \
+ && cp ./wanderlan_*.deb /var/cache/wanderlan-test/wanderlan.deb \
+ && rm -rf /var/lib/apt/lists/* /tmp/out \
+ # Like a real host: package scripts may start and stop services (the
+ # Docker image forbids it, for builds).
+ && rm -f /usr/sbin/policy-rc.d
 COPY tests/integration/node/ /usr/local/bin/
 COPY tests/systemd/wl-node-setup /usr/local/bin/
 COPY tests/systemd/wl-node-setup.service /etc/systemd/system/
