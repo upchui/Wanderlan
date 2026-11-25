@@ -136,7 +136,7 @@ fn peer_vlans(frame: &mut Frame, app: &App, peer: &str, vlan: Option<u16>, area:
     );
 }
 
-/// The peer's identity and how its tunnel is built.
+/// The peer's identity and how its tunnel runs.
 fn identity_line(peer: &PeerStatus) -> Line<'static> {
     use wanderlan_core::api::IdentityState;
     let id = peer.identity.clone().unwrap_or_else(|| "none".into());
@@ -152,8 +152,8 @@ fn identity_line(peer: &PeerStatus) -> Line<'static> {
         Span::styled(state, style),
         Span::styled(
             match &peer.endpoint {
-                Some(at) => format!("   tunnel {} from {at}", peer.tunnel.label()),
-                None => format!("   tunnel {}", peer.tunnel.label()),
+                Some(at) => format!("   VXLAN {} from {at}", peer.tunnel),
+                None => format!("   VXLAN {}", peer.tunnel),
             },
             theme::dim(),
         ),
@@ -366,6 +366,12 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, area: Rect) {
             Span::raw(format::role(site.uplink.as_deref())),
             if site.name == me {
                 dim("   this site")
+            } else {
+                Span::raw("")
+            },
+            // A client: how its tunnel to its server runs.
+            if site.uplink.is_some() {
+                dim(&format!("   tunnel {}", site.tunnel_mode))
             } else {
                 Span::raw("")
             },

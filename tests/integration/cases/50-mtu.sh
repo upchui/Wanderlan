@@ -1,25 +1,25 @@
 # shellcheck shell=bash
-# Path MTU measurement, MSS clamping and GRE fragmentation.
+# Path MTU measurement, MSS clamping and fragmentation of the tunnel packets.
 # The underlay of site5 has MTU 1400 (see compose.yml).
 
 begin "MTU: measured path MTU, MSS clamping and a large TCP transfer"
 
 wait_for 90 "site5 measured a path MTU of 1400 to site2" \
-  x site5 "grep -q 'Path MTU to \"site2\" is 1400 bytes (TCP MSS 1314)' /var/log/wanderland.log"
+  x site5 "grep -q 'Path MTU to \"site2\" is 1400 bytes (TCP MSS 1306)' /var/log/wanderland.log"
 wait_for 90 "site2 measured a path MTU of 1400 to site5" \
   x site2 "grep -q 'Path MTU to \"site5\" is 1400 bytes' /var/log/wanderland.log"
 wait_for 90 "site1 measured a path MTU of 1400 to site5 (direct tunnel)" \
   x site1 "grep -q 'Path MTU to \"site5\" is 1400 bytes' /var/log/wanderland.log"
 wait_for 90 "site1 measured the full 1500-byte underlay MTU to site2" \
-  x site1 "grep -q 'Path MTU to \"site2\" is 1500 bytes (TCP MSS 1414)' /var/log/wanderland.log"
-wait_for 30 "site5 clamps the MSS to 1314 on gt-site2" \
-  x site5 "nft list table bridge wanderlan | grep -q 'oifname \"gt-site2\" .*maxseg size set 1314'"
-check "site5 clamps IPv6 TCP to 1294" \
-  x site5 "nft list table bridge wanderlan | grep -q 'meta protocol ip6 oifname \"gt-site2\" .*maxseg size set 1294'"
-check "site2 clamps SYNs from site5 to 1314 as well" \
-  x site2 "nft list table bridge wanderlan | grep -q 'iifname \"gt-site5\" .*maxseg size set 1314'"
+  x site1 "grep -q 'Path MTU to \"site2\" is 1500 bytes (TCP MSS 1406)' /var/log/wanderland.log"
+wait_for 30 "site5 clamps the MSS to 1306 on vx-site2" \
+  x site5 "nft list table bridge wanderlan | grep -q 'oifname \"vx-site2\" .*maxseg size set 1306'"
+check "site5 clamps IPv6 TCP to 1286" \
+  x site5 "nft list table bridge wanderlan | grep -q 'meta protocol ip6 oifname \"vx-site2\" .*maxseg size set 1286'"
+check "site2 clamps SYNs from site5 to 1306 as well" \
+  x site2 "nft list table bridge wanderlan | grep -q 'iifname \"vx-site5\" .*maxseg size set 1306'"
 check "every bridged frame passes one rule: only TCP SYNs go on to the MSS rules" \
-  x site5 "nft list chain bridge wanderlan forward | grep -q 'tcp flags.*jump wl-mss' && ! nft list chain bridge wanderlan forward | grep -q maxseg && nft list chain bridge wanderlan wl-mss | grep -q 'maxseg size set 1314'"
+  x site5 "nft list chain bridge wanderlan forward | grep -q 'tcp flags.*jump wl-mss' && ! nft list chain bridge wanderlan forward | grep -q maxseg && nft list chain bridge wanderlan wl-mss | grep -q 'maxseg size set 1306'"
 
 # Large TCP transfer between the untagged client at site5 (VLAN 20) and site1's client.
 x c-site5 "head -c 100M /dev/urandom > /tmp/data && sha256sum < /tmp/data | cut -d' ' -f1 > /tmp/data.sha"
@@ -39,13 +39,13 @@ if [ -n "$sent" ] && [ "$sent" = "$got" ]; then
 else
   fail "the transferred data differs (sent $sent, received $got)"
 fi
-check "the SYN arrives at site1 with MSS 1314" x c-site1 "grep -q 'mss 1314' /tmp/syn.txt"
+check "the SYN arrives at site1 with MSS 1306" x c-site1 "grep -q 'mss 1306' /tmp/syn.txt"
 
 begin "Fragmentation: inner packets larger than the path still arrive"
 
+expect_ping c-site1 "-M do -s 1472 10.20.0.2" "1500-byte packet with DF set crosses the tunnel"
 frag_before=$(x site1 "nstat -az IpFragCreates | awk '/IpFragCreates/ {print \$2}'")
 reasm_before=$(x site2 "nstat -az IpReasmOKs | awk '/IpReasmOKs/ {print \$2}'")
-expect_ping c-site1 "-M do -s 1472 10.20.0.2" "1500-byte packet with DF set crosses the tunnel"
 x c-site2 "rm -f /tmp/udp; (timeout 10 nc -u -l 5002 > /tmp/udp) >/dev/null 2>&1 & sleep 1"
 x c-site1 "head -c 4000 /dev/zero | tr '\\0' 'x' | timeout 3 nc -u -w 1 10.20.0.2 5002" || true
 sleep 1
@@ -58,7 +58,7 @@ fi
 frag_after=$(x site1 "nstat -az IpFragCreates | awk '/IpFragCreates/ {print \$2}'")
 reasm_after=$(x site2 "nstat -az IpReasmOKs | awk '/IpReasmOKs/ {print \$2}'")
 if [ "${frag_after:-0}" -gt "${frag_before:-0}" ] && [ "${reasm_after:-0}" -gt "${reasm_before:-0}" ]; then
-  pass "GRE packets were fragmented by site1 and reassembled by site2 ($((frag_after - frag_before)) fragments)"
+  pass "the tunnel packets were fragmented by site1 and reassembled by site2 ($((frag_after - frag_before)) fragments)"
 else
-  fail "no GRE fragmentation seen (FragCreates $frag_before -> $frag_after, ReasmOKs $reasm_before -> $reasm_after)"
+  fail "no fragmentation of the tunnel packets seen (FragCreates $frag_before -> $frag_after, ReasmOKs $reasm_before -> $reasm_after)"
 fi

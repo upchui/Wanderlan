@@ -19,10 +19,18 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::{Network, Site, VlanSet};
+use crate::config::{Network, Site, TunnelMode, VlanSet};
 
-/// Prefix of the GRETAP interfaces created by wanderlan.
-pub const GRETAP_PREFIX: &str = "gt-";
+/// Prefix of the tunnel (VXLAN) interfaces created by wanderlan.
+pub const TUNNEL_PREFIX: &str = "vx-";
+/// Prefix of the GRETAP interfaces of older versions (removed on upgrade).
+pub const LEGACY_TUNNEL_PREFIX: &str = "gt-";
+
+/// True for the name of a tunnel interface of wanderlan (also of an older
+/// version).
+pub fn is_tunnel_name(name: &str) -> bool {
+    name.starts_with(TUNNEL_PREFIX) || name.starts_with(LEGACY_TUNNEL_PREFIX)
+}
 
 /// What a tunnel connects, seen from the local site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -45,9 +53,9 @@ pub struct Tunnel<'a> {
 }
 
 impl Tunnel<'_> {
-    /// Name of the GRETAP interface for this tunnel.
+    /// Name of the tunnel interface.
     pub fn ifname(&self) -> String {
-        gretap_name(&self.peer.name)
+        tunnel_name(&self.peer.name)
     }
 
     /// Server-to-server ports are isolated (split horizon); the ports of a
@@ -55,11 +63,21 @@ impl Tunnel<'_> {
     pub fn isolated(&self) -> bool {
         self.kind == TunnelKind::Server
     }
+
+    /// How the tunnel runs: in the mode of the client in it (`own` is this
+    /// site's); servers among each other send directly.
+    pub fn mode(&self, own: TunnelMode) -> TunnelMode {
+        match self.kind {
+            TunnelKind::Server => TunnelMode::Direct,
+            TunnelKind::Uplink => own,
+            TunnelKind::Client => self.peer.tunnel_mode,
+        }
+    }
 }
 
-/// Name of the GRETAP interface towards a peer.
-pub fn gretap_name(peer: &str) -> String {
-    format!("{GRETAP_PREFIX}{peer}")
+/// Name of the tunnel interface towards a peer.
+pub fn tunnel_name(peer: &str) -> String {
+    format!("{TUNNEL_PREFIX}{peer}")
 }
 
 /// True for a server (a site without uplink).
@@ -280,6 +298,7 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
+            tunnel_mode: Default::default(),
             uplink: None,
         }
     }
@@ -324,7 +343,7 @@ mod tests {
             .iter()
             .map(Tunnel::ifname)
             .collect();
-        assert_eq!(names, vec!["gt-buero", "gt-haus2"]);
+        assert_eq!(names, vec!["vx-buero", "vx-haus2"]);
         assert!(tunnels_for(&network, "heim").iter().all(Tunnel::isolated));
         assert_eq!(tunnels_for(&network, "haus2").len(), 2);
         assert!(tunnels_for(&network, "unknown").is_empty());

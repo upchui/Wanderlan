@@ -10,14 +10,12 @@ authors.workspace = true
 
 [dependencies]
 futures-util.workspace = true
-genetlink.workspace = true
 hkdf.workspace = true
 hmac.workspace = true
 humantime.workspace = true
 ipnet.workspace = true
 nftables.workspace = true
 netlink-packet-core.workspace = true
-netlink-packet-generic.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_spanned.workspace = true

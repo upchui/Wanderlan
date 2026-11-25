@@ -196,7 +196,7 @@ mod tests {
     fn map() -> PortMap {
         PortMap {
             bridges: [1].into(),
-            tunnels: [(10, ("gt-lab".to_string(), false))].into(),
+            tunnels: [(10, ("vx-lab".to_string(), false))].into(),
             // 2 is the main trunk port ens19, 3 the further port ens20.
             trunks: [(3, "ens20".to_string())].into(),
         }
@@ -209,9 +209,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_tunnel_goes_before_a_trunk_port() {
-        assert_eq!(moves(map(), 3, 10).await.as_deref(), Some("gt-lab"));
+        assert_eq!(moves(map(), 3, 10).await.as_deref(), Some("vx-lab"));
         // Main trunk and tunnel: the tunnel, as always.
-        assert_eq!(moves(map(), 2, 10).await.as_deref(), Some("gt-lab"));
+        assert_eq!(moves(map(), 2, 10).await.as_deref(), Some("vx-lab"));
     }
 
     #[tokio::test]

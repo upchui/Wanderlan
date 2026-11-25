@@ -45,7 +45,7 @@ x heim "wanderlan online buero --confirm" || exit 1
 
 ok=1
 for _ in $(seq 1 30); do
-  x heim "ip link show gt-buero up | grep -q gt-buero" && break
+  x heim "ip link show vx-buero up | grep -q vx-buero" && break
   sleep 1
 done
 x c-heim "ip link add link trunk0 name trunk0.20 type vlan id 20 && ip addr add 10.20.0.1/24 dev trunk0.20 && ip link set trunk0.20 up"

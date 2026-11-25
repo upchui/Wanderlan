@@ -71,7 +71,7 @@ mod tests {
     fn port(port: &str, vid: u16, rx_bps: u64) -> VlanPortTraffic {
         VlanPortTraffic {
             port: port.into(),
-            peer: port.strip_prefix("gt-").map(str::to_string),
+            peer: port.strip_prefix("vx-").map(str::to_string),
             vid,
             rx_bps,
             tx_bps: rx_bps / 2,
@@ -85,10 +85,10 @@ mod tests {
             note: None,
             ports: vec![
                 port("ens19", 20, 900),
-                port("gt-buero", 10, 100),
-                port("gt-buero", 20, 5000),
-                port("gt-buero", 30, 0),
-                port("gt-haus2", 20, 50),
+                port("vx-buero", 10, 100),
+                port("vx-buero", 20, 5000),
+                port("vx-buero", 30, 0),
+                port("vx-haus2", 20, 50),
             ],
         }
     }
@@ -105,7 +105,7 @@ mod tests {
     fn one_vlan_on_all_ports() {
         let t = traffic();
         let ports: Vec<&str> = vlan_ports(&t, 20).iter().map(|p| p.port.as_str()).collect();
-        assert_eq!(ports, ["gt-buero", "gt-haus2", "ens19"], "the trunk last");
+        assert_eq!(ports, ["vx-buero", "vx-haus2", "ens19"], "the trunk last");
         assert_eq!(vlan_total(&t, 20), (5950, 2975));
         assert_eq!(vlan_ids(&t), [10, 20, 30]);
         assert_eq!(next_vlan(&t, 20, 1), 30);

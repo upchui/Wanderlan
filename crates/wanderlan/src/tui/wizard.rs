@@ -16,7 +16,7 @@ use wanderlan_core::config::{
     validate,
 };
 use wanderlan_core::join;
-use wanderlan_core::{BRIDGE_NAME, topology::GRETAP_PREFIX};
+use wanderlan_core::{BRIDGE_NAME, topology::is_tunnel_name};
 
 use super::form::trunk_candidates;
 use super::input::{Outcome, TextInput};
@@ -420,7 +420,7 @@ impl Wizard {
         if let Some(e) = ifname_error(&trunk) {
             return Err(e);
         }
-        if trunk.starts_with(GRETAP_PREFIX) || trunk == BRIDGE_NAME {
+        if is_tunnel_name(&trunk) || trunk == BRIDGE_NAME {
             return Err(format!("\"{trunk}\" is an interface managed by wanderlan"));
         }
         if self.transport.as_deref() == Some(trunk.as_str()) {
@@ -446,6 +446,7 @@ impl Wizard {
             online: true,
             managed_by: None,
             self_managed: false,
+            tunnel_mode: Default::default(),
             uplink: None,
         });
         let local = Local {

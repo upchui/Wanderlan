@@ -459,7 +459,7 @@ fn a_long_form_hint_wraps() {
     let mut app = connected();
     key(&mut app, KeyCode::Char('2'));
     key(&mut app, KeyCode::Char('n'));
-    // Down to "Connected to", whose hint is longer than a line.
+    // Down to "Tunnel", whose hint is longer than a line.
     for _ in 0..5 {
         key(&mut app, KeyCode::Tab);
     }

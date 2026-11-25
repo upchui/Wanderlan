@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use super::model::{Local, LocalVid, Network};
+use super::model::{Local, LocalVid, Network, TunnelMode};
 
 const NETWORK_HEADER: &str = "\
 # wanderlan network configuration, shared by all sites.
@@ -119,6 +119,9 @@ pub fn render_network(network: &Network) -> String {
             }
             if !site.online {
                 out.push_str("online = false\n");
+            }
+            if site.tunnel_mode != TunnelMode::default() {
+                let _ = writeln!(out, "tunnel_mode = {}", quote(site.tunnel_mode.as_str()));
             }
             if let Some(vlans) = &site.vlans {
                 let _ = writeln!(out, "vlans = {}", quote(&vlans.to_string()));
@@ -226,6 +229,9 @@ fn render_network_inner(network: &Network, with_revision: bool) -> String {
         }
         if site.self_managed {
             out.push_str("self_managed = true\n");
+        }
+        if site.tunnel_mode != TunnelMode::default() {
+            let _ = writeln!(out, "tunnel_mode = {}", quote(site.tunnel_mode.as_str()));
         }
         match &site.uplink {
             Some(up) => {

@@ -6,7 +6,6 @@
 //! tested without root privileges.
 
 pub mod fake;
-pub mod fou;
 pub mod linux;
 pub mod netlink;
 mod netlink_observe;
@@ -19,13 +18,13 @@ pub mod tc;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 /// Error from a system call, with a description of what was attempted.
 #[derive(Debug, thiserror::Error)]
 #[error("{op}: {source}")]
 pub struct SysError {
-    /// What was attempted, e.g. "create GRETAP interface gt-heim".
+    /// What was attempted, e.g. "create VXLAN interface vx-heim".
     pub op: String,
     /// The underlying error.
     #[source]
@@ -66,42 +65,34 @@ pub struct BridgeOptions {
     pub vlan_stats: bool,
 }
 
-/// Parameters of a GRETAP interface.
+/// Parameters of a VXLAN tunnel interface (one per peer site). Every
+/// tunnel sends from any address of this box (the kernel picks it per
+/// packet); where it sends to is its default FDB entry, see
+/// [`NetOps::set_tunnel_remote`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GretapParams {
-    /// Local tunnel address.
-    pub local: Ipv4Addr,
-    /// Remote tunnel address.
-    pub remote: Ipv4Addr,
-    /// Fragment encapsulated packets even if the inner packet has DF set.
-    pub ignore_df: bool,
-    /// Path MTU discovery (DF on the outer header).
-    pub pmtudisc: bool,
-    /// GRE key (the same in both directions); `None` for a tunnel to a
-    /// site without identity.
-    pub key: Option<u32>,
-    /// GRE inside UDP (FOU): the tunnels between a client and its server,
-    /// which pass NAT. `None`: plain GRE.
-    pub encap: Option<FouEncap>,
+pub struct VxlanParams {
+    /// VXLAN network identifier (24 bits), derived from the identities of
+    /// both sites: the kernel drops frames of a box with another one.
+    pub vni: u32,
+    /// The UDP port the tunnel receives on (and sends to by default).
+    pub port: u16,
+    /// A fixed source port, so that a NAT keeps one mapping for the tunnel;
+    /// `None`: one per flow (spreads the load over the receive queues).
+    pub source_port: Option<u16>,
 }
 
-/// The UDP ports of a GRE tunnel inside UDP (FOU, without UDP checksum).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct FouEncap {
-    /// Source port of the packets.
-    pub sport: u16,
-    /// Destination port: the FOU port of the peer, or the port its NAT
-    /// maps the peer's packets to.
-    pub dport: u16,
-}
+/// Where the VXLAN interfaces send to, by index: each address with its
+/// port, `None` where it is the interface's own (the kernel leaves it out
+/// then).
+pub type TunnelRemotes = BTreeMap<u32, Vec<(Ipv4Addr, Option<u16>)>>;
 
 /// Kind of a link as far as wanderlan cares.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkKind {
     /// A bridge with its options.
     Bridge(BridgeOptions),
-    /// A GRETAP tunnel with its parameters.
-    Gretap(GretapParams),
+    /// A VXLAN tunnel with its parameters.
+    Vxlan(VxlanParams),
     /// Anything else; the string is the kernel's kind ("" for physical).
     Other(String),
 }
@@ -214,22 +205,30 @@ pub trait NetOps: Send + Sync {
         options: &BridgeOptions,
     ) -> impl Future<Output = SysResult<()>> + Send;
 
-    /// Creates a GRETAP interface.
-    fn create_gretap(
+    /// Creates a VXLAN interface (without learning, UDP checksum or DF on
+    /// the outer header).
+    fn create_vxlan(
         &self,
         name: &str,
-        params: &GretapParams,
+        params: &VxlanParams,
         mtu: u32,
     ) -> impl Future<Output = SysResult<()>> + Send;
 
-    /// Changes the parameters of a GRETAP interface in place (endpoints,
-    /// key, encapsulation): the interface and its bridge port stay.
-    fn change_gretap(
+    /// Where the VXLAN interfaces send to (their default FDB entry), by
+    /// index: each address with its port, `None` where it is the
+    /// interface's own (the kernel leaves it out then). An interface
+    /// without one is missing.
+    fn tunnel_remotes(&self) -> impl Future<Output = SysResult<TunnelRemotes>> + Send;
+
+    /// Sets or removes where a VXLAN interface sends to, in place: the
+    /// interface and its bridge port stay. `own_port` is the interface's
+    /// port (that of the entries listed without one).
+    fn set_tunnel_remote(
         &self,
         index: u32,
         name: &str,
-        params: &GretapParams,
-        mtu: u32,
+        own_port: u16,
+        remote: Option<SocketAddrV4>,
     ) -> impl Future<Output = SysResult<()>> + Send;
 
     /// Deletes a link.
@@ -272,12 +271,12 @@ pub trait NetOps: Send + Sync {
 
 /// Everything the daemon needs from the system.
 pub trait System:
-    NetOps + tc::TcOps + nft::NftOps + observe::ObserveOps + fou::FouOps + nft_ip::LearnOps
+    NetOps + tc::TcOps + nft::NftOps + observe::ObserveOps + nft_ip::LearnOps
 {
 }
 
 impl<T> System for T where
-    T: NetOps + tc::TcOps + nft::NftOps + observe::ObserveOps + fou::FouOps + nft_ip::LearnOps
+    T: NetOps + tc::TcOps + nft::NftOps + observe::ObserveOps + nft_ip::LearnOps
 {
 }
 

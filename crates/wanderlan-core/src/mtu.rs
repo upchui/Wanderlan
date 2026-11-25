@@ -4,52 +4,36 @@
 //! the DF bit set, using a binary search over the probe size. The TCP MSS for
 //! traffic through the tunnel is derived from it:
 //!
-//! `MSS = PMTU - 20 (outer IPv4) - 4 (GRE) - 18 (Ethernet + VLAN tag) - 40 (inner IPv4 + TCP)`
-//!
-//! A tunnel with a key adds 4 bytes (the GRE key), a tunnel inside UDP
-//! another 8 (see [`overhead`]).
+//! `MSS = PMTU - 20 (outer IPv4) - 8 (UDP) - 8 (VXLAN) - 18 (Ethernet + VLAN tag) - 40 (inner IPv4 + TCP)`
 
 use std::future::Future;
 
 /// Outer IPv4 header.
 pub const OUTER_IP: u16 = 20;
-/// GRE header (no key, no checksum).
-pub const GRE: u16 = 4;
+/// UDP header of the tunnel packets.
+pub const UDP: u16 = 8;
+/// VXLAN header.
+pub const VXLAN: u16 = 8;
 /// Inner Ethernet header plus one VLAN tag.
 pub const ETHERNET_VLAN: u16 = 18;
 /// Inner IPv4 and TCP headers.
 pub const INNER_IP_TCP: u16 = 40;
 /// Additional header size of IPv6 compared to IPv4.
 pub const IPV6_EXTRA: u16 = 20;
-/// Total overhead between path MTU and MSS (a tunnel without key).
-pub const MSS_OVERHEAD: u16 = OUTER_IP + GRE + ETHERNET_VLAN + INNER_IP_TCP;
-/// The GRE key field.
-pub const GRE_KEY: u16 = 4;
-/// The UDP header of a tunnel inside UDP (FOU).
-pub const UDP: u16 = 8;
-
-/// Overhead between path MTU and MSS of a tunnel: with a GRE key, inside UDP.
-pub const fn overhead(key: bool, udp: bool) -> u16 {
-    MSS_OVERHEAD + if key { GRE_KEY } else { 0 } + if udp { UDP } else { 0 }
-}
+/// Total overhead between path MTU and MSS.
+pub const MSS_OVERHEAD: u16 = OUTER_IP + UDP + VXLAN + ETHERNET_VLAN + INNER_IP_TCP;
 
 /// Smallest probe size (minimum IPv4 MTU).
 pub const PROBE_MIN: u16 = 576;
 /// Largest probe size worth testing: a full 1500-byte inner packet plus all
-/// encapsulation headers (also key and UDP). Paths at least this large never
-/// fragment.
-pub const PROBE_MAX: u16 = 1500 + ETHERNET_VLAN + GRE + GRE_KEY + UDP + OUTER_IP;
+/// encapsulation headers. Paths at least this large never fragment.
+pub const PROBE_MAX: u16 = 1500 + ETHERNET_VLAN + VXLAN + UDP + OUTER_IP;
 /// Largest MSS that makes sense with the 1500-byte inner MTU.
 pub const MSS_LIMIT: u16 = 1500 - INNER_IP_TCP;
 
-/// IPv4 MSS for a path MTU through a tunnel without key.
+/// IPv4 MSS for a path MTU through a tunnel.
 pub fn mss_for_pmtu(pmtu: u16) -> u16 {
-    mss_with(pmtu, MSS_OVERHEAD)
-}
-
-/// IPv4 MSS for a path MTU through a tunnel with this [`overhead`].
-pub fn mss_with(pmtu: u16, overhead: u16) -> u16 {
-    pmtu.saturating_sub(overhead).min(MSS_LIMIT)
+    pmtu.saturating_sub(MSS_OVERHEAD).min(MSS_LIMIT)
 }
 
 /// IPv6 MSS corresponding to an IPv4 MSS.
@@ -384,20 +368,14 @@ mod tests {
 
     #[test]
     fn mss_formula() {
-        assert_eq!(MSS_OVERHEAD, 82);
-        assert_eq!(mss_for_pmtu(1500), 1418);
-        assert_eq!(mss_for_pmtu(1400), 1318);
-        assert_eq!(mss_for_pmtu(PROBE_MAX), 1460);
-        assert_eq!(mss_for_pmtu(9000), 1460);
-        assert_eq!(mss_ipv6(1318), 1298);
+        assert_eq!(MSS_OVERHEAD, 94);
+        assert_eq!(mss_for_pmtu(1500), 1406);
+        assert_eq!(mss_for_pmtu(1400), 1306);
+        assert_eq!(mss_ipv6(1306), 1286);
         assert_eq!(PROBE_MAX, 1554);
-        assert_eq!(overhead(false, false), 82);
-        assert_eq!(overhead(true, false), 86);
-        assert_eq!(overhead(true, true), 94);
-        assert_eq!(mss_with(1500, overhead(true, false)), 1414);
-        assert_eq!(mss_with(1500, overhead(true, true)), 1406);
-        // Full-size inner frames fit through every kind of tunnel.
-        assert_eq!(mss_with(PROBE_MAX, overhead(true, true)), MSS_LIMIT);
+        // Full-size inner frames fit through a path this large.
+        assert_eq!(mss_for_pmtu(PROBE_MAX), MSS_LIMIT);
+        assert_eq!(mss_for_pmtu(9000), MSS_LIMIT);
     }
 
     #[test]

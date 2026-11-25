@@ -62,11 +62,11 @@ What that means:
 * A connection between the sites. wanderlan does **not** build a VPN: the
   boxes must already reach each other, usually through a VPN such as
   WireGuard, Tailscale or the site-to-site VPN of the firewall. The VPN also
-  encrypts the traffic; wanderlan's tunnels (GRE) are not encrypted. GRE and
-  UDP/TCP port 51821 must pass through it.
+  encrypts the traffic; wanderlan's tunnels (VXLAN) are not encrypted. UDP
+  and TCP port 51821 and UDP port 51822 must pass through it.
 
 Under the hood each site runs a small daemon (`wanderland`) with a
-VLAN-aware Linux bridge and GRETAP tunnels to the other sites, and a terminal
+VLAN-aware Linux bridge and VXLAN tunnels to the other sites, and a terminal
 UI (`wanderlan`) to set it up and watch it; see [Concepts](#concepts) and
 [How it works](#how-it-works).
 
@@ -96,13 +96,13 @@ UI (`wanderlan`) to set it up and watch it; see [Concepts](#concepts) and
   must not be part of another bridge or bond.
 * An **existing transport network** in which every site has an IPv4 address.
   * **Servers** must reach each other and be reachable by their clients:
-    GRE (IP protocol 47) between the servers, UDP and TCP on the control
-    port (default 51821: probes, configuration sync, joining) and UDP on the
-    tunnel port (default 51822: the tunnels of the clients).
+    UDP and TCP on the control port (default 51821: probes, configuration
+    sync, joining) and UDP on the tunnel port (default 51822: the tunnels,
+    VXLAN).
   * **Clients** only need to reach their server, outgoing: TCP and UDP to
     its control port, UDP to its tunnel port. A client may sit behind NAT,
     several behind the same one (see [Clients behind NAT](#clients-behind-nat)).
-* The kernel modules `bridge`, `ip_gre`, `fou`, `sch_ingress`, `cls_flower`,
+* The kernel modules `bridge`, `vxlan`, `sch_ingress`, `cls_flower`,
   `act_vlan`, `act_gact` and `nf_tables` (standard kernels have them; the
   service loads them when it starts).
 
@@ -243,18 +243,28 @@ router or on a mobile connection with a changing public address; several
 clients behind the same NAT share its address and are told apart by their
 identity.
 
-The tunnel between a client and its server runs **inside UDP** (GRE in UDP,
-FOU, on the tunnel port 51822), because a NAT passes GRE for one box at most,
-if at all. Every 15 s the client sends a small keepalive frame through its
-tunnel; it keeps the NAT's mapping open and shows the server which address
-and port the NAT uses for the client (nftables table `ip wanderlan`). When
-the NAT changes the port (it forgot the mapping, the router restarted), the
-server follows with the next keepalive; the tunnel is changed in place.
-Where connection tracking is loaded (a firewall), a server exempts the
-tunnel packets from it (`notrack`, table `ip wanderlan`): tracking them
-would cost every packet. A stateful firewall on a server must therefore
-accept UDP to the tunnel port by its port, not only as an established
-connection.
+Every tunnel is **VXLAN** on the tunnel port (UDP 51822), one interface per
+neighbour. How the tunnel between a client and its server runs is the
+client's **tunnel mode** (`tunnel_mode` in `network.toml`, `wanderlan
+tunnel-mode <client> nat|direct`, or the site form in the terminal UI):
+
+* **`nat`** (the default, also right after joining): the client may sit
+  behind NAT. It sends from the tunnel port, and every 15 s a small
+  keepalive frame through its tunnel; that keeps the NAT's mapping open and
+  shows the server which address and port the NAT uses for the client
+  (nftables table `ip wanderlan`). When the NAT changes the port (it forgot
+  the mapping, the router restarted), the server follows with the next
+  keepalive, in place.
+* **`direct`**: the client is reachable at its address (the same LAN, a
+  public address, a VPN). Its server sends there directly, both ends from a
+  source port per connection, which spreads the load over the receive
+  queues of the network cards; no keepalives, nothing to learn.
+
+Between servers the tunnels always run `direct`. Where connection tracking
+is loaded (a firewall), a server with clients behind NAT exempts the tunnel
+packets from it (`notrack`, table `ip wanderlan`): tracking them would cost
+every packet. A stateful firewall on such a server must therefore accept UDP
+to the tunnel port by its port, not only as an established connection.
 
 A site with clients of its own must be reachable for them, so it cannot sit
 behind NAT itself. A carrier-grade NAT that gives the control traffic and the
@@ -351,9 +361,9 @@ public key; `wanderlan status` shows it, the terminal UI its first
 characters. The two sites of a tunnel derive the keys of that tunnel from
 their identities; no key travels over the network or is written to a file:
 
-* the **GRE key** of the tunnel: the kernel drops tunnel packets with
-  another key, so a second box at the same address (behind the same NAT)
-  or a cloned machine does not get into the network;
+* the **VNI** of the tunnel (24 bits): the kernel drops tunnel packets
+  with another one, so a second box at the same address (behind the same
+  NAT) or a cloned machine does not get into the network;
 * the **probe key**: every control probe carries a tag, and a tunnel comes
   up only once the other site has answered with its key ("identity
   confirmed"). A box at its address that answers with another key keeps the
@@ -371,13 +381,15 @@ reset` on it first. Identities are never edited by hand: a `network.toml`
 written without the `id` lines keeps them.
 
 The keys **authenticate, they do not encrypt**: the traffic between the
-sites is only as private as the transport network (the VPN). The GRE key is
+sites is only as private as the transport network (the VPN). The VNI is
 visible in every packet; it tells boxes apart but does not stop someone who
 can see the traffic.
 
-Sites of older versions have no identity: tunnels to them have no key and
-their probes and sync are not authenticated until they are updated (update
-all sites; an older version cannot read a `network.toml` with identities).
+Until a site knows the identity of a neighbour (right after an update, for
+a moment), their tunnel takes a VNI from the two names and comes up without
+proof of identity; probes and sync are not authenticated then. Sites of
+older versions run GRE and get no tunnel until they are updated (update all
+sites).
 
 ### Online, offline and confirmed changes
 
@@ -458,9 +470,9 @@ or `wanderlan trunk <site> ens20` / `ens20,ens21` (`default` to undo).
 ```
 hq
   ens19 ─┐
-  ens22 ─┴ br0 ───────┬── gt-office ══ office
-                      └── gt-lab    ══ lab
-  ens20 ── wl-ens20 ───── gt-dc     ══ dc
+  ens22 ─┴ br0 ───────┬── vx-office ══ office
+                      └── vx-lab    ══ lab
+  ens20 ── wl-ens20 ───── vx-dc     ══ dc
 ```
 
 **Watch the traffic of one VLAN.** Overview (`1`), `Enter` on a neighbour:
@@ -473,9 +485,8 @@ site passes it on. `m` shows its MAC table. CLI: `wanderlan vlan 20`.
 
 **Start over on a site.** Setup (`6`), `R`, or `sudo wanderlan reset`: the
 bridges, tunnels, all rules, the configuration and the invitations are
-removed and the site is unconfigured again, like after the installation
-(also the kernel's `gre0`/`gretap0`/`erspan0` when it runs as root outside a
-container and no other GRE tunnel needs them). Join again with a new
+removed and the site is unconfigured again, like after the installation.
+Join again with a new
 invitation; a client that joins through another site becomes that site's
 client. If the site leaves for good, delete it on its server (Sites, `d`).
 
@@ -559,9 +570,10 @@ sites with older and newer versions keep working together.
 | `network.mtu_probe_interval` | `5m` | Interval of the path MTU measurement (at least 10 s). |
 | `network.mss` | unset | Fixed TCP MSS (536 to 1460) instead of the measured value. |
 | `network.control_port` | `51821` | UDP and TCP port of the daemons on the site addresses. |
-| `network.tunnel_port` | control port + 1 (`51822`) | UDP port of the tunnels between a client and its server (GRE in UDP). |
+| `network.tunnel_port` | control port + 1 (`51822`) | UDP port of the tunnels (VXLAN). |
+| `site.<name>.tunnel_mode` | `nat` | Only for a client: `nat` (it may sit behind NAT; its server answers only) or `direct` (its server sends to its address). See [Clients behind NAT](#clients-behind-nat). |
 | `network.revision` | `0` | Revision counter of the sync; raised by the daemon. |
-| `[site.<name>]` | | One table per site. The name is unique; `a-z`, `0-9` and `-`, at most 12 characters (it is part of the interface name `gt-<name>`). |
+| `[site.<name>]` | | One table per site. The name is unique; `a-z`, `0-9` and `-`, at most 12 characters (it is part of the interface name `vx-<name>`). |
 | `site.<name>.address` | | Unique IPv4 address of the site in the transport network. |
 | `site.<name>.server` | none | The site this one is a client of; none: a server. |
 | `site.<name>.managed_by` | none | The site that manages this one (the inviting site). |
@@ -597,9 +609,10 @@ client of its manager.
 
 The daemon creates, and removes again whenever the service ends (a stop,
 an update, a crash or a kill: systemd then runs `wanderland --cleanup`, and
-once more before every start in case that could not run; it also unloads
-the kernel module `ip_gre` and with it its devices `gre0`, `gretap0` and
-`erspan0`, unless another GRE tunnel uses it or this is a container):
+once more before every start in case that could not run; after an update
+from an older version it also unloads the kernel module `ip_gre` of its GRE
+tunnels and with it its devices `gre0`, `gretap0` and `erspan0`, unless
+something else uses it or this is a container):
 
 * `br0`: a bridge with VLAN filtering, STP off, no default VLAN and no
   netfilter calls of its own (if `br_netfilter` is loaded, e.g. by Docker,
@@ -610,15 +623,16 @@ the kernel module `ip_gre` and with it its devices `gre0`, `gretap0` and
   anew once (a short interruption); on a kernel without them the bridge
   stays as it is and the traffic per VLAN is not shown;
 * `wl-<interface>`: the same for every further trunk ("trunk per tunnel");
-* `gt-<peer>`: a GRETAP tunnel (`ignore-df`, `nopmtudisc`, MTU 1500, with
-  the GRE key of the two identities) to its
-  server, to each of its clients and, on a server, to every other server;
-  between a client and its server inside UDP (FOU, without UDP checksum, so
-  the kernel's GSO and GRO for UDP tunnels apply), the client from any of its
-  addresses (`local any`). The
-  ports between servers are `isolated` (split horizon: a frame from one
-  server is never forwarded to another server); the ports of clients and
-  uplinks are ordinary ports, a tree that is loop-free by itself;
+* `vx-<peer>`: a VXLAN tunnel (UDP 51822, the VNI of the two identities,
+  no learning, no UDP checksum and no DF outside, MTU 1500) to its server,
+  to each of its clients and, on a server, to every other server. It sends
+  from any address of the box; where to is its default FDB entry
+  (`bridge fdb show dev vx-<peer>`: `00:00:00:00:00:00 dst …`), for a client
+  behind NAT the address and port its packets come from. In `nat` mode
+  both ends send from the tunnel port, otherwise from a port per
+  connection. The ports between servers are `isolated` (split horizon: a
+  frame from one server is never forwarded to another server); the ports of
+  clients and uplinks are ordinary ports, a tree that is loop-free by itself;
 * the VLANs of the site on the trunk (VLAN 1 untagged as the native VLAN) and
   on every tunnel the VLANs both ends take part in;
 * tc `clsact` filters on the trunk for translations (recognised by their
@@ -628,14 +642,18 @@ the kernel module `ip_gre` and with it its devices `gre0`, `gretap0` and
 * the nftables table `bridge wanderlan` for MSS clamping: every bridged
   frame of the host passes one rule there, only TCP SYNs go on to the MSS
   rules (chain `wl-mss`);
-* with client tunnels: the FOU port (`ip fou show`, UDP 51822) and, on a
-  server, the nftables table `ip wanderlan`: a tunnel packet to that port
-  costs one compare of its inner ethertype (data frames always carry a VLAN
-  tag), only the keepalives of the clients go on and put their source
-  address and port into the set of their client (`ep-<client>`).
+* with tunnels in `nat` mode: the nftables table `ip wanderlan`. Both ends
+  send from the tunnel port: the VXLAN interface sends from it or the port
+  above (Linux includes the upper end of a port range since March 2026), and
+  a rule in output (chain `out`) puts the tunnel port back into the packets
+  of these tunnels (by their VNI). On the server a tunnel packet to the
+  tunnel port costs one compare of its inner ethertype (data frames always
+  carry a VLAN tag); only the keepalives of the clients go on and put their
+  source address and port into the set of their client (`ep-<client>`,
+  recognised by the VNI).
 
 Everything it creates carries the interface alias `wanderlan`; foreign
-interfaces are never touched (a foreign `br0` or `gt-*` stops the
+interfaces are never touched (a foreign `br0` or `vx-*` stops the
 configuration with an error). After a restart it adopts what is there
 without changes. After a topology change it flushes the learned MAC
 addresses, again after 10 s and 30 s while the other sites follow.
@@ -678,12 +696,11 @@ probes that have the DF bit set: at start, every `mtu_probe_interval` and
 when a neighbour becomes reachable again. TCP SYNs entering or leaving a
 tunnel port are clamped to
 
-`MSS = path MTU − 20 (outer IP) − 4 (GRE) − 4 (GRE key) − 18 (Ethernet + VLAN tag) − 40 (inner IP + TCP)`
+`MSS = path MTU − 20 (outer IP) − 8 (UDP) − 8 (VXLAN) − 18 (Ethernet + VLAN tag) − 40 (inner IP + TCP)`
 
-(a tunnel inside UDP, between a client and its server: 8 bytes less; a
-tunnel to a site without identity has no key: 4 bytes more; IPv6: 20 bytes
-less; ports without a measurement use the smallest measured path). GRE fragmentation stays on as a safety net, so non-TCP packets larger
-than the path still arrive.
+(IPv6: 20 bytes less; ports without a measurement use the smallest measured
+path). Larger packets still arrive, also with DF set: the tunnel packets are
+fragmented on the way (no DF outside) and put together at the other end.
 
 ### Loops
 
@@ -699,7 +716,7 @@ passes VLANs on between servers uses nftables rules (`wl split` in table
 The loop guard watches the forwarding database of every bridge: if a MAC
 address keeps moving between the trunk and a tunnel, or between two tunnels
 (5 times within 10 s), it shuts the tunnel port down (never the trunk),
-logs it and shows it in the TUI until `wanderlan unblock gt-<site>` (`u` in
+logs it and shows it in the TUI until `wanderlan unblock vx-<site>` (`u` in
 the TUI) or the configuration changes.
 
 ### Operation
@@ -758,6 +775,7 @@ its last log lines and keeps trying.
 | `wanderlan invite list` / `wanderlan invite delete <code>` | Open invitations of this site |
 | `wanderlan join <address>[:port] <code> [--name N] [--trunk IF]` | Join a network (on an unconfigured site) |
 | `wanderlan online <site>` / `wanderlan offline <site>` | Take a site online or offline |
+| `wanderlan tunnel-mode <client> nat\|direct` | How the tunnel of a client to its server runs (`nat`: it may sit behind NAT; `direct`: its server sends to its address) |
 | `wanderlan manage <site> [--by S] [--self-managed yes\|no]` | Who may change (and rename) a site |
 | `wanderlan rename <site> <new-name>` | Rename a site: this site always, a site it manages too |
 | `wanderlan role <site> server\|client <server>` | Make a site a server or a client |
@@ -794,9 +812,9 @@ or `WANDERLAN_SOCKET`.
   server (Sites, `o`).
 * **Tunnel up but no traffic in a VLAN**: the VLAN must be one of the VLANs of
   both ends (`status` shows the VLANs per tunnel; for two clients also their
-  server's), and the switch port or VM must carry it tagged. GRE (IP protocol
-  47) must pass between the site addresses in both directions:
-  `tcpdump -ni any proto gre`.
+  server's), and the switch port or VM must carry it tagged. UDP to the
+  tunnel port (51822) must pass between the site addresses:
+  `tcpdump -ni any udp port 51822`.
 * **Untagged clients get nothing (e.g. no DHCP)**: the site must take part in
   `native` (the default "all" does), or put its untagged traffic into a VLAN
   with a mapping. On Proxmox, switch off the firewall (or its MAC filter) on
@@ -824,7 +842,7 @@ or `WANDERLAN_SOCKET`.
 * **Large transfers stall**: compare the path MTU in `wanderlan status` with
   the MTU of the VPN; set `mss` if probes are filtered.
 * **A port is BLOCKED**: the loop guard found a loop through another layer-2
-  path between sites; remove it, then `wanderlan unblock gt-<site>`.
+  path between sites; remove it, then `wanderlan unblock vx-<site>`.
 * **A change was rolled back**: confirm within the commit timeout (`c`,
   `wanderlan confirm`).
 * **A change did not arrive at a site**: `wanderlan log` there and on its
@@ -840,18 +858,24 @@ or `WANDERLAN_SOCKET`.
 ## Project decisions
 
 * **No VPN inside wanderlan.** Transport and encryption belong to the existing
-  VPN; wanderlan only does layer 2 and VLANs, and GRE runs unencrypted on top
-  of that trusted network.
-* **The client opens every flow.** A server never contacts a client first,
-  so clients work behind NAT; the tunnels between a client and its server run
-  inside UDP (FOU) and the server learns the NAT's port from the client's
-  keepalives in the kernel (nftables), so nothing per packet runs in user
-  space. Between servers, which reach each other, plain GRE with a key.
+  VPN; wanderlan only does layer 2 and VLANs, and VXLAN runs unencrypted on
+  top of that trusted network.
+* **VXLAN for every tunnel.** L2 over UDP that every kernel segments and
+  aggregates (GSO/GRO) and many network cards offload, through NAT as well.
+  GRE inside UDP (FOU) was the first try: on kernels before October 2026
+  (Debian 13 among them) GRO loses the UDP tunnel type of aggregated GRE
+  packets and the kernel drops them, which cut a 10 Gbit/s LAN down to
+  13 Mbit/s.
+* **The client opens every flow (`nat`).** A server never contacts a client
+  in `nat` mode first, so clients work behind NAT; the server learns the
+  NAT's port from the client's keepalives in the kernel (nftables), so
+  nothing per packet runs in user space. A client that is reachable runs
+  `direct`, like the servers among each other.
 * **A site is a box with a key, not an address.** Every box has an X25519
   identity; the keys of a tunnel are derived from the two identities
   (Diffie-Hellman, HKDF-SHA256), so they never travel and no third site knows
-  them. They authenticate the probes, the sync and (as GRE key) the tunnel
-  packets; they cost nothing per packet but the kernel's key compare.
+  them. They authenticate the probes, the sync and (as VNI) the tunnel
+  packets; they cost nothing per packet.
 * **Servers and clients, like plugging switches together.** Roles are not
   configured up front: a site that joins is a client of the site that invited
   it and only has to reach it; servers are all connected with each other,
@@ -877,12 +901,12 @@ or `WANDERLAN_SOCKET`.
   the client tunnels).
 * **MSS clamping on entering and leaving SYNs** per tunnel port, so both
   directions get the smaller value.
-* **netlink everywhere except nftables**: links, bridges, VLANs, GRETAP and tc
+* **netlink everywhere except nftables**: links, bridges, VLANs, VXLAN with its FDB entry and tc
   use rtnetlink; nftables is driven through its JSON interface (the
   `nftables` crate, hence the dependency on the `nftables` package; a test
   guards a workaround for swapped `<`/`>` in its 0.6.3 release).
-* **Fixed interface names** `br0`, `wl-<interface>` and `gt-<site>`; site
-  names have at most 12 characters so that `gt-<site>` fits.
+* **Fixed interface names** `br0`, `wl-<interface>` and `vx-<site>`; site
+  names have at most 12 characters so that `vx-<site>` fits.
 
 Open questions are collected in [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md).
 

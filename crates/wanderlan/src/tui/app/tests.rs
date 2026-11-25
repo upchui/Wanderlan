@@ -970,7 +970,7 @@ fn the_vlan_history_follows_the_answers() {
     }
     let samples = app.vlan_history.get(&20).expect("VLAN 20");
     assert_eq!(samples.len(), 3);
-    // All ports: gt-buero 2.4M + gt-haus2 300k + ens19 2.1M in.
+    // All ports: vx-buero 2.4M + vx-haus2 300k + ens19 2.1M in.
     assert_eq!(samples[0].rx_bps, 4_800_000);
 }
 

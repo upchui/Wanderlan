@@ -86,7 +86,7 @@ fn peer(name: &str, address: &str) -> PeerStatus {
     PeerStatus {
         name: name.into(),
         address: address.into(),
-        port: format!("gt-{name}"),
+        port: format!("vx-{name}"),
         port_state: PortState::Up,
         vlans: "10-50".into(),
         trunk: "ens19".into(),
@@ -118,7 +118,8 @@ fn peer(name: &str, address: &str) -> PeerStatus {
         refused: None,
         identity: Some(format!("{}Ab3dE", &name[..name.len().min(3)])),
         identity_state: Some(wanderlan_core::api::IdentityState::Confirmed),
-        tunnel: wanderlan_core::api::TunnelKindLabel::GreKey,
+        tunnel: wanderlan_core::config::TunnelMode::Direct,
+        vni: Some(0x12_3456),
         endpoint: None,
     }
 }
@@ -134,6 +135,7 @@ pub fn summary(name: &str, address: &str, vlans: &str) -> SiteSummary {
         uplink: (name == "haus6").then(|| "heim".to_string()),
         via: None,
         id: None,
+        tunnel_mode: (name == "haus6").then_some(wanderlan_core::config::TunnelMode::Nat),
     }
 }
 
@@ -209,7 +211,7 @@ pub fn status() -> Status {
             summary("haus5", "10.8.0.15", "10-50"),
             summary("haus6", "10.8.0.16", "10-50"),
         ],
-        blocked: vec!["gt-haus2".into()],
+        blocked: vec!["vx-haus2".into()],
         invites: 1,
         trunk_traffic: None,
         trunks: Vec::new(),
@@ -267,7 +269,7 @@ pub fn interfaces() -> Vec<Interface> {
         iface("eth1", "", false, Some("br-lan"), false),
         iface("br-lan", "bridge", true, None, false),
         iface("br0", "bridge", true, None, true),
-        iface("gt-buero", "gretap", true, Some("br0"), true),
+        iface("vx-buero", "vxlan", true, Some("br0"), true),
     ]
 }
 
@@ -276,7 +278,7 @@ pub fn interfaces() -> Vec<Interface> {
 pub fn vlan_traffic() -> VlanTraffic {
     let port = |port: &str, vid: u16, rx_bps: u64, tx_bps: u64| VlanPortTraffic {
         port: port.into(),
-        peer: port.strip_prefix("gt-").map(str::to_string),
+        peer: port.strip_prefix("vx-").map(str::to_string),
         vid,
         rx_bps,
         tx_bps,
@@ -292,11 +294,11 @@ pub fn vlan_traffic() -> VlanTraffic {
             port("ens19", 10, 64_000, 120_000),
             port("ens19", 20, 2_100_000, 2_700_000),
             port("ens19", 30, 0, 9_000),
-            port("gt-buero", 10, 56_000, 64_000),
-            port("gt-buero", 20, 2_400_000, 1_800_000),
-            port("gt-buero", 30, 0, 0),
-            port("gt-haus2", 20, 300_000, 300_000),
-            port("gt-haus2", 30, 9_000, 0),
+            port("vx-buero", 10, 56_000, 64_000),
+            port("vx-buero", 20, 2_400_000, 1_800_000),
+            port("vx-buero", 30, 0, 0),
+            port("vx-haus2", 20, 300_000, 300_000),
+            port("vx-haus2", 30, 9_000, 0),
         ],
     }
 }
@@ -313,12 +315,12 @@ fn mac(mac: &str, vlan: Option<u16>, port: &str, age: Option<u64>) -> MacEntry {
 /// A small MAC table.
 pub fn macs() -> Vec<MacEntry> {
     vec![
-        mac("52:54:00:12:34:56", Some(20), "gt-buero", Some(12)),
+        mac("52:54:00:12:34:56", Some(20), "vx-buero", Some(12)),
         mac("02:00:00:00:00:01", Some(10), "ens19", Some(0)),
-        mac("52:54:00:ab:cd:ef", Some(20), "gt-haus2", Some(45)),
-        mac("52:54:00:aa:00:01", Some(30), "gt-buero", Some(130)),
+        mac("52:54:00:ab:cd:ef", Some(20), "vx-haus2", Some(45)),
+        mac("52:54:00:aa:00:01", Some(30), "vx-buero", Some(130)),
         mac("3c:ec:ef:00:11:22", None, "ens19", None),
-        mac("de:ad:be:ef:00:01", Some(10), "gt-haus5", Some(5)),
+        mac("de:ad:be:ef:00:01", Some(10), "vx-haus5", Some(5)),
     ]
 }
 
@@ -335,7 +337,7 @@ pub fn events() -> Vec<Event> {
     };
     vec![
         ev(0, Level::Info, None, "daemon started, network revision 7"),
-        ev(2, Level::Info, Some("buero"), "tunnel gt-buero is up"),
+        ev(2, Level::Info, Some("buero"), "tunnel vx-buero is up"),
         ev(
             3,
             Level::Info,
@@ -352,7 +354,7 @@ pub fn events() -> Vec<Event> {
             130,
             Level::Error,
             Some("haus2"),
-            "loop detected on gt-haus2: own frames came back; the port is blocked",
+            "loop detected on vx-haus2: own frames came back; the port is blocked",
         ),
         ev(
             400,

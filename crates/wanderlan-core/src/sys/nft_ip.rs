@@ -1,11 +1,11 @@
 //! Where the clients of this site are: the nftables table `ip wanderlan`.
 //!
-//! A client behind NAT sends its tunnel packets (GRE in UDP) from a port the
-//! NAT chooses; to answer, its server needs that port. Every few seconds the
+//! A client behind NAT sends its tunnel packets (VXLAN) from a port the NAT
+//! chooses; to answer, its server needs that port. Every few seconds the
 //! client sends a keepalive frame through its tunnel (untagged, ethertype
 //! `0x88b5`, see [`crate::nat`]); a rule in prerouting puts the source
 //! address and port of such a packet into the set of that client, recognised
-//! by the GRE key of its tunnel. The daemon reads the sets.
+//! by the VNI of its tunnel. The daemon reads the sets.
 //!
 //! Cheap for the traffic: every tunnel data frame carries a VLAN tag
 //! (`0x8100`), so the inner ethertype compare stops it after one look; only
@@ -13,6 +13,16 @@
 //! sets survive a rewrite of the rules (only the chains are flushed). Where
 //! connection tracking is loaded, the tunnel packets skip it (`notrack`):
 //! tracking them would cost every packet and gain nothing.
+//!
+//! Through NAT both ends of a tunnel must send from the tunnel port: a NAT
+//! keeps one mapping per source port, and the answers must reach the port
+//! the tunnel listens on. A VXLAN interface cannot send from one fixed port
+//! (since Linux fixed an off-by-one in March 2026 its port range includes
+//! the upper end, and a range of one port means "any"), so it gets the
+//! range of the tunnel port and the one above, and a rule in output puts
+//! the tunnel port back into the packets of these tunnels (by their VNI;
+//! one compare for the other packets, none where the kernel only uses the
+//! lower end).
 //!
 //! The table is written in the syntax of `nft -f` (the JSON of nftables
 //! 1.0, Debian 12, knows no dynamic sets); it is read back as JSON.
@@ -38,6 +48,8 @@ const LEARN_CHAIN: &str = "wl-learn";
 const OUT_CHAIN: &str = "out";
 /// Comment of the rules that exempt the tunnel packets from tracking.
 const NOTRACK: &str = "wl notrack";
+/// Comment prefix of the rules that set the source port: port and VNI.
+const FIXED_PREFIX: &str = "wl fixed ";
 /// Prefix of the set of one client.
 const SET_PREFIX: &str = "ep-";
 /// How long a learned endpoint stays without a new keepalive.
@@ -46,28 +58,27 @@ pub const ENDPOINT_TIMEOUT_SECS: u32 = 90;
 const SET_SIZE: u32 = 8;
 /// Ethertype of the keepalive frames (IEEE local experimental).
 pub const KEEPALIVE_ETHERTYPE: u16 = 0x88b5;
-/// The GRE header of a tunnel with a key: flags (key present) and protocol
-/// (transparent Ethernet bridging).
-const GRE_WITH_KEY: u32 = 0x2000_6558;
-// Offsets in bits from the start of the UDP header: 8 bytes UDP, 4 bytes
-// GRE flags and protocol, 4 bytes key, then the inner Ethernet header (two
-// MAC addresses before the ethertype).
-const OFFSET_GRE: u32 = 64;
-const OFFSET_KEY: u32 = 96;
+/// The flags of a VXLAN header: the VNI is valid.
+const VXLAN_FLAGS: u8 = 0x08;
+// Offsets in bits from the start of the UDP header: 8 bytes UDP, the VXLAN
+// header (1 byte flags, 3 reserved, 3 bytes VNI, 1 reserved), then the
+// inner Ethernet header (two MAC addresses before the ethertype).
+const OFFSET_FLAGS: u32 = 64;
+const OFFSET_VNI: u32 = 96;
 const OFFSET_ETHERTYPE: u32 = 224;
 
-/// One client whose endpoint is learned: by the GRE key of its tunnel.
+/// One client whose endpoint is learned: by the VNI of its tunnel.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LearnRule {
     /// The client site.
     pub client: String,
-    /// The GRE key of its tunnel.
-    pub key: u32,
+    /// The VNI of its tunnel.
+    pub vni: u32,
 }
 
 impl LearnRule {
     fn comment(&self) -> String {
-        format!("wl learn {} {}", self.client, self.key)
+        format!("wl learn {} {}", self.client, self.vni)
     }
 
     fn from_comment(comment: &str) -> Option<Self> {
@@ -76,8 +87,8 @@ impl LearnRule {
             return None;
         }
         let client = parts.next()?.to_string();
-        let key = parts.next()?.parse().ok()?;
-        parts.next().is_none().then_some(Self { client, key })
+        let vni = parts.next()?.parse().ok()?;
+        parts.next().is_none().then_some(Self { client, vni })
     }
 
     fn set(&self) -> String {
@@ -96,6 +107,10 @@ pub struct LearnState {
     pub sets: BTreeSet<String>,
     /// The tunnel packets skip connection tracking.
     pub notrack: bool,
+    /// The tunnels (by VNI) whose packets get the tunnel port as source.
+    pub fixed: BTreeSet<u32>,
+    /// The tunnel port of these rules.
+    pub fixed_port: Option<u16>,
 }
 
 /// One learned endpoint.
@@ -114,12 +129,14 @@ pub trait LearnOps: Send + Sync {
 
     /// Writes the gate for `port` and the rules (the sets of other clients
     /// go, the others keep their entries); with `notrack`, the tunnel
-    /// packets to and from `port` skip connection tracking.
+    /// packets to and from `port` skip connection tracking; the packets of
+    /// the tunnels in `fixed` (VNIs) get `port` as source port.
     fn set_learn(
         &self,
         port: u16,
         rules: &BTreeSet<LearnRule>,
         notrack: bool,
+        fixed: &BTreeSet<u32>,
     ) -> impl Future<Output = SysResult<()>> + Send;
 
     /// Deletes the table.
@@ -137,6 +154,7 @@ pub fn learn_script(
     port: u16,
     rules: &BTreeSet<LearnRule>,
     notrack: bool,
+    fixed: &BTreeSet<u32>,
     stale_sets: &BTreeSet<String>,
 ) -> String {
     let t = format!("ip {TABLE}");
@@ -175,16 +193,26 @@ pub fn learn_script(
             "add rule {t} {OUT_CHAIN} udp sport {port} notrack comment \"{NOTRACK}\""
         );
     }
+    // The source port of the tunnels through NAT (see the module doc).
+    let upper = port.saturating_add(1);
+    for vni in fixed {
+        let _ = writeln!(
+            out,
+            "add rule {t} {OUT_CHAIN} udp sport {upper} @th,{OFFSET_FLAGS},8 {VXLAN_FLAGS:#04x} @th,{OFFSET_VNI},24 {vni} udp sport set {port} comment \"{FIXED_PREFIX}{port} {vni}\""
+        );
+    }
     // The gate: tunnel packets to the port whose inner frame is a keepalive.
-    let _ = writeln!(
-        out,
-        "add rule {t} {CHAIN} udp dport {port} @th,{OFFSET_ETHERTYPE},16 {KEEPALIVE_ETHERTYPE:#06x} jump {LEARN_CHAIN} comment \"wl learn gate {port}\""
-    );
+    if !rules.is_empty() {
+        let _ = writeln!(
+            out,
+            "add rule {t} {CHAIN} udp dport {port} @th,{OFFSET_ETHERTYPE},16 {KEEPALIVE_ETHERTYPE:#06x} jump {LEARN_CHAIN} comment \"wl learn gate {port}\""
+        );
+    }
     for rule in rules {
         let _ = writeln!(
             out,
-            "add rule {t} {LEARN_CHAIN} @th,{OFFSET_GRE},32 {GRE_WITH_KEY:#010x} @th,{OFFSET_KEY},32 {} update @{} {{ ip saddr . udp sport }} comment \"{}\"",
-            rule.key,
+            "add rule {t} {LEARN_CHAIN} @th,{OFFSET_FLAGS},8 {VXLAN_FLAGS:#04x} @th,{OFFSET_VNI},24 {} update @{} {{ ip saddr . udp sport }} comment \"{}\"",
+            rule.vni,
             rule.set(),
             rule.comment()
         );
@@ -240,6 +268,15 @@ pub fn parse_state(json: &str) -> Option<LearnState> {
                 state.port = port.trim().parse().ok();
             } else if comment == NOTRACK {
                 state.notrack = true;
+            } else if let Some(rest) = comment.strip_prefix(FIXED_PREFIX) {
+                let mut parts = rest.split_whitespace();
+                if let (Some(port), Some(vni)) = (
+                    parts.next().and_then(|p| p.parse().ok()),
+                    parts.next().and_then(|v| v.parse().ok()),
+                ) {
+                    state.fixed_port = Some(port);
+                    state.fixed.insert(vni);
+                }
             } else if let Some(rule) = LearnRule::from_comment(comment) {
                 state.rules.insert(rule);
             }
@@ -369,6 +406,7 @@ impl LearnOps for LearnCli {
         port: u16,
         rules: &BTreeSet<LearnRule>,
         notrack: bool,
+        fixed: &BTreeSet<u32>,
     ) -> SysResult<()> {
         let current = list()
             .await?
@@ -377,14 +415,16 @@ impl LearnOps for LearnCli {
             .unwrap_or_default();
         let wanted: BTreeSet<String> = rules.iter().map(LearnRule::set).collect();
         let stale: BTreeSet<String> = current.sets.difference(&wanted).cloned().collect();
-        let script = learn_script(port, rules, notrack, &stale);
+        let script = learn_script(port, rules, notrack, fixed, &stale);
         let result = apply_script("apply nftables table ip wanderlan", &script).await;
         self.store(result.is_ok().then(|| {
             Some(LearnState {
-                port: Some(port),
+                port: (!rules.is_empty()).then_some(port),
                 rules: rules.clone(),
                 sets: wanted,
                 notrack,
+                fixed: fixed.clone(),
+                fixed_port: (!fixed.is_empty()).then_some(port),
             })
         }));
         result
@@ -416,16 +456,23 @@ mod tests {
     fn rules() -> BTreeSet<LearnRule> {
         [LearnRule {
             client: "lab".into(),
-            key: 0x1234_5678,
+            vni: 0x12_3456,
         }]
         .into()
     }
 
     #[test]
     fn the_script_matches_the_keepalives_of_each_client() {
-        let script = learn_script(51822, &rules(), true, &["ep-old".to_string()].into());
+        let fixed: BTreeSet<u32> = [0x12_3456].into();
+        let script = learn_script(
+            51822,
+            &rules(),
+            true,
+            &fixed,
+            &["ep-old".to_string()].into(),
+        );
         // Prerouting at the raw priority, notrack both ways, the gate on the
-        // port and the inner ethertype, the key at its offset, the update.
+        // port and the inner ethertype, the VNI at its offset, the update.
         for needle in [
             "add chain ip wanderlan pre { type filter hook prerouting priority -300; policy accept; }",
             "add chain ip wanderlan out { type filter hook output priority -300; policy accept; }",
@@ -435,14 +482,21 @@ mod tests {
             "add rule ip wanderlan pre udp dport 51822 notrack comment \"wl notrack\"",
             "add rule ip wanderlan out udp sport 51822 notrack comment \"wl notrack\"",
             "add rule ip wanderlan pre udp dport 51822 @th,224,16 0x88b5 jump wl-learn comment \"wl learn gate 51822\"",
-            "add rule ip wanderlan wl-learn @th,64,32 0x20006558 @th,96,32 305419896 update @ep-lab { ip saddr . udp sport } comment \"wl learn lab 305419896\"",
+            "add rule ip wanderlan wl-learn @th,64,8 0x08 @th,96,24 1193046 update @ep-lab { ip saddr . udp sport } comment \"wl learn lab 1193046\"",
+            // The tunnel port as source port again.
+            "add rule ip wanderlan out udp sport 51823 @th,64,8 0x08 @th,96,24 1193046 udp sport set 51822 comment \"wl fixed 51822 1193046\"",
         ] {
             assert!(script.contains(needle), "{needle} not in\n{script}");
         }
         // The sets keep their entries: they are only added, never flushed.
         assert!(!script.contains("flush set"), "{script}");
         assert!(!script.contains("flush table"), "{script}");
-        assert!(!learn_script(51822, &rules(), false, &BTreeSet::new()).contains("notrack"));
+        let (no_vnis, no_sets) = (BTreeSet::new(), BTreeSet::new());
+        assert!(!learn_script(51822, &rules(), false, &no_vnis, &no_sets).contains("notrack"));
+        // A client: only its source port, no gate.
+        let client = learn_script(51822, &BTreeSet::new(), false, &fixed, &no_sets);
+        assert!(client.contains("udp sport set 51822"), "{client}");
+        assert!(!client.contains("learn gate"), "{client}");
     }
 
     #[test]
@@ -456,11 +510,14 @@ mod tests {
                        {"elem": {"val": {"concat": ["203.0.113.7", 40500]}, "timeout": 90, "expires": 87}}]}},
             {"set": {"family": "ip", "name": "ep-lab2", "table": "wanderlan", "type": ["ipv4_addr", "inet_service"], "handle": 4}},
             {"rule": {"family": "ip", "table": "wanderlan", "chain": "pre", "handle": 5, "comment": "wl learn gate 51822", "expr": []}},
-            {"rule": {"family": "ip", "table": "wanderlan", "chain": "wl-learn", "handle": 6, "comment": "wl learn lab 305419896", "expr": []}},
-            {"rule": {"family": "ip", "table": "wanderlan", "chain": "pre", "handle": 7, "comment": "wl notrack", "expr": []}}
+            {"rule": {"family": "ip", "table": "wanderlan", "chain": "wl-learn", "handle": 6, "comment": "wl learn lab 1193046", "expr": []}},
+            {"rule": {"family": "ip", "table": "wanderlan", "chain": "pre", "handle": 7, "comment": "wl notrack", "expr": []}},
+            {"rule": {"family": "ip", "table": "wanderlan", "chain": "out", "handle": 8, "comment": "wl fixed 51822 1193046", "expr": []}}
         ]}"#;
         let state = parse_state(json).unwrap();
         assert_eq!(state.port, Some(51822));
+        assert_eq!(state.fixed_port, Some(51822));
+        assert_eq!(state.fixed, [0x12_3456].into());
         assert_eq!(state.rules, rules());
         assert!(state.notrack);
         assert_eq!(

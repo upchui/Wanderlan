@@ -7,24 +7,40 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
-### Clients behind NAT
+### VXLAN tunnels, clients behind NAT
 
-Open UDP 51822 (the tunnel port, `network.tunnel_port`) towards the servers:
-the tunnels between a client and its server move into UDP.
+Update all sites and open UDP 51822 (the tunnel port, `network.tunnel_port`)
+between the sites: every tunnel is VXLAN now (`vx-<site>` instead of
+`gt-<site>`); GRE between the servers is no longer needed.
 
-- A client opens every connection to its server; a server never contacts a
-  client first, it answers and sends where the client's packets come from.
-  Clients work behind NAT, several behind the same one, also with a changing
-  public address.
-- The tunnel between a client and its server is GRE inside UDP (FOU, port
-  51822), the client sending from any of its addresses. A keepalive frame
-  every 15 s keeps the NAT open; the server learns the NAT's port from it in
-  the kernel (nftables table `ip wanderlan`) and follows a new port in place.
+- Every tunnel is a VXLAN interface on the tunnel port, the VNI from the two
+  identities. VXLAN is segmented and aggregated (GSO/GRO) by every kernel
+  and offloaded by many network cards. The GRE tunnels of an older version
+  are removed on the update.
+- A client's tunnel runs in one of two modes, `tunnel_mode` in
+  `network.toml`, `wanderlan tunnel-mode <client> nat|direct` or the site
+  form of the TUI (its manager decides):
+  - `nat` (the default, also right after joining): the client may sit behind
+    NAT, several behind the same one, also with a changing public address.
+    It opens every connection to its server; its server never contacts it
+    first, it answers and sends where the client's packets come from. A
+    keepalive frame every 15 s keeps the NAT open; the server learns the
+    NAT's port from it in the kernel (nftables table `ip wanderlan`) and
+    follows a new port in place.
+  - `direct`: the server sends to the client's address, both ends from a
+    source port per connection, which spreads the load over the receive
+    queues; no keepalives. Between servers always.
 - Cheap per packet: only the keepalives reach the learning rule (data frames
   stop at one compare of their inner ethertype), and where connection
   tracking is loaded the server exempts the tunnel packets from it
   (`notrack`). The table is written in the syntax of `nft -f`, so nftables
   1.0 (Debian 12) works too.
+- The MSS is 94 bytes below the path MTU for every tunnel; larger packets are
+  fragmented outside as before, also with DF.
+- Through NAT both ends send from the tunnel port. A VXLAN interface cannot
+  be held to one source port any more (Linux includes the upper end of the
+  range since March 2026), so a rule in `ip wanderlan` sets the tunnel port
+  in the packets of these tunnels.
 - A client sends its changes to its server itself (`SYNC` with a body); the
   server no longer fetches them. Its probes are answered, and the server
   probes it only where its authenticated probes come from, once that place
@@ -33,7 +49,7 @@ the tunnels between a client and its server move into UDP.
   that joins behind the NAT of a client becomes a client of its own (with the
   same host name it needs `--name`).
 - The service also has `CAP_NET_RAW` and `AF_PACKET` (for the keepalives)
-  and loads the module `fou`.
+  and loads the module `vxlan` instead of `ip_gre`.
 
 ### Identities and keyed tunnels
 
@@ -45,7 +61,7 @@ identities, and joins need the new join protocol (2) on both sides.
   site's `id` in `network.toml`. A site of an older version claims its
   identity at its first start.
 - The keys of a tunnel derive from the two identities and never travel: the
-  GRE key of the tunnel (the kernel drops packets of another box), the key of
+  VNI of the tunnel (the kernel drops packets of another box), the key of
   the control probes (version 2, `WLP2`: every probe and answer carries a
   tag) and the key of the configuration sync (`SYNC`, both sides prove their
   key over fresh nonces).
@@ -61,7 +77,6 @@ identities, and joins need the new join protocol (2) on both sides.
   the first one's site silently when it joined with its host name.
 - Renames are recognised by the identity; a `network.toml` written without
   the `id` lines keeps the identities.
-- The MSS of a tunnel with a key is 4 bytes smaller (the GRE key).
 
 ### Several trunk ports
 

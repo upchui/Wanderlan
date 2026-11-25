@@ -23,7 +23,7 @@ pub const DEFAULT_CONTROL_PORT: u16 = 51821;
 pub const DEFAULT_MTU_PROBE_INTERVAL: Duration = Duration::from_secs(300);
 /// Default time to confirm a configuration change before it is rolled back.
 pub const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(60);
-/// Maximum length of a site name (`gt-` + name must fit into IFNAMSIZ - 1).
+/// Maximum length of a site name (`vx-` + name must fit into IFNAMSIZ - 1).
 pub const MAX_SITE_NAME_LEN: usize = 12;
 
 /// The shared network configuration (`network.toml`).
@@ -144,7 +144,7 @@ impl Network {
 /// One site of the network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Site {
-    /// Unique name, also used in interface names (`gt-<name>`).
+    /// Unique name, also used in interface names (`vx-<name>`).
     pub name: String,
     /// Address of the site in the existing transport network (e.g. its VPN
     /// address). GRETAP tunnels run between these addresses.
@@ -171,6 +171,55 @@ pub struct Site {
     /// The site this one is plugged into (a client of it): its only tunnel
     /// leads there. `None`: a server, connected with all other servers.
     pub uplink: Option<String>,
+    /// How the tunnel of a client to its server runs (servers among each
+    /// other always run [`TunnelMode::Direct`]).
+    pub tunnel_mode: TunnelMode,
+}
+
+/// How the tunnel between a client and its server runs. Both are VXLAN on
+/// the tunnel port; they differ in who may send first.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum TunnelMode {
+    /// The client may sit behind NAT: it sends from a fixed port and keeps
+    /// the mapping open with keepalives; its server answers where the
+    /// client's packets come from and never sends first.
+    #[default]
+    Nat,
+    /// The client is reachable at its address: its server sends there
+    /// directly, from a port per flow (spreads the load over the receive
+    /// queues), without keepalives.
+    Direct,
+}
+
+impl TunnelMode {
+    /// The word in `network.toml` and on the command line.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Nat => "nat",
+            Self::Direct => "direct",
+        }
+    }
+}
+
+impl fmt::Display for TunnelMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for TunnelMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim() {
+            "nat" => Ok(Self::Nat),
+            "direct" => Ok(Self::Direct),
+            other => Err(format!("\"{other}\" is no tunnel mode (nat or direct)")),
+        }
+    }
 }
 
 /// The local side of a VLAN mapping.
@@ -469,6 +518,7 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
+            tunnel_mode: Default::default(),
             uplink: None,
         });
         network.sites.push(Site {
@@ -480,6 +530,7 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
+            tunnel_mode: Default::default(),
             uplink: None,
         });
         assert!(network.site("c").is_none());

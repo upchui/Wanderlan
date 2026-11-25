@@ -4,21 +4,22 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use crate::BRIDGE_NAME;
-use crate::config::{Config, LocalVid, NATIVE_VID};
+use crate::config::{Config, LocalVid, NATIVE_VID, TunnelMode};
 use crate::forwarding;
 use crate::identity::PeerIdentity;
 use crate::mtu;
 use crate::sys::nft::{MssRule, PortDir, SplitRule};
 use crate::sys::nft_ip::LearnRule;
 use crate::sys::tc::{Direction, TcAction, TcRule};
-use crate::sys::{BridgeOptions, FouEncap, GretapParams, PortVlans, VlanFlags};
+use crate::sys::{BridgeOptions, PortVlans, VlanFlags, VxlanParams};
 use crate::topology::{self, TunnelKind};
 
 /// Alias that marks interfaces created by wanderlan.
 pub const OWNER_ALIAS: &str = "wanderlan";
-/// MTU of the GRETAP interfaces: full Ethernet frames; GRE fragments the
-/// encapsulated packets if the transport path is smaller.
-pub const GRETAP_MTU: u32 = 1500;
+/// MTU of the tunnel interfaces: full Ethernet frames. On a smaller path
+/// the outer packets of frames without DF are fragmented; for those with DF
+/// the kernel answers "fragmentation needed" (VXLAN path MTU discovery).
+pub const TUNNEL_MTU: u32 = 1500;
 
 /// Prefix of the bridges of additional trunks (`wl-<trunk>`). The default
 /// trunk is in [`BRIDGE_NAME`].
@@ -53,17 +54,20 @@ pub struct TrunkSpec {
     pub down_reason: Option<String>,
 }
 
-/// One GRETAP tunnel port.
+/// One tunnel port (VXLAN).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelSpec {
-    /// Interface name (`gt-<peer>`).
+    /// Interface name (`vx-<peer>`).
     pub name: String,
     /// Remote site name.
     pub peer: String,
     /// The bridge (segment) the tunnel belongs to: that of its trunk.
     pub bridge: String,
-    /// GRETAP parameters.
-    pub params: GretapParams,
+    /// VXLAN parameters.
+    pub params: VxlanParams,
+    /// Where the tunnel sends to; `None` until a client behind NAT has
+    /// shown where its packets come from.
+    pub remote: Option<SocketAddrV4>,
     /// Split horizon: isolated ports do not forward to each other. Every
     /// tunnel port is isolated, so frames from one tunnel never enter another.
     pub isolated: bool,
@@ -85,21 +89,25 @@ pub struct Desired {
     pub trunks: Vec<TrunkSpec>,
     /// Tunnels to the peer sites, sorted by name.
     pub tunnels: Vec<TunnelSpec>,
-    /// Local address of the site (GRE source).
+    /// Address of the site in the network.
     pub local_address: Ipv4Addr,
     /// TCP MSS clamping rules (nftables).
     pub mss: BTreeSet<MssRule>,
     /// Split horizon in nftables instead of `isolated` ports, where this
     /// site passes VLANs on between server tunnels (see [`forwarding`]).
     pub split: BTreeSet<SplitRule>,
-    /// The FOU port of the tunnels inside UDP (to the uplink and the
-    /// clients), if this site has one.
-    pub fou_port: Option<u16>,
+    /// The UDP port of the tunnels.
+    pub tunnel_port: u16,
+    /// Tunnels that cannot be built, by peer, with the reason.
+    pub unbuilt: BTreeMap<String, String>,
     /// The clients whose endpoints are learned (table `ip wanderlan`).
     pub learn: BTreeSet<LearnRule>,
     /// The tunnel packets of the clients skip connection tracking (only
     /// where it is loaded).
     pub notrack: bool,
+    /// The tunnels through NAT (by VNI): their packets get the tunnel port
+    /// as source port (see [`crate::sys::nft_ip`]).
+    pub fixed: BTreeSet<u32>,
 }
 
 impl Desired {
@@ -146,9 +154,10 @@ pub struct Runtime {
     /// MTU of the interface the tunnel to a peer site leaves by: the path
     /// MTU is at most that, so it gives an MSS until the path is measured.
     pub underlay_mtu: BTreeMap<String, u16>,
-    /// GRE keys of the tunnels to peers whose identity is known (both
-    /// sites have one); other tunnels have no key.
-    pub gre_keys: BTreeMap<String, u32>,
+    /// VNIs of the tunnels to peers whose identity is known (both sites
+    /// have one, the keys derive from them); the others use a VNI from the
+    /// two names and come up without proof of identity.
+    pub vnis: BTreeMap<String, u32>,
     /// What the probes found about the identity of the peers with a key. A
     /// tunnel with a key comes up only once its peer is confirmed.
     pub identity: BTreeMap<String, PeerIdentity>,
@@ -196,80 +205,85 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
     let self_online = cfg.self_site().is_none_or(|s| s.online);
     let tunnel_port = network.tunnel_port();
     let passing = forwarding::forwarding(network, me);
-    let tunnels: Vec<TunnelSpec> = topology::tunnels_for(network, me)
-        .into_iter()
-        .map(|t| {
-            let name = t.ifname();
-            // What the tunnel carries: the VLANs both ends take part in (on
-            // the way down also the own VLANs of the upper site), at most its
-            // own limit.
-            let carried = topology::tunnel_vlans(network, me, &t.peer.name).unwrap_or_default();
-            // Down while blocked by the loop guard, or while this site or the
-            // peer is offline (set up but not taken online yet).
-            let key = runtime.gre_keys.get(&t.peer.name).copied();
-            let identity = runtime.identity.get(&t.peer.name).copied();
-            let down_reason = if blocked.contains(&name) {
-                Some("blocked by the loop guard".to_string())
-            } else if !self_online {
-                Some("this site is offline".to_string())
-            } else if !t.peer.online {
-                Some(format!("site \"{}\" is offline", t.peer.name))
-            } else if key.is_some() {
-                identity_reason(&t.peer.name, t.peer.address, identity.unwrap_or_default())
-            } else {
-                None
-            };
-            // Between a client and its server the tunnel runs inside UDP,
-            // so that it passes NAT. The client sends from any of its
-            // addresses (the kernel picks it); its server answers where the
-            // client's packets come from.
-            let endpoint = runtime.endpoints.get(&t.peer.name);
-            let (local, remote, encap) = match (t.kind, key) {
-                (TunnelKind::Uplink, Some(_)) => (
-                    Ipv4Addr::UNSPECIFIED,
-                    t.peer.address,
-                    Some(FouEncap {
-                        sport: tunnel_port,
-                        dport: tunnel_port,
-                    }),
+    let own_mode = cfg
+        .self_site()
+        .map_or(TunnelMode::default(), |s| s.tunnel_mode);
+    let mut unbuilt = BTreeMap::new();
+    let mut learn = BTreeSet::new();
+    let mut vni_of: BTreeMap<u32, String> = BTreeMap::new();
+    let mut tunnels: Vec<TunnelSpec> = Vec::new();
+    for t in topology::tunnels_for(network, me) {
+        let name = t.ifname();
+        // What the tunnel carries: the VLANs both ends take part in (on
+        // the way down also the own VLANs of the upper site), at most its
+        // own limit.
+        let carried = topology::tunnel_vlans(network, me, &t.peer.name).unwrap_or_default();
+        let keyed = runtime.vnis.get(&t.peer.name).copied();
+        let vni = keyed.unwrap_or_else(|| fallback_vni(me, &t.peer.name));
+        // One VNI per UDP port on a box (the kernel refuses a second).
+        if let Some(other) = vni_of.get(&vni) {
+            unbuilt.insert(
+                t.peer.name.clone(),
+                format!(
+                    "its tunnel would get the same VNI {vni} as the one to \"{other}\" (by chance, one in 16 million); a `wanderlan reset` and a new join of \"{}\" gives it another",
+                    t.peer.name
                 ),
-                (TunnelKind::Client, Some(_)) => (
-                    local_address,
-                    endpoint.map_or(t.peer.address, |e| *e.ip()),
-                    Some(FouEncap {
-                        sport: tunnel_port,
-                        dport: endpoint.map_or(tunnel_port, SocketAddrV4::port),
-                    }),
-                ),
-                _ => (local_address, t.peer.address, None),
-            };
-            let down_reason = down_reason.or_else(|| {
-                (t.kind == TunnelKind::Client && key.is_some() && endpoint.is_none()).then(|| {
-                    format!(
-                        "waiting for client \"{}\" to connect (its tunnel packets, UDP {tunnel_port})",
-                        t.peer.name
-                    )
-                })
-            });
-            TunnelSpec {
-                enabled: down_reason.is_none(),
-                down_reason,
-                name,
-                peer: t.peer.name.clone(),
-                bridge: bridge_for(cfg.trunk_for(&t.peer.name), default_trunk),
-                params: GretapParams {
-                    local,
-                    remote,
-                    ignore_df: true,
-                    pmtudisc: false,
-                    key,
-                    encap,
-                },
-                isolated: passing.isolated.contains(&t.peer.name),
-                vlans: carried.iter().map(|v| (v, VlanFlags::TAGGED)).collect(),
+            );
+            continue;
+        }
+        vni_of.insert(vni, t.peer.name.clone());
+        // Down while blocked by the loop guard, or while this site or the
+        // peer is offline (set up but not taken online yet).
+        let identity = runtime.identity.get(&t.peer.name).copied();
+        let down_reason = if blocked.contains(&name) {
+            Some("blocked by the loop guard".to_string())
+        } else if !self_online {
+            Some("this site is offline".to_string())
+        } else if !t.peer.online {
+            Some(format!("site \"{}\" is offline", t.peer.name))
+        } else if keyed.is_some() {
+            identity_reason(&t.peer.name, t.peer.address, identity.unwrap_or_default())
+        } else {
+            None
+        };
+        // The mode is that of the client in the tunnel; servers send
+        // directly. Through NAT the client sends from the tunnel port and
+        // its server answers where the client's packets come from.
+        let mode = t.mode(own_mode);
+        let remote = match (t.kind, mode) {
+            (TunnelKind::Client, TunnelMode::Nat) => {
+                learn.insert(LearnRule {
+                    client: t.peer.name.clone(),
+                    vni,
+                });
+                runtime.endpoints.get(&t.peer.name).copied()
             }
-        })
-        .collect();
+            _ => Some(SocketAddrV4::new(t.peer.address, tunnel_port)),
+        };
+        let down_reason = down_reason.or_else(|| {
+            remote.is_none().then(|| {
+                format!(
+                    "waiting for client \"{}\" to connect (its tunnel packets, UDP {tunnel_port})",
+                    t.peer.name
+                )
+            })
+        });
+        tunnels.push(TunnelSpec {
+            enabled: down_reason.is_none(),
+            down_reason,
+            name,
+            peer: t.peer.name.clone(),
+            bridge: bridge_for(cfg.trunk_for(&t.peer.name), default_trunk),
+            params: VxlanParams {
+                vni,
+                port: tunnel_port,
+                source_port: (mode == TunnelMode::Nat).then_some(tunnel_port),
+            },
+            remote,
+            isolated: passing.isolated.contains(&t.peer.name),
+            vlans: carried.iter().map(|v| (v, VlanFlags::TAGGED)).collect(),
+        });
+    }
 
     // Every trunk port carries the same VLANs and mappings; the ports of the
     // default segment always exist, those of a tunnel's own segment while
@@ -303,24 +317,17 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
         }
     }
 
-    let fou_port = tunnels
-        .iter()
-        .any(|t| t.params.encap.is_some())
-        .then_some(tunnel_port);
-    let learn: BTreeSet<LearnRule> = topology::tunnels_for(network, me)
-        .into_iter()
-        .filter(|t| t.kind == TunnelKind::Client)
-        .filter_map(|t| {
-            Some(LearnRule {
-                client: t.peer.name.clone(),
-                key: *runtime.gre_keys.get(&t.peer.name)?,
-            })
-        })
-        .collect();
     let notrack = runtime.conntrack && !learn.is_empty();
+    let fixed = tunnels
+        .iter()
+        .filter(|t| t.params.source_port.is_some())
+        .map(|t| t.params.vni)
+        .collect();
     Desired {
-        fou_port,
+        tunnel_port,
+        unbuilt,
         notrack,
+        fixed,
         learn,
         bridge_options: BRIDGE_OPTIONS,
         trunks,
@@ -329,7 +336,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
             .split
             .iter()
             .map(|(peers, vlans)| SplitRule {
-                ports: peers.iter().map(|p| topology::gretap_name(p)).collect(),
+                ports: peers.iter().map(|p| topology::tunnel_name(p)).collect(),
                 vlans: vlans.ranges(),
             })
             .collect(),
@@ -351,9 +358,16 @@ fn identity_reason(peer: &str, address: Ipv4Addr, state: PeerIdentity) -> Option
     }
 }
 
-/// The overhead between path MTU and MSS of a tunnel.
-fn tunnel_overhead(tunnel: &TunnelSpec) -> u16 {
-    mtu::overhead(tunnel.params.key.is_some(), tunnel.params.encap.is_some())
+/// The VNI of a tunnel to a peer whose identity is not known (yet): the
+/// same at both ends, from the two names (FNV-1a, 24 bits, never 0).
+fn fallback_vni(a: &str, b: &str) -> u32 {
+    let (low, high) = if a < b { (a, b) } else { (b, a) };
+    let hash = format!("wanderlan {low}\0{high}")
+        .bytes()
+        .fold(0x811c_9dc5_u32, |h, byte| {
+            (h ^ u32::from(byte)).wrapping_mul(0x0100_0193)
+        });
+    (hash & 0x00ff_ffff).max(1)
 }
 
 /// MSS clamping per tunnel port: a fixed value from the configuration, or
@@ -371,12 +385,11 @@ fn mss_rules(cfg: &Config, tunnels: &[TunnelSpec], runtime: &Runtime) -> BTreeSe
     let smallest = measured.values().copied().min();
     let mut out = BTreeSet::new();
     for t in tunnels {
-        let overhead = tunnel_overhead(t);
-        let fallback = smallest.map(|p| mtu::mss_with(p, overhead));
+        let fallback = smallest.map(mtu::mss_for_pmtu);
         let underlay = runtime
             .underlay_mtu
             .get(&t.peer)
-            .map(|m| mtu::mss_with(*m, overhead));
+            .map(|m| mtu::mss_for_pmtu(*m));
         let preliminary = match (fallback, underlay) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -384,11 +397,7 @@ fn mss_rules(cfg: &Config, tunnels: &[TunnelSpec], runtime: &Runtime) -> BTreeSe
         let mss = cfg
             .network
             .mss
-            .or_else(|| {
-                measured
-                    .get(t.name.as_str())
-                    .map(|p| mtu::mss_with(*p, overhead))
-            })
+            .or_else(|| measured.get(t.name.as_str()).map(|p| mtu::mss_for_pmtu(*p)))
             .or(preliminary);
         let Some(mss) = mss else { continue };
         for dir in [PortDir::In, PortDir::Out] {
@@ -475,6 +484,8 @@ mod tests {
     use crate::config::{Loaded, load};
 
     const NETWORK: &str = include_str!("config/testdata/network-v1.toml");
+    /// A server with a client behind NAT.
+    const NETWORK_CLIENTS: &str = "[network]\nvlans = \"10-50\"\n\n[site.heim]\naddress = \"10.8.0.1\"\n\n[site.nat1]\naddress = \"10.8.0.30\"\nserver = \"heim\"\n";
 
     fn config(self_name: &str) -> Config {
         let local = format!("self = \"{self_name}\"\ntrunk = \"ens19\"\n");
@@ -489,26 +500,124 @@ mod tests {
         let d = derive(&config("heim"), &Runtime::default());
         assert_eq!(d.bridges().collect::<Vec<_>>(), ["br0"]);
         assert_eq!(d.local_address, Ipv4Addr::new(10, 8, 0, 1));
+        let at = |a, b, c, d| Some(SocketAddrV4::new(Ipv4Addr::new(a, b, c, d), 51822));
         let summary: Vec<_> = d
             .tunnels
             .iter()
-            .map(|t| (t.name.as_str(), t.isolated, t.params.remote))
+            .map(|t| (t.name.as_str(), t.isolated, t.remote))
             .collect();
         assert_eq!(
             summary,
             vec![
-                ("gt-buero", true, Ipv4Addr::new(10, 8, 0, 2)),
-                ("gt-haus2", true, Ipv4Addr::new(10, 8, 0, 11)),
-                ("gt-haus3", true, Ipv4Addr::new(10, 8, 0, 12)),
+                ("vx-buero", true, at(10, 8, 0, 2)),
+                ("vx-haus2", true, at(10, 8, 0, 11)),
+                ("vx-haus3", true, at(10, 8, 0, 12)),
             ]
         );
+        // Between servers: direct, a source port per flow.
         for t in &d.tunnels {
-            assert!(t.params.ignore_df && !t.params.pmtudisc);
-            assert_eq!(t.params.local, d.local_address);
+            assert_eq!(t.params.port, 51822);
+            assert_eq!(t.params.source_port, None);
         }
+        // Without identities both ends take the VNI from the two names.
+        let buero = derive(&config("buero"), &Runtime::default());
+        let vni = |d: &Desired, peer: &str| {
+            d.tunnels
+                .iter()
+                .find(|t| t.peer == peer)
+                .unwrap()
+                .params
+                .vni
+        };
+        assert_eq!(vni(&d, "buero"), vni(&buero, "heim"));
+        assert_ne!(vni(&d, "buero"), vni(&d, "haus2"));
+        assert!(d.unbuilt.is_empty());
         assert_eq!(d.trunk().vlans.len(), 41);
         assert!(d.trunk().vlans.values().all(|f| *f == VlanFlags::TAGGED));
         assert!(!d.trunk().vlans.contains_key(&1));
+    }
+
+    #[test]
+    fn a_client_behind_nat_is_reached_where_its_packets_come_from() {
+        let text = format!(
+            "{NETWORK_CLIENTS}\n[site.lan]\naddress = \"10.8.0.31\"\nserver = \"heim\"\ntunnel_mode = \"direct\"\n"
+        );
+        let cfg = |me: &str| match load(&text, &format!("self = \"{me}\"\ntrunk = \"ens19\"\n"))
+            .unwrap()
+            .loaded
+        {
+            Loaded::Configured(cfg) => cfg,
+            Loaded::Unconfigured { .. } => panic!("configured"),
+        };
+        let tunnel =
+            |d: &Desired, peer: &str| d.tunnels.iter().find(|t| t.peer == peer).unwrap().clone();
+        let mut runtime = Runtime::default();
+        let server = derive(&cfg("heim"), &runtime);
+        // nat (the default): no remote until the client was seen, a fixed
+        // source port, learned by its VNI.
+        let nat = tunnel(&server, "nat1");
+        assert_eq!(nat.remote, None);
+        assert!(!nat.enabled);
+        assert!(
+            nat.down_reason
+                .as_deref()
+                .unwrap()
+                .contains("waiting for client \"nat1\"")
+        );
+        assert_eq!(nat.params.source_port, Some(51822));
+        assert_eq!(
+            server
+                .learn
+                .iter()
+                .map(|r| (r.client.as_str(), r.vni))
+                .collect::<Vec<_>>(),
+            [("nat1", nat.params.vni)]
+        );
+        // direct: straight to its address, a port per flow, nothing learned.
+        let direct = tunnel(&server, "lan");
+        assert_eq!(
+            direct.remote,
+            Some(SocketAddrV4::new(Ipv4Addr::new(10, 8, 0, 31), 51822))
+        );
+        assert_eq!(direct.params.source_port, None);
+        assert!(direct.enabled);
+        let endpoint = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 40001);
+        runtime.endpoints.insert("nat1".into(), endpoint);
+        let server = derive(&cfg("heim"), &runtime);
+        assert_eq!(tunnel(&server, "nat1").remote, Some(endpoint));
+        assert!(tunnel(&server, "nat1").enabled);
+        // The clients follow their own mode towards the server.
+        let client = derive(&cfg("nat1"), &Runtime::default());
+        let up = tunnel(&client, "heim");
+        assert_eq!(up.params.source_port, Some(51822));
+        assert_eq!(
+            up.remote,
+            Some(SocketAddrV4::new(Ipv4Addr::new(10, 8, 0, 1), 51822))
+        );
+        assert_eq!(up.params.vni, nat.params.vni, "the same VNI at both ends");
+        assert!(client.learn.is_empty());
+        assert_eq!(
+            tunnel(&derive(&cfg("lan"), &Runtime::default()), "heim")
+                .params
+                .source_port,
+            None
+        );
+    }
+
+    #[test]
+    fn a_second_tunnel_with_the_same_vni_is_not_built() {
+        let mut runtime = Runtime::default();
+        runtime.vnis.insert("buero".into(), 77);
+        runtime.vnis.insert("haus2".into(), 77);
+        let d = derive(&config("heim"), &runtime);
+        assert_eq!(
+            d.tunnels
+                .iter()
+                .map(|t| t.peer.as_str())
+                .collect::<Vec<_>>(),
+            ["buero", "haus3"]
+        );
+        assert!(d.unbuilt["haus2"].contains("same VNI 77 as the one to \"buero\""));
     }
 
     #[test]
@@ -521,14 +630,14 @@ mod tests {
                 .map(|t| t.vlans.keys().copied().collect())
                 .unwrap_or_default()
         };
-        assert_eq!(vids(&heim, "gt-buero").len(), 41);
-        assert_eq!(vids(&heim, "gt-haus2"), vec![20, 30]);
+        assert_eq!(vids(&heim, "vx-buero").len(), 41);
+        assert_eq!(vids(&heim, "vx-haus2"), vec![20, 30]);
         let haus2 = derive(&config("haus2"), &Runtime::default());
         assert_eq!(
             haus2.trunk().vlans.keys().copied().collect::<Vec<_>>(),
             vec![20, 30]
         );
-        assert_eq!(vids(&haus2, "gt-heim"), vec![20, 30]);
+        assert_eq!(vids(&haus2, "vx-heim"), vec![20, 30]);
     }
 
     #[test]
@@ -552,9 +661,9 @@ mod tests {
         assert_eq!(
             at("heim"),
             vec![
-                ("gt-buero".to_string(), false),
-                ("gt-haus2".to_string(), true),
-                ("gt-haus3".to_string(), true),
+                ("vx-buero".to_string(), false),
+                ("vx-haus2".to_string(), true),
+                ("vx-haus3".to_string(), true),
             ]
         );
         assert!(at("buero").iter().all(|(_, enabled)| !enabled));
@@ -580,10 +689,10 @@ mod tests {
                 .map(|t| t.vlans.clone())
                 .unwrap_or_default()
         };
-        assert_eq!(tunnel("gt-buero").get(&1), Some(&VlanFlags::TAGGED));
-        assert_eq!(tunnel("gt-buero").len(), 4094);
-        assert_eq!(tunnel("gt-haus3").get(&1), None, "haus3 maps native to 20");
-        assert_eq!(tunnel("gt-haus3").len(), 4093);
+        assert_eq!(tunnel("vx-buero").get(&1), Some(&VlanFlags::TAGGED));
+        assert_eq!(tunnel("vx-buero").len(), 4094);
+        assert_eq!(tunnel("vx-haus3").get(&1), None, "haus3 maps native to 20");
+        assert_eq!(tunnel("vx-haus3").len(), 4093);
 
         let local = "self = \"haus3\"\ntrunk = \"ens19\"\n";
         let Loaded::Configured(cfg) = load(&network, local).unwrap().loaded else {
@@ -664,18 +773,18 @@ mod tests {
         assert_eq!(
             rules,
             vec![
-                "wl mss iif gt-buero ip 1318",
-                "wl mss iif gt-buero ip6 1298",
-                "wl mss oif gt-buero ip 1318",
-                "wl mss oif gt-buero ip6 1298",
-                "wl mss iif gt-haus2 ip 1318",
-                "wl mss iif gt-haus2 ip6 1298",
-                "wl mss oif gt-haus2 ip 1318",
-                "wl mss oif gt-haus2 ip6 1298",
-                "wl mss iif gt-haus3 ip 1318",
-                "wl mss iif gt-haus3 ip6 1298",
-                "wl mss oif gt-haus3 ip 1318",
-                "wl mss oif gt-haus3 ip6 1298",
+                "wl mss iif vx-buero ip 1306",
+                "wl mss iif vx-buero ip6 1286",
+                "wl mss oif vx-buero ip 1306",
+                "wl mss oif vx-buero ip6 1286",
+                "wl mss iif vx-haus2 ip 1306",
+                "wl mss iif vx-haus2 ip6 1286",
+                "wl mss oif vx-haus2 ip 1306",
+                "wl mss oif vx-haus2 ip6 1286",
+                "wl mss iif vx-haus3 ip 1306",
+                "wl mss iif vx-haus3 ip6 1286",
+                "wl mss oif vx-haus3 ip 1306",
+                "wl mss oif vx-haus3 ip6 1286",
             ]
         );
         runtime.pmtu.insert("haus2".into(), 1500);
@@ -683,12 +792,12 @@ mod tests {
         assert!(
             d.mss
                 .iter()
-                .any(|r| r.comment() == "wl mss oif gt-haus2 ip 1418")
+                .any(|r| r.comment() == "wl mss oif vx-haus2 ip 1406")
         );
         assert!(
             d.mss
                 .iter()
-                .any(|r| r.comment() == "wl mss oif gt-buero ip 1318")
+                .any(|r| r.comment() == "wl mss oif vx-buero ip 1306")
         );
     }
 
@@ -701,11 +810,11 @@ mod tests {
         let buero: Vec<String> = d
             .mss
             .iter()
-            .filter(|r| r.port == "gt-buero")
+            .filter(|r| r.port == "vx-buero")
             .map(MssRule::comment)
             .collect();
         assert!(
-            buero.contains(&"wl mss oif gt-buero ip 1338".to_string()),
+            buero.contains(&"wl mss oif vx-buero ip 1326".to_string()),
             "{buero:?}"
         );
         // Measured, the measurement counts; others take the smaller value.
@@ -713,9 +822,9 @@ mod tests {
         runtime.underlay_mtu.insert("haus2".into(), 1500);
         let d = derive(&config("heim"), &runtime);
         let has = |c: &str| d.mss.iter().any(|r| r.comment() == c);
-        assert!(has("wl mss oif gt-buero ip 1318"));
+        assert!(has("wl mss oif vx-buero ip 1306"));
         assert!(
-            has("wl mss oif gt-haus2 ip 1318"),
+            has("wl mss oif vx-haus2 ip 1306"),
             "min(measured 1318, 1418)"
         );
     }
@@ -741,7 +850,7 @@ mod tests {
     #[test]
     fn blocked_tunnels_are_disabled() {
         let runtime = Runtime {
-            blocked: BTreeSet::from(["gt-haus2".to_string()]),
+            blocked: BTreeSet::from(["vx-haus2".to_string()]),
             ..Runtime::default()
         };
         let d = derive(&config("heim"), &runtime);
@@ -752,7 +861,7 @@ mod tests {
             .collect();
         assert_eq!(
             enabled,
-            vec![("gt-buero", true), ("gt-haus2", false), ("gt-haus3", true)]
+            vec![("vx-buero", true), ("vx-haus2", false), ("vx-haus3", true)]
         );
     }
 

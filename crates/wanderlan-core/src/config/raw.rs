@@ -22,7 +22,7 @@ use serde_spanned::Spanned;
 use super::diag::{ConfigFile, Diagnostic, FieldPath, SpanMap};
 use super::model::{
     DEFAULT_COMMIT_TIMEOUT, DEFAULT_CONTROL_PORT, DEFAULT_MTU_PROBE_INTERVAL, Local, LocalVid,
-    Network, Site, TunnelVlans, VlanMap, site_pair,
+    Network, Site, TunnelMode, TunnelVlans, VlanMap, site_pair,
 };
 use super::vlan::{VID_MAX, VID_MIN, VlanSet};
 use crate::identity::SiteId;
@@ -80,6 +80,7 @@ struct RawSite {
     self_managed: Option<Spanned<bool>>,
     rename_by_manager: Option<Spanned<bool>>,
     uplink: Option<Spanned<String>>,
+    tunnel_mode: Option<Spanned<String>>,
     /// Since 0.2 there are no roles; read and ignored with a warning.
     role: Option<Spanned<String>>,
     /// Since 0.2 there are no hubs; read and ignored with a warning.
@@ -160,6 +161,7 @@ struct RawSite2 {
     self_managed: Option<Spanned<bool>>,
     rename_by_manager: Option<Spanned<bool>>,
     online: Option<Spanned<bool>>,
+    tunnel_mode: Option<Spanned<String>>,
     vlans: Option<Spanned<RawVlans>>,
     own_vlans: Option<Spanned<RawVlans>>,
     /// Source VLAN (key) = VLAN on the trunk of the site, or `"native"`.
@@ -478,6 +480,7 @@ fn parse_network_2(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
             self_managed: raw_site.self_managed,
             rename_by_manager: raw_site.rename_by_manager,
             uplink: raw_site.server,
+            tunnel_mode: raw_site.tunnel_mode,
             role: None,
             hub: None,
         };
@@ -731,6 +734,8 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
     let self_managed = lw
         .take(&FieldPath::site_field(i, "self_managed"), s.self_managed)
         .unwrap_or(false);
+    let mode_path = FieldPath::site_field(i, "tunnel_mode");
+    let mode_text = lw.take(&mode_path, s.tunnel_mode);
     // Written by 1.0.22; renaming follows `managed_by` now.
     let rename_path = FieldPath::site_field(i, "rename_by_manager");
     let rename_by_manager = lw.take(&rename_path, s.rename_by_manager).is_some();
@@ -804,6 +809,14 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
             None
         }
     });
+    let tunnel_mode = match mode_text.map(|t| t.parse::<TunnelMode>()) {
+        None => TunnelMode::default(),
+        Some(Ok(mode)) => mode,
+        Some(Err(e)) => {
+            lw.error(mode_path, format!("{label}: tunnel_mode: {e}"));
+            TunnelMode::default()
+        }
+    };
 
     Some((
         Site {
@@ -816,6 +829,7 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
             managed_by,
             self_managed,
             uplink,
+            tunnel_mode,
         },
         uplink_given,
     ))

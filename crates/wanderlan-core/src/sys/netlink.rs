@@ -2,23 +2,33 @@
 
 use std::collections::BTreeMap;
 
-use futures_util::TryStreamExt as _;
-use rtnetlink::packet_core::{DefaultNla, Nla as _};
-use rtnetlink::packet_route::AddressFamily;
-use rtnetlink::packet_route::link::{
-    BridgeStpState, BridgeVlanInfoFlags, GreEncapFlags, GreEncapType, GreIOFlags, InfoBridge,
-    InfoBridgePort, InfoData, InfoGre, InfoPortData, LinkAttribute, LinkExtentMask, LinkFlags,
-    LinkInfo, LinkMessage, State,
+use std::net::{Ipv4Addr, SocketAddrV4};
+
+use futures_util::{StreamExt as _, TryStreamExt as _};
+use rtnetlink::packet_core::{
+    NLM_F_ACK, NLM_F_APPEND, NLM_F_CREATE, NLM_F_DUMP, NLM_F_REQUEST, NetlinkMessage,
+    NetlinkPayload,
 };
-use rtnetlink::{Handle, LinkBridge, LinkBridgePort, LinkBridgeVlan, LinkGre, LinkUnspec};
+use rtnetlink::packet_route::link::{
+    BridgeStpState, BridgeVlanInfoFlags, InfoBridge, InfoBridgePort, InfoData, InfoPortData,
+    InfoVxlan, LinkAttribute, LinkExtentMask, LinkFlags, LinkInfo, LinkMessage, State, VxlanDf,
+};
+use rtnetlink::packet_route::neighbour::{
+    NeighbourAddress, NeighbourAttribute, NeighbourFlags, NeighbourMessage, NeighbourState,
+};
+use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
+use rtnetlink::{Handle, LinkBridge, LinkBridgePort, LinkBridgeVlan, LinkUnspec, LinkVxlan};
 
 use super::{
-    BridgeOptions, FouEncap, GretapParams, LinkKind, LinkState, LinkUpdate, NetOps, PortVlans,
-    SysError, SysResult, VlanFlags, vlan_ranges,
+    BridgeOptions, LinkKind, LinkState, LinkUpdate, NetOps, PortVlans, SysError, SysResult,
+    VlanFlags, VxlanParams, vlan_ranges,
 };
 
-/// `IFLA_GRE_IGNORE_DF`, not modelled by netlink-packet-route.
-const IFLA_GRE_IGNORE_DF: u16 = 19;
+/// The MAC address of the default FDB entry of a VXLAN interface: frames to
+/// any address without an entry of their own go there.
+const ALL_ZEROS_MAC: [u8; 6] = [0; 6];
+/// `ENOENT`: what the kernel answers for an entry that is not there.
+const ENOENT: i32 = 2;
 
 /// Network operations over an rtnetlink connection.
 ///
@@ -79,6 +89,26 @@ impl Netlink {
     pub fn handle(&self) -> &Handle {
         &self.handle
     }
+
+    /// Sends a neighbour (FDB) change and waits for the kernel's answer.
+    async fn neighbour(
+        &self,
+        msg: RouteNetlinkMessage,
+        flags: u16,
+    ) -> Result<(), rtnetlink::Error> {
+        let mut req = NetlinkMessage::from(msg);
+        req.header.flags = NLM_F_REQUEST | NLM_F_ACK | flags;
+        let mut handle = self.handle.clone();
+        let mut responses = handle.request(req)?;
+        while let Some(resp) = responses.next().await {
+            if let NetlinkPayload::Error(err) = resp.payload
+                && err.code.is_some()
+            {
+                return Err(rtnetlink::Error::NetlinkError(err));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn parse_link(msg: &LinkMessage) -> LinkState {
@@ -117,8 +147,8 @@ fn parse_link(msg: &LinkMessage) -> LinkState {
                         LinkInfo::Data(InfoData::Bridge(opts)) => {
                             kind = Some(LinkKind::Bridge(parse_bridge(opts)));
                         }
-                        LinkInfo::Data(InfoData::GreTap(opts)) => {
-                            kind = Some(LinkKind::Gretap(parse_gretap(opts)));
+                        LinkInfo::Data(InfoData::Vxlan(opts)) => {
+                            kind = Some(LinkKind::Vxlan(parse_vxlan(opts)));
                         }
                         LinkInfo::PortData(InfoPortData::BridgePort(opts)) => {
                             isolated = Some(opts.contains(&InfoBridgePort::Isolated(true)));
@@ -174,74 +204,86 @@ fn parse_bridge(opts: &[InfoBridge]) -> BridgeOptions {
     out
 }
 
-fn parse_gretap(opts: &[InfoGre]) -> GretapParams {
-    let mut out = GretapParams {
-        local: std::net::Ipv4Addr::UNSPECIFIED,
-        remote: std::net::Ipv4Addr::UNSPECIFIED,
-        ignore_df: false,
-        pmtudisc: true,
-        key: None,
-        encap: None,
+fn parse_vxlan(opts: &[InfoVxlan]) -> VxlanParams {
+    let mut out = VxlanParams {
+        vni: 0,
+        port: 0,
+        source_port: None,
     };
-    let mut keyed = false;
-    let mut ikey = 0;
-    let mut fou = false;
-    let (mut sport, mut dport) = (0, 0);
     for opt in opts {
         match opt {
-            InfoGre::Local(a) => out.local = *a,
-            InfoGre::Remote(a) => out.remote = *a,
-            InfoGre::PathMTUDiscovery(v) => out.pmtudisc = *v,
-            InfoGre::IFlags(flags) => keyed = flags.contains(GreIOFlags::Key),
-            InfoGre::IKey(k) => ikey = *k,
-            InfoGre::EncapType(t) => fou = *t == GreEncapType::Fou,
-            InfoGre::SourcePort(p) => sport = *p,
-            InfoGre::DestinationPort(p) => dport = *p,
-            InfoGre::Other(nla) if nla.kind() == IFLA_GRE_IGNORE_DF => {
-                let mut buf = vec![0u8; nla.value_len()];
-                nla.emit_value(&mut buf);
-                out.ignore_df = buf.first().is_some_and(|b| *b != 0);
+            InfoVxlan::Id(v) => out.vni = *v,
+            InfoVxlan::Port(p) => out.port = *p,
+            // A range of one port: a fixed source port.
+            InfoVxlan::PortRange((low, high))
+                if *low != 0 && u32::from(*high) == u32::from(*low) + 1 =>
+            {
+                out.source_port = Some(*low);
             }
             _ => {}
         }
     }
-    out.key = keyed.then_some(ikey);
-    out.encap = fou.then_some(FouEncap { sport, dport });
     out
 }
 
-/// The GRETAP attributes for `params`; a change sends all of them again.
-fn gretap_info(params: &GretapParams) -> Vec<InfoGre> {
-    let mut info = vec![
-        InfoGre::Local(params.local),
-        InfoGre::Remote(params.remote),
-        InfoGre::Ttl(0),
-        InfoGre::PathMTUDiscovery(params.pmtudisc),
-        InfoGre::Other(DefaultNla::new(
-            IFLA_GRE_IGNORE_DF,
-            vec![u8::from(params.ignore_df)],
-        )),
-    ];
-    if let Some(key) = params.key {
-        info.extend([
-            InfoGre::IFlags(GreIOFlags::Key),
-            InfoGre::OFlags(GreIOFlags::Key),
-            InfoGre::IKey(key),
-            InfoGre::OKey(key),
-        ]);
+/// The default FDB entry of a VXLAN interface in a bridge FDB message:
+/// interface index, remote address and port (`None`: the interface's own).
+fn parse_remote(msg: &NeighbourMessage) -> Option<(u32, Ipv4Addr, Option<u16>)> {
+    if msg.header.family != AddressFamily::Bridge {
+        return None;
     }
-    // Without a UDP checksum (no encap flags): GSO and GRO for UDP tunnels.
-    let (kind, sport, dport) = match params.encap {
-        Some(e) => (GreEncapType::Fou, e.sport, e.dport),
-        None => (GreEncapType::None, 0, 0),
-    };
-    info.extend([
-        InfoGre::EncapType(kind),
-        InfoGre::EncapFlags(GreEncapFlags::empty()),
-        InfoGre::SourcePort(sport),
-        InfoGre::DestinationPort(dport),
-    ]);
-    info
+    let mut zero_mac = false;
+    let mut address = None;
+    let mut port = None;
+    for attr in &msg.attributes {
+        match attr {
+            NeighbourAttribute::LinkLayerAddress(mac) => zero_mac = mac.as_slice() == ALL_ZEROS_MAC,
+            // In a bridge FDB message the address comes as plain bytes.
+            NeighbourAttribute::Destination(NeighbourAddress::Inet(a)) => address = Some(*a),
+            NeighbourAttribute::Destination(NeighbourAddress::Other(bytes)) => {
+                address = <[u8; 4]>::try_from(bytes.as_slice())
+                    .ok()
+                    .map(Ipv4Addr::from);
+            }
+            NeighbourAttribute::Port(p) => port = Some(*p),
+            _ => {}
+        }
+    }
+    // Entries of the bridge for the port have no destination.
+    zero_mac
+        .then_some(())
+        .and(address)
+        .map(|a| (msg.header.ifindex, a, port))
+}
+
+/// A message for the default FDB entry of VXLAN interface `index` (of the
+/// interface itself, not of the bridge): to `remote`, or all of it.
+fn fdb_message(index: u32, remote: Option<SocketAddrV4>) -> NeighbourMessage {
+    let mut msg = NeighbourMessage::default();
+    msg.header.family = AddressFamily::Bridge;
+    msg.header.ifindex = index;
+    msg.header.flags = NeighbourFlags::Own;
+    msg.header.state = NeighbourState::Permanent;
+    msg.attributes
+        .push(NeighbourAttribute::LinkLayerAddress(ALL_ZEROS_MAC.to_vec()));
+    if let Some(remote) = remote {
+        msg.attributes
+            .push(NeighbourAttribute::Destination(NeighbourAddress::Inet(
+                *remote.ip(),
+            )));
+        msg.attributes.push(NeighbourAttribute::Port(remote.port()));
+    }
+    msg
+}
+
+/// An entry that is not there counts as removed.
+fn ignore_enoent(e: rtnetlink::Error) -> Result<(), rtnetlink::Error> {
+    match e {
+        rtnetlink::Error::NetlinkError(ref err) if err.code.is_some_and(|c| c.get() == -ENOENT) => {
+            Ok(())
+        }
+        e => Err(e),
+    }
 }
 
 /// The bridge attributes for `options`. The per-port counters go only into
@@ -420,40 +462,109 @@ impl NetOps for Netlink {
             .map_err(|e| SysError::new(format!("set options of bridge {name}"), e))
     }
 
-    async fn create_gretap(&self, name: &str, params: &GretapParams, mtu: u32) -> SysResult<()> {
-        let data = InfoData::GreTap(gretap_info(params));
-        let msg = LinkGre::new_gretap(name)
-            .set_info_data(data)
-            .mtu(mtu)
-            .build();
+    async fn create_vxlan(&self, name: &str, params: &VxlanParams, mtu: u32) -> SysResult<()> {
+        // No learning (the remote is set, the bridge learns the MACs), no
+        // UDP checksum and no DF outside: a 1500-byte frame without DF still
+        // passes a smaller path, fragmented.
+        let mut builder = LinkVxlan::new(name, params.vni)
+            .port(params.port)
+            .learning(false)
+            .udp_csum(false)
+            .df(VxlanDf::Unset);
+        if let Some(sport) = params.source_port {
+            builder = builder.port_range(sport, sport.saturating_add(1));
+        }
         self.handle
             .link()
-            .add(msg)
+            .add(builder.mtu(mtu).build())
             .execute()
             .await
-            .map_err(|e| SysError::new(format!("create GRETAP interface {name}"), e))
+            .map_err(|e| SysError::new(format!("create VXLAN interface {name}"), e))
     }
 
-    async fn change_gretap(
+    async fn tunnel_remotes(&self) -> SysResult<super::TunnelRemotes> {
+        let _dump = self.dump_guard().await;
+        let mut msg = NeighbourMessage::default();
+        msg.header.family = AddressFamily::Bridge;
+        let mut req = NetlinkMessage::from(RouteNetlinkMessage::GetNeighbour(msg));
+        req.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
+        let mut handle = self.handle.clone();
+        let mut responses = handle
+            .request(req)
+            .map_err(|e| SysError::new("list the remotes of the VXLAN interfaces", e))?;
+        let mut out: BTreeMap<u32, Vec<(Ipv4Addr, Option<u16>)>> = BTreeMap::new();
+        while let Some(resp) = responses.next().await {
+            match resp.payload {
+                NetlinkPayload::Error(err) if err.code.is_some() => {
+                    return Err(SysError::new(
+                        "list the remotes of the VXLAN interfaces",
+                        rtnetlink::Error::NetlinkError(err),
+                    ));
+                }
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(m)) => {
+                    if let Some((index, address, port)) = parse_remote(&m) {
+                        out.entry(index).or_default().push((address, port));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
+    }
+
+    async fn set_tunnel_remote(
         &self,
         index: u32,
         name: &str,
-        params: &GretapParams,
-        mtu: u32,
+        own_port: u16,
+        remote: Option<SocketAddrV4>,
     ) -> SysResult<()> {
-        // A change sets every parameter anew (the kernel zeroes what is
-        // missing) and keeps the MTU (else it follows the new headers).
-        let msg = LinkGre::new_gretap(name)
-            .index(index)
-            .set_info_data(InfoData::GreTap(gretap_info(params)))
-            .mtu(mtu)
-            .build();
-        self.handle
-            .link()
-            .change(msg)
-            .execute()
+        let fail = |e: rtnetlink::Error| match remote {
+            Some(r) => SysError::new(
+                format!("set the remote of VXLAN interface {name} to {r}"),
+                e,
+            ),
+            None => SysError::new(format!("remove the remote of VXLAN interface {name}"), e),
+        };
+        let Some(remote) = remote else {
+            // Without an address: the whole entry goes.
+            return self
+                .neighbour(
+                    RouteNetlinkMessage::DelNeighbour(fdb_message(index, None)),
+                    0,
+                )
+                .await
+                .or_else(ignore_enoent)
+                .map_err(fail);
+        };
+        // The kernel never replaces the default entry of a VXLAN interface:
+        // the new address is appended, then the old ones go (no gap, at most
+        // a frame sent twice).
+        let old: Vec<(Ipv4Addr, Option<u16>)> = self
+            .tunnel_remotes()
+            .await?
+            .remove(&index)
+            .unwrap_or_default();
+        self.neighbour(
+            RouteNetlinkMessage::NewNeighbour(fdb_message(index, Some(remote))),
+            NLM_F_CREATE | NLM_F_APPEND,
+        )
+        .await
+        .map_err(fail)?;
+        for (address, port) in old {
+            let gone = SocketAddrV4::new(address, port.unwrap_or(own_port));
+            if gone == remote {
+                continue;
+            }
+            self.neighbour(
+                RouteNetlinkMessage::DelNeighbour(fdb_message(index, Some(gone))),
+                0,
+            )
             .await
-            .map_err(|e| SysError::new(format!("change GRETAP interface {name}"), e))
+            .or_else(ignore_enoent)
+            .map_err(fail)?;
+        }
+        Ok(())
     }
 
     async fn delete_link(&self, index: u32) -> SysResult<()> {
@@ -544,15 +655,67 @@ impl NetOps for Netlink {
 
 #[cfg(test)]
 mod tests {
-    use rtnetlink::packet_route::link::{InfoBridge, InfoKind};
+    use std::net::Ipv4Addr;
 
-    use super::{BridgeOptions, bridge_info, parse_bridge};
+    use rtnetlink::packet_route::AddressFamily;
+    use rtnetlink::packet_route::link::{InfoBridge, InfoKind, InfoVxlan};
+    use rtnetlink::packet_route::neighbour::{
+        NeighbourAddress, NeighbourAttribute, NeighbourMessage,
+    };
+
+    use super::{BridgeOptions, VxlanParams, bridge_info, parse_bridge, parse_remote, parse_vxlan};
     use crate::desired::BRIDGE_OPTIONS;
 
     #[test]
     fn kind_names_match_kernel() {
-        assert_eq!(InfoKind::GreTap.to_string(), "gretap");
+        assert_eq!(InfoKind::Vxlan.to_string(), "vxlan");
         assert_eq!(InfoKind::Bridge.to_string(), "bridge");
+    }
+
+    #[test]
+    fn a_vxlan_dump_gives_the_parameters() {
+        let fixed = [
+            InfoVxlan::Id(0x00ab_cdef),
+            InfoVxlan::Port(51822),
+            InfoVxlan::PortRange((51822, 51823)),
+            InfoVxlan::Learning(false),
+        ];
+        assert_eq!(
+            parse_vxlan(&fixed),
+            VxlanParams {
+                vni: 0x00ab_cdef,
+                port: 51822,
+                source_port: Some(51822),
+            }
+        );
+        // The kernel dumps (0, 0) without a range: a port per flow.
+        let per_flow = [
+            InfoVxlan::Id(7),
+            InfoVxlan::Port(51822),
+            InfoVxlan::PortRange((0, 0)),
+        ];
+        assert_eq!(parse_vxlan(&per_flow).source_port, None);
+    }
+
+    #[test]
+    fn only_the_default_entry_of_a_vxlan_is_its_remote() {
+        let mut own = NeighbourMessage::default();
+        own.header.family = AddressFamily::Bridge;
+        own.header.ifindex = 9;
+        own.attributes = vec![
+            NeighbourAttribute::LinkLayerAddress(vec![0; 6]),
+            // As the kernel sends it in a bridge message: plain bytes.
+            NeighbourAttribute::Destination(NeighbourAddress::Other(vec![10, 0, 0, 2])),
+            NeighbourAttribute::Port(4000),
+        ];
+        assert_eq!(
+            parse_remote(&own),
+            Some((9, Ipv4Addr::new(10, 0, 0, 2), Some(4000)))
+        );
+        // A MAC the bridge learned behind the tunnel: no destination.
+        let mut learned = own.clone();
+        learned.attributes = vec![NeighbourAttribute::LinkLayerAddress(vec![2, 0, 0, 0, 0, 1])];
+        assert_eq!(parse_remote(&learned), None);
     }
 
     #[test]

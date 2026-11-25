@@ -408,7 +408,7 @@ fn self_must_exist() {
 fn trunk_is_checked() {
     let err = single_error(EXAMPLE_NETWORK, "self = \"haus2\"\n");
     assert!(err.message.contains("trunk is missing"));
-    let err = single_error(EXAMPLE_NETWORK, "self = \"haus2\"\ntrunk = \"gt-heim\"\n");
+    let err = single_error(EXAMPLE_NETWORK, "self = \"haus2\"\ntrunk = \"vx-heim\"\n");
     assert_eq!(err.line, Some(2));
     assert!(err.message.contains("managed by wanderlan"));
     let err = single_error(
@@ -565,7 +565,7 @@ fn a_tunnel_can_have_its_own_trunk() {
 
 #[test]
 fn the_trunk_of_a_tunnel_is_checked() {
-    let local = "self = \"haus2\"\ntrunk = \"ens19\"\n\n[tunnels.heim]\ntrunk = \"gt-heim\"\n";
+    let local = "self = \"haus2\"\ntrunk = \"ens19\"\n\n[tunnels.heim]\ntrunk = \"vx-heim\"\n";
     let err = single_error(EXAMPLE_NETWORK, local);
     assert_eq!(err.file, ConfigFile::Local);
     assert!(err.message.contains("managed by wanderlan"), "{err}");

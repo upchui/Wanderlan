@@ -26,7 +26,7 @@ trunk interface is renamed to `trunk0`. Clients add VLAN subinterfaces
 (`trunk0.<vid>`) with addresses `10.<vid>.0.<n>`.
 
 natc1 and natc2 reach the others through the NAT, nobody reaches them; they
-join site1 in case 92 (clients behind NAT, GRE in UDP).
+join site1 in case 92 (clients behind NAT, VXLAN in `nat` mode).
 
 Options: `KEEP=1` keeps the containers running, `CASES="10 20"` runs only
 some cases.

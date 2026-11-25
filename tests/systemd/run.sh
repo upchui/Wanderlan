@@ -83,7 +83,7 @@ ping_ok() { x c-alpha "ping -c 2 -i 0.2 -W 1 10.20.0.2"; }
 # Nothing of wanderlan is left on a host: no bridge, tunnel or segment, no
 # nftables table, no tc filter on the trunk, no API socket.
 nothing_left() {
-  x "$1" "! ip link show br0 2>/dev/null && ! ip -o link show | grep -qE ' (gt|wl)-' \
+  x "$1" "! ip link show br0 2>/dev/null && ! ip -o link show | grep -qE ' (vx|gt|wl)-' \
     && ! nft list table bridge wanderlan 2>/dev/null \
     && [ -z \"\$(tc filter show dev trunk0 ingress 2>/dev/null)\" ] \
     && ! test -e /run/wanderlan/wanderlan.sock"
@@ -143,7 +143,7 @@ out=$(x alpha "script -qec 'timeout 10 wanderland' /dev/null; echo exit=\$?" 2>&
 expect_output "in a terminal it only explains what it is" 'The user interface is `wanderlan`' "$out"
 expect_output "and exits with 2" 'exit=2' "$out"
 check "the socket is still there" x alpha "test -S /run/wanderlan/wanderlan.sock"
-check "the tunnel is still there" x alpha "ip link show gt-beta"
+check "the tunnel is still there" x alpha "ip link show vx-beta"
 check "VLAN 20 still works" ping_ok
 healthy
 
@@ -157,11 +157,9 @@ healthy
 begin "Reset under ProtectSystem=strict"
 out=$(x alpha "wanderlan reset --yes" 2>&1)
 expect_output "alpha is reset" 'Reset done' "$out"
-expect_output "the host's kernel module is left alone in a container" \
-  'belong to the kernel module ip_gre of the host' "$out"
 check "alpha is unconfigured" test "$(state alpha)" = unconfigured
 check "no bridge and no tunnels are left" \
-  x alpha "! ip link show br0 2>/dev/null && ! ip -o link show | grep -q ' gt-'"
+  x alpha "! ip link show br0 2>/dev/null && ! ip -o link show | grep -q ' vx-'"
 check "no nftables table is left" x alpha "! nft list table bridge wanderlan 2>/dev/null"
 check "the state directory exists and is empty" \
   x alpha "[ -d /var/lib/wanderlan ] && [ -z \"\$(ls -A /var/lib/wanderlan)\" ]"
@@ -232,8 +230,6 @@ wait_for 20 "alpha runs again after a restart" x alpha "wanderlan status --json 
 wait_for 30 "VLAN 20 works after the restart" ping_ok
 x alpha "systemctl stop wanderland"
 check "stopping removes everything: interfaces, nftables, tc, socket" nothing_left alpha
-check "the cleanup leaves the kernel's GRE devices of the host alone (a container)" \
-  x alpha "journalctl -u wanderland -b --no-pager -o cat | grep -q 'belong to the kernel module ip_gre of the host'"
 x alpha "systemctl start wanderland"
 wait_for 20 "alpha runs again after a start" x alpha "wanderlan status --json | jq -e '.state == \"running\"'"
 wait_for 30 "VLAN 20 works after the start" ping_ok

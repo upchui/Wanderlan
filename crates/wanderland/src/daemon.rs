@@ -20,8 +20,8 @@ use tracing::{debug, info, warn};
 use wanderlan_core::api::{
     ApiError, Applied, ChangeSource, ConfigInput, ConfigTexts, Confirmed, Done, Interface,
     Invitation, JoinParams, Joined, Level, MacEntry, PeerStatus, PendingChange, PortState,
-    PortTraffic, Request, ResetReport, SiteState, SiteSummary, Status, TunnelKindLabel, Validation,
-    VlanPortTraffic, VlanTraffic,
+    PortTraffic, Request, ResetReport, SiteState, SiteSummary, Status, Validation, VlanPortTraffic,
+    VlanTraffic,
 };
 use wanderlan_core::config::{
     self, Config, ConfigFile, Diagnostic, Loaded, Network, render_local, render_network,
@@ -41,7 +41,7 @@ use wanderlan_core::sys::nft::PortDir;
 use wanderlan_core::sys::nft_ip::LearnOps as _;
 use wanderlan_core::sys::observe::ObserveOps as _;
 use wanderlan_core::sys::{LinkKind, NetOps as _};
-use wanderlan_core::topology::{self, ForwardingKey, GRETAP_PREFIX, TunnelKind};
+use wanderlan_core::topology::{self, ForwardingKey, TUNNEL_PREFIX, TunnelKind};
 use wanderlan_core::view;
 
 use crate::Args;
@@ -506,7 +506,7 @@ fn interface_list(
             name: l.name.clone(),
             kind: match &l.kind {
                 LinkKind::Bridge(_) => "bridge".into(),
-                LinkKind::Gretap(_) => "gretap".into(),
+                LinkKind::Vxlan(_) => "vxlan".into(),
                 LinkKind::Other(k) => k.clone(),
             },
             up: l.admin_up,
@@ -813,34 +813,32 @@ impl Controller {
         };
         let peers = self.direct_peers();
         for rule in rules.iter().filter(|r| r.dir == PortDir::Out && !r.ipv6) {
-            if let Some(peer) = rule.port.strip_prefix(GRETAP_PREFIX)
+            if let Some(peer) = rule.port.strip_prefix(TUNNEL_PREFIX)
                 && peers.contains_key(peer)
             {
-                let keyed = self.runtime.gre_keys.contains_key(peer);
                 self.runtime.pmtu.insert(
                     peer.to_string(),
-                    rule.mss
-                        .saturating_add(wanderlan_core::mtu::overhead(keyed, false)),
+                    rule.mss.saturating_add(wanderlan_core::mtu::MSS_OVERHEAD),
                 );
             }
         }
     }
 
-    /// Takes the tunnels left by a previous run with the key they should
+    /// Takes the tunnels left by a previous run with the VNI they should
     /// have as confirmed, so that a restart does not take them down until
-    /// the peers answer again (the kernel checks the key on every packet).
+    /// the peers answer again (the kernel checks the VNI on every packet).
     async fn seed_identities(&mut self) {
         let Ok(actual) = reconcile::Actual::observe(&self.sys).await else {
             return;
         };
-        for (peer, key) in &self.runtime.gre_keys {
+        for (peer, vni) in &self.runtime.vnis {
             let adopted = actual
                 .links
-                .get(&topology::gretap_name(peer))
+                .get(&topology::tunnel_name(peer))
                 .is_some_and(|l| {
                     l.alias.as_deref() == Some(OWNER_ALIAS)
                         && l.admin_up
-                        && matches!(l.kind, LinkKind::Gretap(p) if p.key == Some(*key))
+                        && matches!(l.kind, LinkKind::Vxlan(p) if p.vni == *vni)
                 });
             if adopted {
                 self.runtime
@@ -858,15 +856,15 @@ impl Controller {
                 .collect()
         });
         for peer in clients {
-            if let Some(link) = actual.links.get(&topology::gretap_name(&peer))
+            let name = topology::tunnel_name(&peer);
+            if let Some(link) = actual.links.get(&name)
                 && link.admin_up
-                && let LinkKind::Gretap(p) = link.kind
-                && let Some(encap) = p.encap
+                && let LinkKind::Vxlan(p) = link.kind
+                && p.source_port.is_some()
+                && let Some(remote) = actual.remotes.get(&name)
                 && self.runtime.identity.get(&peer) == Some(&PeerIdentity::Confirmed)
             {
-                self.runtime
-                    .endpoints
-                    .insert(peer, SocketAddrV4::new(p.remote, encap.dport));
+                self.runtime.endpoints.insert(peer, *remote);
             }
         }
     }
@@ -990,7 +988,7 @@ impl Controller {
                     .collect()
             });
         self.runtime.blocked.retain(|port| {
-            new_peers.keys().any(|p| topology::gretap_name(p) == *port)
+            new_peers.keys().any(|p| topology::tunnel_name(p) == *port)
                 || trunk_ports.contains(port)
         });
         self.update_keys();
@@ -1030,9 +1028,9 @@ impl Controller {
             keys.get(peer).map(|k| k.id) == before.get(peer).map(|k| k.id)
                 && keys.contains_key(peer)
         });
-        self.runtime.gre_keys = keys
+        self.runtime.vnis = keys
             .iter()
-            .map(|(name, k)| (name.clone(), k.keys.gre_key()))
+            .map(|(name, k)| (name.clone(), k.keys.vni()))
             .collect();
         self.peer_keys = keys;
     }
@@ -1052,8 +1050,8 @@ impl Controller {
             move_key(&mut self.runtime.pmtu, old, new);
             move_key(&mut self.runtime.underlay_mtu, old, new);
             self.grace.remove(old);
-            if self.runtime.blocked.remove(&topology::gretap_name(old)) {
-                self.runtime.blocked.insert(topology::gretap_name(new));
+            if self.runtime.blocked.remove(&topology::tunnel_name(old)) {
+                self.runtime.blocked.insert(topology::tunnel_name(new));
             }
         }
     }
@@ -1197,13 +1195,12 @@ impl Controller {
             me: self.own_id(),
             keyed: Arc::new(keyed),
         });
-        // Keepalives through the tunnel to the uplink when it runs in UDP.
+        // Keepalives through the tunnel to the uplink through NAT.
         let interfaces: Vec<String> = self.config.as_ref().map_or_else(Vec::new, |cfg| {
+            let own = cfg.self_site().map(|s| s.tunnel_mode).unwrap_or_default();
             topology::tunnels_for(&cfg.network, cfg.self_name())
                 .into_iter()
-                .filter(|t| {
-                    t.kind == TunnelKind::Uplink && self.peer_keys.contains_key(&t.peer.name)
-                })
+                .filter(|t| t.kind == TunnelKind::Uplink && t.mode(own) == config::TunnelMode::Nat)
                 .map(|t| t.ifname())
                 .collect()
         });
@@ -1279,7 +1276,7 @@ impl Controller {
             Input::Pushed { peer, result } => self.push_answered(&peer, result),
             Input::Loop(report) => {
                 if self.runtime.blocked.insert(report.port.clone()) {
-                    let peer = report.port.strip_prefix(GRETAP_PREFIX).map(str::to_string);
+                    let peer = report.port.strip_prefix(TUNNEL_PREFIX).map(str::to_string);
                     self.events
                         .emit(Level::Warn, peer.as_deref(), report.message);
                     self.reconcile().await;
@@ -2776,6 +2773,9 @@ impl Controller {
         };
         self.runtime.underlay_mtu = self.underlay_mtus(&cfg).await;
         let desired = desired::derive(&cfg, &self.runtime);
+        for (peer, reason) in &desired.unbuilt {
+            self.error_once(format!("No tunnel to site \"{peer}\": {reason}"));
+        }
         let events = self.events.clone();
         // A hanging kernel or nft call must not block the daemon (and with
         // it the API and the rollback deadline).
@@ -2790,6 +2790,15 @@ impl Controller {
                 format!("no answer within {} s", RECONCILE_TIMEOUT.as_secs()),
             ))
         })??;
+        // A tunnel was built or now sends elsewhere: a keepalive through
+        // NAT at once, so that the uplink learns where this site is now
+        // (instead of with the next one, up to 15 s later).
+        if changes
+            .iter()
+            .any(|c| matches!(c, Change::CreateTunnel { .. } | Change::SetRemote { .. }))
+        {
+            self.keepalive.send_modify(|k| k.kick += 1);
+        }
         let key = topology::forwarding_key(&cfg.network);
         let network_changed = self.applied_key.as_ref().is_some_and(|k| *k != key);
         if network_changed || reconcile::ports_changed(&changes) {
@@ -2841,7 +2850,7 @@ impl Controller {
         let tunnels = links
             .iter()
             .filter(|l| {
-                l.name.starts_with(GRETAP_PREFIX) && l.master.is_some_and(|m| bridges.contains(&m))
+                l.name.starts_with(TUNNEL_PREFIX) && l.master.is_some_and(|m| bridges.contains(&m))
             })
             .map(|l| (l.index, (l.name.clone(), l.isolated.unwrap_or(false))))
             .collect();
@@ -2980,7 +2989,7 @@ impl Controller {
             .into_iter()
             .filter(|((port, _), _)| ports_of_ours.contains(port.as_str()))
             .map(|((port, vid), r)| VlanPortTraffic {
-                peer: port.strip_prefix(GRETAP_PREFIX).map(str::to_string),
+                peer: port.strip_prefix(TUNNEL_PREFIX).map(str::to_string),
                 port,
                 vid,
                 rx_bps: r.rx_bps,
@@ -3169,6 +3178,11 @@ impl Controller {
                     .map(|r| r.mss);
                 let (rx_bps, tx_bps) = rates.get(&port).copied().unwrap_or_default();
                 let announce = probe.and_then(|p| p.announce);
+                let vni = desired
+                    .tunnels
+                    .iter()
+                    .find(|d| d.name == port)
+                    .map(|d| d.params.vni);
                 let vlans = desired
                     .tunnels
                     .iter()
@@ -3222,14 +3236,8 @@ impl Controller {
                             .unwrap_or_default()
                             .into()
                     }),
-                    tunnel: match (
-                        self.runtime.gre_keys.contains_key(&t.peer.name),
-                        matches!(t.kind, TunnelKind::Uplink | TunnelKind::Client),
-                    ) {
-                        (true, true) => TunnelKindLabel::GreUdp,
-                        (true, false) => TunnelKindLabel::GreKey,
-                        (false, _) => TunnelKindLabel::Gre,
-                    },
+                    tunnel: t.mode(me.map(|s| s.tunnel_mode).unwrap_or_default()),
+                    vni,
                     endpoint: self
                         .runtime
                         .endpoints
@@ -3261,6 +3269,7 @@ impl Controller {
                 uplink: s.uplink.clone(),
                 id: s.id.map(|id| id.fingerprint()),
                 via: topology::via(&cfg.network, cfg.self_name(), &s.name).map(str::to_string),
+                tunnel_mode: s.uplink.is_some().then_some(s.tunnel_mode),
             })
             .collect();
         let trunks: Vec<PortTraffic> = desired

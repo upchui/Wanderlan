@@ -13,8 +13,8 @@ use super::nft::{MssRule, NftOps, NftState, SplitRule};
 use super::observe::{FdbEntry, FdbEvent, ObserveOps, VlanCounters};
 use super::tc::{IfTc, TcOps, TcRule};
 use super::{
-    BridgeOptions, GretapParams, LinkKind, LinkState, LinkUpdate, NetOps, PortVlans, SysError,
-    SysResult, VlanFlags,
+    BridgeOptions, LinkKind, LinkState, LinkUpdate, NetOps, PortVlans, SysError, SysResult,
+    VlanFlags, VxlanParams,
 };
 
 /// Mutable state of the fake kernel.
@@ -46,8 +46,9 @@ pub struct FakeState {
     pub nft_delete_fails: bool,
     /// Reading the tc state fails.
     pub tc_state_fails: bool,
-    /// FOU receive ports.
-    pub fou: BTreeSet<super::fou::FouPort>,
+    /// Where the VXLAN interfaces send to (their default FDB entry), by
+    /// index.
+    pub remotes: BTreeMap<u32, std::net::SocketAddrV4>,
     /// The table `ip wanderlan`, if it exists.
     pub learn: Option<super::nft_ip::LearnState>,
     /// What its sets hold.
@@ -284,14 +285,23 @@ impl NetOps for FakeNet {
         }
     }
 
-    async fn create_gretap(&self, name: &str, params: &GretapParams, mtu: u32) -> SysResult<()> {
+    async fn create_vxlan(&self, name: &str, params: &VxlanParams, mtu: u32) -> SysResult<()> {
         let mut s = self.lock();
         s.calls.push(format!(
-            "create_gretap {name} {}->{}",
-            params.local, params.remote
+            "create_vxlan {name} vni {} port {}",
+            params.vni, params.port
         ));
         if s.name_taken(name) {
-            return Err(err("create gretap", "File exists"));
+            return Err(err("create vxlan", "File exists"));
+        }
+        // Like the kernel: one VNI per UDP port.
+        if s.links.values().any(|l| {
+            matches!(l.kind, LinkKind::Vxlan(p) if p.vni == params.vni && p.port == params.port)
+        }) {
+            return Err(err(
+                "create vxlan",
+                "A VXLAN device with the specified VNI already exists",
+            ));
         }
         let index = s.alloc();
         s.links.insert(
@@ -299,7 +309,7 @@ impl NetOps for FakeNet {
             LinkState {
                 index,
                 name: name.to_string(),
-                kind: LinkKind::Gretap(*params),
+                kind: LinkKind::Vxlan(*params),
                 alias: None,
                 master: None,
                 admin_up: false,
@@ -312,27 +322,49 @@ impl NetOps for FakeNet {
         Ok(())
     }
 
-    async fn change_gretap(
+    async fn tunnel_remotes(&self) -> SysResult<super::TunnelRemotes> {
+        let s = self.lock();
+        // Like the kernel: the port only where it is not the interface's.
+        Ok(s.remotes
+            .iter()
+            .map(|(index, remote)| {
+                let own = s.links.get(index).and_then(|l| match l.kind {
+                    LinkKind::Vxlan(p) => Some(p.port),
+                    _ => None,
+                });
+                let port = (own != Some(remote.port())).then_some(remote.port());
+                (*index, vec![(*remote.ip(), port)])
+            })
+            .collect())
+    }
+
+    async fn set_tunnel_remote(
         &self,
         index: u32,
         name: &str,
-        params: &GretapParams,
-        mtu: u32,
+        _own_port: u16,
+        remote: Option<std::net::SocketAddrV4>,
     ) -> SysResult<()> {
         let mut s = self.lock();
-        s.calls.push(format!(
-            "change_gretap {name} {}->{}",
-            params.local, params.remote
-        ));
-        match s.links.get_mut(&index) {
-            Some(link) if matches!(link.kind, LinkKind::Gretap(_)) => {
-                link.kind = LinkKind::Gretap(*params);
-                link.mtu = mtu;
-                Ok(())
-            }
-            Some(_) => Err(err("change gretap", "not a GRETAP interface")),
-            None => Err(err("change gretap", "No such device")),
+        match remote {
+            Some(r) => s.calls.push(format!("set_tunnel_remote {name} {r}")),
+            None => s.calls.push(format!("set_tunnel_remote {name} none")),
         }
+        if !matches!(
+            s.links.get(&index).map(|l| &l.kind),
+            Some(LinkKind::Vxlan(_))
+        ) {
+            return Err(err("set tunnel remote", "Operation not supported"));
+        }
+        match remote {
+            Some(r) => {
+                s.remotes.insert(index, r);
+            }
+            None => {
+                s.remotes.remove(&index);
+            }
+        }
+        Ok(())
     }
 
     async fn delete_link(&self, index: u32) -> SysResult<()> {
@@ -343,6 +375,7 @@ impl NetOps for FakeNet {
         s.calls.push(format!("delete_link {}", link.name));
         s.vlans.remove(&index);
         s.tc.remove(&index);
+        s.remotes.remove(&index);
         let ports: Vec<u32> = s
             .links
             .values()
@@ -590,38 +623,6 @@ impl NftOps for FakeNet {
     }
 }
 
-impl super::fou::FouOps for FakeNet {
-    async fn fou_ports(&self) -> SysResult<Vec<super::fou::FouPort>> {
-        Ok(self.lock().fou.iter().copied().collect())
-    }
-
-    async fn add_fou_port(&self, port: u16) -> SysResult<()> {
-        let mut s = self.lock();
-        s.calls.push(format!("add_fou_port {port}"));
-        let entry = super::fou::FouPort {
-            port,
-            ipproto: super::fou::IPPROTO_GRE,
-        };
-        if !s.fou.insert(entry) {
-            return Err(err("open a FOU port", "File exists"));
-        }
-        Ok(())
-    }
-
-    async fn del_fou_port(&self, port: u16) -> SysResult<()> {
-        let mut s = self.lock();
-        s.calls.push(format!("del_fou_port {port}"));
-        let entry = super::fou::FouPort {
-            port,
-            ipproto: super::fou::IPPROTO_GRE,
-        };
-        if !s.fou.remove(&entry) {
-            return Err(err("close a FOU port", "No such file or directory"));
-        }
-        Ok(())
-    }
-}
-
 impl super::nft_ip::LearnOps for FakeNet {
     async fn learn_state(&self) -> SysResult<Option<super::nft_ip::LearnState>> {
         Ok(self.lock().learn.clone())
@@ -632,6 +633,7 @@ impl super::nft_ip::LearnOps for FakeNet {
         port: u16,
         rules: &BTreeSet<super::nft_ip::LearnRule>,
         notrack: bool,
+        fixed: &BTreeSet<u32>,
     ) -> SysResult<()> {
         let mut s = self.lock();
         s.calls.push(format!("set_learn {port} {}", rules.len()));
@@ -642,10 +644,12 @@ impl super::nft_ip::LearnOps for FakeNet {
         s.learned
             .retain(|client, _| sets.contains(&format!("ep-{client}")));
         s.learn = Some(super::nft_ip::LearnState {
-            port: Some(port),
+            port: (!rules.is_empty()).then_some(port),
             rules: rules.clone(),
             sets,
             notrack,
+            fixed: fixed.clone(),
+            fixed_port: (!fixed.is_empty()).then_some(port),
         });
         Ok(())
     }

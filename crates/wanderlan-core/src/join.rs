@@ -346,6 +346,7 @@ pub fn add_site(
         online: false,
         managed_by: Some(inviter.to_string()),
         self_managed: rules.allow_self,
+        tunnel_mode: Default::default(),
         // Plugged into the inviting site: its only tunnel leads there.
         uplink: Some(inviter.to_string()),
     });
@@ -511,6 +512,7 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
+            tunnel_mode: Default::default(),
             uplink: None,
         });
         network
@@ -629,6 +631,7 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
+            tunnel_mode: Default::default(),
             uplink: None,
         });
         let moved = join(&base, "site3", "site2", false, NEW, &none()).unwrap();
@@ -666,6 +669,7 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
+            tunnel_mode: Default::default(),
             uplink: Some("site2".into()),
         });
         let no_loop = join(&chain, "site4", "site2", false, NEW, &none()).unwrap();

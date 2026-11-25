@@ -19,7 +19,7 @@ use wanderlan_core::api::{
 };
 use wanderlan_core::config::{Diagnostic, has_errors, render_local, render_network};
 use wanderlan_core::policy;
-use wanderlan_core::topology::{self, gretap_name};
+use wanderlan_core::topology::{self, tunnel_name};
 
 use super::diff::{self, DiffLine};
 use super::draft::{Draft, Running, TunnelRow};
@@ -2770,7 +2770,7 @@ impl App {
                     .network
                     .sites
                     .get(selected)
-                    .map(|s| gretap_name(&s.name))
+                    .map(|s| tunnel_name(&s.name))
                     .unwrap_or_default();
                 let state = self
                     .status

@@ -31,9 +31,9 @@ for c in natc1 natc2; do
   check "site1 takes $c online" x site1 "wanderlan online $c --confirm"
 done
 for c in natc1 natc2; do
-  wait_eq 60 "site1: the tunnel to $c runs in UDP, $c proved its identity" "confirmed gre_udp up" \
+  wait_eq 60 "site1: the tunnel to $c runs through NAT, $c proved its identity" "confirmed nat up" \
     peer_of site1 "$c" '"\(.identity_state) \(.tunnel) \(.port_state)"'
-  wait_eq 30 "$c: its tunnel to site1 is up" "confirmed gre_udp up" \
+  wait_eq 30 "$c: its tunnel to site1 is up" "confirmed nat up" \
     peer_of "$c" site1 '"\(.identity_state) \(.tunnel) \(.port_state)"'
   check "site1 knows where the tunnel packets of $c come from (the NAT)" \
     grep -q '^10\.100\.20\.10:[0-9]*$' <<<"$(peer_of site1 "$c" .endpoint)"
@@ -42,10 +42,10 @@ check "the NAT gave the two boxes different ports" \
   test "$(peer_of site1 natc1 .endpoint)" != "$(peer_of site1 natc2 .endpoint)"
 check "site1 learned them from the keepalives (table ip wanderlan)" \
   x site1 "nft list set ip wanderlan ep-natc1 | grep -q '10.100.20.10 . '"
-check "a client tunnel is GRE in UDP with a key on port 51822" \
-  x natc1 "ip -d link show gt-site1 | grep -q 'encap fou encap-sport 51822 encap-dport 51822' && ip -d link show gt-site1 | grep -q ' ikey '"
-check "the client sends from any of its addresses (local 0.0.0.0)" \
-  x natc1 "ip -d link show gt-site1 | grep -q 'remote 10.100.1.10 local any'"
+check "a client tunnel is VXLAN from and to port 51822" \
+  x natc1 "ip -d link show vx-site1 | grep -q 'vxlan id [0-9]* .*srcport 51822 51823 dstport 51822'"
+check "site1 sends to the NAT, where natc1's packets come from" \
+  x site1 "bridge fdb show dev vx-natc1 | grep -q '^00:00:00:00:00:00 dst 10.100.20.10 '"
 
 client_vlan c-site1 20 10.20.0.1/24
 client_vlan c-natc1 20 10.20.0.31/24
@@ -59,20 +59,20 @@ check "site1 never opened a flow towards the boxes behind the NAT" \
 begin "NAT: a new mapping (the NAT forgot the flows) is followed"
 
 before=$(peer_of site1 natc1 .endpoint)
-index=$(x site1 "cat /sys/class/net/gt-natc1/ifindex")
+index=$(x site1 "cat /sys/class/net/vx-natc1/ifindex")
 x nat "conntrack -F >/dev/null 2>&1"
 wait_for 60 "site1 follows the new port of natc1 (was $before)" \
   eval "[ \"\$(peer_of site1 natc1 .endpoint)\" != '$before' ]"
 wait_for 60 "VLAN 20: natc1 reaches site1's client again" ping_once c-natc1 10.20.0.1
 check "the tunnel was changed in place (same interface)" \
-  test "$(x site1 "cat /sys/class/net/gt-natc1/ifindex")" = "$index"
+  test "$(x site1 "cat /sys/class/net/vx-natc1/ifindex")" = "$index"
 wait_for 60 "VLAN 20: natc2 reaches site1's client again" ping_once c-natc2 10.20.0.1
 
 begin "NAT: a restart of the server is followed"
 
 x site1 "wl-daemon stop; wl-daemon start"
 for c in natc1 natc2; do
-  wait_eq 90 "site1: the tunnel to $c is up again" "confirmed gre_udp up" \
+  wait_eq 90 "site1: the tunnel to $c is up again" "confirmed nat up" \
     peer_of site1 "$c" '"\(.identity_state) \(.tunnel) \(.port_state)"'
 done
 wait_for 60 "VLAN 20: natc1 reaches site1's client" ping_once c-natc1 10.20.0.1

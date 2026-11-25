@@ -11,16 +11,15 @@ Type=simple
 # What an earlier run left behind if its ExecStopPost could not run (some
 # kernels also kill a process started into the unit's cgroup after
 # `systemctl kill`); usually nothing. Before the modules: the cleanup may
-# unload ip_gre.
+# unload ip_gre (left by an older version, which ran GRE tunnels).
 ExecStartPre=-+/usr/bin/wanderland --cleanup
 # The kernel modules only while wanderlan runs ("+": with full rights, the
 # daemon itself may not load modules; "-": not possible in a container).
-ExecStartPre=-+/sbin/modprobe -a bridge ip_gre fou sch_ingress cls_flower act_vlan act_gact nf_tables
+ExecStartPre=-+/sbin/modprobe -a bridge vxlan sch_ingress cls_flower act_vlan act_gact nf_tables
 ExecStart=/usr/bin/wanderland
 ExecReload=/bin/kill -HUP $MAINPID
 # After every end of the service (stop, restart, update, crash, kill):
-# nothing of wanderlan stays, also not the kernel's gre0/gretap0/erspan0
-# when nothing else needs ip_gre. A start builds everything anew.
+# nothing of wanderlan stays. A start builds everything anew.
 ExecStopPost=-+/usr/bin/wanderland --cleanup
 # Also after a crash or a kill; `systemctl stop` stops it for good.
 Restart=always
@@ -30,8 +29,8 @@ LimitNOFILE=8192
 TimeoutStopSec=30s
 
 # Runs as root but with CAP_NET_ADMIN and CAP_NET_RAW as its only
-# capabilities (CAP_NET_RAW and AF_PACKET: a client sends a keepalive frame
-# through its tunnel inside UDP, so that its NAT stays open).
+# capabilities (CAP_NET_RAW and AF_PACKET: a client behind NAT sends a
+# keepalive frame through its tunnel, so that its NAT stays open).
 User=root
 Group=wanderlan
 UMask=0007

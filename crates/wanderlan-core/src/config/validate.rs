@@ -6,7 +6,7 @@ use std::time::Duration;
 use super::diag::{ConfigFile, Diagnostic, FieldPath};
 use super::model::{Local, LocalVid, MAX_SITE_NAME_LEN, Network};
 use super::vlan::NATIVE_VID;
-use crate::topology::GRETAP_PREFIX;
+use crate::topology::TUNNEL_PREFIX;
 
 /// Smallest accepted fixed MSS.
 pub const MSS_MIN: u16 = 536;
@@ -47,7 +47,7 @@ pub fn site_name_error(name: &str) -> Option<String> {
     }
     if name.len() > MAX_SITE_NAME_LEN {
         return Some(format!(
-            "site name \"{name}\" is longer than {MAX_SITE_NAME_LEN} characters (it becomes part of the interface name {GRETAP_PREFIX}{name})"
+            "site name \"{name}\" is longer than {MAX_SITE_NAME_LEN} characters (it becomes part of the interface name {TUNNEL_PREFIX}{name})"
         ));
     }
     let valid_chars = name
@@ -206,6 +206,15 @@ impl Validator {
                 );
             }
 
+            // Servers among each other always send directly.
+            if site.uplink.is_none() && site.tunnel_mode != super::model::TunnelMode::default() {
+                self.error(
+                    FieldPath::site_field(i, "tunnel_mode"),
+                    format!(
+                        "site \"{name}\": tunnel_mode is only for a client (a site with `server`); the tunnels between servers always run direct"
+                    ),
+                );
+            }
             if site
                 .vlans
                 .as_ref()
@@ -575,7 +584,7 @@ impl Validator {
 
 /// True for names of interfaces wanderlan creates itself.
 fn is_managed_name(name: &str) -> bool {
-    name.starts_with(GRETAP_PREFIX)
+    crate::topology::is_tunnel_name(name)
         || name == crate::BRIDGE_NAME
         || name.starts_with(crate::desired::SEGMENT_PREFIX)
 }

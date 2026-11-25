@@ -96,7 +96,7 @@ pub enum Command {
     },
     /// Re-enable a tunnel port shut down by the loop guard.
     Unblock {
-        /// Tunnel interface, e.g. gt-haus2.
+        /// Tunnel interface, e.g. vx-haus2.
         port: String,
     },
     /// Show the event log.
@@ -122,6 +122,20 @@ pub enum Command {
     Online {
         /// The site.
         site: String,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// How the tunnel of a client to its server runs: "nat" (the default;
+    /// the client may sit behind NAT, its server only answers) or "direct"
+    /// (the server sends to the client's address; spreads the load over
+    /// the receive queues).
+    #[command(name = "tunnel-mode")]
+    TunnelMode {
+        /// The client.
+        site: String,
+        /// "nat" or "direct".
+        mode: wanderlan_core::config::TunnelMode,
         /// Confirm the change right away.
         #[arg(long)]
         confirm: bool,
@@ -375,6 +389,11 @@ pub async fn run(args: Args) -> Result<ExitCode> {
         Some(Command::Offline { site, confirm }) => {
             set_online(&socket, &site, false, confirm).await
         }
+        Some(Command::TunnelMode {
+            site,
+            mode,
+            confirm,
+        }) => set_tunnel_mode(&socket, &site, mode, confirm).await,
         Some(Command::Role {
             site,
             role,
@@ -655,6 +674,27 @@ async fn set_online(socket: &Path, site: &str, online: bool, confirm: bool) -> R
         }
         entry.online = online;
         Ok(format!("{site} is {word}"))
+    })
+    .await
+}
+
+async fn set_tunnel_mode(
+    socket: &Path,
+    site: &str,
+    mode: wanderlan_core::config::TunnelMode,
+    confirm: bool,
+) -> Result<ExitCode> {
+    edit_site(socket, site, confirm, |entry, _| {
+        if entry.uplink.is_none() {
+            return Err(format!(
+                "{site} is a server: the tunnels between servers always run direct."
+            ));
+        }
+        if entry.tunnel_mode == mode {
+            return Err(format!("The tunnel of {site} already runs {mode}."));
+        }
+        entry.tunnel_mode = mode;
+        Ok(format!("The tunnel of {site} to its server runs {mode}"))
     })
     .await
 }

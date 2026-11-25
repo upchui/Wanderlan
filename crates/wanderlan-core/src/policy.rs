@@ -37,6 +37,7 @@ struct Rules<'a> {
     managed_by: Option<&'a str>,
     self_managed: bool,
     uplink: Option<&'a str>,
+    tunnel_mode: crate::config::TunnelMode,
     maps: Vec<&'a VlanMap>,
 }
 
@@ -50,6 +51,7 @@ fn rules<'a>(network: &'a Network, site: &'a Site) -> Rules<'a> {
         managed_by: site.managed_by.as_deref(),
         self_managed: site.self_managed,
         uplink: site.uplink.as_deref(),
+        tunnel_mode: site.tunnel_mode,
         maps,
     }
 }
@@ -356,6 +358,7 @@ mod tests {
             managed_by: managed_by.map(Into::into),
             self_managed,
             uplink: None,
+            tunnel_mode: Default::default(),
         }
     }
 

@@ -3,7 +3,7 @@
 //!
 //! The rules are applied through the JSON interface of nftables (`nft -j`),
 //! using the `nftables` crate. Every rule carries a comment that encodes it,
-//! e.g. `wl mss oif gt-hub2 ip 1318`, so the current state can be read back
+//! e.g. `wl mss oif vx-hub2 ip 1318`, so the current state can be read back
 //! and compared without parsing expressions.
 //!
 //! Every bridged frame of the host passes the base chain, so it holds as
@@ -591,21 +591,21 @@ mod tests {
     #[test]
     fn comment_roundtrip() {
         let rule = MssRule {
-            port: "gt-hub2".into(),
+            port: "vx-hub2".into(),
             dir: PortDir::Out,
             ipv6: true,
             mss: 1298,
         };
-        assert_eq!(rule.comment(), "wl mss oif gt-hub2 ip6 1298");
+        assert_eq!(rule.comment(), "wl mss oif vx-hub2 ip6 1298");
         assert_eq!(MssRule::from_comment(&rule.comment()), Some(rule));
         assert_eq!(MssRule::from_comment("something else"), None);
-        assert_eq!(MssRule::from_comment("wl mss oif gt-x ip 1 extra"), None);
+        assert_eq!(MssRule::from_comment("wl mss oif vx-x ip 1 extra"), None);
     }
 
     #[test]
     fn batch_json_contains_the_expected_rule() {
         let rules = BTreeSet::from([MssRule {
-            port: "gt-hub2".into(),
+            port: "vx-hub2".into(),
             dir: PortDir::Out,
             ipv6: false,
             mss: 1318,
@@ -618,7 +618,7 @@ mod tests {
             r#""tcp option":{"name":"maxseg","field":"size"}"#,
             r#"{"match":{"left":{"tcp option":{"name":"maxseg","field":"size"}},"right":1318,"op":">"}}"#,
             r#""mangle""#,
-            r#""comment":"wl mss oif gt-hub2 ip 1318""#,
+            r#""comment":"wl mss oif vx-hub2 ip 1318""#,
             r#""oifname""#,
             // Only TCP SYNs reach the MSS rules.
             r#""chain":"wl-mss""#,
@@ -636,7 +636,7 @@ mod tests {
     #[test]
     fn the_table_of_an_older_version_is_written_anew() {
         let rule = MssRule {
-            port: "gt-a".into(),
+            port: "vx-a".into(),
             dir: PortDir::In,
             ipv6: false,
             mss: 1318,
@@ -693,7 +693,7 @@ mod tests {
         );
         // A write is remembered.
         let rules = BTreeSet::from([MssRule {
-            port: "gt-a".into(),
+            port: "vx-a".into(),
             dir: PortDir::In,
             ipv6: false,
             mss: 1318,
@@ -725,7 +725,7 @@ mod tests {
 
     fn split() -> SplitRule {
         SplitRule {
-            ports: BTreeSet::from(["gt-a".to_string(), "gt-b".to_string()]),
+            ports: BTreeSet::from(["vx-a".to_string(), "vx-b".to_string()]),
             vlans: vec![(10, 19), (21, 21)],
         }
     }
@@ -736,8 +736,8 @@ mod tests {
             serde_json::to_string(&replace_batch(&BTreeSet::new(), &BTreeSet::from([split()])))
                 .unwrap();
         for needle in [
-            r#"{"match":{"left":{"meta":{"key":"iifname"}},"right":{"set":["gt-a","gt-b"]},"op":"=="}}"#,
-            r#"{"match":{"left":{"meta":{"key":"oifname"}},"right":{"set":["gt-a","gt-b"]},"op":"=="}}"#,
+            r#"{"match":{"left":{"meta":{"key":"iifname"}},"right":{"set":["vx-a","vx-b"]},"op":"=="}}"#,
+            r#"{"match":{"left":{"meta":{"key":"oifname"}},"right":{"set":["vx-a","vx-b"]},"op":"=="}}"#,
             r#"{"match":{"left":{"payload":{"protocol":"vlan","field":"id"}},"right":{"set":[{"range":[10,19]},21]},"op":"=="}}"#,
             r#"{"drop":null}"#,
         ] {

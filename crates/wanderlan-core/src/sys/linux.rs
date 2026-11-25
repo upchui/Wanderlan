@@ -1,8 +1,8 @@
 //! The real system: rtnetlink for links, bridge and tc, `nft` for nftables.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::SocketAddrV4;
 
-use super::fou::{Fou, FouOps, FouPort};
 use super::netlink::Netlink;
 use super::nft::{CachedNft, MssRule, NftCli, NftOps, NftState, SplitRule};
 use super::nft_ip::{LearnCli, LearnOps, LearnRule, LearnState, Learned};
@@ -11,7 +11,7 @@ use super::nft_ip::{LearnCli, LearnOps, LearnRule, LearnState, Learned};
 const NFT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
 use super::tc::{IfTc, TcOps, TcRule};
 use super::{
-    BridgeOptions, GretapParams, LinkState, LinkUpdate, NetOps, PortVlans, SysResult, VlanFlags,
+    BridgeOptions, LinkState, LinkUpdate, NetOps, PortVlans, SysResult, VlanFlags, VxlanParams,
 };
 
 /// [`super::System`] implementation for Linux.
@@ -21,8 +21,6 @@ pub struct LinuxSystem {
     pub net: Netlink,
     /// nftables backend (reads of the MSS rules are cached).
     pub nft: CachedNft<NftCli>,
-    /// FOU ports (generic netlink).
-    pub fou: Fou,
     /// Where the clients are (table `ip wanderlan`).
     pub learn: LearnCli,
 }
@@ -33,7 +31,6 @@ impl LinuxSystem {
         Ok(Self {
             net: Netlink::connect()?,
             nft: CachedNft::new(NftCli, NFT_CACHE_TTL),
-            fou: Fou::default(),
             learn: LearnCli::default(),
         })
     }
@@ -60,17 +57,22 @@ impl NetOps for LinuxSystem {
     ) -> SysResult<()> {
         self.net.set_bridge_options(index, name, options).await
     }
-    async fn create_gretap(&self, name: &str, params: &GretapParams, mtu: u32) -> SysResult<()> {
-        self.net.create_gretap(name, params, mtu).await
+    async fn create_vxlan(&self, name: &str, params: &VxlanParams, mtu: u32) -> SysResult<()> {
+        self.net.create_vxlan(name, params, mtu).await
     }
-    async fn change_gretap(
+    async fn tunnel_remotes(&self) -> SysResult<super::TunnelRemotes> {
+        self.net.tunnel_remotes().await
+    }
+    async fn set_tunnel_remote(
         &self,
         index: u32,
         name: &str,
-        params: &GretapParams,
-        mtu: u32,
+        own_port: u16,
+        remote: Option<SocketAddrV4>,
     ) -> SysResult<()> {
-        self.net.change_gretap(index, name, params, mtu).await
+        self.net
+            .set_tunnel_remote(index, name, own_port, remote)
+            .await
     }
     async fn delete_link(&self, index: u32) -> SysResult<()> {
         self.net.delete_link(index).await
@@ -131,18 +133,6 @@ impl NftOps for LinuxSystem {
     }
 }
 
-impl FouOps for LinuxSystem {
-    async fn fou_ports(&self) -> SysResult<Vec<FouPort>> {
-        self.fou.fou_ports().await
-    }
-    async fn add_fou_port(&self, port: u16) -> SysResult<()> {
-        self.fou.add_fou_port(port).await
-    }
-    async fn del_fou_port(&self, port: u16) -> SysResult<()> {
-        self.fou.del_fou_port(port).await
-    }
-}
-
 impl LearnOps for LinuxSystem {
     async fn learn_state(&self) -> SysResult<Option<LearnState>> {
         self.learn.learn_state().await
@@ -152,8 +142,9 @@ impl LearnOps for LinuxSystem {
         port: u16,
         rules: &BTreeSet<LearnRule>,
         notrack: bool,
+        fixed: &BTreeSet<u32>,
     ) -> SysResult<()> {
-        self.learn.set_learn(port, rules, notrack).await
+        self.learn.set_learn(port, rules, notrack, fixed).await
     }
     async fn delete_learn(&self) -> SysResult<()> {
         self.learn.delete_learn().await

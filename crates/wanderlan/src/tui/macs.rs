@@ -4,7 +4,7 @@ use std::cmp::Ordering;
 
 use crossterm::event::{KeyCode, KeyEvent};
 use wanderlan_core::api::MacEntry;
-use wanderlan_core::topology::GRETAP_PREFIX;
+use wanderlan_core::topology::TUNNEL_PREFIX;
 
 use super::input::TextInput;
 
@@ -67,7 +67,7 @@ pub struct MacState {
 /// The site behind a bridge port: the peer for tunnel ports, `None` for
 /// local ports.
 pub fn port_site(port: &str) -> Option<&str> {
-    port.strip_prefix(GRETAP_PREFIX)
+    port.strip_prefix(TUNNEL_PREFIX)
 }
 
 impl MacState {
@@ -216,7 +216,7 @@ mod tests {
 
     #[test]
     fn port_sites() {
-        assert_eq!(port_site("gt-buero"), Some("buero"));
+        assert_eq!(port_site("vx-buero"), Some("buero"));
         assert_eq!(port_site("ens19"), None);
     }
 }

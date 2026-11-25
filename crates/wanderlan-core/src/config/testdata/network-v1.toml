@@ -11,7 +11,7 @@
 # beforehand (WireGuard, IPsec, a provider network, ...). Sites without
 # `uplink` are servers: they are connected with each other and must reach
 # each other there. A site with `uplink` is a client of that site: its only
-# GRETAP tunnel leads there (sites that join with an invitation become
+# tunnel leads there (sites that join with an invitation become
 # clients of the inviting site).
 
 [network]

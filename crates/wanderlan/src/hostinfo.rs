@@ -160,7 +160,7 @@ dead0\t0000090A\t00000000\t0000\t0\t0\t0\t0000FFFF\t0\t0\t0\n";
             up: true,
             master: master.map(Into::into),
             mtu: 1500,
-            managed: kind == "gretap",
+            managed: kind == "vxlan",
             carries: Vec::new(),
         }
     }
@@ -172,7 +172,7 @@ dead0\t0000090A\t00000000\t0000\t0\t0\t0\t0000FFFF\t0\t0\t0\n";
             iface("ens18", "", None),
             iface("ens19", "", None),
             iface("docker0", "bridge", None),
-            iface("gt-a", "gretap", Some("br0")),
+            iface("vx-a", "vxlan", Some("br0")),
         ];
         assert_eq!(choose_trunk(&interfaces, Some("ens18")), Ok("ens19".into()));
         assert_eq!(

@@ -9,18 +9,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::net::SocketAddrV4;
 
 use crate::config::VlanSet;
-use crate::desired::{Desired, GRETAP_MTU, OWNER_ALIAS};
-use crate::sys::fou::IPPROTO_GRE;
+use crate::desired::{Desired, OWNER_ALIAS, TUNNEL_MTU};
 use crate::sys::nft::{MssRule, NftState, SplitRule};
 use crate::sys::nft_ip::{LearnRule, LearnState};
 use crate::sys::tc::{IfTc, TcRule};
 use crate::sys::{
-    BridgeOptions, GretapParams, LinkKind, LinkState, LinkUpdate, PortVlans, SysError, System,
-    VlanFlags,
+    BridgeOptions, LinkKind, LinkState, LinkUpdate, PortVlans, SysError, System, VlanFlags,
+    VxlanParams,
 };
-use crate::topology::GRETAP_PREFIX;
+use crate::topology::{LEGACY_TUNNEL_PREFIX, is_tunnel_name};
 
 /// Maximum number of observe/plan/apply rounds before giving up.
 pub const MAX_ROUNDS: usize = 6;
@@ -40,22 +40,39 @@ pub struct Actual {
     pub vlan_stats_supported: bool,
     /// Why the nftables rules could not be read (e.g. no `nft`).
     pub nft_error: Option<String>,
-    /// The FOU ports for GRE (taken as wanderlan's).
-    pub fou_ports: BTreeSet<u16>,
+    /// Where the tunnel interfaces send to, by name.
+    pub remotes: BTreeMap<String, SocketAddrV4>,
     /// The table `ip wanderlan`, `None` if it does not exist.
     pub learn: Option<LearnState>,
-    /// Why the FOU ports or the table `ip wanderlan` could not be read.
+    /// Why the table `ip wanderlan` could not be read.
     pub nat_error: Option<String>,
 }
 
 impl Actual {
     /// Reads the current state from the system.
     pub async fn observe<N: System>(net: &N) -> Result<Self, SysError> {
-        let links = net
+        let links: BTreeMap<String, LinkState> = net
             .links()
             .await?
             .into_iter()
             .map(|l| (l.name.clone(), l))
+            .collect();
+        // The kernel names the port only where it is not the interface's.
+        let raw = net.tunnel_remotes().await?;
+        let remotes = links
+            .values()
+            .filter_map(|l| match l.kind {
+                // Exactly one: several are left over from a change that
+                // did not finish, set anew.
+                LinkKind::Vxlan(params) => match raw.get(&l.index)?.as_slice() {
+                    [(address, port)] => Some((
+                        l.name.clone(),
+                        SocketAddrV4::new(*address, port.unwrap_or(params.port)),
+                    )),
+                    _ => None,
+                },
+                _ => None,
+            })
             .collect();
         let vlans = net.port_vlans().await?;
         let tc = net.tc_state().await?;
@@ -65,7 +82,10 @@ impl Actual {
             Ok(nft) => (nft, None),
             Err(e) => (None, Some(e.to_string())),
         };
-        let (fou_ports, learn, nat_error) = observe_nat(net).await;
+        let (learn, nat_error) = match net.learn_state().await {
+            Ok(learn) => (learn, None),
+            Err(e) => (None, Some(e.to_string())),
+        };
         Ok(Self {
             links,
             vlans,
@@ -73,7 +93,7 @@ impl Actual {
             nft,
             vlan_stats_supported: net.vlan_stats_supported(),
             nft_error,
-            fou_ports,
+            remotes,
             learn,
             nat_error,
         })
@@ -86,31 +106,6 @@ impl Actual {
     fn vlans_of(&self, link: &LinkState) -> PortVlans {
         self.vlans.get(&link.index).cloned().unwrap_or_default()
     }
-}
-
-/// The FOU ports for GRE and the table `ip wanderlan`; what cannot be read
-/// counts as absent (with the reason).
-async fn observe_nat<N: System>(net: &N) -> (BTreeSet<u16>, Option<LearnState>, Option<String>) {
-    let mut error = None;
-    let fou_ports = match net.fou_ports().await {
-        Ok(ports) => ports
-            .into_iter()
-            .filter(|p| p.ipproto == IPPROTO_GRE)
-            .map(|p| p.port)
-            .collect(),
-        Err(e) => {
-            error = Some(e.to_string());
-            BTreeSet::new()
-        }
-    };
-    let learn = match net.learn_state().await {
-        Ok(learn) => learn,
-        Err(e) => {
-            error = Some(e.to_string());
-            None
-        }
-    };
-    (fou_ports, learn, error)
 }
 
 /// Returns true if wanderlan created this link.
@@ -131,27 +126,25 @@ pub enum Change {
         name: String,
         options: BridgeOptions,
     },
-    /// Create a GRETAP tunnel.
-    CreateGretap {
+    /// Create a tunnel (VXLAN); where it sends to follows (see
+    /// [`Change::SetRemote`]).
+    CreateTunnel {
         name: String,
         peer: String,
-        params: GretapParams,
+        params: VxlanParams,
     },
-    /// Change a GRETAP tunnel in place (endpoints, key, encapsulation).
-    ChangeGretap {
+    /// Set where a tunnel sends to, in place (the port, its VLANs and
+    /// counters stay); `None`: nowhere.
+    SetRemote {
         name: String,
-        params: GretapParams,
-        reason: String,
+        remote: Option<SocketAddrV4>,
     },
-    /// Open the FOU port of the tunnels inside UDP.
-    AddFouPort { port: u16 },
-    /// Close a FOU port.
-    DelFouPort { port: u16 },
     /// Write the rules that learn where the clients are.
     SetLearn {
         port: u16,
         rules: BTreeSet<LearnRule>,
         notrack: bool,
+        fixed: BTreeSet<u32>,
     },
     /// Delete the table `ip wanderlan`.
     DeleteLearn,
@@ -224,19 +217,22 @@ impl fmt::Display for Change {
                 on_off(options.stp),
                 options.default_pvid
             ),
-            Self::CreateGretap { name, peer, params } => write!(
+            Self::CreateTunnel { name, peer, params } => write!(
                 f,
-                "Creating GRETAP tunnel {name} to site \"{peer}\" ({} -> {}{})",
-                params.local,
-                params.remote,
-                if params.key.is_some() {
-                    ", with a key"
-                } else {
-                    ""
+                "Creating VXLAN tunnel {name} to site \"{peer}\" (VNI {}, UDP {}, {})",
+                params.vni,
+                params.port,
+                match params.source_port {
+                    Some(_) => "through NAT",
+                    None => "direct",
                 }
             ),
-            Self::ChangeGretap { name, reason, .. } => {
-                write!(f, "Changing GRETAP tunnel {name} ({reason})")
+            Self::SetRemote {
+                name,
+                remote: Some(remote),
+            } => write!(f, "Tunnel {name} sends to {remote}"),
+            Self::SetRemote { name, remote: None } => {
+                write!(f, "Tunnel {name} sends nowhere until its client is seen")
             }
             Self::DeleteLink { name, reason } => write!(f, "Deleting interface {name} ({reason})"),
             Self::SetMtu { name, mtu } => write!(f, "Setting MTU of {name} to {mtu}"),
@@ -313,22 +309,23 @@ impl fmt::Display for Change {
                 }
             }
             Self::DeleteNftTable => write!(f, "Deleting nftables table bridge wanderlan"),
-            Self::AddFouPort { port } => write!(
-                f,
-                "Opening UDP port {port} for the tunnels inside UDP (FOU)"
-            ),
-            Self::DelFouPort { port } => write!(f, "Closing the FOU port {port}"),
-            Self::SetLearn { port, rules, .. } => {
+            Self::SetLearn {
+                port, rules, fixed, ..
+            } => {
                 let clients: Vec<&str> = rules.iter().map(|r| r.client.as_str()).collect();
-                write!(
-                    f,
-                    "Learning where the clients are on UDP {port}: {}",
-                    if clients.is_empty() {
-                        "none".to_string()
-                    } else {
+                if clients.is_empty() {
+                    write!(
+                        f,
+                        "Sending the tunnel packets through NAT from UDP {port} ({} tunnel(s), table ip wanderlan)",
+                        fixed.len()
+                    )
+                } else {
+                    write!(
+                        f,
+                        "Learning where the clients are on UDP {port}: {}",
                         clients.join(", ")
-                    }
-                )
+                    )
+                }
             }
             Self::DeleteLearn => write!(f, "Deleting nftables table ip wanderlan"),
         }
@@ -451,7 +448,14 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
         .map(|t| (t.name.as_str(), t))
         .collect();
     for link in actual.links.values() {
-        if !is_owned(link) || !link.name.starts_with(GRETAP_PREFIX) {
+        if !is_owned(link) || !is_tunnel_name(&link.name) {
+            continue;
+        }
+        if link.name.starts_with(LEGACY_TUNNEL_PREFIX) {
+            deletes.push(Change::DeleteLink {
+                name: link.name.clone(),
+                reason: "the tunnels run in VXLAN now".into(),
+            });
             continue;
         }
         match (wanted.get(link.name.as_str()), &link.kind) {
@@ -459,28 +463,32 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
                 name: link.name.clone(),
                 reason: "the site is no longer a peer".into(),
             }),
-            // Changed in place: the port, its VLANs and counters stay.
-            (Some(spec), LinkKind::Gretap(params)) if *params != spec.params => {
-                let reason = if params.key == spec.params.key {
-                    format!(
-                        "tunnel endpoints change to {} -> {}",
-                        spec.params.local, spec.params.remote
-                    )
-                } else if spec.params.key.is_some() {
-                    "it gets the key of the two sites' identities".to_string()
+            // VNI, port and source port are fixed in the kernel: built anew.
+            (Some(spec), LinkKind::Vxlan(params)) if *params != spec.params => {
+                let reason = if params.vni != spec.params.vni {
+                    "its VNI changes (from the identities of the two sites)"
+                } else if params.port != spec.params.port {
+                    "the tunnel port changes"
                 } else {
-                    "it has no key any more (a site without identity)".to_string()
+                    "its tunnel mode changes"
                 };
-                tunnel_changes.push(Change::ChangeGretap {
+                deletes.push(Change::DeleteLink {
                     name: link.name.clone(),
-                    params: spec.params,
-                    reason,
+                    reason: reason.into(),
                 });
             }
-            (Some(_), LinkKind::Gretap(_)) => {}
+            // Where it sends to changes in place.
+            (Some(spec), LinkKind::Vxlan(_)) => {
+                if actual.remotes.get(&link.name) != spec.remote.as_ref() {
+                    tunnel_changes.push(Change::SetRemote {
+                        name: link.name.clone(),
+                        remote: spec.remote,
+                    });
+                }
+            }
             (Some(_), _) => deletes.push(Change::DeleteLink {
                 name: link.name.clone(),
-                reason: "it is not a GRETAP interface".into(),
+                reason: "it is not a VXLAN interface".into(),
             }),
         }
     }
@@ -553,7 +561,7 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
             Some(link) if !deleted.contains(&link.name) => port_changes(
                 PortWanted {
                     name: &spec.name,
-                    mtu: Some(GRETAP_MTU),
+                    mtu: Some(TUNNEL_MTU),
                     isolated: spec.isolated,
                     up: spec.enabled,
                     up_reason: spec.down_reason.clone(),
@@ -568,7 +576,7 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
                 &mut vlan_adds,
                 &mut ups,
             ),
-            _ => creates.push(Change::CreateGretap {
+            _ => creates.push(Change::CreateTunnel {
                 name: spec.name.clone(),
                 peer: spec.peer.clone(),
                 params: spec.params,
@@ -623,27 +631,20 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
         )
     });
 
-    // The FOU port opens before the tunnels that use it and closes after
-    // they are gone; the learn rules follow the clients.
-    let mut fou_adds = Vec::new();
-    let mut fou_dels = Vec::new();
-    if actual.nat_error.is_none() || desired.fou_port.is_some() {
-        for port in &actual.fou_ports {
-            if Some(*port) != desired.fou_port {
-                fou_dels.push(Change::DelFouPort { port: *port });
-            }
+    // The table `ip wanderlan` follows the tunnels through NAT.
+    let learn_changes = match &actual.learn {
+        Some(_) if desired.learn.is_empty() && desired.fixed.is_empty() => {
+            vec![Change::DeleteLearn]
         }
-        if let Some(port) = desired.fou_port
-            && !actual.fou_ports.contains(&port)
-        {
-            fou_adds.push(Change::AddFouPort { port });
-        }
-    }
-    let learn_changes = match (&actual.learn, desired.fou_port) {
-        (Some(_), _) if desired.learn.is_empty() => vec![Change::DeleteLearn],
-        (_, Some(port)) if !desired.learn.is_empty() => {
-            let same = actual.learn.as_ref().is_some_and(|l| {
-                l.port == Some(port) && l.rules == desired.learn && l.notrack == desired.notrack
+        _ if desired.learn.is_empty() && desired.fixed.is_empty() => Vec::new(),
+        have => {
+            let port = desired.tunnel_port;
+            let same = have.as_ref().is_some_and(|l| {
+                l.port == (!desired.learn.is_empty()).then_some(port)
+                    && l.fixed_port == (!desired.fixed.is_empty()).then_some(port)
+                    && l.rules == desired.learn
+                    && l.notrack == desired.notrack
+                    && l.fixed == desired.fixed
             });
             if same {
                 Vec::new()
@@ -652,15 +653,13 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
                     port,
                     rules: desired.learn.clone(),
                     notrack: desired.notrack,
+                    fixed: desired.fixed.clone(),
                 }]
             }
         }
-        _ => Vec::new(),
     };
 
     let mut out = deletes;
-    out.extend(fou_dels);
-    out.extend(fou_adds);
     out.extend(tunnel_changes);
     out.extend(bridge_changes);
     out.extend(creates);
@@ -866,9 +865,9 @@ pub fn plan_teardown(actual: &Actual) -> Vec<Change> {
     // The tunnels first (while the split horizon still holds), then the
     // nftables table and the tc rules, the bridges last (that detaches the
     // trunk).
-    let (tunnels, bridges): (Vec<Change>, Vec<Change>) = links.into_iter().partition(
-        |c| matches!(c, Change::DeleteLink { name, .. } if name.starts_with(GRETAP_PREFIX)),
-    );
+    let (tunnels, bridges): (Vec<Change>, Vec<Change>) = links
+        .into_iter()
+        .partition(|c| matches!(c, Change::DeleteLink { name, .. } if is_tunnel_name(name)));
     let mut out = tunnels;
     if actual.nft.is_some() {
         out.push(Change::DeleteNftTable);
@@ -876,12 +875,6 @@ pub fn plan_teardown(actual: &Actual) -> Vec<Change> {
     if actual.learn.is_some() {
         out.push(Change::DeleteLearn);
     }
-    out.extend(
-        actual
-            .fou_ports
-            .iter()
-            .map(|port| Change::DelFouPort { port: *port }),
-    );
     out.extend(tc);
     out.extend(bridges);
     out
@@ -920,11 +913,18 @@ pub async fn apply<N: System>(net: &N, actual: &Actual, change: &Change) -> Resu
             net.set_bridge_options(index_of(name)?, name, options)
                 .await?;
         }
-        Change::CreateGretap { name, params, .. } => {
-            net.create_gretap(name, params, GRETAP_MTU).await?;
+        Change::CreateTunnel { name, params, .. } => {
+            net.create_vxlan(name, params, TUNNEL_MTU).await?;
         }
-        Change::ChangeGretap { name, params, .. } => {
-            net.change_gretap(index_of(name)?, name, params, GRETAP_MTU)
+        Change::SetRemote { name, remote } => {
+            let link = actual
+                .links
+                .get(name)
+                .ok_or_else(|| SysError::new(format!("{change}"), "tunnel vanished"))?;
+            let LinkKind::Vxlan(params) = link.kind else {
+                return Err(SysError::new(format!("{change}"), "not a VXLAN interface"));
+            };
+            net.set_tunnel_remote(link.index, name, params.port, *remote)
                 .await?;
         }
         Change::DeleteLink { name, .. } => net.delete_link(index_of(name)?).await?,
@@ -981,13 +981,12 @@ pub async fn apply<N: System>(net: &N, actual: &Actual, change: &Change) -> Resu
         Change::DelTcRule { dev, rule } => net.del_tc_rule(index_of(dev)?, rule).await?,
         Change::SetNft { mss, split } => net.set_nft_rules(mss, split).await?,
         Change::DeleteNftTable => net.delete_table().await?,
-        Change::AddFouPort { port } => net.add_fou_port(*port).await?,
-        Change::DelFouPort { port } => net.del_fou_port(*port).await?,
         Change::SetLearn {
             port,
             rules,
             notrack,
-        } => net.set_learn(*port, rules, *notrack).await?,
+            fixed,
+        } => net.set_learn(*port, rules, *notrack, fixed).await?,
         Change::DeleteLearn => net.delete_learn().await?,
     }
     Ok(())
@@ -998,7 +997,7 @@ pub async fn apply<N: System>(net: &N, actual: &Actual, change: &Change) -> Resu
 fn changes_links(change: &Change) -> bool {
     matches!(
         change,
-        Change::CreateBridge { .. } | Change::CreateGretap { .. } | Change::DeleteLink { .. }
+        Change::CreateBridge { .. } | Change::CreateTunnel { .. } | Change::DeleteLink { .. }
     )
 }
 
@@ -1014,17 +1013,9 @@ pub async fn reconcile<N: System>(
     // everything else is applied, the error is returned at the end.
     let mut nft_failed: Option<SysError> = None;
     let is_nft = |c: &Change| matches!(c, Change::SetNft { .. } | Change::DeleteNftTable);
-    // FOU and the table `ip wanderlan` only concern the tunnels inside UDP:
-    // the rest goes on without them.
-    let is_nat = |c: &Change| {
-        matches!(
-            c,
-            Change::AddFouPort { .. }
-                | Change::DelFouPort { .. }
-                | Change::SetLearn { .. }
-                | Change::DeleteLearn
-        )
-    };
+    // The table `ip wanderlan` only concerns the clients behind NAT: the
+    // rest goes on without it.
+    let is_nat = |c: &Change| matches!(c, Change::SetLearn { .. } | Change::DeleteLearn);
     let mut nat_failed: Option<SysError> = None;
     for _ in 0..MAX_ROUNDS {
         let mut actual = Actual::observe(net).await?;
@@ -1059,7 +1050,7 @@ pub async fn reconcile<N: System>(
                 Err(e) => return Err(e.into()),
             }
             if changes_links(&change) {
-                if let Change::CreateBridge { name, .. } | Change::CreateGretap { name, .. } =
+                if let Change::CreateBridge { name, .. } | Change::CreateTunnel { name, .. } =
                     &change
                 {
                     mark_owned(net, name).await?;
@@ -1107,12 +1098,11 @@ async fn mark_owned<N: System>(net: &N, name: &str) -> Result<(), SysError> {
 /// forward (creation, deletion, isolation, attaching).
 pub fn ports_changed(changes: &[Change]) -> bool {
     changes.iter().any(|c| match c {
-        Change::CreateGretap { .. }
+        Change::CreateTunnel { .. }
         | Change::SetIsolated { .. }
         | Change::Attach { .. }
         | Change::Detach { .. } => true,
-        Change::DeleteLink { name, .. } => name.starts_with(GRETAP_PREFIX),
-        Change::SetUp { name, .. } => name.starts_with(GRETAP_PREFIX),
+        Change::DeleteLink { name, .. } | Change::SetUp { name, .. } => is_tunnel_name(name),
         _ => false,
     })
 }
@@ -1193,7 +1183,10 @@ async fn observe_for_teardown<N: System>(net: &N) -> Result<(Actual, Vec<String>
         Ok(nft) => (nft, None),
         Err(e) => (None, Some(e.to_string())),
     };
-    let (fou_ports, learn, nat_error) = observe_nat(net).await;
+    let (learn, nat_error) = match net.learn_state().await {
+        Ok(learn) => (learn, None),
+        Err(e) => (None, Some(e.to_string())),
+    };
     if let Some(e) = &nat_error {
         problems.push(e.clone());
     }
@@ -1204,7 +1197,7 @@ async fn observe_for_teardown<N: System>(net: &N) -> Result<(Actual, Vec<String>
         nft,
         vlan_stats_supported: net.vlan_stats_supported(),
         nft_error,
-        fou_ports,
+        remotes: BTreeMap::new(),
         learn,
         nat_error,
     };

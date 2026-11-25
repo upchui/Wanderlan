@@ -6,12 +6,12 @@
 //! (Diffie-Hellman), so no key ever travels over the network or is written
 //! to `network.toml`, and no third site knows them. Per tunnel there are
 //!
-//! * the GRE key (the kernel drops tunnel frames with another key),
+//! * the VNI of its VXLAN tunnel (the kernel drops frames with another one),
 //! * the probe key (an HMAC tag on every probe: the peer proves that it
 //!   holds its private key) and
 //! * the sync key (an HMAC tag on the configuration exchange).
 //!
-//! The GRE key travels in every tunnel packet; it tells boxes apart (a second
+//! The VNI travels in every tunnel packet; it tells boxes apart (a second
 //! box behind the same NAT, a cloned machine) but is no secret. The HMAC keys
 //! never travel. Nothing here encrypts: confidentiality is the job of the
 //! transport network (a VPN).
@@ -155,16 +155,16 @@ impl Identity {
             hkdf.expand_multi_info(&[b"wanderlan pair ", label, &low.0, &high.0], out)
                 .is_ok()
         };
-        let mut gre = [0u8; 4];
+        let mut vni = [0u8; 3];
         let mut probe = [0u8; KEY_LEN];
         let mut sync = [0u8; KEY_LEN];
-        if !(expand(b"gre", &mut gre) && expand(b"probe", &mut probe) && expand(b"sync", &mut sync))
+        if !(expand(b"vni", &mut vni) && expand(b"probe", &mut probe) && expand(b"sync", &mut sync))
         {
             return None;
         }
         Some(PairKeys {
-            // 0 would read as "no key" in some tools.
-            gre_key: u32::from_be_bytes(gre).max(1),
+            // 24 bits; 0 would read as "no VNI" in some tools.
+            vni: u32::from_be_bytes([0, vni[0], vni[1], vni[2]]).max(1),
             probe: Hmac::<Sha256>::new_from_slice(&probe).ok()?,
             sync: Hmac::<Sha256>::new_from_slice(&sync).ok()?,
         })
@@ -196,15 +196,15 @@ pub enum PeerIdentity {
 /// every tag clones them.
 #[derive(Clone)]
 pub struct PairKeys {
-    gre_key: u32,
+    vni: u32,
     probe: Hmac<Sha256>,
     sync: Hmac<Sha256>,
 }
 
 impl PairKeys {
-    /// The GRE key of the tunnel (the same at both ends, never 0).
-    pub const fn gre_key(&self) -> u32 {
-        self.gre_key
+    /// The VNI of the tunnel (the same at both ends; 24 bits, never 0).
+    pub const fn vni(&self) -> u32 {
+        self.vni
     }
 
     /// The tag of a probe over the concatenation of `parts`.
@@ -404,8 +404,8 @@ mod tests {
         let b = identity(2);
         let ab = a.pair(&b.id()).unwrap();
         let ba = b.pair(&a.id()).unwrap();
-        assert_eq!(ab.gre_key(), ba.gre_key());
-        assert_ne!(ab.gre_key(), 0);
+        assert_eq!(ab.vni(), ba.vni());
+        assert!(ab.vni() > 0 && ab.vni() < 1 << 24);
         let parts: [&[u8]; 2] = [b"probe", b"payload"];
         let tag = ab.probe_tag(&parts);
         assert!(ba.probe_verify(&parts, &tag));
@@ -420,7 +420,7 @@ mod tests {
         let c = identity(3);
         let ab = a.pair(&b.id()).unwrap();
         let ac = a.pair(&c.id()).unwrap();
-        assert_ne!(ab.gre_key(), ac.gre_key());
+        assert_ne!(ab.vni(), ac.vni());
         let parts: [&[u8]; 1] = [b"x"];
         assert!(!ac.probe_verify(&parts, &ab.probe_tag(&parts)));
     }

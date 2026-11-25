@@ -112,7 +112,7 @@ pub struct ApplyFilesParams {
 /// Parameters of [`Request::Unblock`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnblockParams {
-    /// Tunnel interface, e.g. `gt-haus2`.
+    /// Tunnel interface, e.g. `vx-haus2`.
     pub port: String,
 }
 
@@ -502,9 +502,12 @@ pub struct PeerStatus {
     /// For a tunnel with a key: whether the peer proved its identity.
     #[serde(default)]
     pub identity_state: Option<IdentityState>,
-    /// How the tunnel is built.
+    /// How the tunnel runs (VXLAN): through NAT or direct.
     #[serde(default)]
-    pub tunnel: TunnelKindLabel,
+    pub tunnel: crate::config::TunnelMode,
+    /// The VNI of the tunnel.
+    #[serde(default)]
+    pub vni: Option<u32>,
     /// For a client (behind NAT): where its tunnel packets come from.
     #[serde(default)]
     pub endpoint: Option<String>,
@@ -543,31 +546,6 @@ impl From<crate::identity::PeerIdentity> for IdentityState {
     }
 }
 
-/// How a tunnel is built.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TunnelKindLabel {
-    /// GRETAP without key (a site without identity).
-    #[default]
-    Gre,
-    /// GRETAP with the key of both identities.
-    GreKey,
-    /// GRETAP with a key inside UDP (FOU): between a client and its
-    /// server, through NAT.
-    GreUdp,
-}
-
-impl TunnelKindLabel {
-    /// The kind as shown in the UI.
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Gre => "GRE",
-            Self::GreKey => "GRE with key",
-            Self::GreUdp => "GRE in UDP",
-        }
-    }
-}
-
 /// One site of the network (for the overview).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SiteSummary {
@@ -595,6 +573,9 @@ pub struct SiteSummary {
     /// The short form of its identity, if it has one.
     #[serde(default)]
     pub id: Option<String>,
+    /// For a client: how its tunnel to its server runs.
+    #[serde(default)]
+    pub tunnel_mode: Option<crate::config::TunnelMode>,
 }
 
 /// Result of [`Request::Status`].
@@ -747,7 +728,7 @@ pub struct VlanTraffic {
 /// bridge (e.g. from the peer); sent: from the bridge out of the port.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VlanPortTraffic {
-    /// Bridge port (`gt-<peer>` or a trunk port).
+    /// Bridge port (`vx-<peer>` or a trunk port).
     pub port: String,
     /// The peer behind a tunnel port; `None` for a trunk port.
     pub peer: Option<String>,
@@ -795,12 +776,12 @@ mod tests {
             r#"{"id":1,"method":"status"}"#
         );
         let req: RequestEnvelope =
-            serde_json::from_str(r#"{"id":2,"method":"unblock","params":{"port":"gt-a"}}"#)
+            serde_json::from_str(r#"{"id":2,"method":"unblock","params":{"port":"vx-a"}}"#)
                 .unwrap();
         assert_eq!(
             req.request,
             Request::Unblock(UnblockParams {
-                port: "gt-a".into()
+                port: "vx-a".into()
             })
         );
         let req: RequestEnvelope = serde_json::from_str(

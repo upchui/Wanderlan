@@ -16,7 +16,7 @@ check "site5 has an identity" grep -qE '^[A-Za-z0-9+/]{43}=$' <<<"$old_id"
 check "wanderlan reset --yes" x site5 "wanderlan reset --yes"
 check "site5 is unconfigured" x site5 "wanderlan status --json | jq -e '.state == \"unconfigured\"'"
 check "no bridge, no tunnels and no nftables table are left" \
-  x site5 "! ip link show br0 2>/dev/null && ! ip -o link show | grep -q ' gt-' && ! nft list table bridge wanderlan 2>/dev/null"
+  x site5 "! ip link show br0 2>/dev/null && ! ip -o link show | grep -q ' vx-' && ! nft list table bridge wanderlan 2>/dev/null"
 check "no tc rules are left on the trunk" x site5 "[ -z \"\$(tc filter show dev trunk0 ingress 2>/dev/null)\" ]"
 check "the identity is gone (the box is a new box now)" x site5 "[ ! -e /var/lib/wanderlan/identity ]"
 
@@ -54,25 +54,42 @@ check "site5 has a new identity" test -n "$new_id" -a "$new_id" != "$old_id"
 check "site2 knows site5 by its new identity" \
   test "$(jqs site2 '.sites[] | select(.name == "site5") | .id')" = "${new_id:0:8}"
 wait_for 30 "site5 is a client of site2: its only tunnel leads there" \
-  x site5 "[ \"\$(ip -j link show master br0 | jq -r '[.[].ifname | select(startswith(\"gt-\"))] | join(\" \")')\" = gt-site2 ]"
+  x site5 "[ \"\$(ip -j link show master br0 | jq -r '[.[].ifname | select(startswith(\"vx-\"))] | join(\" \")')\" = vx-site2 ]"
 check "site1 and site3 have no tunnel to site5" \
-  x site1 "! ip link show gt-site5 2>/dev/null" && x site3 "! ip link show gt-site5 2>/dev/null"
+  x site1 "! ip link show vx-site5 2>/dev/null" && x site3 "! ip link show vx-site5 2>/dev/null"
 check "the client port at site2 is not isolated, the server ports are" \
-  x site2 "bridge -d link show dev gt-site5 | grep -q 'isolated off' && bridge -d link show dev gt-site1 | grep -q 'isolated on'"
+  x site2 "bridge -d link show dev vx-site5 | grep -q 'isolated off' && bridge -d link show dev vx-site1 | grep -q 'isolated on'"
 check "site5 got the rules of the invitation (untagged is VLAN 20)" \
   test "$(vlan_summary site5 trunk0)" = "10-19,20:pu,21-50"
 
 begin "Online/offline: a new site starts offline until it is taken online"
 
 check "site5 is offline, its tunnel at site2 is down" \
-  x site2 "wanderlan status --json | jq -e '.peers[] | select(.name == \"site5\") | .port_state == \"offline\"' && ip -j link show gt-site5 | jq -e '.[0].flags | index(\"UP\") | not'"
+  x site2 "wanderlan status --json | jq -e '.peers[] | select(.name == \"site5\") | .port_state == \"offline\"' && ip -j link show vx-site5 | jq -e '.[0].flags | index(\"UP\") | not'"
 client_native c-site5 10.20.0.13/24
 expect_no_ping c-site5 10.20.0.1 "no traffic while site5 is offline"
 check "site2 takes site5 online" x site2 "wanderlan online site5 --confirm"
 wait_for 30 "the tunnel to site5 is up at site2" \
-  x site2 "ip -j link show gt-site5 | jq -e '.[0].flags | index(\"UP\")'"
+  x site2 "ip -j link show vx-site5 | jq -e '.[0].flags | index(\"UP\")'"
 expect_ping c-site5 10.20.0.1 "VLAN 20: the new site reaches site1's client (through site2)"
 expect_ping c-site3 10.20.0.13 "VLAN 20: site3's client reaches the new site (through site2)"
+
+begin "Tunnel mode: a client runs nat (the default) or direct"
+
+check "a new client runs nat: from the tunnel port, with keepalives" \
+  x site5 "ip -d link show vx-site2 | grep -q 'srcport 51822 51823'"
+check "site2 learned where site5's tunnel packets come from" \
+  x site2 "bridge fdb show dev vx-site5 | grep -q '^00:00:00:00:00:00 dst 10.100.13.10 '"
+check "site2 lets site5 run direct" x site2 "wanderlan tunnel-mode site5 direct --confirm"
+wait_for 30 "site5 sends from a port per flow" \
+  x site5 "ip -d link show vx-site2 | grep -q 'vxlan id' && ! ip -d link show vx-site2 | grep -q 'srcport 51822 51823'"
+wait_eq 30 "site2 shows the tunnel as direct" "direct" \
+  jqs site2 '.peers[] | select(.name == "site5") | .tunnel'
+expect_ping c-site5 10.20.0.1 "VLAN 20: site5 reaches site1's client, direct"
+check "and back to nat" x site2 "wanderlan tunnel-mode site5 nat --confirm"
+wait_for 30 "site5 sends from the tunnel port again" \
+  x site5 "ip -d link show vx-site2 | grep -q 'srcport 51822 51823'"
+expect_ping c-site5 10.20.0.1 "VLAN 20: site5 reaches site1's client through nat again"
 
 begin "Sync: a server refuses a change of its client"
 
@@ -95,7 +112,7 @@ check "site5's status tells why" \
   x site5 "wanderlan status | grep -q 'WARNING: Your change was not taken over by \"site2\": .*already used'"
 wait_eq 30 "site2 no longer marks site5" null \
   jqs site2 '.peers[] | select(.name == "site5") | .refused'
-wait_for 30 "site5 has no tunnel to the made-up site" x site5 "! ip link show gt-site1 2>/dev/null"
+wait_for 30 "site5 has no tunnel to the made-up site" x site5 "! ip link show vx-site1 2>/dev/null"
 
 begin "Join: a reset site joins again via another site"
 
@@ -111,8 +128,8 @@ fi
 check "site5 is a client of site1 now (it joined through site1)" \
   test "$(jqs site1 '"\(.revision) \(.sites[] | select(.name == "site5") | .uplink)"')" = "$((rev + 1)) site1"
 wait_for 30 "site5's only tunnel leads to site1" \
-  x site5 "[ \"\$(ip -j link show master br0 | jq -r '[.[].ifname | select(startswith(\"gt-\"))] | join(\" \")')\" = gt-site1 ]"
-wait_for 30 "site2 has no tunnel to site5 any more" x site2 "! ip link show gt-site5 2>/dev/null"
+  x site5 "[ \"\$(ip -j link show master br0 | jq -r '[.[].ifname | select(startswith(\"vx-\"))] | join(\" \")')\" = vx-site1 ]"
+wait_for 30 "site2 has no tunnel to site5 any more" x site2 "! ip link show vx-site5 2>/dev/null"
 check "site5 is still online (the state is kept)" \
   test "$(jqs site1 '.sites[] | select(.name == "site5") | .online')" = true
 expect_ping c-site5 10.20.0.1 "VLAN 20: site5 reaches site1's client again"

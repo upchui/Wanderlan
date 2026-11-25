@@ -196,14 +196,14 @@ mod tests {
                 ..c(20, 1, 1)
             },
         ];
-        let name_of = |i: u32| (i == 3).then(|| "gt-buero".to_string());
+        let name_of = |i: u32| (i == 3).then(|| "vx-buero".to_string());
         let got = vlan_rates(&now, &before, 2.0, name_of);
         assert_eq!(got.len(), 2, "port 9 is unknown");
-        let r = got[&("gt-buero".to_string(), 20)];
+        let r = got[&("vx-buero".to_string(), 20)];
         assert_eq!((r.rx_bps, r.tx_bps), (8000, 2000));
         assert_eq!(r.counters.rx_bytes, 3000);
         // A VLAN seen the first time has no rate yet.
-        let r = got[&("gt-buero".to_string(), 30)];
+        let r = got[&("vx-buero".to_string(), 30)];
         assert_eq!((r.rx_bps, r.tx_bps), (0, 0));
     }
 }

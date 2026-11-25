@@ -374,7 +374,7 @@ mod tests {
         assert_eq!(
             names,
             ["br-lan", "ens18", "ens19", "eth1"],
-            "no lo, br0, gt-*"
+            "no lo, br0, vx-*"
         );
         // The tunnel to buero runs over ens18: marked, not refused.
         assert_eq!(row(&rows, "ens18").blocked, None);

@@ -7,7 +7,7 @@ expression: render(&app)
 " Filter loop                            1 of 6  / changes it                    "
 "┌ Events (local time, CET; t: UTC) ────────────────────────────────────────────┐"
 "│-- 2026-11-24 --                                                              │"
-"│11:02:10 error haus2        loop detected on gt-haus2: own frames came back;  │"
+"│11:02:10 error haus2        loop detected on vx-haus2: own frames came back;  │"
 "│                            the port is blocked                               │"
 "│                                                                              │"
 "│                                                                              │"

@@ -14,12 +14,11 @@ ports_of() {
   x "$1" "ip -j link show master br0 | jq -r '[.[].ifname] | sort | join(\" \")'"
 }
 for s in site1 site2 site3 site4 site5; do
-  want=$(for o in site1 site2 site3 site4 site5; do [ "$o" = "$s" ] || printf 'gt-%s ' "$o"; done)
-  want="${want}trunk0"
+  want="trunk0$(for o in site1 site2 site3 site4 site5; do [ "$o" = "$s" ] || printf ' vx-%s' "$o"; done)"
   wait_for 30 "$s has tunnels to all four other sites" eval '[ "$(ports_of '"$s"')" = "'"$want"'" ]'
 done
 check "every tunnel port is isolated (split horizon)" \
-  x site3 "for p in gt-site1 gt-site2 gt-site4 gt-site5; do bridge -d link show dev \$p | grep -q 'isolated on' || exit 1; done"
+  x site3 "for p in vx-site1 vx-site2 vx-site4 vx-site5; do bridge -d link show dev \$p | grep -q 'isolated on' || exit 1; done"
 check "the trunk is not isolated" x site3 "bridge -d link show dev trunk0 | grep -q 'isolated off'"
 keyed site1 site2 site3 site4 site5
 
@@ -32,7 +31,7 @@ expect_ping c-site5 10.20.0.1 "VLAN 20: site5 reaches site1's client"
 expect_ping c-site2 10.20.0.11 "VLAN 20: site2's client reaches site3"
 
 # Traffic per VLAN: site3's client pings site1's client, which comes in at
-# site1 through gt-site3 and goes out on its trunk.
+# site1 through vx-site3 and goes out on its trunk.
 check "br0 counts the traffic per VLAN and port" \
   x site1 "ip -d link show br0 | grep -q 'vlan_stats_per_port 1'"
 x c-site3 "ping -c 20 -i 0.05 -W 1 10.20.0.1" >/dev/null 2>&1 || true
@@ -43,11 +42,11 @@ vlan_packets() {
   n=$(x "$1" "wanderlan vlan $2 --json | jq '[.ports[] | select(.port == \"$3\") | .$4_packets] | add // 0'")
   [ "${n:-0}" -ge "$5" ]
 }
-wait_for 10 "wanderlan vlan 20 at site1: the packets from site3 came in on gt-site3" \
-  vlan_packets site1 20 gt-site3 rx 20
+wait_for 10 "wanderlan vlan 20 at site1: the packets from site3 came in on vx-site3" \
+  vlan_packets site1 20 vx-site3 rx 20
 wait_for 10 "and went out on the trunk trunk0" vlan_packets site1 20 trunk0 tx 20
 check "the text names the tunnel and the trunk port" \
-  x site1 "wanderlan vlan 20 | grep -q '^gt-site3 ' && wanderlan vlan 20 | grep -q '^trunk0 (trunk) '"
+  x site1 "wanderlan vlan 20 | grep -q '^vx-site3 ' && wanderlan vlan 20 | grep -q '^trunk0 (trunk) '"
 check "a VLAN on no port of the site is an error" x site1 "! wanderlan vlan 4000"
 
 # Split horizon: a broadcast must never come back to its sender, although
@@ -76,9 +75,9 @@ for s in site1 site2 site3 site4 site5; do
   x "$s" "wl-daemon reload"
 done
 wait_for 30 "site5's trunk carries VLAN 20 only" eval '[ "$(vlan_summary site5 trunk0)" = 20 ]'
-expect_vlans site5 gt-site1 "20"
-expect_vlans site1 gt-site5 "20"
-expect_vlans site1 gt-site2 "10-50"
+expect_vlans site5 vx-site1 "20"
+expect_vlans site1 vx-site5 "20"
+expect_vlans site1 vx-site2 "10-50"
 for s in site3 site5; do
   client_vlan "c-$s" 30 "10.30.0.${HOSTNUM[$s]}/24"
 done

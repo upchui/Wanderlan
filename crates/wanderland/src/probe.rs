@@ -814,11 +814,10 @@ async fn probe_peer(
                 entry.pmtu_measured = Some(SystemTime::now());
             }
             if pmtu != last_pmtu {
-                let keyed = shared.config.borrow().keys.contains_key(&name);
                 match pmtu {
                     Some(p) => info!(
                         "Path MTU to \"{name}\" is {p} bytes (TCP MSS {})",
-                        mtu::mss_with(p, mtu::overhead(keyed, false))
+                        mtu::mss_for_pmtu(p)
                     ),
                     None => warn!("Path MTU to \"{name}\" could not be measured"),
                 }

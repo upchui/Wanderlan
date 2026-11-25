@@ -89,6 +89,7 @@ FROM ${DEBIAN_IMAGE} AS testnode
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       iproute2 nftables iputils-ping tcpdump netcat-openbsd jq procps conntrack \
+      ethtool iperf3 \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=build /out/ /tmp/out/
 RUN cd /tmp/out \

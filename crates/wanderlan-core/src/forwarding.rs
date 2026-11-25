@@ -305,6 +305,7 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
+            tunnel_mode: Default::default(),
             uplink: uplink.map(Into::into),
         }
     }

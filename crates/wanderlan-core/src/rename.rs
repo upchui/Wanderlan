@@ -2,7 +2,7 @@
 //!
 //! A site is known by its name everywhere: the other sites' `uplink` and
 //! `managed_by`, the mappings, the tunnel limits, `self` and the trunks per
-//! tunnel in `local.toml`, the interfaces `gt-<name>`. Its identity (`id`)
+//! tunnel in `local.toml`, the interfaces `vx-<name>`. Its identity (`id`)
 //! stays when it is renamed, so a rename is recognised as the same identity
 //! under a new name; sites without an identity (older versions) by their
 //! address, which is unique among them. Who may rename whom is in
@@ -112,6 +112,7 @@ mod tests {
             online: true,
             managed_by: uplink.map(Into::into),
             self_managed: false,
+            tunnel_mode: Default::default(),
             uplink: uplink.map(Into::into),
         }
     }

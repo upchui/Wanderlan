@@ -13,8 +13,8 @@ use std::time::Duration;
 use crossterm::event::{KeyCode, KeyEvent};
 use wanderlan_core::api::{Interface, SiteRules, Translation};
 use wanderlan_core::config::{
-    Diagnostic, FieldPath, LocalVid, Severity, Site, VID_MAX, VID_MIN, VlanMap, VlanSet,
-    site_name_error,
+    Diagnostic, FieldPath, LocalVid, Severity, Site, TunnelMode, VID_MAX, VID_MIN, VlanMap,
+    VlanSet, site_name_error,
 };
 
 use wanderlan_core::policy;
@@ -214,7 +214,7 @@ impl Form {
             }
             None => (changes_choices(&me, "the new site"), format!("only {me}")),
         };
-        let fields = vec![
+        let mut fields = vec![
             Field::text(
                 "name",
                 "Name",
@@ -245,6 +245,17 @@ impl Form {
             ),
             own_vlans_field(existing),
         ];
+        // A client (a new site is one): how its tunnel to its server runs.
+        if existing.is_none_or(|s| s.uplink.is_some()) {
+            let mode = existing.map(|s| s.tunnel_mode).unwrap_or_default();
+            fields.push(Field::choice(
+                "tunnel",
+                "Tunnel",
+                "nat: may sit behind NAT, its server only answers; direct: its server sends to its address",
+                vec![TunnelMode::Nat.to_string(), TunnelMode::Direct.to_string()],
+                mode.as_str(),
+            ));
+        }
         Self::new(FormKind::Site(index), title, fields, draft)
     }
 
@@ -691,6 +702,7 @@ impl Form {
             FormKind::Site(index) => {
                 let site = self.parse_site()?;
                 let (managed_by, self_managed) = parse_changes(&self.value("changes"));
+                let tunnel_mode = self.value("tunnel").parse::<TunnelMode>().ok();
                 let own_vlans = self.parse_own_vlans()?;
                 match index.and_then(|i| candidate.network.sites.get_mut(i)) {
                     Some(slot) => {
@@ -702,6 +714,7 @@ impl Form {
                         site.uplink = slot.uplink.clone();
                         // Its identity is the box's, never edited here.
                         site.id = slot.id;
+                        site.tunnel_mode = tunnel_mode.unwrap_or(slot.tunnel_mode);
                         site.own_vlans = own_vlans;
                         let old = std::mem::replace(slot, site.clone());
                         if old.name != site.name {
@@ -714,6 +727,7 @@ impl Form {
                         self_managed,
                         uplink: candidate.local.self_name.clone(),
                         own_vlans,
+                        tunnel_mode: tunnel_mode.unwrap_or_default(),
                         ..site
                     }),
                 }
@@ -862,6 +876,7 @@ impl Form {
             managed_by: candidate.local.self_name.clone(),
             uplink: candidate.local.self_name.clone(),
             self_managed: false,
+            tunnel_mode: Default::default(),
         });
         if let Some(shared) = native {
             candidate.network.maps.push(VlanMap {
@@ -925,6 +940,7 @@ impl Form {
             online: true,
             managed_by: None,
             self_managed: false,
+            tunnel_mode: Default::default(),
             uplink: None,
         })
     }
@@ -1161,9 +1177,10 @@ mod tests {
         let form = Form::site(&d, None);
         assert_eq!(
             form.fields.iter().map(|f| f.key).collect::<Vec<_>>(),
-            ["name", "address", "vlans", "changes", "own_vlans"]
+            ["name", "address", "vlans", "changes", "own_vlans", "tunnel"]
         );
         assert_eq!(form.value("changes"), "only heim", "managed by this site");
+        assert_eq!(form.value("tunnel"), "nat", "a new client runs nat");
         // Empty required fields are errors, but hidden until touched.
         let name = form.field("name").unwrap();
         assert!(name.error.is_some());
