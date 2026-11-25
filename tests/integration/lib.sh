@@ -90,17 +90,6 @@ check() {
   fi
 }
 
-# check_not <description> <command...>
-check_not() {
-  local what="$1"
-  shift
-  if "$@" >/dev/null 2>&1; then
-    fail "$what"
-  else
-    pass "$what"
-  fi
-}
-
 # ---- configuration -------------------------------------------------------
 
 # Revision of the generated networks. Every new configuration gets a higher

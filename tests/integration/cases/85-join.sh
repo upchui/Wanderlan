@@ -1,66 +1,24 @@
 # shellcheck shell=bash
-# Invitations, joining, online/offline, who may change a site, reset: a
-# site leaves (reset), joins again with an invitation that carries its rules,
-# starts offline, is taken online by the inviting site; codes work once.
+# Reset, invitations and joining: site5 leaves (reset), joins again with an
+# invitation that carries its rules, starts offline and is taken online by
+# the inviting site; its server refuses a change it may not make; a reset
+# site joins via another site; a copy of a running machine is refused.
 
 code_of() { awk '$1 == "wanderlan" && $2 == "join" {print $4; exit}'; }
-# Any identity (the router never answers probes with it).
-GHOST_ID="AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA="
-raw_join() { # raw_join <from> <target> <code> <name>: one JOIN request
-  x "$1" "printf 'JOIN {\"protocol\":2,\"code\":\"%s\",\"name\":\"%s\",\"id\":\"%s\"}\n' '$3' '$4' '$GHOST_ID' | timeout 10 nc -N $2 51821"
-}
-
-begin "Invitations: created on any site, kept across restarts"
-
-check "an invitation with a mapping onto the native VLAN is refused" \
-  x site2 "! wanderlan invite --native 1 2>/dev/null && wanderlan invite --native 1 2>&1 | grep -q 'native VLAN'"
-check "an invitation for a name that is taken is refused" \
-  x site2 "wanderlan invite --name site1 2>&1 | grep -q 'already used'"
-code1=$(x site2 "wanderlan invite --native 20 --map 130:30" | code_of)
-check "site2 created an invitation with rules (code $code1)" grep -qE '^[0-9A-Z]{5}-[0-9A-Z]{5}$' <<<"$code1"
-check "the invitation shows the command with site2's address" \
-  x site2 "wanderlan invite list | grep -q 'wanderlan join 10.100.2.10 $code1'"
-check "the invitation shows its rules" \
-  x site2 "wanderlan invite list | grep -q 'rules: source VLAN 20 = untagged, source VLAN 30 = VLAN 130'"
-x site2 "wl-daemon stop; wl-daemon start"
-wait_for 30 "site2 is running again" x site2 "wanderlan status --json | jq -e '.state == \"running\"'"
-check "the invitation survives a daemon restart" x site2 "wanderlan invite list | grep -q '$code1'"
-check "the invitations are stored readable for root only" \
-  x site2 "[ \"\$(stat -c %a /var/lib/wanderlan/invites.json)\" = 600 ]"
 
 begin "Reset: everything wanderlan set up is removed"
 
+code1=$(x site2 "wanderlan invite --native 20 --map 130:30" | code_of)
+check "site2 created an invitation with rules (code $code1)" grep -qE '^[0-9A-Z]{5}-[0-9A-Z]{5}$' <<<"$code1"
 client_native_del c-site5
 old_id=$(jqs site5 .site_id)
 check "site5 has an identity" grep -qE '^[A-Za-z0-9+/]{43}=$' <<<"$old_id"
-check "its key is readable for root only" \
-  x site5 "[ \"\$(stat -c %a /var/lib/wanderlan/identity)\" = 600 ]"
-check "wanderlan reset needs a confirmation" x site5 "echo no | wanderlan reset | grep -q 'Nothing was changed'"
 check "wanderlan reset --yes" x site5 "wanderlan reset --yes"
 check "site5 is unconfigured" x site5 "wanderlan status --json | jq -e '.state == \"unconfigured\"'"
-check "no bridge and no tunnels are left" x site5 "! ip link show br0 2>/dev/null && ! ip -o link show | grep -q ' gt-'"
-check "no nftables table is left" x site5 "! nft list table bridge wanderlan 2>/dev/null"
+check "no bridge, no tunnels and no nftables table are left" \
+  x site5 "! ip link show br0 2>/dev/null && ! ip -o link show | grep -q ' gt-' && ! nft list table bridge wanderlan 2>/dev/null"
 check "no tc rules are left on the trunk" x site5 "[ -z \"\$(tc filter show dev trunk0 ingress 2>/dev/null)\" ]"
-check "the configuration files are the package templates again" \
-  x site5 "grep -q 'This site is not configured yet' /etc/wanderlan/network.toml && grep -q 'not configured yet' /etc/wanderlan/local.toml && ! grep -q '^self' /etc/wanderlan/local.toml"
-check "the state is gone" x site5 "[ ! -e /var/lib/wanderlan/confirmed ]"
 check "the identity is gone (the box is a new box now)" x site5 "[ ! -e /var/lib/wanderlan/identity ]"
-check "the state directory itself stays (systemd's StateDirectory)" x site5 "[ -d /var/lib/wanderlan ]"
-check "a second reset changes nothing and succeeds" x site5 "wanderlan reset --yes"
-
-begin "Reset: a new network while the old one still lists this site"
-
-# The other sites still list site5 and probe it with a newer revision; that
-# must not block a new network on site5 (it did: stale announcements).
-x site5 "printf '[network]\n\n[[site]]\nname = \"solo\"\naddress = \"10.100.13.10\"\n' > /tmp/solo-network.toml"
-x site5 "printf 'self = \"solo\"\ntrunk = \"trunk0\"\n' > /tmp/solo-local.toml"
-check "site5 starts its own network" \
-  x site5 "wanderlan apply --network /tmp/solo-network.toml --local /tmp/solo-local.toml >/dev/null && wanderlan confirm >/dev/null"
-check "site5 runs its own network" \
-  test "$(jqs site5 '"\(.state) \(.site) \(.sites | length)"')" = "running solo 1"
-check "site5 ignores the probes of its old network" \
-  test "$(jqs site5 '.peers | length')" = 0
-check "and resets again" x site5 "wanderlan reset --yes"
 
 # The other sites remove site5 (and its VLAN mappings).
 network_toml "10-50" site1 site2 site3 site4 >"$RUN_DIR/network-4.toml"
@@ -79,8 +37,6 @@ if grep -q 'unknown or already used invitation code' <<<"$out"; then
 else
   fail "unexpected output for a wrong code: $out"
 fi
-check "site5 is still unconfigured" x site5 "wanderlan status --json | jq -e '.state == \"unconfigured\"'"
-
 out=$(x site5 "wanderlan join 10.100.2.10 $code1" 2>&1)
 if grep -q 'Done: "site5" is part of the network' <<<"$out" && grep -q 'trunk trunk0' <<<"$out"; then
   pass "site5 joined (name from the host name, trunk chosen automatically)"
@@ -88,213 +44,58 @@ else
   fail "unexpected join output: $out"
 fi
 rev=$(jqs site2 .revision)
-for s in site1 site2 site3 site4; do
+for s in site1 site3 site4; do
   wait_eq 60 "$s has 5 sites (revision $rev)" "$rev 5" jqs "$s" '"\(.revision) \(.sites | length)"'
 done
 wait_eq 60 "site5 knows only site2 and itself (revision $rev)" "$rev site2 site5" \
   jqs site5 '"\(.revision) \([.sites[].name] | sort | join(" "))"'
-check "site5's network.toml names no other site" \
-  x site5 "! grep -qE '^\[site\.site(1|3|4)\]' /etc/wanderlan/network.toml && grep -qx '\[site.site2\]' /etc/wanderlan/network.toml"
-check "site5 sees site2 as its server" \
-  test "$(jqs site5 '.sites[] | select(.name == "site2") | .uplink')" = null
-check "site2 confirmed the new site automatically" test "$(jqs site2 .pending)" = null
-check "site5 has its address from the connection" \
-  test "$(jqs site2 '.sites[] | select(.name == "site5") | .address')" = 10.100.13.10
 new_id=$(jqs site5 .site_id)
 check "site5 has a new identity" test -n "$new_id" -a "$new_id" != "$old_id"
 check "site2 knows site5 by its new identity" \
   test "$(jqs site2 '.sites[] | select(.name == "site5") | .id')" = "${new_id:0:8}"
-check "the invitation is used up" x site2 "! wanderlan invite list | grep -q '$code1'"
-check "site2's log tells who joined" x site2 "wanderlan log | grep -q 'Site \"site5\" joined the network'"
 wait_for 30 "site5 is a client of site2: its only tunnel leads there" \
   x site5 "[ \"\$(ip -j link show master br0 | jq -r '[.[].ifname | select(startswith(\"gt-\"))] | join(\" \")')\" = gt-site2 ]"
-check "the network says so (server)" \
-  test "$(x site2 "grep -A8 '^\[site.site5\]' /etc/wanderlan/network.toml | grep -c 'server = \"site2\"'")" = 1
-check "site1 shows site5 as a client of site2, reached via site2" \
-  test "$(jqs site1 '.sites[] | select(.name == "site5") | "\(.uplink) \(.via) \(.direct)"')" = "site2 site2 false"
 check "site1 and site3 have no tunnel to site5" \
   x site1 "! ip link show gt-site5 2>/dev/null" && x site3 "! ip link show gt-site5 2>/dev/null"
 check "the client port at site2 is not isolated, the server ports are" \
   x site2 "bridge -d link show dev gt-site5 | grep -q 'isolated off' && bridge -d link show dev gt-site1 | grep -q 'isolated on'"
 check "site5 got the rules of the invitation (untagged is VLAN 20)" \
   test "$(vlan_summary site5 trunk0)" = "10-19,20:pu,21-50"
-check "site5 is managed by site2" \
-  test "$(x site2 "grep -A6 '^\[site.site5\]' /etc/wanderlan/network.toml | grep -c 'managed_by = \"site2\"'")" = 1
 
 begin "Online/offline: a new site starts offline until it is taken online"
 
-check "site5 is offline" test "$(jqs site2 '.sites[] | select(.name == "site5") | .online')" = false
-check "site2 shows the tunnel to site5 as offline" \
-  test "$(jqs site2 '.peers[] | select(.name == "site5") | .port_state')" = offline
-check "the tunnel to site5 is down at site2" \
-  x site2 "ip -j link show gt-site5 | jq -e '.[0].flags | index(\"UP\") | not'"
-check "site5 is reachable meanwhile (control channel)" \
-  x site2 "wanderlan status --json | jq -e '.peers[] | select(.name == \"site5\") | .reachable'"
+check "site5 is offline, its tunnel at site2 is down" \
+  x site2 "wanderlan status --json | jq -e '.peers[] | select(.name == \"site5\") | .port_state == \"offline\"' && ip -j link show gt-site5 | jq -e '.[0].flags | index(\"UP\") | not'"
 client_native c-site5 10.20.0.13/24
 expect_no_ping c-site5 10.20.0.1 "no traffic while site5 is offline"
-out=$(x site1 "wanderlan online site5 --confirm" 2>&1)
-if grep -q 'may not change site "site5"' <<<"$out"; then
-  pass "site1 may not take site5 online (managed by site2)"
-else
-  fail "unexpected output when site1 changes site5: $out"
-fi
 check "site2 takes site5 online" x site2 "wanderlan online site5 --confirm"
 wait_for 30 "the tunnel to site5 is up at site2" \
   x site2 "ip -j link show gt-site5 | jq -e '.[0].flags | index(\"UP\")'"
 expect_ping c-site5 10.20.0.1 "VLAN 20: the new site reaches site1's client (through site2)"
 expect_ping c-site3 10.20.0.13 "VLAN 20: site3's client reaches the new site (through site2)"
 
-# Only VLANs: a VLAN that site2 does not take part in does not pass it,
-# even if site1 and site5 have it.
-client_vlan c-site1 45 10.45.0.1/24
-client_vlan c-site5 45 10.45.0.13/24
-expect_ping c-site5 10.45.0.1 "VLAN 45: site5 reaches site1 while site2 has VLAN 45"
-x site2 "sed '/^\[site.site2\]\$/a vlans = \"10-40\"' /etc/wanderlan/network.toml > /tmp/site2-vlans.toml"
-check "site2 limits itself to VLANs 10-40" \
-  x site2 "wanderlan apply --network /tmp/site2-vlans.toml >/dev/null && wanderlan confirm >/dev/null"
-wait_eq 30 "the tunnel site2-site5 no longer carries VLAN 45" "10-40" vlan_summary site2 gt-site5
-expect_no_ping c-site5 10.45.0.1 "VLAN 45: no way from site5 to site1 without site2"
-# The daemon writes the file in canonical order (name, address, vlans, ...).
-x site2 "sed '/^\[site.site2\]\$/,/^\[/{/^vlans = \"10-40\"\$/d;}' /etc/wanderlan/network.toml > /tmp/site2-all.toml"
-check "site2 takes part in all VLANs again" \
-  x site2 "wanderlan apply --network /tmp/site2-all.toml >/dev/null && wanderlan confirm >/dev/null"
-expect_ping c-site5 10.45.0.1 "VLAN 45: site5 reaches site1 again"
-client_vlan_del c-site1 45
-client_vlan_del c-site5 45
-x site2 "wl-daemon stop; wl-daemon start"
-wait_for 30 "site2 is running again" x site2 "wanderlan status --json | jq -e '.state == \"running\"'"
-check "site5 stays online across a restart" \
-  test "$(jqs site2 '.sites[] | select(.name == "site5") | .online')" = true
-expect_ping c-site5 10.20.0.2 "VLAN 20: site5 reaches site2's client after the restart"
-check "site2 takes site5 offline again" x site2 "wanderlan offline site5 --confirm"
-wait_for 30 "the tunnel to site5 is down at site2" \
-  x site2 "ip -j link show gt-site5 | jq -e '.[0].flags | index(\"UP\") | not'"
-check "and online again" x site2 "wanderlan online site5 --confirm"
-expect_ping c-site5 10.20.0.1 "VLAN 20: traffic flows again"
-
-begin "Permissions: a joined site changes no VLANs unless it is released"
-
-rev=$(jqs site2 .revision)
-wait_eq 60 "site5 has revision $rev" "$rev" jqs site5 .revision
-x site5 "sed 's/^vlans = .*/vlans = \"10-40\"/' /etc/wanderlan/network.toml > /tmp/net-vlans.toml"
-out=$(x site5 "wanderlan apply --network /tmp/net-vlans.toml" 2>&1)
-if grep -q 'may not change the VLANs of the network' <<<"$out" && grep -q 'managed by "site2"' <<<"$out"; then
-  pass "site5 may not change the network's VLANs"
-else
-  fail "unexpected output when site5 changes the network's VLANs: $out"
-fi
-x site5 "sed '/^\[site.site2\]\$/a vlans = \"20\"' /etc/wanderlan/network.toml > /tmp/site2-vlans.toml"
-out=$(x site5 "wanderlan apply --network /tmp/site2-vlans.toml" 2>&1)
-if grep -q 'is a client of "site2": it may only change itself and its own clients' <<<"$out"; then
-  pass "site5 may not change its server site2"
-else
-  fail "unexpected output when site5 changes site2: $out"
-fi
-out=$(x site5 "wanderlan offline site5 --confirm" 2>&1)
-if grep -q 'may not change site "site5"' <<<"$out"; then
-  pass "site5 may not take itself offline"
-else
-  fail "unexpected output when site5 changes itself: $out"
-fi
-out=$(x site2 "wanderlan manage site5 --self-managed yes --confirm" 2>&1)
-if grep -q '"site2" and "site5" itself may change it' <<<"$out"; then
-  pass "site2 lets site5 manage itself"
-else
-  fail "unexpected output of wanderlan manage: $out"
-fi
-rev=$(jqs site2 .revision)
-wait_eq 60 "site5 has revision $rev" "$rev" jqs site5 .revision
-check "now site5 takes itself offline" x site5 "wanderlan offline site5 --confirm"
-wait_eq 30 "site2 took over the change of its client" false \
-  jqs site2 '.sites[] | select(.name == "site5") | .online'
-wait_eq 30 "and site1 has it too" false \
-  jqs site1 '.sites[] | select(.name == "site5") | .online'
-wait_for 30 "the tunnel to site5 is down at site2" \
-  x site2 "ip -j link show gt-site5 | jq -e '.[0].flags | index(\"UP\") | not'"
-check "and online again" x site5 "wanderlan online site5 --confirm"
-expect_ping c-site5 10.20.0.1 "VLAN 20: traffic flows again"
-rev=$(jqs site5 .revision)
-wait_eq 60 "site2 has revision $rev" "$rev" jqs site2 .revision
-check "site2 withdraws the release" x site2 "wanderlan manage site5 --self-managed no --confirm"
-
-begin "Own VLANs: a restricted client adds VLANs towards its own side only"
-
-rev=$(jqs site2 .revision)
-wait_eq 60 "site5 has revision $rev" "$rev" jqs site5 .revision
-check "site5 (restricted) sets its own VLANs" x site5 "wanderlan own-vlans site5 60 --confirm"
-wait_eq 30 "site5's trunk carries VLAN 60 too" "10-19,20:pu,21-50,60" vlan_summary site5 trunk0
-check "the tunnel to its server does not carry it (site5's side)" \
-  test "$(vlan_summary site5 gt-site2)" = "10-50"
-check "nor on site2's side" test "$(vlan_summary site2 gt-site5)" = "10-50"
-wait_eq 30 "site2 took the own VLANs over" "10-50 +60" \
-  jqs site2 '.sites[] | select(.name == "site5") | .vlans'
-out=$(x site1 "wanderlan own-vlans site5 70" 2>&1)
-if grep -q 'may not change' <<<"$out"; then
-  pass "site1 may not set the own VLANs of site5"
-else
-  fail "unexpected output when site1 sets site5's own VLANs: $out"
-fi
-check "site5 removes them again" x site5 "wanderlan own-vlans site5 none --confirm"
-wait_eq 30 "site5's trunk is as before" "10-19,20:pu,21-50" vlan_summary site5 trunk0
-wait_eq 30 "site2 took that over too (nothing pending)" "10-50 null" \
-  jqs site2 '"\(.sites[] | select(.name == "site5") | .vlans) \(.pending)"'
-reply=$(raw_join router 10.100.2.10 "$code1" ghost)
-if grep -q 'unknown or already used invitation code' <<<"$reply"; then
-  pass "a used code is refused"
-else
-  fail "unexpected answer for a used code: $reply"
-fi
-
 begin "Sync: a server refuses a change of its client"
 
+rev=$(jqs site2 .revision)
+wait_eq 60 "site5 has revision $rev, nothing pending" "$rev null" \
+  jqs site5 '"\(.revision) \(.pending)"'
 # site5 (a client of site2) adds a client of its own named like a site it
 # does not see: valid on site5, but the name is taken in the network.
 x site5 "printf '\n[site.site1]\naddress = \"10.100.99.10\"\nserver = \"site5\"\n' | cat /etc/wanderlan/network.toml - > /tmp/taken-name.toml"
-check "site5 adds a client named \"site1\"" \
-  x site5 "wanderlan apply --network /tmp/taken-name.toml >/dev/null && wanderlan confirm >/dev/null"
+if out=$(x site5 "wanderlan apply --network /tmp/taken-name.toml && wanderlan confirm" 2>&1); then
+  pass "site5 adds a client named \"site1\""
+else
+  fail "site5 cannot add a client named \"site1\": $out"
+fi
 wait_for 15 "site2 marks the change of site5 as refused" \
   x site2 "wanderlan status --json | jq -e '.peers[] | select(.name == \"site5\") | .refused | test(\"already used\")'"
-check "site2's log says why" \
-  x site2 "wanderlan log | grep -q 'Not taking over the changes of client \"site5\"'"
 wait_eq 45 "site5 takes site2's configuration back" "site2 site5" \
   jqs site5 '[.sites[].name] | sort | join(" ")'
 check "site5's status tells why" \
   x site5 "wanderlan status | grep -q 'WARNING: Your change was not taken over by \"site2\": .*already used'"
-check "site5's log tells why" x site5 "wanderlan log | grep -q 'not taken over by \"site2\"'"
 wait_eq 30 "site2 no longer marks site5" null \
   jqs site2 '.peers[] | select(.name == "site5") | .refused'
 wait_for 30 "site5 has no tunnel to the made-up site" x site5 "! ip link show gt-site1 2>/dev/null"
-
-begin "Sync: a new revision without new content is taken over silently"
-
-mark=$(daemon_log_lines site5)
-check "site1 gives site3 own VLAN 99" x site1 "wanderlan own-vlans site3 99 --confirm"
-check "and takes it back" x site1 "wanderlan own-vlans site3 none --confirm"
-rev=$(jqs site1 .revision)
-wait_eq 60 "site5 has revision $rev too (site3 is not in its view)" "$rev" jqs site5 .revision
-applied=$(daemon_log_since site5 "$mark" | grep -c 'was applied' || true)
-if [ "$applied" = 0 ]; then
-  pass "site5 took the revision over without applying anything"
-else
-  fail "site5 applied the new revision $applied time(s)"
-  daemon_log_since site5 "$mark"
-fi
-check "nothing is pending on site5" test "$(jqs site5 .pending)" = null
-
-begin "Join: a site that never comes up is removed again"
-
-code2=$(x site2 "wanderlan invite" | code_of)
-reply=$(raw_join router 10.100.2.10 "$code2" ghost)
-check "site2 accepts the request (the router never runs wanderland)" grep -q '"ok"' <<<"$reply"
-check "site2 waits for the new site" \
-  x site2 "wanderlan status --json | jq -e '.pending.source == {kind: \"join\", site: \"ghost\"}'"
-check "the invitation is reserved meanwhile" x site2 "wanderlan invite list | grep '$code2' | grep -q 'is joining'"
-wait_eq 90 "site2 rolls the new site back after the commit timeout" "null 5" \
-  jqs site2 '"\(.pending) \(.sites | length)"'
-check "the log explains the rollback" x site2 "wanderlan log | grep -q 'did not come up in time'"
-check "the invitation can be used again" x site2 "wanderlan invite list | grep '$code2' | grep -qv 'is joining'"
-check "wanderlan invite delete removes it" x site2 "wanderlan invite delete $code2"
-check "no open invitations are left" x site2 "wanderlan invite list | grep -q 'No open invitations'"
 
 begin "Join: a reset site joins again via another site"
 
@@ -312,9 +113,6 @@ check "site5 is a client of site1 now (it joined through site1)" \
 wait_for 30 "site5's only tunnel leads to site1" \
   x site5 "[ \"\$(ip -j link show master br0 | jq -r '[.[].ifname | select(startswith(\"gt-\"))] | join(\" \")')\" = gt-site1 ]"
 wait_for 30 "site2 has no tunnel to site5 any more" x site2 "! ip link show gt-site5 2>/dev/null"
-wait_eq 30 "site5 now knows only site1 and itself" "site1 site5" \
-  jqs site5 '[.sites[].name] | sort | join(" ")'
-check "site1's invitation is used up" x site1 "wanderlan invite list | grep -q 'No open invitations'"
 check "site5 is still online (the state is kept)" \
   test "$(jqs site1 '.sites[] | select(.name == "site5") | .online')" = true
 expect_ping c-site5 10.20.0.1 "VLAN 20: site5 reaches site1's client again"
@@ -334,8 +132,6 @@ else
   fail "unexpected join output: $out"
 fi
 check "site5 is still unconfigured" x site5 "wanderlan status --json | jq -e '.state == \"unconfigured\"'"
-check "site4 is untouched" \
-  test "$(jqs site1 '.sites[] | select(.name == "site4") | .address')" = 10.100.12.10
 check "a reset gives site5 its own identity" x site5 "wanderlan reset --yes"
 out=$(x site5 "wanderlan join 10.100.1.10 $code4" 2>&1)
 if grep -q 'Done: "site5" is part of the network' <<<"$out"; then

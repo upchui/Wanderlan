@@ -11,10 +11,10 @@ find_if() {
   ip -o -4 addr show | awk -v p="$1" 'index($4, p) == 1 { print $2; exit }'
 }
 
-# Renames the interface on the given network to trunk0 (or the name given
-# as second argument) and removes its address.
+# Renames the interface on the given network to trunk0 and removes its
+# address.
 make_trunk() {
-  local dev name="${2:-trunk0}"
+  local dev
   dev=$(find_if "$1")
   if [ -z "$dev" ]; then
     echo "no interface on $1" >&2
@@ -22,8 +22,8 @@ make_trunk() {
   fi
   ip addr flush dev "$dev"
   ip link set "$dev" down
-  ip link set "$dev" name "$name"
-  ip link set "$name" up
+  ip link set "$dev" name trunk0
+  ip link set trunk0 up
 }
 
 case "${ROLE:-site}" in
@@ -46,9 +46,6 @@ NFT
     ;;
   site)
     make_trunk "$TRUNK_NET"
-    if [ -n "${TRUNK_NET_B:-}" ]; then
-      make_trunk "$TRUNK_NET_B" trunk1
-    fi
     if [ -n "${GATEWAY:-}" ]; then
       ip route replace default via "$GATEWAY"
     fi
@@ -60,16 +57,6 @@ NFT
     ;;
   client)
     make_trunk "$TRUNK_NET"
-    ;;
-  looper)
-    a=$(find_if "$TRUNK_NET")
-    b=$(find_if "$TRUNK_NET2")
-    ip addr flush dev "$a"
-    ip addr flush dev "$b"
-    ip link set "$a" name loopa
-    ip link set "$b" name loopb
-    ip link add brl type bridge stp_state 0
-    ip link set brl up
     ;;
   *)
     echo "unknown ROLE ${ROLE}" >&2

@@ -19,7 +19,6 @@ Topology:
 | natc1     | 192.168.77.11, behind nat | 10.200.31.0/24              |
 | natc2     | 192.168.77.12, behind nat | 10.200.32.0/24              |
 | c-<site>  | –                       | client on the trunk of <site> |
-| looper    | –                       | bridges the trunks of site3 and site4 on request (loop guard) |
 
 The underlay networks stand in for the transport network (usually a VPN)
 that wanderlan expects to exist; the router connects them. On every site the
@@ -30,6 +29,4 @@ natc1 and natc2 reach the others through the NAT, nobody reaches them; they
 join site1 in case 92 (clients behind NAT, GRE in UDP).
 
 Options: `KEEP=1` keeps the containers running, `CASES="10 20"` runs only
-some cases, `BENCH=1` also measures the throughput and CPU through the
-tunnels (case 95; the containers share the host's CPUs, so the numbers only
-compare the kinds of tunnel).
+some cases.
