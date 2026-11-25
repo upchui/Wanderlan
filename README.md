@@ -3,13 +3,14 @@
 **Your network at another site, as if you had pulled a long network cable
 there, only over the internet.**
 
-Say the main office (`hq`) has a firewall at 10.0.0.1 with the network
-10.0.0.0/24, its DHCP server, the NAS and the printers. Now a second office,
-your home or a workshop (`office`) should simply be part of that network,
-without building a network of its own there. With wanderlan, a small Linux
-box at each site does that: the devices plugged into the switch at `office`
-get their address from the DHCP server at `hq`, use 10.0.0.1 as their
-gateway and find the NAS and the printers as if they stood next to them.
+Say the main office (`hq`), or your home, has a firewall at 10.0.0.1 with
+the network 10.0.0.0/24, its DHCP server, the NAS and the printers. Now a
+second office, a second flat or a holiday house (`office`) should simply be
+part of that network, without building a network of its own there. With
+wanderlan, a small Linux box at each site does that: the devices plugged
+into the switch at `office` get their address from the DHCP server at `hq`,
+use 10.0.0.1 as their gateway and find the NAS and the printers as if they
+stood next to them.
 
 ```
  hq (main office)                                          office (second site)
@@ -24,13 +25,28 @@ gateway and find the NAS and the printers as if they stood next to them.
 
 ## What it is for
 
+Typical uses:
+
+* **A second office in the network of the main office.** The same
+  addresses, the same file server and printers, behind the same firewall.
+* **A second flat or house in your home network.** You have set up the
+  network at home just right: VLANs for the family, guests and the smart
+  home devices, a DNS filter, the NAS, the firewall rules. In a second flat,
+  a holiday home or at your parents' place you want exactly that network,
+  not a second one to set up and keep in step: put the box there, and every
+  device on the switch or the Wi-Fi access point behind it is in your home
+  network, with the same VLANs (the access point's SSIDs on them), DNS and
+  smart home.
+
+What that means:
+
 * **One network, not two.** The second site is not a routed network of its
   own but the same one: broadcasts and discovery (DHCP, mDNS, printers,
   NetBIOS) work like on one switch.
 * **Nothing to build at the second site.** No second address range, no
   routes, no NAT, no DHCP server of its own: plug in the box, done.
-* **Like a cable to the main office.** The devices at the second site go to
-  the internet through the firewall of the main office, and its rules apply
+* **Like a cable to the first site.** The devices at the second site go to
+  the internet through the firewall of the first site, and its rules apply
   to them too.
 * **VLANs come along.** If the network has VLANs (staff, guests, phones), all
   of them reach the other site, or only the ones you choose per site; a VLAN

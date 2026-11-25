@@ -34,8 +34,9 @@ maintainer = "wanderlan maintainers <upchui@users.noreply.github.com>"
 copyright = "2026, wanderlan contributors"
 extended-description = """\
 wanderlan puts other sites into your network, as if a long network cable \
-ran there: the devices at a second office or at home are in the LAN of the \
-main office, with its DHCP, gateway and VLANs. One GRETAP tunnel per peer \
+ran there: the devices at a second office, a second flat or a holiday \
+house are in the LAN of the main office or of your home, with its DHCP, \
+gateway and VLANs. One GRETAP tunnel per peer \
 site, a Linux bridge with VLAN filtering, VLAN mappings, MSS clamping and \
 loop protection. It builds no VPN; the sites must already reach \
 each other through an existing transport network such as a VPN."""
