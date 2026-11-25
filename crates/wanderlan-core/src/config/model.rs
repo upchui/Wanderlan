@@ -256,6 +256,107 @@ impl Local {
     pub fn is_configured(&self) -> bool {
         self.self_name.is_some()
     }
+
+    /// Sets the trunk ports of the default trunk (`tunnel` `None`) or of the
+    /// tunnel to a site (empty: the default trunk). A port belongs to one
+    /// segment: ports another segment has move here, that segment keeps the
+    /// rest, and a tunnel left without ports uses the default trunk. The
+    /// same list as another tunnel shares its segment. Returns what changed
+    /// elsewhere, or why it cannot be (the default trunk needs a port).
+    pub fn assign_trunk(
+        &mut self,
+        tunnel: Option<&str>,
+        ports: Vec<String>,
+    ) -> Result<Vec<String>, String> {
+        let mut notes = Vec::new();
+        let list = |p: &[String]| p.join(", ");
+        match tunnel {
+            None => {
+                if ports.is_empty() {
+                    return Err("the default trunk needs at least one port".into());
+                }
+                for (site, own) in &mut self.tunnel_trunks {
+                    let taken: Vec<String> =
+                        own.iter().filter(|p| ports.contains(p)).cloned().collect();
+                    if taken.is_empty() || *own == ports {
+                        continue;
+                    }
+                    own.retain(|p| !ports.contains(p));
+                    notes.push(if own.is_empty() {
+                        format!(
+                            "{} moves from the tunnel to {site}, which uses the default trunk then",
+                            list(&taken)
+                        )
+                    } else {
+                        format!(
+                            "{} moves from the tunnel to {site}, which keeps {}",
+                            list(&taken),
+                            list(own)
+                        )
+                    });
+                }
+                self.trunk = ports;
+            }
+            Some(site) if ports.is_empty() || ports == self.trunk => {
+                self.tunnel_trunks.remove(site);
+            }
+            Some(site) => {
+                let taken: Vec<String> = self
+                    .trunk
+                    .iter()
+                    .filter(|p| ports.contains(p))
+                    .cloned()
+                    .collect();
+                if !taken.is_empty() {
+                    let left: Vec<String> = self
+                        .trunk
+                        .iter()
+                        .filter(|p| !ports.contains(p))
+                        .cloned()
+                        .collect();
+                    if left.is_empty() {
+                        return Err(format!(
+                            "{} is all of the default trunk; give the default trunk another port first",
+                            list(&taken)
+                        ));
+                    }
+                    notes.push(format!(
+                        "{} moves from the default trunk, which keeps {} for the other tunnels",
+                        list(&taken),
+                        list(&left)
+                    ));
+                    self.trunk = left;
+                }
+                for (other, own) in &mut self.tunnel_trunks {
+                    let taken: Vec<String> =
+                        own.iter().filter(|p| ports.contains(p)).cloned().collect();
+                    if other == site || taken.is_empty() || *own == ports {
+                        continue;
+                    }
+                    own.retain(|p| !ports.contains(p));
+                    notes.push(if own.is_empty() {
+                        format!(
+                            "{} moves from the tunnel to {other}, which uses the default trunk then",
+                            list(&taken)
+                        )
+                    } else {
+                        format!(
+                            "{} moves from the tunnel to {other}, which keeps {}",
+                            list(&taken),
+                            list(own)
+                        )
+                    });
+                }
+                self.tunnel_trunks.insert(site.to_string(), ports);
+            }
+        }
+        // Tunnels left without ports, or with the default ones, use the
+        // default trunk.
+        let default = self.trunk.clone();
+        self.tunnel_trunks
+            .retain(|_, own| !own.is_empty() && *own != default);
+        Ok(notes)
+    }
 }
 
 #[cfg(test)]

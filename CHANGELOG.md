@@ -16,9 +16,12 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
   a client which ports are its trunk. A port belongs to one segment.
 - Settings (7) and Sites `l` list the interfaces of the host to choose the
   trunk ports from, several at once (`Space`, `m` for the main port, a
-  name that is not there yet in the last row). Ports of another bridge and
-  of another segment are grey with the reason. `wanderlan trunk <site>
-  ens20,ens21`, with this site's own name for the default trunk.
+  name that is not there yet in the last row). Ports of a bridge of
+  someone else are grey with the reason. A port of another segment (the
+  default trunk, the trunk of another tunnel) moves here when chosen; that
+  segment keeps the rest, and a tunnel left without ports uses the default
+  trunk. The window, like `wanderlan trunk <site> ens20,ens21`, says what
+  changes elsewhere.
 - An interface the tunnels run over can be a trunk port again, marked with
   a warning ("tunnels to marcel, site2"). Which interface that is, the
   daemon asks the kernel the way the tunnel packets are routed, with the

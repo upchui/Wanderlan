@@ -69,6 +69,11 @@ pub fn draw(frame: &mut Frame, app: &App, picker: &PortPicker, area: Rect) {
     for part in format::wrap(&picker.summary(draft), text_width) {
         info.push(Line::styled(format!(" {part}"), theme::dim()));
     }
+    for effect in picker.effects(draft) {
+        for part in format::wrap(&effect, text_width) {
+            info.push(Line::raw(format!(" {part}")));
+        }
+    }
     if let Some(warning) = picker.warning(&app.interfaces) {
         for part in format::wrap(&warning, text_width) {
             info.push(Line::styled(format!(" {part}"), theme::warn()));

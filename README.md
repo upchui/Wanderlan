@@ -252,8 +252,10 @@ they are bridged like the ports of a switch and all carry the same VLANs and
 mappings (the first is the main port). Settings (`7`), "Trunk", lists the
 interfaces of the host: `Space` chooses one or more, `m` makes one the main
 port, a name that is not there yet goes in the last row; interfaces that
-cannot be a trunk port are grey with the reason (in another bridge or
-another segment). An interface the tunnels run over is marked yellow with
+cannot be a trunk port are grey with the reason (in a bridge of someone
+else). A port of another segment moves here when chosen: that segment keeps
+the rest, a tunnel left without ports uses the default trunk, and the window
+says what changes before it is saved (the same in `wanderlan trunk`). An interface the tunnels run over is marked yellow with
 their peers: as the kernel routes the tunnel packets, so a VPN with its own
 routing rules (Tailscale, WireGuard) counts. It can be chosen, but bridged
 it no longer carries this host's own traffic: if the tunnels drop, do not

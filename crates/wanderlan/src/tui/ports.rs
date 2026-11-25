@@ -58,6 +58,22 @@ pub struct PortPicker {
     initial: Vec<String>,
 }
 
+/// Why `interface` cannot be a trunk port at all: it is in a bridge or bond
+/// of someone else, or of a kind a bridge does not take.
+fn blocked(interface: &Interface) -> Option<String> {
+    if let Some(master) = interface
+        .master
+        .as_deref()
+        .filter(|m| *m != wanderlan_core::BRIDGE_NAME && !m.starts_with(SEGMENT_PREFIX))
+    {
+        return Some(format!("in {master}"));
+    }
+    if !matches!(interface.kind.as_str(), "" | "vlan" | "bond" | "veth") {
+        return Some(format!("a {}", interface.kind));
+    }
+    None
+}
+
 /// The peers of tunnels for display: `buero`, `buero, haus2`, or
 /// `buero, haus2 and 3 more`.
 fn peers_text(peers: &[String]) -> String {
@@ -148,14 +164,16 @@ impl PortPicker {
                     default.join(", ")
                 )
             }
-            PortTarget::Tunnel(site) => format!(
-                "A segment of its own, bridge {}: {}. Only the network on these ports reaches {site} through this site.",
-                bridge_for(
-                    &self.chosen[0],
-                    draft.local.main_trunk().unwrap_or_default()
-                ),
-                list(&self.chosen)
-            ),
+            PortTarget::Tunnel(site) => {
+                // The default trunk as it is after ports moved here.
+                let mut after = draft.local.clone();
+                let _ = after.assign_trunk(Some(site), self.chosen.clone());
+                format!(
+                    "A segment of its own, bridge {}: {}. Only the network on these ports reaches {site} through this site.",
+                    bridge_for(&self.chosen[0], after.main_trunk().unwrap_or_default()),
+                    list(&self.chosen)
+                )
+            }
         }
     }
 
@@ -173,7 +191,7 @@ impl PortPicker {
                 },
                 up: i.up,
                 mtu: i.mtu,
-                blocked: self.blocked(draft, i),
+                blocked: blocked(i),
                 note: self.note(draft, &i.name),
                 warning: (!i.carries.is_empty())
                     .then(|| format!("tunnels to {}", peers_text(&i.carries))),
@@ -202,50 +220,25 @@ impl PortPicker {
         self.chosen.iter().position(|p| p == name)
     }
 
-    /// For a tunnel: ports another tunnel uses too. Allowed if both end up
-    /// with the same list (one segment for both).
+    /// Where a port is now if not in this segment: it moves here when
+    /// chosen (see [`PortPicker::effects`]), or shares the segment of a
+    /// tunnel with the same list.
     fn note(&self, draft: &Draft, name: &str) -> Option<String> {
-        let PortTarget::Tunnel(me) = &self.target else {
-            return None;
+        let local = &draft.local;
+        let here = match &self.target {
+            PortTarget::Default => None,
+            PortTarget::Tunnel(site) => Some(site.as_str()),
         };
-        let others: Vec<&str> = draft
-            .local
+        if here.is_some() && local.trunk.iter().any(|p| p == name) {
+            return Some("in the default trunk".into());
+        }
+        let others: Vec<&str> = local
             .tunnel_trunks
             .iter()
-            .filter(|(site, ports)| *site != me && ports.iter().any(|p| p == name))
+            .filter(|(site, ports)| Some(site.as_str()) != here && ports.iter().any(|p| p == name))
             .map(|(site, _)| site.as_str())
             .collect();
-        (!others.is_empty()).then(|| format!("also for {}", others.join(", ")))
-    }
-
-    /// Why `interface` cannot be a port of this trunk.
-    fn blocked(&self, draft: &Draft, interface: &Interface) -> Option<String> {
-        let name = interface.name.as_str();
-        if let Some(master) = interface
-            .master
-            .as_deref()
-            .filter(|m| *m != wanderlan_core::BRIDGE_NAME && !m.starts_with(SEGMENT_PREFIX))
-        {
-            return Some(format!("in {master}"));
-        }
-        if !matches!(interface.kind.as_str(), "" | "vlan" | "bond" | "veth") {
-            return Some(format!("a {}", interface.kind));
-        }
-        // A port belongs to one segment.
-        let local = &draft.local;
-        match &self.target {
-            PortTarget::Default => local
-                .tunnel_trunks
-                .iter()
-                .find(|(_, ports)| ports.iter().any(|p| p == name))
-                .map(|(site, _)| format!("trunk of the tunnel to {site}")),
-            // Ports of other tunnels: see `note`.
-            PortTarget::Tunnel(_) => local
-                .trunk
-                .iter()
-                .any(|p| p == name)
-                .then(|| "in the default trunk".into()),
-        }
+        (!others.is_empty()).then(|| format!("trunk of the tunnel to {}", others.join(", ")))
     }
 
     /// Chooses the row or takes it out of the choice. A blocked interface
@@ -298,39 +291,51 @@ impl PortPicker {
 
     /// The draft with the choice, or why it cannot be saved.
     pub fn apply(&self, draft: &Draft) -> Result<Draft, String> {
+        if self.target == PortTarget::Default && self.chosen.is_empty() {
+            return Err(
+                "Choose at least one port: the trunk carries the VLANs of this site.".into(),
+            );
+        }
         let mut candidate = draft.clone();
-        let path = match &self.target {
-            PortTarget::Default => {
-                if self.chosen.is_empty() {
-                    return Err(
-                        "Choose at least one port: the trunk carries the VLANs of this site."
-                            .into(),
-                    );
-                }
-                candidate.local.trunk = self.chosen.clone();
-                FieldPath::local("trunk")
-            }
-            PortTarget::Tunnel(site) => {
-                if self.chosen.is_empty() || self.chosen == candidate.local.trunk {
-                    candidate.local.tunnel_trunks.remove(site);
-                } else {
-                    candidate
-                        .local
-                        .tunnel_trunks
-                        .insert(site.clone(), self.chosen.clone());
-                }
-                FieldPath::local(&format!("tunnels.{site}.trunk"))
-            }
+        let (tunnel, path) = match &self.target {
+            PortTarget::Default => (None, FieldPath::local("trunk")),
+            PortTarget::Tunnel(site) => (
+                Some(site.as_str()),
+                FieldPath::local(&format!("tunnels.{site}.trunk")),
+            ),
         };
+        candidate
+            .local
+            .assign_trunk(tunnel, self.chosen.clone())
+            .map_err(|e| format!("{e}."))?;
         candidate.revalidate();
         let problem = candidate
-            .at(&path)
-            .find(|d| d.is_error())
+            .diagnostics
+            .iter()
+            .filter(|d| d.is_error())
+            .find(|d| d.path == path || d.path == FieldPath::local("trunk"))
             .map(|d| d.message.clone());
         match problem {
             Some(message) => Err(message),
             None => Ok(candidate),
         }
+    }
+
+    /// What the choice changes in the other segments (ports that move
+    /// here from them), one sentence each.
+    pub fn effects(&self, draft: &Draft) -> Vec<String> {
+        let tunnel = match &self.target {
+            PortTarget::Default if self.chosen.is_empty() => return Vec::new(),
+            PortTarget::Default => None,
+            PortTarget::Tunnel(site) => Some(site.as_str()),
+        };
+        let mut local = draft.local.clone();
+        local
+            .assign_trunk(tunnel, self.chosen.clone())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|n| format!("{n}."))
+            .collect()
     }
 }
 
@@ -402,8 +407,10 @@ mod tests {
         let mut picker = PortPicker::new(PortTarget::Tunnel("haus2".into()), &d);
         assert!(picker.chosen.is_empty());
         let rows = picker.rows(&d, &fixtures::interfaces());
+        // The default trunk's port can be chosen (it would move here).
+        assert_eq!(row(&rows, "ens19").blocked, None);
         assert_eq!(
-            row(&rows, "ens19").blocked.as_deref(),
+            row(&rows, "ens19").note.as_deref(),
             Some("in the default trunk")
         );
         picker.manual.set("usb0");
@@ -434,16 +441,18 @@ mod tests {
         let rows = picker.rows(&d, &fixtures::interfaces());
         let ens18 = row(&rows, "ens18");
         assert_eq!(ens18.blocked, None);
-        assert_eq!(ens18.note.as_deref(), Some("also for buero"));
+        assert_eq!(ens18.note.as_deref(), Some("trunk of the tunnel to buero"));
         picker.toggle(ens18);
         let saved = picker.apply(&d).expect("the same list: one segment");
         assert_eq!(saved.local.tunnel_trunks.get("haus2").unwrap(), &["ens18"]);
         assert!(picker.summary(&saved).contains("bridge wl-ens18"));
-        // A different list with a shared port is two segments with one port.
+        // A different list takes the port: buero keeps nothing and uses
+        // the default trunk then.
         picker.manual.set("usb0");
         picker.add_manual();
-        let err = picker.apply(&d).unwrap_err();
-        assert!(err.contains("two segments"), "{err}");
+        assert!(picker.effects(&d)[0].contains("moves from the tunnel to buero"));
+        let moved = picker.apply(&d).expect("moved");
+        assert!(!moved.local.tunnel_trunks.contains_key("buero"));
     }
 
     #[test]

@@ -547,10 +547,13 @@ fn a_tunnel_gets_its_own_trunk_in_the_settings() {
     assert!(picker(&app).warning(&app.interfaces).is_some());
     app.update(ch(' '));
     assert!(picker(&app).chosen.is_empty(), "and taken out again");
-    // The default trunk belongs to another segment.
+    // The default trunk's only port can be chosen, which is the default
+    // trunk itself; taken out again.
     app.update(key(KeyCode::Down));
     app.update(ch(' '));
-    assert!(picker(&app).chosen.is_empty(), "ens19 is the default trunk");
+    assert_eq!(picker(&app).chosen, ["ens19"]);
+    app.update(ch(' '));
+    assert!(picker(&app).chosen.is_empty());
     // A name that is not there yet: typed in the last row.
     app.update(key(KeyCode::End));
     for c in "ens20".chars() {

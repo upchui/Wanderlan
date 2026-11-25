@@ -699,13 +699,13 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
         );
     }
     let before = local.clone();
-    if own {
-        local.trunk = ports;
-    } else if back || ports == local.trunk {
-        local.tunnel_trunks.remove(site);
-    } else {
-        local.tunnel_trunks.insert(site.to_string(), ports);
-    }
+    // Ports of another segment move here; that segment keeps the rest.
+    let moved = local
+        .assign_trunk(
+            (!own).then_some(site),
+            if back { Vec::new() } else { ports },
+        )
+        .map_err(|e| anyhow!(e))?;
     let now = local.trunk_ports_for(site).join(", ");
     if local == before {
         if own {
@@ -735,6 +735,9 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
     } else {
         format!("The tunnel to {site} uses its own trunk {now} (a segment of its own)")
     };
+    for note in &moved {
+        println!("{note}.");
+    }
     if confirm && risky.is_empty() {
         let _: Confirmed = client.call(Request::Confirm).await?;
         println!("{done}.");
