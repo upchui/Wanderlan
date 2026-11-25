@@ -14,9 +14,25 @@ COMPOSE=(docker compose -f "$here/compose.yml")
 x() { local s="$1"; shift; "${COMPOSE[@]}" exec -T "$s" bash -c "$*"; }
 
 failures=0
+failed=()
 begin() { printf '\n== %s\n' "$*"; }
 pass() { echo "  ok    $*"; }
-fail() { echo "  FAIL  $*"; failures=$((failures + 1)); }
+fail() { echo "  FAIL  $*"; failures=$((failures + 1)); failed+=("$*"); }
+# On GitHub also as error annotations, 25 lines each: the job log needs a
+# login, the annotations of a check run are public.
+annotate() { # annotate <title> <text>
+  [ "${GITHUB_ACTIONS:-}" = true ] || return 0
+  local -a lines
+  local i text
+  mapfile -t lines <<<"$2"
+  for ((i = 0; i < ${#lines[@]}; i += 25)); do
+    printf -v text '%s\n' "${lines[@]:i:25}"
+    text=${text//'%'/'%25'}
+    text=${text//$'\r'/'%0D'}
+    text=${text//$'\n'/'%0A'}
+    echo "::error title=$1 ($((i / 25 + 1)))::$text"
+  done
+}
 check() {
   local what="$1"
   shift
@@ -73,9 +89,18 @@ nothing_left() {
     && ! test -e /run/wanderlan/wanderlan.sock"
 }
 br0_index() { x alpha "ip -j link show br0 | jq -r '.[0].ifindex'"; }
+journal_cursor() { x "$1" "journalctl -n 1 --show-cursor --no-pager -o cat | sed -n 's/^-- cursor: //p'"; }
+# The journal of a host after a cursor: the service's lines, systemd's about
+# it, and those of short-lived processes such as `wanderland --cleanup`,
+# which journald cannot always attribute to the unit.
+journal_since() { # journal_since <host> <cursor>
+  x "$1" "journalctl -b --no-pager -o short-monotonic --after-cursor='$2' \
+    _SYSTEMD_UNIT=wanderland.service + UNIT=wanderland.service + SYSLOG_IDENTIFIER=wanderland"
+}
 
 cleanup() {
   if [ "$failures" -gt 0 ]; then
+    annotate "failed checks" "$(printf '%s\n' "${failed[@]}")"
     for s in alpha beta; do
       echo "--- journal of $s"
       x "$s" "journalctl -u wanderland -b --no-pager -o short-monotonic | tail -n 60"
@@ -166,13 +191,27 @@ healthy
 
 begin "A crash: the cleanup removes what is left, the restart builds it anew"
 before=$(br0_index)
+cursor=$(journal_cursor alpha)
+failures_before=$failures
 x alpha "systemctl kill -s KILL wanderland"
 RESTARTS[alpha]=1
 wait_for 20 "systemd restarted wanderland" \
   x alpha "systemctl is-active wanderland | grep -qx active && wanderlan status --json | jq -e '.state == \"running\"'"
-check "the cleanup after the crash removed the interfaces of the dead daemon" \
-  x alpha "journalctl -u wanderland -b --no-pager -o cat | grep -q 'Cleanup: .* changes undone'"
+wait_for 10 "the cleanup after the crash removed the interfaces of the dead daemon" \
+  eval 'journal_since alpha "$cursor" | grep -q "Cleanup: .* changes undone"'
 wait_for 30 "the new daemon built br0 anew" eval '[ -n "$(br0_index)" ] && [ "$(br0_index)" != "'"$before"'" ]'
+if [ "$failures" -gt "$failures_before" ]; then
+  report=$(
+    echo "--- journal of alpha since the kill (all units)"
+    x alpha "journalctl -b --no-pager -o short-monotonic --after-cursor='$cursor' | grep -v 'modprobe: WARNING'"
+    echo "--- links of alpha"
+    x alpha "ip -br link"
+    echo "--- nftables tables of alpha"
+    x alpha "nft list tables"
+  )
+  printf '%s\n' "$report"
+  annotate "crash cleanup" "$report"
+fi
 wait_for 30 "VLAN 20 works" ping_ok
 healthy
 
