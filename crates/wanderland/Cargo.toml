@@ -1,6 +1,6 @@
 [package]
 name = "wanderland"
-description = "wanderlan daemon: stretches VLANs across sites over GRETAP"
+description = "wanderlan daemon: carries the LAN of a site to the other sites over GRETAP"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

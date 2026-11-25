@@ -1,37 +1,66 @@
 # Wanderlan
 
-Wanderlan stretches VLANs between sites on layer 2, over a network that
-already connects them (usually a VPN). It works like plugging switches
-together: one site is the **server**, every further site is a **client**
-plugged into it with an invitation code, and for every site you decide
-which VLANs it gets, which VLAN its untagged traffic belongs to and which
-VLAN IDs are translated.
+**Your network at another site, as if you had pulled a long network cable
+there, only over the internet.**
+
+Say the main office (`hq`) has a firewall at 10.0.0.1 with the network
+10.0.0.0/24, its DHCP server, the NAS and the printers. Now a second office,
+your home or a workshop (`office`) should simply be part of that network,
+without building a network of its own there. With wanderlan, a small Linux
+box at each site does that: the devices plugged into the switch at `office`
+get their address from the DHCP server at `hq`, use 10.0.0.1 as their
+gateway and find the NAS and the printers as if they stood next to them.
 
 ```
-                  hq   (server, VLANs: all)
-                 /    \
-  office (client of hq)   lab (client of hq)
-  VLANs 10, 20            untagged traffic = VLAN 30
+ hq (main office)                                          office (second site)
+
+ firewall 10.0.0.1                                         laptop  10.0.0.57
+ DHCP, NAS 10.0.0.20                                       printer 10.0.0.58
+     │                                                       │
+   switch ─ ens19 [box] ══ internet / VPN ══ [box] ens19 ─ switch
+     │                                                       │
+     └────────────── one network: 10.0.0.0/24 ───────────────┘
 ```
 
-`office` and `lab` each have one tunnel, to `hq`. They have no tunnel to
-each other and do not even know about each other; whether traffic flows
-between two sites is decided by the VLANs alone.
+## What it is for
 
-wanderlan does **not** build a VPN, route or hand out addresses: the sites
-must already reach each other through an existing transport network
-(WireGuard, IPsec, a provider network, ...), and gateways and DHCP servers of
-the stretched VLANs stay where they are. On top of the transport network each
-site runs a small daemon (`wanderland`) that builds a VLAN-aware Linux
-bridge and GRETAP tunnels, and a terminal UI (`wanderlan`) to set it up and
-watch it.
+* **One network, not two.** The second site is not a routed network of its
+  own but the same one: broadcasts and discovery (DHCP, mDNS, printers,
+  NetBIOS) work like on one switch.
+* **Nothing to build at the second site.** No second address range, no
+  routes, no NAT, no DHCP server of its own: plug in the box, done.
+* **Like a cable to the main office.** The devices at the second site go to
+  the internet through the firewall of the main office, and its rules apply
+  to them too.
+* **VLANs come along.** If the network has VLANs (staff, guests, phones), all
+  of them reach the other site, or only the ones you choose per site; a VLAN
+  can also arrive untagged or with another ID there.
+* **More sites.** A third and fourth site join the same way.
+
+**What you need:**
+
+* At each site a small Linux host (Debian 13 or 12, Ubuntu 24.04): a mini PC
+  with two network ports, a Raspberry Pi with a USB network adapter, or a VM
+  on Proxmox with two network interfaces. One interface reaches the other
+  site; the other one (the **trunk**) goes to the local switch.
+* A connection between the sites. wanderlan does **not** build a VPN: the
+  boxes must already reach each other, usually through a VPN such as
+  WireGuard, Tailscale or the site-to-site VPN of the firewall. The VPN also
+  encrypts the traffic; wanderlan's tunnels (GRE) are not encrypted. GRE and
+  UDP/TCP port 51821 must pass through it.
+
+Under the hood each site runs a small daemon (`wanderland`) with a
+VLAN-aware Linux bridge and GRETAP tunnels to the other sites, and a terminal
+UI (`wanderlan`) to set it up and watch it; see [Concepts](#concepts) and
+[How it works](#how-it-works).
 
 ## Contents
 
-- [Concepts](#concepts)
+- [What it is for](#what-it-is-for)
 - [Requirements](#requirements)
 - [Installation](#installation)
-- [Quick start](#quick-start)
+- [Quick start: a second site in your network](#quick-start-a-second-site-in-your-network)
+- [Concepts](#concepts)
 - [Everyday tasks](#everyday-tasks)
 - [Configuration](#configuration)
 - [How it works](#how-it-works)
@@ -42,7 +71,130 @@ watch it.
 - [Development](#development)
 - [Maintainers: releases and the APT repository](#maintainers-releases-and-the-apt-repository)
 
+## Requirements
+
+* **Debian 13 (trixie)**; Debian 12, Ubuntu 24.04 and Proxmox VE 8/9 work as
+  well. The binaries are static (musl) for amd64 and arm64.
+* Per site a VM or small host with a **trunk**: an interface that carries the
+  VLANs tagged (and the untagged network) to the switch or hypervisor. It
+  must not be part of another bridge or bond.
+* An **existing transport network** in which every site has an IPv4 address.
+  Between each client and its server, and between all servers, it must carry
+  * GRE (IP protocol 47), and
+  * UDP and TCP on the control port (default 51821): probes, configuration
+    sync, joining.
+* The kernel modules `bridge`, `ip_gre`, `sch_ingress`, `cls_flower`,
+  `act_vlan`, `act_gact` and `nf_tables` (standard kernels have them; the
+  package loads them at boot).
+
+## Installation
+
+```
+curl -fsSL https://upchui.github.io/Wanderlan/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/wanderlan.gpg
+echo "deb [signed-by=/usr/share/keyrings/wanderlan.gpg] https://upchui.github.io/Wanderlan/apt stable main" | sudo tee /etc/apt/sources.list.d/wanderlan.list
+sudo apt update && sudo apt install wanderlan
+```
+
+(On minimal installations first `sudo apt install curl gpg`.)
+
+Every commit on `main` that passes all tests is published with a version of
+its own: 1.0.0, 1.0.1, 1.0.2 and so on; the package is named exactly like
+the version, and `wanderlan --version` also names the commit
+(`wanderlan 1.0.2 (c463aa1)`), so
+`sudo apt upgrade` always brings the newest one. The last 20 versions and
+every tagged release stay in the repository: `apt-cache madison wanderlan`
+lists them, `sudo apt install wanderlan=<version>` goes back. Update all
+sites to the same version. Older builds kept the shared configuration under another file
+name; the first start of a new build moves it to `network.toml`.
+
+The package installs the daemon `wanderland` (systemd service, enabled and
+started), the terminal UI and command line `wanderlan`, empty configuration
+files in `/etc/wanderlan/`, examples in `/usr/share/doc/wanderlan/examples/`
+and the group `wanderlan`. Its members can use `wanderlan` without root:
+
+```
+sudo usermod -aG wanderlan $USER    # then log in again
+```
+
+## Quick start: a second site in your network
+
+The example from the top: `hq` (main office, firewall 10.0.0.1, network
+10.0.0.0/24) and `office` (the second site). Each has a box with `ens18`
+towards the VPN (VPN addresses `10.8.0.1` at `hq` and `10.8.0.2` at
+`office`) and `ens19` to the local switch.
+
+1. [Install](#installation) wanderlan on both boxes.
+2. On **`hq`** run `sudo wanderlan`. The setup wizard opens; choose **Start a
+   new network**:
+   * name `hq` (suggested from the host name),
+   * trunk `ens19`: the port into 10.0.0.0/24 (an untagged switch port, or a
+     trunk port if the network has VLANs),
+   * address `10.8.0.1`, its address in the VPN,
+   * VLANs empty: everything, the untagged 10.0.0.0/24 included.
+
+   `Enter` shows the change, `c` confirms it.
+3. The invitation for the next site opens: name `office`, `Enter`. It shows
+   the command for the new site, e.g. `wanderlan join 10.8.0.1 K7F3Q-9QX2M`
+   (later: Sites, `i`).
+4. On **`office`** run it:
+
+   ```
+   sudo wanderlan join 10.8.0.1 K7F3Q-9QX2M
+   ```
+
+   The box takes its name from the host name (`--name` to choose one) and
+   its trunk itself (`--trunk ens19` if there are several candidates), gets
+   its part of the configuration and reports when both sides agree. In the
+   TUI the wizard offers the same under **Join an existing network**.
+5. Back on **`hq`**, the overview shows `office` reachable, with round trip
+   and path MTU. A new site starts offline; take it online:
+
+   ```
+   sudo wanderlan online office --confirm
+   ```
+
+   (or in the TUI: Sites `2`, select it, `o`, `a`, `c`).
+6. Plug a laptop into the switch at `office`: it gets a 10.0.0.x address
+   from the firewall at `hq`, and `ping 10.0.0.1` answers. In the TUI,
+   `Enter` on `office` in the overview shows the tunnel, its traffic and the
+   traffic of every VLAN.
+
+### Good to know
+
+* The boxes need no address in 10.0.0.0/24; their own addresses stay in the
+  VPN (and their own LAN, if any).
+* Only part of the network at a site: give the invitation its VLANs
+  (`wanderlan invite --name office --vlans 10,20`), put the untagged traffic
+  of the site into a VLAN (`--native 30`) or translate VLAN IDs
+  (`--map 130:30`); see [Everyday tasks](#everyday-tasks).
+* No DHCP server of its own on the switch at the second site, otherwise the
+  one network has two.
+* Do not connect the two networks a second way as well (another VPN bridge,
+  a cable): that is a loop. The loop guard then shuts the tunnel down until
+  it is fixed.
+* Speed and latency are those of the connection between the sites. Path MTU
+  and TCP MSS are measured and set automatically.
+
 ## Concepts
+
+For two sites the example above is all there is. With more sites, wanderlan
+works like plugging switches together: one site is the **server**, every
+further site is a **client** plugged into it with an invitation code, and for
+every site you decide which VLANs it gets, which VLAN its untagged traffic
+belongs to and which VLAN IDs are translated.
+
+```
+                  hq   (server, VLANs: all)
+                 /    \
+  office (client of hq)   lab (client of hq)
+  VLANs 10, 20            untagged traffic = VLAN 30
+```
+
+`office` and `lab` each have one tunnel, to `hq`. They have no tunnel to
+each other and do not even know about each other; whether traffic flows
+between two sites is decided by the VLANs alone. Gateways and DHCP servers
+of the network stay where they are; wanderlan does not route or hand out
+addresses.
 
 ### Servers and clients
 
@@ -128,85 +280,6 @@ online, also across restarts, until someone takes it offline.
 Every change is applied immediately and must be **confirmed** within the
 commit timeout (60 s by default); otherwise the previous state comes back.
 So a change that cuts you off undoes itself.
-
-## Requirements
-
-* **Debian 13 (trixie)**; Debian 12, Ubuntu 24.04 and Proxmox VE 8/9 work as
-  well. The binaries are static (musl) for amd64 and arm64.
-* Per site a VM or small host with a **trunk**: an interface that carries the
-  VLANs tagged (and the untagged network) to the switch or hypervisor. It
-  must not be part of another bridge or bond.
-* An **existing transport network** in which every site has an IPv4 address.
-  Between each client and its server, and between all servers, it must carry
-  * GRE (IP protocol 47), and
-  * UDP and TCP on the control port (default 51821): probes, configuration
-    sync, joining.
-* The kernel modules `bridge`, `ip_gre`, `sch_ingress`, `cls_flower`,
-  `act_vlan`, `act_gact` and `nf_tables` (standard kernels have them; the
-  package loads them at boot).
-
-## Installation
-
-```
-curl -fsSL https://upchui.github.io/Wanderlan/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/wanderlan.gpg
-echo "deb [signed-by=/usr/share/keyrings/wanderlan.gpg] https://upchui.github.io/Wanderlan/apt stable main" | sudo tee /etc/apt/sources.list.d/wanderlan.list
-sudo apt update && sudo apt install wanderlan
-```
-
-(On minimal installations first `sudo apt install curl gpg`.)
-
-Every commit on `main` that passes all tests is published with a version of
-its own: 1.0.0, 1.0.1, 1.0.2 and so on; the package is named exactly like
-the version, and `wanderlan --version` also names the commit
-(`wanderlan 1.0.2 (c463aa1)`), so
-`sudo apt upgrade` always brings the newest one. The last 20 versions and
-every tagged release stay in the repository: `apt-cache madison wanderlan`
-lists them, `sudo apt install wanderlan=<version>` goes back. Update all
-sites to the same version. Older builds kept the shared configuration under another file
-name; the first start of a new build moves it to `network.toml`.
-
-The package installs the daemon `wanderland` (systemd service, enabled and
-started), the terminal UI and command line `wanderlan`, empty configuration
-files in `/etc/wanderlan/`, examples in `/usr/share/doc/wanderlan/examples/`
-and the group `wanderlan`. Its members can use `wanderlan` without root:
-
-```
-sudo usermod -aG wanderlan $USER    # then log in again
-```
-
-## Quick start
-
-On the **first site** (here `hq` at transport address `10.8.0.1`):
-
-1. Run `wanderlan`. On a site without configuration the setup wizard opens;
-   choose **Start a new network**. Name (from the host name), trunk (the
-   interface that does not lead to the transport network) and address are
-   suggested. Leave the VLANs empty for all VLANs, or limit them, e.g.
-   `native,10-50`.
-2. Review the change (`Enter`), then confirm it with `c`.
-3. The invitation form for the next site opens: its name, VLANs, the VLAN
-   for its untagged traffic, translations and whether it may change its own
-   VLANs. `Enter` creates the code and shows the command, e.g.
-   `wanderlan join 10.8.0.1 K7F3Q-9QX2M` (`Esc` skips this; `i` in Sites
-   later).
-
-On the **new site** install the package and run that command:
-
-```
-sudo wanderlan join 10.8.0.1 K7F3Q-9QX2M
-```
-
-It takes its name from the host name (`--name` to choose one), picks its
-trunk itself (`--trunk` if there are several candidates), receives its part
-of the configuration and reports when both sides agree. In the TUI the
-wizard offers the same under **Join an existing network**.
-
-Back on `hq`, check the new site in the overview (reachable, round trip,
-path MTU) and take it online: Sites (`2`), select it, `o`, `a`, `c`, or
-
-```
-sudo wanderlan online office --confirm
-```
 
 ## Everyday tasks
 
