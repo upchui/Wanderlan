@@ -40,6 +40,8 @@ pub struct FakeState {
     pub routes: BTreeMap<std::net::Ipv4Addr, String>,
     /// A kernel without per-VLAN counters per port: bridges come without.
     pub no_vlan_stats: bool,
+    /// nftables does not work (no `nft`, no bridge family).
+    pub no_nft: bool,
     /// A bridge asked for counters came without them.
     vlan_stats_missed: bool,
     next_index: u32,
@@ -106,6 +108,11 @@ impl FakeNet {
     /// Routes packets to `dst` over the link `interface`.
     pub fn set_route(&self, dst: std::net::Ipv4Addr, interface: &str) {
         self.lock().routes.insert(dst, interface.to_string());
+    }
+
+    /// Behaves like a host where nftables does not work.
+    pub fn without_nft(&self) {
+        self.lock().no_nft = true;
     }
 
     /// Behaves like a kernel without per-VLAN counters per port.
@@ -498,6 +505,9 @@ impl TcOps for FakeNet {
 impl NftOps for FakeNet {
     async fn nft_state(&self) -> SysResult<Option<NftState>> {
         let s = self.lock();
+        if s.no_nft {
+            return Err(err("list nftables tables", "nft: command not found"));
+        }
         Ok(s.mss.as_ref().map(|mss| NftState::of(mss, &s.split)))
     }
 
@@ -507,6 +517,9 @@ impl NftOps for FakeNet {
         split: &BTreeSet<SplitRule>,
     ) -> SysResult<()> {
         let mut s = self.lock();
+        if s.no_nft {
+            return Err(err("apply nftables table", "nft: command not found"));
+        }
         s.calls
             .push(format!("set_nft_rules {} {}", rules.len(), split.len()));
         s.mss = Some(rules.clone());

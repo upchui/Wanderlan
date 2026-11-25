@@ -395,6 +395,87 @@ async fn a_kernel_without_vlan_counters_does_not_rebuild_forever() {
     assert!(run(&net, &desired("heim")).await.is_empty(), "stable");
 }
 
+#[tokio::test]
+async fn new_vlans_reach_the_ports_only_after_the_split_horizon_covers_them() {
+    let net = fresh();
+    let limited = format!(
+        "{NETWORK}\n[[tunnel]]\nbetween = [\"heim\", \"haus3\"]\nvlans = \"10-39,41-50\"\n"
+    );
+    run(
+        &net,
+        &derive(&config_from(&limited, "buero"), &Runtime::default()),
+    )
+    .await;
+    // The network gets VLANs 51-60, also on heim - haus3: split horizon.
+    let wider = limited
+        .replacen("vlans = \"10-50\"", "vlans = \"10-60\"", 1)
+        .replace("vlans = \"10-39,41-50\"", "vlans = \"10-39,41-60\"");
+    assert_ne!(wider, limited);
+    let d = derive(&config_from(&wider, "buero"), &Runtime::default());
+    let changes = plan(&d, &Actual::observe(&net).await.unwrap()).unwrap();
+    let rules = changes
+        .iter()
+        .position(|c| matches!(c, Change::SetNft { .. }))
+        .expect("the rules grow");
+    let vlans = changes
+        .iter()
+        .position(|c| matches!(c, Change::AddVlans { port, .. } if port.starts_with("gt-")))
+        .expect("the tunnels get the VLANs");
+    assert!(rules < vlans, "{changes:#?}");
+}
+
+#[tokio::test]
+async fn without_nftables_only_the_mss_clamping_is_missing() {
+    let net = fresh();
+    net.without_nft();
+    let err = reconcile(&net, &desired("heim"), |_| {})
+        .await
+        .expect_err("the error is reported");
+    assert!(err.to_string().contains("nft"), "{err}");
+    // Everything else is in place: the tunnels are up.
+    let buero = net.link("gt-buero").expect("the tunnel exists");
+    assert!(buero.admin_up);
+    assert_eq!(net.vlans("ens19").len(), 41);
+    // With a split horizon it is a hard stop: no loops without the rules.
+    let limited = format!(
+        "{NETWORK}\n[[tunnel]]\nbetween = [\"heim\", \"haus3\"]\nvlans = \"10-39,41-50\"\n"
+    );
+    let d = derive(&config_from(&limited, "buero"), &Runtime::default());
+    assert!(!d.split.is_empty());
+    let err = reconcile(&net, &d, |_| {}).await.expect_err("refused");
+    assert!(
+        matches!(err, ReconcileError::Plan(PlanError::Nft(_))),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn the_teardown_removes_the_tunnels_before_the_split_horizon() {
+    let net = fresh();
+    let limited = format!(
+        "{NETWORK}\n[[tunnel]]\nbetween = [\"heim\", \"haus3\"]\nvlans = \"10-39,41-50\"\n"
+    );
+    run(
+        &net,
+        &derive(&config_from(&limited, "buero"), &Runtime::default()),
+    )
+    .await;
+    let changes = plan_teardown(&Actual::observe(&net).await.unwrap());
+    let last_tunnel = changes
+        .iter()
+        .rposition(|c| matches!(c, Change::DeleteLink { name, .. } if name.starts_with("gt-")))
+        .expect("tunnels");
+    let table = changes
+        .iter()
+        .position(|c| matches!(c, Change::DeleteNftTable))
+        .expect("the table");
+    let bridge = changes
+        .iter()
+        .position(|c| matches!(c, Change::DeleteLink { name, .. } if name == "br0"))
+        .expect("the bridge");
+    assert!(last_tunnel < table && table < bridge, "{changes:#?}");
+}
+
 #[test]
 fn change_descriptions_are_readable() {
     let c = Change::AddVlans {

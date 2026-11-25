@@ -36,6 +36,8 @@ pub struct Actual {
     pub nft: Option<NftState>,
     /// The kernel can count traffic per VLAN and port.
     pub vlan_stats_supported: bool,
+    /// Why the nftables rules could not be read (e.g. no `nft`).
+    pub nft_error: Option<String>,
 }
 
 impl Actual {
@@ -49,13 +51,19 @@ impl Actual {
             .collect();
         let vlans = net.port_vlans().await?;
         let tc = net.tc_state().await?;
-        let nft = net.nft_state().await?;
+        // Without nftables only the MSS clamping is missing (unless the
+        // split horizon needs it, see `plan`): the rest still goes on.
+        let (nft, nft_error) = match net.nft_state().await {
+            Ok(nft) => (nft, None),
+            Err(e) => (None, Some(e.to_string())),
+        };
         Ok(Self {
             links,
             vlans,
             tc,
             nft,
             vlan_stats_supported: net.vlan_stats_supported(),
+            nft_error,
         })
     }
 
@@ -263,6 +271,9 @@ pub enum PlanError {
     /// The trunk is attached to another bridge or bond.
     #[error("trunk interface {trunk} is already attached to {master}; detach it first")]
     TrunkEnslaved { trunk: String, master: String },
+    /// The split horizon needs nftables, which does not work.
+    #[error("the split horizon between the server tunnels needs nftables: {0}")]
+    Nft(String),
 }
 
 /// Computes the changes needed to get from `actual` to `desired`.
@@ -303,14 +314,19 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
                             reason: "a new bridge counts the traffic per VLAN; once".into(),
                         });
                         rebuild.push(create);
-                    } else if *has != options {
-                        bridge_changes.push(Change::SetBridgeOptions {
-                            name: link.name.clone(),
-                            options: BridgeOptions {
-                                vlan_stats: has.vlan_stats,
-                                ..options
-                            },
-                        });
+                    } else {
+                        // The counters stay as the bridge was built: a change
+                        // cannot alter them, so they do not count here.
+                        let wanted = BridgeOptions {
+                            vlan_stats: has.vlan_stats,
+                            ..options
+                        };
+                        if *has != wanted {
+                            bridge_changes.push(Change::SetBridgeOptions {
+                                name: link.name.clone(),
+                                options: wanted,
+                            });
+                        }
                     }
                 }
                 _ => {
@@ -488,7 +504,13 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
 
     let tc_changes = tc_changes(desired, actual);
     let want = NftState::of(&desired.mss, &desired.split);
+    if let Some(error) = &actual.nft_error
+        && !desired.split.is_empty()
+    {
+        return Err(PlanError::Nft(error.clone()));
+    }
     let nft_changes = match (&actual.nft, want.is_empty()) {
+        _ if actual.nft_error.is_some() => Vec::new(),
         (None, true) => Vec::new(),
         (Some(_), true) => vec![Change::DeleteNftTable],
         (Some(have), false) if *have == want => Vec::new(),
@@ -514,9 +536,10 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
     out.extend(creates);
     out.extend(settings);
     out.extend(vlan_dels);
+    // The split horizon covers a new VLAN before the VLAN reaches the ports.
+    out.extend(nft_changes);
     out.extend(vlan_adds);
     out.extend(tc_changes);
-    out.extend(nft_changes);
     out.extend(unisolate);
     out.extend(ups);
     Ok(out)
@@ -681,9 +704,6 @@ fn port_changes(
 /// ours. Deleting the bridge also detaches the trunk.
 pub fn plan_teardown(actual: &Actual) -> Vec<Change> {
     let mut tc = Vec::new();
-    if actual.nft.is_some() {
-        tc.push(Change::DeleteNftTable);
-    }
     for (index, state) in &actual.tc {
         let Some(link) = actual.by_index(*index) else {
             continue;
@@ -703,7 +723,7 @@ pub fn plan_teardown(actual: &Actual) -> Vec<Change> {
             });
         }
     }
-    let mut links: Vec<Change> = actual
+    let links: Vec<Change> = actual
         .links
         .values()
         .filter(|l| is_owned(l))
@@ -712,13 +732,19 @@ pub fn plan_teardown(actual: &Actual) -> Vec<Change> {
             reason: "wanderlan is stopping".into(),
         })
         .collect();
-    // Delete tunnels before the bridge so the trunk is detached last.
-    links.sort_by_key(|c| match c {
-        Change::DeleteLink { name, .. } if name.starts_with(GRETAP_PREFIX) => 0,
-        _ => 1,
-    });
-    tc.extend(links);
-    tc
+    // The tunnels first (while the split horizon still holds), then the
+    // nftables table and the tc rules, the bridges last (that detaches the
+    // trunk).
+    let (tunnels, bridges): (Vec<Change>, Vec<Change>) = links.into_iter().partition(
+        |c| matches!(c, Change::DeleteLink { name, .. } if name.starts_with(GRETAP_PREFIX)),
+    );
+    let mut out = tunnels;
+    if actual.nft.is_some() {
+        out.push(Change::DeleteNftTable);
+    }
+    out.extend(tc);
+    out.extend(bridges);
+    out
 }
 
 /// Error from [`reconcile`] or [`teardown`].
@@ -829,15 +855,35 @@ pub async fn reconcile<N: System>(
     mut log: impl FnMut(&Change),
 ) -> Result<Vec<Change>, ReconcileError> {
     let mut applied = Vec::new();
+    // nftables failing only costs the MSS clamping (without split horizon):
+    // everything else is applied, the error is returned at the end.
+    let mut nft_failed: Option<SysError> = None;
+    let is_nft = |c: &Change| matches!(c, Change::SetNft { .. } | Change::DeleteNftTable);
     for _ in 0..MAX_ROUNDS {
         let mut actual = Actual::observe(net).await?;
-        let changes = plan(desired, &actual)?;
+        let mut changes = plan(desired, &actual)?;
+        if nft_failed.is_some() {
+            changes.retain(|c| !is_nft(c));
+        }
         if changes.is_empty() {
-            return Ok(applied);
+            return match (nft_failed, actual.nft_error) {
+                (Some(e), _) => Err(e.into()),
+                (None, Some(e)) => {
+                    Err(SysError::new("read nftables table bridge wanderlan", e).into())
+                }
+                (None, None) => Ok(applied),
+            };
         }
         for change in changes {
             log(&change);
-            apply(net, &actual, &change).await?;
+            match apply(net, &actual, &change).await {
+                Ok(()) => {}
+                Err(e) if is_nft(&change) && desired.split.is_empty() => {
+                    nft_failed = Some(e);
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            }
             if changes_links(&change) {
                 if let Change::CreateBridge { name, .. } | Change::CreateGretap { name, .. } =
                     &change
