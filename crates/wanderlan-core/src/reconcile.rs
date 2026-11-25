@@ -759,6 +759,9 @@ pub enum ReconcileError {
     /// Changes kept coming back.
     #[error("the system state did not converge after {MAX_ROUNDS} rounds; still pending: {0}")]
     NoConvergence(String),
+    /// The teardown removed what it could; these steps failed.
+    #[error("not everything could be removed: {0}")]
+    Incomplete(String),
 }
 
 /// Applies one change.
@@ -955,32 +958,79 @@ pub async fn flush_learned<N: System>(net: &N, bridge: &str) -> Result<(), SysEr
     Ok(())
 }
 
-/// Removes everything wanderlan created.
+/// Removes everything wanderlan created. A step that fails does not stop
+/// the others: the remaining tunnels, rules and bridges are still removed,
+/// the failed step is tried once more, and the error then lists what failed.
 pub async fn teardown<N: System>(
     net: &N,
     mut log: impl FnMut(&Change),
 ) -> Result<Vec<Change>, ReconcileError> {
     let mut applied = Vec::new();
+    let mut failed = Vec::new();
+    let mut last = observe_for_teardown(net).await?;
     for _ in 0..2 {
-        let actual = Actual::observe(net).await?;
-        let changes = plan_teardown(&actual);
+        let changes = plan_teardown(&last.0);
         if changes.is_empty() {
-            return Ok(applied);
+            break;
         }
+        failed.clear();
         // Deleting links does not change the indices of the remaining ones.
         for change in changes {
             log(&change);
-            apply(net, &actual, &change).await?;
-            applied.push(change);
+            match apply(net, &last.0, &change).await {
+                Ok(()) => applied.push(change),
+                Err(e) => failed.push(e.to_string()),
+            }
         }
+        last = observe_for_teardown(net).await?;
     }
-    let pending = plan_teardown(&Actual::observe(net).await?);
+    let (actual, problems) = last;
+    let pending = plan_teardown(&actual);
+    if pending.is_empty() {
+        // What failed before went in the second round.
+        failed.clear();
+    }
+    failed.extend(problems);
+    if !failed.is_empty() {
+        return Err(ReconcileError::Incomplete(failed.join("; ")));
+    }
     if pending.is_empty() {
         Ok(applied)
     } else {
         let list: Vec<String> = pending.iter().map(ToString::to_string).collect();
         Err(ReconcileError::NoConvergence(list.join("; ")))
     }
+}
+
+/// What the teardown needs to know, and what could not be read. The links
+/// say what is wanderlan's; the VLAN entries are not needed for removing,
+/// and without the tc state the rest is still removed (only rules on the
+/// trunk may then stay, which is reported).
+async fn observe_for_teardown<N: System>(net: &N) -> Result<(Actual, Vec<String>), SysError> {
+    let links = net
+        .links()
+        .await?
+        .into_iter()
+        .map(|l| (l.name.clone(), l))
+        .collect();
+    let mut problems = Vec::new();
+    let tc = net.tc_state().await.unwrap_or_else(|e| {
+        problems.push(e.to_string());
+        BTreeMap::new()
+    });
+    let (nft, nft_error) = match net.nft_state().await {
+        Ok(nft) => (nft, None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+    let actual = Actual {
+        links,
+        vlans: BTreeMap::new(),
+        tc,
+        nft,
+        vlan_stats_supported: net.vlan_stats_supported(),
+        nft_error,
+    };
+    Ok((actual, problems))
 }
 
 #[cfg(test)]

@@ -449,25 +449,29 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
 /// package is removed, so nothing stays behind. Does nothing if nothing is
 /// there.
 pub async fn cleanup(args: &Args) -> Result<()> {
-    let sys = LinuxSystem::connect().context("cannot open a netlink connection")?;
-    let removed = tokio::time::timeout(
+    let sys = LinuxSystem::connect().context("Cleanup failed: cannot open a netlink connection")?;
+    let result = match tokio::time::timeout(
         CLEANUP_TIMEOUT,
         reconcile::teardown(&sys, |c| info!("Cleanup: {c}")),
     )
     .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "the cleanup did not finish within {} s",
+    {
+        Ok(Ok(removed)) => {
+            if removed.is_empty() {
+                debug!("Cleanup: nothing of wanderlan left");
+            } else {
+                info!("Cleanup: {} changes undone", removed.len());
+            }
+            Ok(())
+        }
+        Ok(Err(e)) => Err(anyhow::anyhow!("Cleanup failed: {e}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "Cleanup failed: did not finish within {} s",
             CLEANUP_TIMEOUT.as_secs()
-        )
-    })?
-    .context("cleanup failed")?;
+        )),
+    };
+    // The socket and the GRE devices also after a failure.
     let _ = std::fs::remove_file(&args.socket);
-    if removed.is_empty() {
-        debug!("Cleanup: nothing of wanderlan left");
-    } else {
-        info!("Cleanup: {} changes undone", removed.len());
-    }
     // gre0, gretap0 and erspan0 of the kernel module ip_gre.
     let links = sys.links().await.unwrap_or_default();
     if let Some(message) =
@@ -476,7 +480,7 @@ pub async fn cleanup(args: &Args) -> Result<()> {
     {
         info!("Cleanup: {message}");
     }
-    Ok(())
+    result
 }
 
 /// Removes everything at an end of the daemon, at most `limit` long.

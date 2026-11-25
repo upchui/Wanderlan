@@ -42,6 +42,10 @@ pub struct FakeState {
     pub no_vlan_stats: bool,
     /// nftables does not work (no `nft`, no bridge family).
     pub no_nft: bool,
+    /// Deleting the nftables table fails (the table stays).
+    pub nft_delete_fails: bool,
+    /// Reading the tc state fails.
+    pub tc_state_fails: bool,
     /// A bridge asked for counters came without them.
     vlan_stats_missed: bool,
     next_index: u32,
@@ -113,6 +117,16 @@ impl FakeNet {
     /// Behaves like a host where nftables does not work.
     pub fn without_nft(&self) {
         self.lock().no_nft = true;
+    }
+
+    /// Deleting the nftables table fails from now on.
+    pub fn fail_nft_delete(&self) {
+        self.lock().nft_delete_fails = true;
+    }
+
+    /// Reading the tc state fails from now on.
+    pub fn fail_tc_state(&self) {
+        self.lock().tc_state_fails = true;
     }
 
     /// Behaves like a kernel without per-VLAN counters per port.
@@ -435,6 +449,9 @@ impl NetOps for FakeNet {
 
 impl TcOps for FakeNet {
     async fn tc_state(&self) -> SysResult<BTreeMap<u32, IfTc>> {
+        if self.lock().tc_state_fails {
+            return Err(err("list tc filters", "Operation not supported"));
+        }
         Ok(self
             .lock()
             .tc
@@ -530,6 +547,12 @@ impl NftOps for FakeNet {
     async fn delete_table(&self) -> SysResult<()> {
         let mut s = self.lock();
         s.calls.push("delete_table".into());
+        if s.nft_delete_fails {
+            return Err(err(
+                "delete nftables table bridge wanderlan",
+                "Device or resource busy",
+            ));
+        }
         s.split.clear();
         if s.mss.take().is_none() {
             return Err(err("delete table", "No such file or directory"));

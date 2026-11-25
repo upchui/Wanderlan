@@ -249,6 +249,49 @@ async fn teardown_removes_everything_we_created() {
 }
 
 #[tokio::test]
+async fn a_failing_step_does_not_stop_the_teardown() {
+    let net = fresh();
+    let limited = format!(
+        "{NETWORK}\n[[tunnel]]\nbetween = [\"heim\", \"haus3\"]\nvlans = \"10-39,41-50\"\n"
+    );
+    run(
+        &net,
+        &derive(&config_from(&limited, "buero"), &Runtime::default()),
+    )
+    .await;
+    assert!(
+        net.state().mss.is_some(),
+        "the split horizon needs the table"
+    );
+    net.fail_nft_delete();
+    net.take_calls();
+    let err = teardown(&net, |_| {}).await.unwrap_err().to_string();
+    assert!(
+        err.contains("delete nftables table bridge wanderlan: Device or resource busy"),
+        "{err}"
+    );
+    let names: Vec<String> = net.state().links.values().map(|l| l.name.clone()).collect();
+    assert_eq!(names, vec!["ens19", "eth0"], "bridge and tunnels are gone");
+    let deletes = net
+        .take_calls()
+        .iter()
+        .filter(|c| *c == "delete_table")
+        .count();
+    assert_eq!(deletes, 2, "the failed step is tried once more");
+}
+
+#[tokio::test]
+async fn the_teardown_removes_the_links_without_the_tc_state() {
+    let net = fresh();
+    run(&net, &desired("heim")).await;
+    net.fail_tc_state();
+    let err = teardown(&net, |_| {}).await.unwrap_err().to_string();
+    assert!(err.contains("list tc filters"), "{err}");
+    let names: Vec<String> = net.state().links.values().map(|l| l.name.clone()).collect();
+    assert_eq!(names, vec!["ens19", "eth0"]);
+}
+
+#[tokio::test]
 async fn blocked_tunnel_is_brought_down_and_back_up() {
     let net = fresh();
     run(&net, &desired("heim")).await;
