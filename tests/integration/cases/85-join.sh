@@ -19,7 +19,7 @@ check "site2 created an invitation with rules (code $code1)" grep -qE '^[0-9A-Z]
 check "the invitation shows the command with site2's address" \
   x site2 "wanderlan invite list | grep -q 'wanderlan join 10.100.2.10 $code1'"
 check "the invitation shows its rules" \
-  x site2 "wanderlan invite list | grep -q 'rules: native → 20, 130 → 30'"
+  x site2 "wanderlan invite list | grep -q 'rules: source VLAN 20 = untagged, source VLAN 30 = VLAN 130'"
 x site2 "wl-daemon stop; wl-daemon start"
 wait_for 30 "site2 is running again" x site2 "wanderlan status --json | jq -e '.state == \"running\"'"
 check "the invitation survives a daemon restart" x site2 "wanderlan invite list | grep -q '$code1'"

@@ -127,10 +127,11 @@ pub struct SiteRules {
     /// network's VLANs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vlans: Option<String>,
-    /// Shared VLAN that takes the untagged traffic of the new site.
+    /// Source VLAN that takes the untagged traffic of the new site.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native: Option<u16>,
-    /// Translations: local VLAN at the new site → shared VLAN.
+    /// Mappings: VLAN at the new site (`local`, the mapped VLAN) → VLAN of the
+    /// network (`shared`, the source VLAN).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub translations: Vec<Translation>,
     /// The new site may change its own rules too; otherwise only the
@@ -154,7 +155,8 @@ impl SiteRules {
         *self == Self::default()
     }
 
-    /// Short description, e.g. `name site5, VLANs native,10-50, native → 20`.
+    /// Short description, e.g. `name site5, VLANs native,10-50, source VLAN 20 =
+    /// untagged, source VLAN 30 = VLAN 130`.
     pub fn summary(&self) -> String {
         let mut parts = Vec::new();
         if let Some(n) = &self.name {
@@ -164,10 +166,10 @@ impl SiteRules {
             parts.push(format!("VLANs {v}"));
         }
         if let Some(n) = self.native {
-            parts.push(format!("native → {n}"));
+            parts.push(format!("source VLAN {n} = untagged"));
         }
         for t in &self.translations {
-            parts.push(format!("{} → {}", t.local, t.shared));
+            parts.push(format!("source VLAN {} = VLAN {}", t.shared, t.local));
         }
         if self.allow_self {
             parts.push("may change itself".into());

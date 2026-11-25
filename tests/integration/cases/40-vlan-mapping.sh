@@ -36,16 +36,16 @@ client_native c-site5 10.20.0.13/24
 expect_ping c-site5 10.20.0.1 "untagged client at site5 reaches VLAN 20 at site1"
 expect_ping c-site3 10.20.0.13 "VLAN 20 at site3 reaches the untagged client at site5"
 
-# Translation: local VLAN 130 at site5 is shared VLAN 30.
+# Mapping: source VLAN 30 is mapped VLAN 130 at site5.
 client_vlan c-site5 130 10.30.0.13/24
 client_vlan c-site1 30 10.30.0.1/24
 client_vlan c-site4 30 10.30.0.12/24
-expect_ping c-site5 10.30.0.1 "local VLAN 130 at site5 reaches VLAN 30 at site1"
-expect_ping c-site4 10.30.0.13 "VLAN 30 at site4 reaches local VLAN 130 at site5"
+expect_ping c-site5 10.30.0.1 "mapped VLAN 130 at site5 reaches VLAN 30 at site1"
+expect_ping c-site4 10.30.0.13 "VLAN 30 at site4 reaches mapped VLAN 130 at site5"
 check "site5's client sees VLAN 130 tagged frames back (translated on egress)" \
   x c-site5 "ip neigh show dev trunk0.130 | grep -q '10.30.0.1 .*lladdr'"
 
-# Tagged VLAN 30 at site5 must not leak into shared VLAN 30.
+# Tagged VLAN 30 at site5 must not leak into source VLAN 30.
 client_vlan c-site5 30 10.30.0.113/24
 x c-site5 "ip route del 10.30.0.0/24 dev trunk0.130 2>/dev/null; true"
 expect_no_ping c-site5 10.30.0.1 "tagged VLAN 30 at site5 is dropped (it would merge with VLAN 130)"

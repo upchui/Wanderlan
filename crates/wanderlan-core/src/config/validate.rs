@@ -338,7 +338,7 @@ impl Validator {
                 Some(vlans) if map.shared != NATIVE_VID && !vlans.contains(map.shared) => self.error(
                     FieldPath::map_field(i, "shared"),
                     format!(
-                        "map #{}: shared VLAN {} is not one of the VLANs of site \"{site}\" ({vlans})",
+                        "map #{}: source VLAN {} is not one of the VLANs of site \"{site}\" ({vlans})",
                         i + 1,
                         map.shared,
                     ),
@@ -349,7 +349,7 @@ impl Validator {
                 self.error(
                     FieldPath::map_field(i, "shared"),
                     format!(
-                        "map #{}: VLAN 1 is the native VLAN (untagged traffic) and cannot be a mapping target; add `native` to the VLANs of the sites instead",
+                        "map #{}: VLAN 1 is the native VLAN (untagged traffic) and cannot be a source VLAN; add `native` to the VLANs of the sites instead",
                         i + 1
                     ),
                 );
@@ -358,7 +358,7 @@ impl Validator {
                 self.error(
                     FieldPath::map_field(i, "local"),
                     format!(
-                        "map #{}: VLAN 1 is the native VLAN (untagged traffic); write local = \"native\"",
+                        "map #{}: VLAN 1 is the native VLAN (untagged traffic); write \"native\" as the mapped VLAN (local = \"native\")",
                         i + 1
                     ),
                 );
@@ -372,7 +372,7 @@ impl Validator {
             if let Some(first) = locals.insert((site, map.local), i) {
                 let what = match map.local {
                     LocalVid::Native => "has more than one native mapping".to_string(),
-                    LocalVid::Vid(v) => format!("maps local VLAN {v} twice"),
+                    LocalVid::Vid(v) => format!("uses mapped VLAN {v} twice"),
                 };
                 self.error(
                     FieldPath::map_field(i, "local"),
@@ -383,7 +383,7 @@ impl Validator {
                 self.error(
                     FieldPath::map_field(i, "shared"),
                     format!(
-                        "site \"{site}\" maps two local VLANs onto shared VLAN {} (map #{} and #{})",
+                        "site \"{site}\" maps source VLAN {} twice (map #{} and #{})",
                         map.shared,
                         first + 1,
                         i + 1
@@ -397,7 +397,7 @@ impl Validator {
                 self.warning(
                     FieldPath::map_field(i, "local"),
                     format!(
-                        "site \"{site}\": local VLAN {local} is one of its own VLANs; at this site it carries shared VLAN {} instead, so the own VLAN {local} does not reach its trunk",
+                        "site \"{site}\": mapped VLAN {local} is one of its own VLANs; at this site it carries source VLAN {} instead, so the own VLAN {local} does not reach its trunk",
                         map.shared
                     ),
                 );
@@ -408,7 +408,7 @@ impl Validator {
                 self.warning(
                     FieldPath::map_field(i, "local"),
                     format!(
-                        "site \"{site}\": local VLAN {local} is also a shared VLAN; at this site it carries shared VLAN {} and shared VLAN {local} is not available on the trunk",
+                        "site \"{site}\": mapped VLAN {local} is also a VLAN of the network; at this site it carries source VLAN {}, and VLAN {local} of the network is not available on its trunk",
                         map.shared
                     ),
                 );

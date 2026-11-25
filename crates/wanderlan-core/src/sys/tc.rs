@@ -111,17 +111,17 @@ impl fmt::Display for TcRule {
         match (self.direction, self.action) {
             (Direction::Ingress, TcAction::Translate(to)) => write!(
                 f,
-                "translate local VLAN {} to shared VLAN {to} (incoming)",
+                "translate mapped VLAN {} to source VLAN {to} (incoming)",
                 self.vid
             ),
             (Direction::Egress, TcAction::Translate(to)) => write!(
                 f,
-                "translate shared VLAN {} back to local VLAN {to} (outgoing)",
+                "translate source VLAN {} back to mapped VLAN {to} (outgoing)",
                 self.vid
             ),
             (Direction::Ingress, TcAction::Drop) => write!(
                 f,
-                "drop incoming frames tagged with VLAN {} (here shared VLAN {} is reached through a translated local VLAN)",
+                "drop incoming frames tagged with VLAN {} (here source VLAN {} is reached through a mapped VLAN)",
                 self.vid, self.vid
             ),
             (Direction::Egress, TcAction::Drop) => {

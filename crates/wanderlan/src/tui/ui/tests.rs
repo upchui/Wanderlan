@@ -84,7 +84,7 @@ fn sites() {
 fn vlans_with_conflict() {
     let mut app = connected();
     if let Some(d) = &mut app.draft {
-        // Two local VLANs onto shared VLAN 20 at haus3.
+        // Source VLAN 20 mapped twice at haus3.
         d.network.maps[1].shared = 20;
         d.revalidate();
     }
@@ -320,6 +320,16 @@ fn tunnel_vlans_form() {
     let mut app = connected();
     key(&mut app, KeyCode::Char('3'));
     key(&mut app, KeyCode::Char('t'));
+    key(&mut app, KeyCode::Enter);
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
+fn edit_vlan_mapping_form() {
+    // Site, then the source VLAN, then the mapped VLAN.
+    let mut app = connected();
+    key(&mut app, KeyCode::Char('3'));
+    key(&mut app, KeyCode::Down);
     key(&mut app, KeyCode::Enter);
     insta::assert_snapshot!(render(&app));
 }

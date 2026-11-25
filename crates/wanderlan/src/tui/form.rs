@@ -267,13 +267,13 @@ impl Form {
             Field::text(
                 "native",
                 "Untagged",
-                "empty: no mapping; or a VLAN for its untagged traffic",
+                "empty: none; or the source VLAN for untagged traffic",
                 "",
             ),
             Field::text(
                 "translations",
                 "Translations",
-                "local:shared, e.g. 130:30, 140:40",
+                "mapped:source, e.g. 130:30, 140:40",
                 "",
             ),
             Field::choice(
@@ -349,16 +349,16 @@ impl Form {
                 &site,
             ),
             Field::text(
-                "local",
-                "Local VLAN",
-                "\"native\" (untagged on the trunk) or a local VLAN ID",
-                local,
+                "shared",
+                "Source VLAN",
+                "the VLAN in the network (one of the site's VLANs)",
+                shared,
             ),
             Field::text(
-                "shared",
-                "Shared VLAN",
-                "VLAN ID in the shared network (one of network.vlans)",
-                shared,
+                "local",
+                "Mapped VLAN",
+                "\"native\" (untagged) or the VLAN ID on this site's trunk",
+                local,
             ),
         ];
         Self::new(FormKind::Map(index), title, fields, draft)
@@ -1030,7 +1030,7 @@ fn parse_translations(text: &str) -> Result<Vec<Translation>, String> {
         .map(|t| {
             let (local, shared) = t
                 .split_once(':')
-                .ok_or_else(|| format!("\"{t}\" is not local:shared, e.g. 130:30"))?;
+                .ok_or_else(|| format!("\"{t}\" is not mapped:source, e.g. 130:30"))?;
             Ok(Translation {
                 local: parse_vid(local.trim())?,
                 shared: parse_vid(shared.trim())?,
@@ -1287,7 +1287,7 @@ mod tests {
         assert!(
             form.notes
                 .iter()
-                .any(|n| n.message.contains("shared VLAN 20 is not one of the VLANs")),
+                .any(|n| n.message.contains("source VLAN 20 is not one of the VLANs")),
             "{:?}",
             form.notes
         );
@@ -1310,7 +1310,7 @@ mod tests {
 
         // A second native mapping for haus3 conflicts with map #1.
         let mut map = Form::map(&d, None, Some("haus3"));
-        map.focus = 2;
+        map.focus = 1;
         type_text(&mut map, &d, "40");
         let local = map.field("local").unwrap();
         assert!(
@@ -1355,7 +1355,7 @@ mod tests {
         assert!(
             form.notes
                 .iter()
-                .any(|n| n.message.contains("shared VLAN 30 is not one of the VLANs")),
+                .any(|n| n.message.contains("source VLAN 30 is not one of the VLANs")),
             "{:?}",
             form.notes
         );

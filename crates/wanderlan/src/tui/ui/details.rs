@@ -10,6 +10,7 @@ use ratatui::widgets::{
     Axis, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Sparkline, Table, Wrap,
 };
 use wanderlan_core::api::{PeerStatus, Traffic};
+use wanderlan_core::config::LocalVid;
 use wanderlan_core::{policy, topology};
 
 use super::{health_style, list, port_state, titled};
@@ -405,7 +406,10 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, area: Rect) {
     }
     let maps: Vec<String> = network
         .maps_of(name)
-        .map(|m| format!("{} → {}", m.local, m.shared))
+        .map(|m| match m.local {
+            LocalVid::Native => format!("source VLAN {} = untagged", m.shared),
+            LocalVid::Vid(v) => format!("source VLAN {} = VLAN {v}", m.shared),
+        })
         .collect();
     if !maps.is_empty() {
         lines.push(Line::raw(""));
@@ -440,7 +444,8 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, area: Rect) {
 pub fn invites(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
     let rows = app.invitations.len().max(1);
     let height = u16::try_from(rows + 6).unwrap_or(u16::MAX);
-    let popup = area.centered(Constraint::Max(80), Constraint::Max(height));
+    // Wider than the other windows: the rules of an invitation can be long.
+    let popup = area.centered(Constraint::Max(100), Constraint::Max(height));
     frame.render_widget(Clear, popup);
     let block = titled(" Open invitations ");
     let inner = block.inner(popup);

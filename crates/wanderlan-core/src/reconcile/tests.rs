@@ -616,7 +616,7 @@ async fn removing_the_mapping_removes_rules_and_qdisc() {
     let text: Vec<String> = changes.iter().map(ToString::to_string).collect();
     assert!(
         text.iter()
-            .any(|t| t == "On ens19: translate local VLAN 131 to shared VLAN 31 (incoming)"),
+            .any(|t| t == "On ens19: translate mapped VLAN 131 to source VLAN 31 (incoming)"),
         "{text:?}"
     );
     let mut cookies: Vec<String> = net.tc("ens19").ours.iter().map(TcRule::cookie).collect();

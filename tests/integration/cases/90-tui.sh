@@ -12,7 +12,7 @@ x site1 "tmux send-keys -t wl 2"
 wait_for 10 "key 2 opens the sites view" x site1 "tmux capture-pane -p -t wl | grep -q 'Sites (draft)'"
 x site1 "tmux send-keys -t wl 3"
 wait_for 10 "key 3 opens the VLAN view with the mappings of site5" \
-  x site1 "tmux capture-pane -p -t wl | grep -q 'VLAN 130 at site5 = shared VLAN 30'"
+  x site1 "tmux capture-pane -p -t wl | grep -q 'source VLAN 30 = VLAN 130 at site5'"
 x site1 "tmux send-keys -t wl 5"
 wait_for 10 "key 5 opens the live log" x site1 "tmux capture-pane -p -t wl | grep -qi 'log'"
 x site1 "tmux send-keys -t wl 7"

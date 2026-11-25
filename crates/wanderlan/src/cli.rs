@@ -251,11 +251,12 @@ pub struct RuleArgs {
     /// VLANs of the new site, e.g. native,10-50 (default: the network's).
     #[arg(long)]
     vlans: Option<String>,
-    /// Shared VLAN for the untagged traffic of the new site.
+    /// Source VLAN for the untagged traffic of the new site.
     #[arg(long)]
     native: Option<u16>,
-    /// Translation LOCAL:SHARED, e.g. 130:30 (repeatable).
-    #[arg(long = "map", value_name = "LOCAL:SHARED", value_parser = parse_translation)]
+    /// Mapping MAPPED:SOURCE, e.g. 130:30: VLAN 130 on the new site's trunk
+    /// is source VLAN 30 (repeatable).
+    #[arg(long = "map", value_name = "MAPPED:SOURCE", value_parser = parse_translation)]
     maps: Vec<api::Translation>,
     /// The new site may change its own VLANs and mappings too (otherwise
     /// only this site may).
@@ -278,7 +279,7 @@ impl RuleArgs {
 fn parse_translation(text: &str) -> Result<api::Translation, String> {
     let (local, shared) = text
         .split_once(':')
-        .ok_or_else(|| format!("\"{text}\" is not LOCAL:SHARED, e.g. 130:30"))?;
+        .ok_or_else(|| format!("\"{text}\" is not MAPPED:SOURCE, e.g. 130:30"))?;
     let vid = |v: &str| {
         v.trim()
             .parse::<u16>()

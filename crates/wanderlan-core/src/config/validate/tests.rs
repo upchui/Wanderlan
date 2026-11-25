@@ -255,7 +255,7 @@ fn map_target_must_be_a_vlan_of_the_site() {
     assert_error(
         &network,
         line,
-        "shared VLAN 20 is not one of the VLANs of site \"haus3\" (30)",
+        "source VLAN 20 is not one of the VLANs of site \"haus3\" (30)",
     );
 }
 
@@ -281,7 +281,7 @@ fn shared_vid_must_be_in_range() {
     assert_error(
         &network,
         line,
-        "shared VLAN 60 is not one of the VLANs of site \"haus3\" (10-50)",
+        "source VLAN 60 is not one of the VLANs of site \"haus3\" (10-50)",
     );
 }
 
@@ -300,7 +300,7 @@ fn at_most_one_native_mapping_per_site() {
 fn two_locals_onto_one_shared_vlan() {
     let network = EXAMPLE_NETWORK.replace("shared = 30", "shared = 20");
     let line = line_of(&network, "local = 130", "shared = 20");
-    assert_error(&network, line, "maps two local VLANs onto shared VLAN 20");
+    assert_error(&network, line, "maps source VLAN 20 twice");
 }
 
 #[test]
@@ -308,7 +308,7 @@ fn duplicate_local_vid() {
     let network =
         format!("{EXAMPLE_NETWORK}\n[[map]]\nsite = \"haus3\"\nlocal = 130\nshared = 40\n");
     let line = line_of(&network, "shared = 30", "local = 130");
-    assert_error(&network, line, "maps local VLAN 130 twice");
+    assert_error(&network, line, "uses mapped VLAN 130 twice");
 }
 
 #[test]
@@ -378,7 +378,7 @@ fn vlan_1_is_the_native_vlan_and_no_mapping_target() {
     assert_error(&network, line, "VLAN 1 is the native VLAN");
     let network = EXAMPLE_NETWORK.replace("local = 130", "local = 1");
     let line = line_of(&network, "", "local = 1");
-    assert_error(&network, line, "write local = \"native\"");
+    assert_error(&network, line, "write \"native\" as the mapped VLAN");
 }
 
 #[test]

@@ -35,6 +35,18 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 - Fix: an interface that is no longer a trunk port is taken off the bridge;
   before, it stayed bridged after the trunk was changed.
 
+### VLAN mappings: source VLAN and mapped VLAN
+
+- A mapping now speaks of the **source VLAN** (the VLAN of the network,
+  before "shared") and the **mapped VLAN** (its name on the site's trunk,
+  `native` or a VLAN ID; before "local"): in the mapping table (columns
+  Site, Source VLAN, Mapped VLAN; meaning `source VLAN 15 = VLAN 115 at
+  site2`), the edit window (the same order), the site details, the
+  invitations, the help, the check messages, the log lines of the
+  translation, `wanderlan invite --map MAPPED:SOURCE` and the README.
+- `network.toml` keeps its keys (`local`, `shared`); existing files load
+  unchanged.
+
 ### The system stays clean
 
 - Whenever the service ends (stop, update, crash, kill), systemd runs

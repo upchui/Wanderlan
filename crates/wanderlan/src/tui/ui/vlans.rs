@@ -45,7 +45,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     }
     if lines.is_empty() {
         lines.push(Line::styled(
-            " A mapping changes the VLAN ID on one site's trunk; all other sites see the shared VLAN.",
+            " A mapping changes the VLAN ID on one site's trunk; all other sites see the source VLAN.",
             theme::dim(),
         ));
     }
@@ -116,8 +116,8 @@ fn marked(text: String, severity: Option<Severity>) -> Cell<'static> {
 
 fn effect(map: &VlanMap) -> String {
     match map.local {
-        LocalVid::Native => format!("untagged at {} = shared VLAN {}", map.site, map.shared),
-        LocalVid::Vid(v) => format!("VLAN {v} at {} = shared VLAN {}", map.site, map.shared),
+        LocalVid::Native => format!("source VLAN {} = untagged at {}", map.shared, map.site),
+        LocalVid::Vid(v) => format!("source VLAN {} = VLAN {v} at {}", map.shared, map.site),
     }
 }
 
@@ -254,8 +254,15 @@ fn draw_tunnels(frame: &mut Frame, app: &App, draft: &Draft, area: Rect, detail:
 }
 
 fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
-    let header =
-        Row::new(vec!["", "#", "SITE", "LOCAL", "SHARED", "MEANING"]).style(theme::header());
+    let header = Row::new(vec![
+        "",
+        "#",
+        "SITE",
+        "SOURCE VLAN",
+        "MAPPED VLAN",
+        "MEANING",
+    ])
+    .style(theme::header());
     let running = app.running.as_ref().and_then(|r| r.network.as_ref());
     let shown = app.visible_maps();
     let area = if app.maps_filter.is_shown() {
@@ -271,6 +278,12 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         .iter()
         .position(|i| *i == app.maps_selected)
         .unwrap_or_default();
+    let site_text = |map: &VlanMap| {
+        draft
+            .network
+            .site(&map.site)
+            .map_or_else(|| map.site.clone(), format::site_with_kind)
+    };
     let rows: Vec<Row> = shown
         .iter()
         .filter_map(|&i| draft.network.maps.get(i).map(|m| (i, m)))
@@ -292,28 +305,36 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
             Row::new(vec![
                 Cell::from(marker),
                 Cell::from(format!("{}", i + 1)),
-                marked(
-                    draft
-                        .network
-                        .site(&map.site)
-                        .map_or_else(|| map.site.clone(), format::site_with_kind),
-                    at("site"),
-                ),
-                marked(map.local.to_string(), at("local")),
+                marked(site_text(map), at("site")),
                 marked(map.shared.to_string(), at("shared")),
+                marked(map.local.to_string(), at("local")),
                 Cell::from(effect(map)),
             ])
             .style(severity_style(draft.worst_within(&FieldPath::map(i))))
         })
         .collect();
     let empty = rows.is_empty();
-    // The meaning must fit "VLAN 1234 at <site> = shared VLAN 1234".
+    // SITE as wide as its longest entry (with " !"), # as its largest number:
+    // the meaning ("source VLAN 1234 = VLAN 1234 at <site>") keeps the rest.
+    let site_width = shown
+        .iter()
+        .filter_map(|&i| draft.network.maps.get(i).map(|m| (i, m)))
+        .map(|(i, map)| {
+            let mark = draft
+                .worst_at(&FieldPath::map_field(i, "site"))
+                .map_or(0, |_| 2);
+            site_text(map).chars().count() + mark
+        })
+        .max()
+        .unwrap_or_default()
+        .clamp(4, 21);
+    let number_width = draft.network.maps.len().max(1).to_string().len();
     let widths = [
         Constraint::Length(1),
-        Constraint::Length(3),
-        Constraint::Length(21),
-        Constraint::Length(7),
-        Constraint::Length(7),
+        Constraint::Length(u16::try_from(number_width).unwrap_or(3)),
+        Constraint::Length(u16::try_from(site_width).unwrap_or(21)),
+        Constraint::Length(11),
+        Constraint::Length(11),
         Constraint::Min(10),
     ];
     let errors = (0..draft.network.maps.len())
@@ -334,9 +355,11 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         .row_highlight_style(theme::selected());
     if empty {
         frame.render_widget(
-            Paragraph::new(" No mappings: every site uses the shared VLAN IDs. n adds one.")
-                .style(theme::dim())
-                .block(titled(" VLAN mappings ")),
+            Paragraph::new(
+                " No mappings: every site uses the VLAN IDs of the network. n adds one.",
+            )
+            .style(theme::dim())
+            .block(titled(" VLAN mappings ")),
             area,
         );
     } else {

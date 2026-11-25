@@ -686,8 +686,7 @@ fn a_server_managed_by_itself_edits_vlans_and_mappings() {
     app.update(key(KeyCode::Esc));
     app.update(ch('n'));
     assert!(matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::Map(None)));
-    // Site heim, local "native" (prefilled), shared VLAN 30.
-    app.update(key(KeyCode::Tab));
+    // Site heim, source VLAN 30, mapped VLAN "native" (prefilled).
     app.update(key(KeyCode::Tab));
     for c in "30".chars() {
         app.update(ch(c));

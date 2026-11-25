@@ -74,7 +74,7 @@ pub const SECTIONS: &[Section] = &[
         keys: &[
             ("v", "VLANs of the network (empty: all; e.g. native,10-50)"),
             ("o", "own VLANs of this site: trunk and own clients only"),
-            ("n", "new mapping (native or local VLAN -> shared VLAN)"),
+            ("n", "new mapping (source VLAN -> mapped VLAN or native)"),
             ("e, Enter", "edit the mapping"),
             ("d, Del", "delete the mapping"),
             ("t", "tunnels: what each carries (Enter: limit it)"),

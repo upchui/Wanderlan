@@ -47,7 +47,7 @@ wait_eq 90 "site5 fetched the network from site2 (revision $want, 5 sites)" "$wa
   jqs site5 '"\(.revision) \(.sites | length)"'
 check "site5 has its mappings again (tc rules from the synced network)" \
   x site5 "tc filter show dev trunk0 ingress | grep -q 'vlan_id 130'"
-expect_ping c-site5 10.30.0.1 "local VLAN 130 at site5 reaches VLAN 30 at site1 again"
+expect_ping c-site5 10.30.0.1 "mapped VLAN 130 at site5 reaches VLAN 30 at site1 again"
 
 # Back to VLANs 10-50 for the remaining cases.
 sed 's/^vlans = .*/vlans = "10-50"/' "$RUN_DIR/network-map.toml" | put site1 /tmp/network-50.toml

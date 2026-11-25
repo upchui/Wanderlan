@@ -13,7 +13,7 @@ expression: render(&app)
 "┌ Open invitations ────────────────────────────────────────────────────────────┐"
 "│CODE         RULES FOR THE NEW SITE                                           │"
 "│K7F3Q-9QX2M  defaults of the network                                          │"
-"│M0K8J-S8T4F  name haus7, VLANs native,20,30, 130 → 30, may change itself      │"
+"│M0K8J-S8T4F  name haus7, VLANs native,20,30, source VLAN 30 = VLAN 130, may ch│"
 "│                                                                              │"
 "│ On the new site run:                                                         │"
 "│ wanderlan join 10.8.0.1 M0K8J-S8T4F                                          │"

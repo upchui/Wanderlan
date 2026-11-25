@@ -187,8 +187,8 @@ towards the VPN (VPN addresses `10.8.0.1` at `hq` and `10.8.0.2` at
   VPN (and their own LAN, if any).
 * Only part of the network at a site: give the invitation its VLANs
   (`wanderlan invite --name office --vlans 10,20`), put the untagged traffic
-  of the site into a VLAN (`--native 30`) or translate VLAN IDs
-  (`--map 130:30`); see [Everyday tasks](#everyday-tasks).
+  of the site into a VLAN (`--native 30`) or map VLAN IDs (`--map 130:30`:
+  VLAN 130 there is source VLAN 30); see [Everyday tasks](#everyday-tasks).
 * No DHCP server of its own on the switch at the second site, otherwise the
   one network has two.
 * Do not connect the two networks a second way as well (another VPN bridge,
@@ -263,11 +263,17 @@ decided.
 
 ### VLAN mappings
 
-Per site, untagged traffic can be put into a VLAN (`native → 30`: what
-arrives untagged at that site's trunk is VLAN 30 everywhere else, and VLAN 30
-leaves its trunk untagged), and local VLAN IDs can be translated (`130 → 30`:
-VLAN 130 at that site is VLAN 30 everywhere else). The VLAN mapping views
-show next to each site whether it is a server or a client.
+A mapping gives a VLAN of the network, the **source VLAN**, another name on
+one site's trunk, the **mapped VLAN**:
+
+* `source VLAN 30 = untagged at lab`: what arrives untagged at lab's trunk is
+  VLAN 30 everywhere else, and VLAN 30 leaves lab's trunk untagged;
+* `source VLAN 30 = VLAN 130 at lab`: VLAN 130 at lab is VLAN 30 everywhere
+  else.
+
+The VLAN mapping views (Site, Source VLAN, Mapped VLAN) show next to each
+site whether it is a server or a client. In `network.toml` a mapping keeps
+its keys: `shared` is the source VLAN, `local` the mapped VLAN.
 
 ### Who knows what
 
@@ -328,8 +334,8 @@ the server manages everything else. CLI: `wanderlan own-vlans <site> 50,60`
 (`none` removes them).
 
 **Put untagged traffic into a VLAN, translate a VLAN.** VLANs (`3`), `n`:
-site, local VLAN `native` (or a local VLAN ID, e.g. `130`), shared VLAN
-(e.g. `30`).
+site, source VLAN (e.g. `30`), mapped VLAN `native` (or the VLAN ID on that
+site's trunk, e.g. `130`).
 
 **Let a site change its own VLANs, move it.** Sites, `Enter` on the site:
 "Changes" (only its manager / the manager and the site / any site) and
@@ -479,8 +485,8 @@ mapping.
 | `site.managed_by` | none | The site that manages this one (the inviting site). |
 | `site.self_managed` | `false` | The site may also change its own VLANs, mappings and online state. |
 | `map.site` | | The site the mapping belongs to. |
-| `map.local` | | `"native"` (untagged) or a local VLAN ID (not 1). |
-| `map.shared` | | The VLAN in the network; one of the VLANs of the site, not 1. |
+| `map.local` | | The mapped VLAN: `"native"` (untagged) or the VLAN ID on the site's trunk (not 1). |
+| `map.shared` | | The source VLAN: the VLAN in the network; one of the VLANs of the site, not 1. |
 | `tunnel.between` | | The two sites of a tunnel, e.g. `["dc", "lab"]`. |
 | `tunnel.vlans` | | The most this tunnel carries (on top of the VLANs of both sites), e.g. `"30-40"`; `"none"`: no VLAN at all. |
 | `self` (local) | | Which site of `network.toml` this host is. |
@@ -492,13 +498,13 @@ with file and line:
 
 ```
 network.toml:24: error: site "office": vlans: VLAN ID 5000 is outside 1-4094
-network.toml:42: error: map #2: shared VLAN 60 is not one of the VLANs of site "office" (10,20)
+network.toml:42: error: map #2: source VLAN 60 is not one of the VLANs of site "office" (10,20)
 ```
 
 Names and addresses are unique, uplinks lead to an existing site and never
 in a circle, mappings use VLANs of their site (at most one native mapping
-per site, no local VLAN mapped twice, no two local VLANs onto one shared
-VLAN), `self` exists, and unknown keys are errors (typos). Older files load
+per site, no mapped VLAN used twice, no source VLAN mapped twice per site),
+`self` exists, and unknown keys are errors (typos). Older files load
 too: `role` and `hub` (wanderlan 0.1) are ignored with a warning, and a site
 with `managed_by` but without `uplink` is a client of its manager.
 
@@ -649,7 +655,7 @@ its last log lines and keeps trying.
 | `wanderlan status [--json]` | This site, all known sites with role and link, the tunnel neighbours |
 | `wanderlan log [-f]` | Event log |
 | `wanderlan vlan <vid> [--json]` | Traffic of one VLAN on every port of this site now, its counters and MAC addresses |
-| `wanderlan invite [--name N] [--vlans V] [--native VID] [--map L:S]... [--self-managed]` | Create an invitation with rules; prints `wanderlan join <address> <code>` |
+| `wanderlan invite [--name N] [--vlans V] [--native VID] [--map MAPPED:SOURCE]... [--self-managed]` | Create an invitation with rules; prints `wanderlan join <address> <code>` |
 | `wanderlan invite list` / `wanderlan invite delete <code>` | Open invitations of this site |
 | `wanderlan join <address>[:port] <code> [--name N] [--trunk IF]` | Join a network (on an unconfigured site) |
 | `wanderlan online <site>` / `wanderlan offline <site>` | Take a site online or offline |

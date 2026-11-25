@@ -32,7 +32,7 @@ fn facts(network: &Network, me: &str, vid: u16) -> Vec<Line<'static>> {
         .filter(|m| m.site == me && m.shared == vid)
         .map(|m| match m.local {
             LocalVid::Native => "untagged".to_string(),
-            LocalVid::Vid(v) => format!("as local VLAN {v}"),
+            LocalVid::Vid(v) => format!("as mapped VLAN {v}"),
         })
         .collect();
     let here = match (on_trunk, mapped.as_slice()) {

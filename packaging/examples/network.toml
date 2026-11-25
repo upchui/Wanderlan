@@ -38,13 +38,13 @@ name = "haus3"
 address = "10.8.0.12"
 # uplink = "heim"             # would make haus3 a client of heim
 
-# Untagged traffic on the trunk of haus3 belongs to shared VLAN 20.
+# Source VLAN 20 ("shared") is untagged ("local", the mapped VLAN) at haus3.
 [[map]]
 site = "haus3"
 local = "native"
 shared = 20
 
-# Local VLAN 130 at haus3 is shared VLAN 30 everywhere else.
+# Source VLAN 30 is mapped VLAN 130 on the trunk of haus3.
 [[map]]
 site = "haus3"
 local = 130
