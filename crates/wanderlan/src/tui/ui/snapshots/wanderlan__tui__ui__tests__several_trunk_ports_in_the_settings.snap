@@ -1,6 +1,5 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 559
 expression: render(&app)
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
@@ -14,7 +13,7 @@ expression: render(&app)
 "│T│[ ]    br-lan          bridge    up    1500  a bridge                     │ █"
 "│ │[ ]    ens18           physical  up    1500  tunnels to buero             │ █"
 "│ │[x] 2  ens19           physical  up    1500                               │ █"
-"│R│[ ]    eth1            physical  down  1500  in br-lan                    │ █"
+"│R│[ ]    eth1            physical  down  1500  in br-lan                    │ ║"
 "│ │[x] 1  ens20                                 not on this host (now)       │ ║"
 "│ │ other:                   an interface that is not there yet              │ ║"
 "│ │                                                                          │ ║"

@@ -35,6 +35,27 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 - Fix: an interface that is no longer a trunk port is taken off the bridge;
   before, it stayed bridged after the trunk was changed.
 
+### Renaming sites
+
+- A site can always rename itself, also a client that is restricted:
+  Sites (2), `N`, or `wanderlan rename <site> <new-name>`. Its manager may
+  rename it only if the site allows it (Settings, "Renamed by", or
+  `wanderlan manage <site> --rename-by-manager yes` on the site itself;
+  `rename_by_manager = true` in network.toml). Before, a client could not
+  rename itself at all, and its server could rename it without asking.
+- The rename reaches every site: a renamed site is recognised by its
+  address. The server takes over the new name of its client (also where
+  others refer to it, e.g. `managed_by`), the client follows a rename by
+  its server (its `self` in local.toml), and every site moves the trunk of
+  the tunnel to the renamed site in its local.toml along. Before, the
+  server refused the client's change and the client refused the server's
+  network, so they stayed apart.
+- Fix: after a site was renamed (or replaced by one with the same
+  address), its old name kept answering for the address, so the renamed
+  site was given an empty network and fetched it again every second.
+- A site that is renamed is checked like any other change: whoever may
+  not rename it gets "only <site> itself may".
+
 ### A more readable network.toml
 
 - Every site is a table `[site.<name>]` with everything about it:

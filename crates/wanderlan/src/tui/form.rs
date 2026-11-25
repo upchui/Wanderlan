@@ -43,6 +43,9 @@ pub enum FormKind {
     OwnVlans(usize),
     /// The VLANs of the tunnel between two sites (indices in the network).
     TunnelVlans(usize, usize),
+    /// A new name for a site (index in the network); everything that names
+    /// it follows.
+    Rename(usize),
 }
 
 /// The editable value of a field.
@@ -415,6 +418,28 @@ impl Form {
         )
     }
 
+    /// Form for a new name of a site.
+    pub fn rename(draft: &Draft, site: usize) -> Self {
+        let name = draft
+            .network
+            .sites
+            .get(site)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        let fields = vec![Field::text(
+            "name",
+            "New name",
+            "a-z, 0-9 and -, at most 12 characters; its address stays, the tunnels to it are built anew",
+            name.clone(),
+        )];
+        Self::new(
+            FormKind::Rename(site),
+            format!("Rename site {name}"),
+            fields,
+            draft,
+        )
+    }
+
     /// Form for the VLANs of the tunnel between the sites `a` and `b`.
     pub fn tunnel_vlans(draft: &Draft, a: &str, b: &str) -> Self {
         let index = |name: &str| {
@@ -618,7 +643,7 @@ impl Form {
     fn index(&self, draft: &Draft) -> Option<usize> {
         match self.kind {
             FormKind::Site(i) => Some(i.unwrap_or(draft.network.sites.len())),
-            FormKind::OwnVlans(i) => Some(i),
+            FormKind::OwnVlans(i) | FormKind::Rename(i) => Some(i),
             FormKind::Invite => Some(draft.network.sites.len()),
             FormKind::Map(i) => Some(i.unwrap_or(draft.network.maps.len())),
             FormKind::TunnelVlans(a, b) => {
@@ -640,7 +665,7 @@ impl Form {
     fn entity_path(&self, draft: &Draft) -> Option<FieldPath> {
         let i = self.index(draft)?;
         match self.kind {
-            FormKind::Site(_) | FormKind::Invite | FormKind::OwnVlans(_) => {
+            FormKind::Site(_) | FormKind::Invite | FormKind::OwnVlans(_) | FormKind::Rename(_) => {
                 Some(FieldPath::site(i))
             }
             FormKind::Map(_) => Some(FieldPath::map(i)),
@@ -653,7 +678,7 @@ impl Form {
     fn path_of(&self, key: &str, draft: &Draft) -> FieldPath {
         let i = self.index(draft).unwrap_or_default();
         match self.kind {
-            FormKind::Site(_) | FormKind::Invite | FormKind::OwnVlans(_) => {
+            FormKind::Site(_) | FormKind::Invite | FormKind::OwnVlans(_) | FormKind::Rename(_) => {
                 FieldPath::site_field(i, key)
             }
             FormKind::Map(_) => FieldPath::map_field(i, key),
@@ -681,6 +706,8 @@ impl Form {
                     Some(slot) => {
                         let mut site = site;
                         site.online = slot.online;
+                        // Only the site itself decides this (Settings).
+                        site.rename_by_manager = slot.rename_by_manager;
                         site.managed_by = managed_by;
                         site.self_managed = self_managed;
                         site.uplink = uplink;
@@ -728,6 +755,24 @@ impl Form {
             FormKind::OwnVlans(site) => {
                 let own = self.parse_own_vlans()?;
                 candidate.network.sites.get_mut(site)?.own_vlans = own;
+            }
+            FormKind::Rename(site) => {
+                let new = self.value("name").trim().to_string();
+                if let Some(msg) = site_name_error(&new) {
+                    self.set_error("name", msg);
+                    return None;
+                }
+                let old = candidate.network.sites.get(site)?.name.clone();
+                if new != old {
+                    if candidate.network.site(&new).is_some() {
+                        self.set_error(
+                            "name",
+                            format!("\"{new}\" is already a site of the network"),
+                        );
+                        return None;
+                    }
+                    candidate.rename_references(&old, &new);
+                }
             }
             FormKind::TunnelVlans(a, b) => {
                 let a = candidate.network.sites.get(a)?.name.clone();
@@ -824,6 +869,7 @@ impl Form {
             managed_by: candidate.local.self_name.clone(),
             uplink: candidate.local.self_name.clone(),
             self_managed: false,
+            rename_by_manager: false,
         });
         if let Some(shared) = native {
             candidate.network.maps.push(VlanMap {
@@ -886,6 +932,7 @@ impl Form {
             online: true,
             managed_by: None,
             self_managed: false,
+            rename_by_manager: false,
             uplink: None,
         })
     }

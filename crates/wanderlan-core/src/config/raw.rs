@@ -75,6 +75,7 @@ struct RawSite {
     online: Option<Spanned<bool>>,
     managed_by: Option<Spanned<String>>,
     self_managed: Option<Spanned<bool>>,
+    rename_by_manager: Option<Spanned<bool>>,
     uplink: Option<Spanned<String>>,
     /// Since 0.2 there are no roles; read and ignored with a warning.
     role: Option<Spanned<String>>,
@@ -153,6 +154,7 @@ struct RawSite2 {
     server: Option<Spanned<String>>,
     managed_by: Option<Spanned<String>>,
     self_managed: Option<Spanned<bool>>,
+    rename_by_manager: Option<Spanned<bool>>,
     online: Option<Spanned<bool>>,
     vlans: Option<Spanned<RawVlans>>,
     own_vlans: Option<Spanned<RawVlans>>,
@@ -469,6 +471,7 @@ fn parse_network_2(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
             online: raw_site.online,
             managed_by: raw_site.managed_by,
             self_managed: raw_site.self_managed,
+            rename_by_manager: raw_site.rename_by_manager,
             uplink: raw_site.server,
             role: None,
             hub: None,
@@ -714,6 +717,12 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
     let self_managed = lw
         .take(&FieldPath::site_field(i, "self_managed"), s.self_managed)
         .unwrap_or(false);
+    let rename_by_manager = lw
+        .take(
+            &FieldPath::site_field(i, "rename_by_manager"),
+            s.rename_by_manager,
+        )
+        .unwrap_or(false);
     // `uplink = ""` marks a server explicitly.
     let uplink_given = s.uplink.is_some();
     let uplink = lw
@@ -779,6 +788,7 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
             online,
             managed_by,
             self_managed,
+            rename_by_manager,
             uplink,
         },
         uplink_given,

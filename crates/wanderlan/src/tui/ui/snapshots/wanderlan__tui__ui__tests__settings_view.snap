@@ -13,7 +13,7 @@ expression: render(&app)
 "│This host                                                                     █"
 "│  This site            heim                                                   █"
 "│  Trunk                ens19                                                  █"
-"│Role and rights        who may change VLANs: Sites (2), Enter, Changes        █"
+"│Role and rights        who may change VLANs: Sites (2), Enter, Changes        ║"
 "│  Role                 server (connected with the other servers)              ║"
 "│  Clients              haus6                                                  ║"
 "│  Managed by           - (not managed by another site)                        ║"

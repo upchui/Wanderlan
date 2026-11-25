@@ -8,7 +8,7 @@
 use wanderlan_core::api::ConfigTexts;
 use wanderlan_core::config::{
     Diagnostic, FieldPath, Local, Network, Severity, Site, VlanSet, parse_local, parse_network,
-    render_local, render_network, site_pair, validate,
+    render_local, render_network, validate,
 };
 use wanderlan_core::topology;
 
@@ -178,34 +178,12 @@ impl Draft {
         true
     }
 
-    /// Updates all references to a renamed site (mappings, `self`).
+    /// Renames the site `old` to `new` with everything that names it: the
+    /// site itself, mappings, `managed_by`, `uplink`, tunnel limits, `self`
+    /// and the trunk of the tunnel to it.
     pub fn rename_references(&mut self, old: &str, new: &str) {
-        for map in &mut self.network.maps {
-            if map.site == old {
-                map.site = new.to_string();
-            }
-        }
-        for site in &mut self.network.sites {
-            if site.managed_by.as_deref() == Some(old) {
-                site.managed_by = Some(new.to_string());
-            }
-            if site.uplink.as_deref() == Some(old) {
-                site.uplink = Some(new.to_string());
-            }
-        }
-        for tunnel in &mut self.network.tunnels {
-            if tunnel.touches(old) {
-                let [a, b] = &tunnel.sites;
-                let rename = |n: &String| if n == old { new.to_string() } else { n.clone() };
-                tunnel.sites = site_pair(&rename(a), &rename(b));
-            }
-        }
-        if self.local.self_name.as_deref() == Some(old) {
-            self.local.self_name = Some(new.to_string());
-        }
-        if let Some(trunk) = self.local.tunnel_trunks.remove(old) {
-            self.local.tunnel_trunks.insert(new.to_string(), trunk);
-        }
+        self.network.rename_site(old, new);
+        self.local.rename_site(old, new);
     }
 
     /// How many things the draft changes against `running`: settings,

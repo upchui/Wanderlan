@@ -233,6 +233,10 @@ struct Controller {
     sync_problem: Option<String>,
     /// The version each client of this site should have (its view).
     expected: BTreeMap<String, Version>,
+    /// The name this site had before it was renamed last. Its uplink may
+    /// give it back (a newer network of the uplink that does not have the
+    /// rename yet wins, like for every change of this site).
+    renamed_from: Option<String>,
     /// The FDB as read last, for the status.
     /// The MAC addresses per port as counted last, for the status.
     fdb_cache: std::sync::Mutex<Option<(Instant, MacCounts)>>,
@@ -323,6 +327,7 @@ pub async fn run(args: Args) -> Result<()> {
         diverged_since: None,
         sync_problem: None,
         expected: BTreeMap::new(),
+        renamed_from: None,
         fdb_cache: std::sync::Mutex::new(None),
         config_id: 0,
         derived: std::sync::Mutex::new(None),
@@ -716,12 +721,24 @@ impl Controller {
     /// services. The announced version is always the confirmed one.
     fn set_config(&mut self, cfg: Option<Config>) {
         let old_peers = self.direct_peers();
+        let renamed = match (&self.config, &cfg) {
+            (Some(old), Some(new)) => wanderlan_core::rename::renames(&old.network, &new.network),
+            _ => Vec::new(),
+        };
+        if let Some(me) = self.config.as_ref().map(|c| c.self_name().to_string())
+            && renamed.iter().any(|(old, _)| *old == me)
+        {
+            self.renamed_from = Some(me);
+        }
         self.config = cfg;
         self.config_id += 1;
+        self.follow_renames(&renamed);
         let new_peers = self.direct_peers();
         let now = Instant::now();
         for (name, addr) in old_peers {
-            if !new_peers.contains_key(&name) {
+            // A renamed peer is still there under its new name: its old name
+            // must not answer for its address.
+            if !new_peers.contains_key(&name) && !new_peers.values().any(|a| *a == addr) {
                 self.grace.insert(name, (addr, now + GRACE));
             }
         }
@@ -748,6 +765,27 @@ impl Controller {
         self.publish();
     }
 
+    /// Carries what is known per peer over to its new name: refusals,
+    /// backoffs, the path MTU and a port shut by the loop guard.
+    fn follow_renames(&mut self, renamed: &[(String, String)]) {
+        fn move_key<V>(map: &mut BTreeMap<String, V>, old: &str, new: &str) {
+            if let Some(value) = map.remove(old) {
+                map.insert(new.to_string(), value);
+            }
+        }
+        for (old, new) in renamed {
+            move_key(&mut self.refused, old, new);
+            move_key(&mut self.fetch_backoff, old, new);
+            move_key(&mut self.expected, old, new);
+            move_key(&mut self.runtime.pmtu, old, new);
+            move_key(&mut self.runtime.underlay_mtu, old, new);
+            self.grace.remove(old);
+            if self.runtime.blocked.remove(&topology::gretap_name(old)) {
+                self.runtime.blocked.insert(topology::gretap_name(new));
+            }
+        }
+    }
+
     /// Direct peers of the configuration in effect.
     fn direct_peers(&self) -> BTreeMap<String, Ipv4Addr> {
         self.config.as_ref().map_or_else(BTreeMap::new, |cfg| {
@@ -761,9 +799,15 @@ impl Controller {
     /// Updates the probe service and the sync server.
     fn publish(&mut self) {
         let peers = self.direct_peers();
+        let now = Instant::now();
+        // Former peers still answer for a while; a current peer at the same
+        // address (renamed) wins.
         let responders: BTreeMap<String, Ipv4Addr> = self
             .grace
             .iter()
+            .filter(|(n, (a, until))| {
+                *until > now && !peers.contains_key(*n) && !peers.values().any(|p| p == a)
+            })
             .map(|(n, (a, _))| (n.clone(), *a))
             .collect();
         let bind = self.config.as_ref().and_then(|cfg| {
@@ -1172,7 +1216,14 @@ impl Controller {
                 match view::merge(&own, &network, &peer) {
                     Ok(merged) => {
                         self.refused.remove(&peer);
-                        merged
+                        for (old, new) in &merged.renamed {
+                            self.events.emit(
+                                Level::Info,
+                                Some(new),
+                                format!("Site \"{old}\" is now called \"{new}\""),
+                            );
+                        }
+                        merged.network
                     }
                     Err(e) => {
                         self.reject(fingerprint);
@@ -1208,7 +1259,21 @@ impl Controller {
             }
             FetchMode::Replace => network,
         };
-        match sync::accept(network, &local) {
+        let previous = self.confirmed.as_ref().map(|c| c.network.clone());
+        // This site's own name back: its change was refused (Resync), or the
+        // uplink's newer network does not have the rename yet.
+        let own_address = self
+            .confirmed
+            .as_ref()
+            .and_then(|c| c.self_site())
+            .map(|s| s.address);
+        let taken_back = mode == FetchMode::Resync
+            || self
+                .renamed_from
+                .as_deref()
+                .and_then(|old| network.site(old))
+                .is_some_and(|s| Some(s.address) == own_address);
+        match sync::accept(network, &local, previous.as_ref(), taken_back) {
             Err(e) => {
                 self.reject(fingerprint);
                 self.events.emit(
@@ -1583,7 +1648,7 @@ impl Controller {
             trunk: vec![params.trunk.clone()],
             ..Default::default()
         };
-        let cfg = sync::accept(network, &local).map_err(|e| {
+        let cfg = sync::accept(network, &local, None, false).map_err(|e| {
             ApiError::new(format!(
                 "the configuration from \"{via}\" cannot be used: {e}"
             ))

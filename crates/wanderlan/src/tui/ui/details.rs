@@ -368,6 +368,15 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, area: Rect) {
             label("Changes"),
             Span::raw(policy::managers(network, site)),
         ]),
+        Line::from(vec![
+            label("Renamed by"),
+            Span::raw(match policy::manager(network, site) {
+                Some(m) if site.rename_by_manager && m != site.name => {
+                    format!("\"{}\" itself and \"{m}\"", site.name)
+                }
+                _ => format!("only \"{}\" itself", site.name),
+            }),
+        ]),
     ];
     let clients: Vec<&str> = network
         .sites

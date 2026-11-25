@@ -291,12 +291,24 @@ The site that created an invitation **manages** the site that joined with it.
 | VLANs, mappings, online state of a managed site, removing it | its manager; the site itself too if it was released ("may change its own VLANs") |
 | The same for a site without a manager (the first site) and the VLANs of the network | every site that is not *restricted* |
 | Timeouts, MTU check, MSS, control port, invitations | every site |
+| The name of a site | the site itself, always; its manager only if the site allows it |
 
 A site that joined and was not released is **restricted**: it cannot change
 the VLANs its server gave it, only those of sites it invited itself. Its own
 VLANs (see above) are always its own business. A client may in any case only
 change itself and its own clients, never its server. The daemons enforce
 this among themselves; it is not a cryptographic protection.
+
+**Renaming a site.** Sites (`2`), `N`, or `wanderlan rename <site>
+<new-name>`. A site may always rename itself, also a restricted one. Its
+manager may rename it only if the site allows it: Settings (`7`), "Renamed
+by", or `wanderlan manage <site> --rename-by-manager yes` on that site
+(`no` takes it back; only the site itself decides). The address stays, so
+every site recognises the renamed one: the network, `self` in its own
+`local.toml` and the trunks per tunnel of the others follow, and the
+tunnels to it are built anew (about a second without traffic on them).
+Older sites do not understand a rename made by their client; update them
+first.
 
 ### Online, offline and confirmed changes
 
@@ -484,6 +496,7 @@ sites with older and newer versions keep working together.
 | `site.<name>.server` | none | The site this one is a client of; none: a server. |
 | `site.<name>.managed_by` | none | The site that manages this one (the inviting site). |
 | `site.<name>.self_managed` | `false` | The site may also change its own VLANs, mappings and online state. |
+| `site.<name>.rename_by_manager` | `false` | Its manager may rename it too (the site itself always may). Only the site itself sets this. |
 | `site.<name>.online` | `true` | `false`: the tunnels of the site stay down. Sites that join start with `false`. |
 | `site.<name>.vlans` | `network.vlans` | VLANs this site takes part in. |
 | `site.<name>.own_vlans` | none | The site's own VLANs: on its trunk and towards its own clients, never towards its server. The site itself may always change them. |
@@ -660,7 +673,8 @@ its last log lines and keeps trying.
 | `wanderlan invite list` / `wanderlan invite delete <code>` | Open invitations of this site |
 | `wanderlan join <address>[:port] <code> [--name N] [--trunk IF]` | Join a network (on an unconfigured site) |
 | `wanderlan online <site>` / `wanderlan offline <site>` | Take a site online or offline |
-| `wanderlan manage <site> [--by S \| --anyone] [--self-managed yes\|no]` | Who may change a site |
+| `wanderlan manage <site> [--by S \| --anyone] [--self-managed yes\|no] [--rename-by-manager yes\|no]` | Who may change a site; whether its manager may rename it (only the site itself decides) |
+| `wanderlan rename <site> <new-name>` | Rename a site: this site always, a site it manages if that site allows it |
 | `wanderlan role <site> server\|client <server>` | Make a site a server or a client |
 | `wanderlan trunk <site> <interfaces\|default>` | Trunk ports of the tunnel to a site, or (this site's name) of the default trunk; several separated by commas |
 | `wanderlan own-vlans <site> <vlans\|none>` | Own VLANs of a site (trunk and its own clients only) |

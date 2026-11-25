@@ -60,22 +60,53 @@ pub enum Rejection {
     /// This site is not part of it.
     #[error("the received configuration does not contain this site (\"{0}\")")]
     SelfMissing(String),
+    /// Another site renamed this one, which it does not allow.
+    #[error(
+        "the received configuration renames this site (\"{0}\") to \"{1}\", which it does not allow (only it may rename itself, unless it allows its manager to)"
+    )]
+    RenamedWithoutConsent(String, String),
 }
 
 /// Checks a received network against the local configuration and returns the
 /// complete configuration to apply.
-pub fn accept(received: Network, local: &Local) -> Result<Config, Rejection> {
+///
+/// Renames since `previous` (the network in effect here; a site with the
+/// same address under a new name) are followed in `local.toml`: the own
+/// name and the trunks of tunnels. This site itself may be renamed by
+/// another only if it allows it, or if `taken_back`: its server refused a
+/// change of this site, its new name included, and its network applies
+/// again.
+pub fn accept(
+    received: Network,
+    local: &Local,
+    previous: Option<&Network>,
+    taken_back: bool,
+) -> Result<Config, Rejection> {
+    let mut local = local.clone();
+    if let Some(previous) = previous {
+        let me = local.self_name.clone().unwrap_or_default();
+        let renamed = crate::rename::renames(previous, &received);
+        if let Some((_, new)) = renamed.iter().find(|(old, _)| *old == me)
+            && !taken_back
+            && !previous.site(&me).is_some_and(|s| s.rename_by_manager)
+        {
+            return Err(Rejection::RenamedWithoutConsent(me, new.clone()));
+        }
+        for (old, new) in &renamed {
+            local.rename_site(old, new);
+        }
+    }
     let me = local.self_name.clone().unwrap_or_default();
     if received.site(&me).is_none() {
         return Err(Rejection::SelfMissing(me));
     }
-    let diags = validate(&received, Some(local));
+    let diags = validate(&received, Some(&local));
     if let Some(err) = diags.iter().find(|d| d.is_error()) {
         return Err(Rejection::Invalid(err.message.clone()));
     }
     Ok(Config {
         network: received,
-        local: local.clone(),
+        local,
     })
 }
 
@@ -135,15 +166,52 @@ mod tests {
             trunk: vec!["ens19".into()],
             ..Default::default()
         };
-        assert!(accept(network.clone(), &local).is_ok());
+        assert!(accept(network.clone(), &local, None, false).is_ok());
         let stranger = Local {
             self_name: Some("haus9".into()),
             trunk: vec!["ens19".into()],
             ..Default::default()
         };
         assert_eq!(
-            accept(network, &stranger).unwrap_err(),
+            accept(network, &stranger, None, false).unwrap_err(),
             Rejection::SelfMissing("haus9".into())
         );
+    }
+
+    #[test]
+    fn renames_are_followed_and_this_site_needs_to_agree() {
+        let previous = parse_network(include_str!("config/testdata/network-v1.toml"))
+            .unwrap()
+            .network
+            .unwrap();
+        let local = Local {
+            self_name: Some("haus2".into()),
+            trunk: vec!["ens19".into()],
+            tunnel_trunks: [("heim".to_string(), vec!["ens20".to_string()])].into(),
+        };
+        // A peer renamed: the trunk of the tunnel to it follows.
+        let mut received = previous.clone();
+        received.rename_site("heim", "home");
+        let cfg = accept(received, &local, Some(&previous), false).unwrap();
+        assert!(cfg.local.tunnel_trunks.contains_key("home"));
+        assert!(!cfg.local.tunnel_trunks.contains_key("heim"));
+        // This site renamed by another: only if it allows it.
+        let mut received = previous.clone();
+        received.rename_site("haus2", "h2");
+        assert_eq!(
+            accept(received.clone(), &local, Some(&previous), false).unwrap_err(),
+            Rejection::RenamedWithoutConsent("haus2".into(), "h2".into())
+        );
+        let cfg = accept(received.clone(), &local, Some(&previous), true).unwrap();
+        assert_eq!(cfg.local.self_name.as_deref(), Some("h2"), "taken back");
+        let mut allowing = previous.clone();
+        allowing
+            .sites
+            .iter_mut()
+            .find(|s| s.name == "haus2")
+            .unwrap()
+            .rename_by_manager = true;
+        let cfg = accept(received, &local, Some(&allowing), false).unwrap();
+        assert_eq!(cfg.local.self_name.as_deref(), Some("h2"));
     }
 }

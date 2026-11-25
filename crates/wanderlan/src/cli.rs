@@ -150,6 +150,24 @@ pub enum Command {
         /// Whether the site may change its own VLANs too (yes/no).
         #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
         self_managed: Option<bool>,
+        /// Whether its manager may rename it (yes/no); only the site itself
+        /// decides this.
+        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+        rename_by_manager: Option<bool>,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Rename a site: this site always, another site if this one manages it
+    /// and it allows that (`wanderlan manage <site> --rename-by-manager yes`
+    /// on that site). Everything that names it follows, on every site.
+    ///
+    /// Example: `wanderlan rename site5 lab`.
+    Rename {
+        /// The site.
+        site: String,
+        /// Its new name (a-z, 0-9 and -, at most 12 characters).
+        new_name: String,
         /// Confirm the change right away.
         #[arg(long)]
         confirm: bool,
@@ -431,15 +449,28 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             vlans,
             confirm,
         }) => set_tunnel_vlans(&socket, &site, &other, &vlans, confirm).await,
+        Some(Command::Rename {
+            site,
+            new_name,
+            confirm,
+        }) => rename(&socket, &site, &new_name, confirm).await,
         Some(Command::Manage {
             site,
             by,
             anyone,
             self_managed,
+            rename_by_manager,
             confirm,
         }) => {
             edit_site(&socket, &site, confirm, |entry, me| {
-                let before = (entry.managed_by.clone(), entry.self_managed);
+                let before = (
+                    entry.managed_by.clone(),
+                    entry.self_managed,
+                    entry.rename_by_manager,
+                );
+                if let Some(v) = rename_by_manager {
+                    entry.rename_by_manager = v;
+                }
                 if anyone {
                     entry.managed_by = None;
                     entry.self_managed = false;
@@ -452,14 +483,25 @@ pub async fn run(args: Args) -> Result<ExitCode> {
                         entry.self_managed = v;
                     }
                 }
-                let who = match (&entry.managed_by, entry.self_managed) {
+                let mut who = match (&entry.managed_by, entry.self_managed) {
                     (None, _) => "every site may change it".to_string(),
                     (Some(m), false) => format!("only \"{m}\" may change it"),
                     (Some(m), true) => {
                         format!("\"{m}\" and \"{}\" itself may change it", entry.name)
                     }
                 };
-                if before == (entry.managed_by.clone(), entry.self_managed) {
+                who.push_str(if entry.rename_by_manager {
+                    "; its manager may rename it"
+                } else {
+                    "; only it may rename itself"
+                });
+                if before
+                    == (
+                        entry.managed_by.clone(),
+                        entry.self_managed,
+                        entry.rename_by_manager,
+                    )
+                {
                     Err(format!("Nothing to change: {who}."))
                 } else {
                     Ok(format!("{}: {who}", entry.name))
@@ -870,13 +912,27 @@ async fn edit_site(
             return Ok(ExitCode::SUCCESS);
         }
     };
+    let local = running.local.clone();
+    send_edit(&client, &network, local, running.revision, confirm, &done).await
+}
+
+/// Applies an edited network (and `local.toml`), confirmed right away or
+/// with the usual countdown.
+async fn send_edit(
+    client: &Client,
+    network: &config::Network,
+    local: String,
+    base_revision: u64,
+    confirm: bool,
+    done: &str,
+) -> Result<ExitCode> {
     let applied: Applied = client
         .call(Request::Apply(ApplyParams {
             config: ConfigInput {
-                network: config::render_network(&network),
-                local: running.local,
+                network: config::render_network(network),
+                local,
             },
-            base_revision: Some(running.revision),
+            base_revision: Some(base_revision),
             timeout_secs: None,
         }))
         .await?;
@@ -890,6 +946,44 @@ async fn edit_site(
         );
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// `wanderlan rename`: the site and everything that names it, also
+/// `self` and the trunk of the tunnel to it in `local.toml`. Who may is
+/// checked by the daemon.
+async fn rename(socket: &Path, site: &str, new: &str, confirm: bool) -> Result<ExitCode> {
+    if let Some(msg) = config::site_name_error(new) {
+        bail!("\"{new}\": {msg}");
+    }
+    let client = connect(socket).await?;
+    settle(&client).await?;
+    let running: ConfigTexts = client.call(Request::GetConfig).await?;
+    if !running.configured {
+        bail!("this site is not part of a network");
+    }
+    let mut network = config::parse_network(&running.network)
+        .ok()
+        .and_then(|p| p.network)
+        .context("cannot read the running configuration")?;
+    let mut local = config::parse_local(&running.local)
+        .ok()
+        .map(|p| p.local)
+        .context("cannot read the running local.toml")?;
+    if network.site(site).is_none() {
+        bail!("there is no site \"{site}\" in the network of this site");
+    }
+    if site == new {
+        println!("Nothing to change: the site is called \"{new}\" already.");
+        return Ok(ExitCode::SUCCESS);
+    }
+    if network.site(new).is_some() {
+        bail!("\"{new}\" is already a site of the network");
+    }
+    network.rename_site(site, new);
+    local.rename_site(site, new);
+    let done = format!("Site \"{site}\" is called \"{new}\"");
+    let local = config::render_local(&local);
+    send_edit(&client, &network, local, running.revision, confirm, &done).await
 }
 
 async fn reset(socket: &Path, yes: bool) -> Result<ExitCode> {

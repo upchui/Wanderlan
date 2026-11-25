@@ -15,6 +15,7 @@ pub mod loopguard;
 pub mod mtu;
 pub mod policy;
 pub mod reconcile;
+pub mod rename;
 pub mod sync;
 pub mod sys;
 pub mod topology;

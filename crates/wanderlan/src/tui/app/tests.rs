@@ -527,8 +527,9 @@ fn picker(app: &App) -> &PortPicker {
 fn a_tunnel_gets_its_own_trunk_in_the_settings() {
     let mut app = connected();
     app.update(ch('7'));
-    // The fixed settings come first, then one row per tunnel (buero, haus2, ...).
-    app.settings_selected = crate::tui::ui::settings::ROWS.len() + 1;
+    // The fixed settings come first, then who may rename this site, then
+    // one row per tunnel (buero, haus2, ...).
+    app.settings_selected = crate::tui::ui::settings::ROWS.len() + 2;
     let fx = app.update(key(KeyCode::Enter));
     assert!(
         requests(&fx).contains(&&Request::Interfaces),
@@ -972,4 +973,38 @@ fn the_vlan_history_follows_the_answers() {
     assert_eq!(samples.len(), 3);
     // All ports: gt-buero 2.4M + gt-haus2 300k + ens19 2.1M in.
     assert_eq!(samples[0].rx_bps, 4_800_000);
+}
+
+#[test]
+fn a_restricted_site_renames_itself_but_not_its_manager() {
+    let mut app = restricted();
+    app.update(ch('2'));
+    let index = |app: &App, name: &str| {
+        app.draft
+            .as_ref()
+            .and_then(|d| d.network.sites.iter().position(|s| s.name == name))
+            .unwrap()
+    };
+    // heim is managed by buero (restricted), but its name is its own.
+    let heim = index(&app, "heim");
+    app.sites_selected = heim;
+    app.update(ch('N'));
+    assert!(
+        matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::Rename(heim)),
+        "{:?}",
+        app.message
+    );
+    app.update(key(KeyCode::Esc));
+    assert!(app.modal.is_none());
+    // buero may not be renamed from here.
+    app.sites_selected = index(&app, "buero");
+    app.update(ch('N'));
+    assert!(app.modal.is_none());
+    assert!(
+        app.message
+            .as_ref()
+            .is_some_and(|m| m.text.contains("only \"buero\" itself may")),
+        "{:?}",
+        app.message
+    );
 }

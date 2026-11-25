@@ -57,6 +57,7 @@ pub const SECTIONS: &[Section] = &[
             ("n", "new site by hand"),
             ("Enter", "details: role, VLANs, tunnels, mappings, rights"),
             ("e", "edit the site; \"Changes\": who may change its VLANs"),
+            ("N", "new name: this site always, others if they allow it"),
             ("d, Del", "delete the site and its VLAN mappings"),
             (
                 "m",
@@ -268,7 +269,12 @@ pub fn bar(app: &App) -> Vec<Binding> {
                 ("m", "its MACs"),
                 ("Esc", if back.is_some() { "back" } else { "close" }),
             ],
-            Modal::Site { .. } => vec![("Up/Down", "next site"), ("e", "edit"), ("Esc", "close")],
+            Modal::Site { .. } => vec![
+                ("Up/Down", "next site"),
+                ("e", "edit"),
+                ("N", "rename"),
+                ("Esc", "close"),
+            ],
             Modal::Ports(_) => vec![
                 ("Space", "choose"),
                 ("m", "main port"),
@@ -321,6 +327,7 @@ pub fn bar(app: &App) -> Vec<Binding> {
                 ("e", "edit"),
                 ("i", "invite"),
                 ("o", "on/off"),
+                ("N", "rename"),
                 ("n", "new"),
                 ("d", "delete"),
                 ("I", "invites"),

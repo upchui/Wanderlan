@@ -72,12 +72,55 @@ fn maps_of<'a>(network: &'a Network, site: &str) -> Vec<&'a VlanMap> {
     maps
 }
 
+/// What [`merge`] took over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Merged {
+    /// The network with the client's changes.
+    pub network: Network,
+    /// Sites the client renamed (itself, its own clients), as (old, new).
+    pub renamed: Vec<(String, String)>,
+}
+
 /// Merges the view of the client `from` into `full` (the network of its
 /// uplink): its own entry, the entries of its own clients (new ones too,
 /// removed ones go), their mappings and the network settings. Anything else
-/// in the view must be as `from` received it. The result is checked against
-/// the rights of `from` and validated.
-pub fn merge(full: &Network, view: &Network, from: &str) -> Result<Network, String> {
+/// in the view must be as `from` received it. A site of the view at the
+/// address of a site under another name is that site renamed (the client
+/// itself, too); the rename reaches the whole network. The result is checked
+/// against the rights of `from` and validated.
+pub fn merge(full: &Network, view: &Network, from: &str) -> Result<Merged, String> {
+    let renamed = crate::rename::renames(&view_for(full, from), view);
+    let mut base = full.clone();
+    for (old, new) in &renamed {
+        if full.site(new).is_some() {
+            return Err(format!("the name \"{new}\" is already used in the network"));
+        }
+        base.rename_site(old, new);
+    }
+    let from_now = renamed
+        .iter()
+        .find(|(old, _)| old == from)
+        .map_or(from, |(_, new)| new.as_str());
+    let mut merged = merge_named(&base, view, from_now)?;
+    merged.revision = if fingerprint(&merged) == fingerprint(full) {
+        full.revision.max(view.revision)
+    } else if view.revision > full.revision {
+        view.revision
+    } else {
+        full.revision + 1
+    };
+    policy::check_edit(full, &merged, from)?;
+    if let Some(error) = validate(&merged, None).into_iter().find(|d| d.is_error()) {
+        return Err(error.message);
+    }
+    Ok(Merged {
+        network: merged,
+        renamed,
+    })
+}
+
+/// [`merge`] after the renames: `full` already has the new names.
+fn merge_named(full: &Network, view: &Network, from: &str) -> Result<Network, String> {
     if view.site(from).is_none() {
         return Err(format!(
             "the configuration of \"{from}\" does not contain \"{from}\" itself"
@@ -188,17 +231,6 @@ pub fn merge(full: &Network, view: &Network, from: &str) -> Result<Network, Stri
         }
     }
 
-    merged.revision = if fingerprint(&merged) == fingerprint(full) {
-        full.revision.max(view.revision)
-    } else if view.revision > full.revision {
-        view.revision
-    } else {
-        full.revision + 1
-    };
-    policy::check_edit(full, &merged, from)?;
-    if let Some(error) = validate(&merged, None).into_iter().find(|d| d.is_error()) {
-        return Err(error.message);
-    }
     Ok(merged)
 }
 
@@ -218,6 +250,7 @@ mod tests {
             online: true,
             managed_by: uplink.map(Into::into),
             self_managed: true,
+            rename_by_manager: false,
             uplink: uplink.map(Into::into),
         }
     }
@@ -295,7 +328,7 @@ mod tests {
             .unwrap()
             .online = false;
         view.sites.push(site("z", 9, Some("marcel")));
-        let merged = merge(&network, &view, "marcel").unwrap();
+        let merged = merge(&network, &view, "marcel").unwrap().network;
         assert_eq!(merged.revision, 8);
         assert!(!merged.site("x").unwrap().online);
         assert!(merged.site("z").is_some());
@@ -309,7 +342,7 @@ mod tests {
         let mut view = view_for(&network, "marcel");
         view.revision = 8;
         view.sites.retain(|s| s.name != "x");
-        let merged = merge(&network, &view, "marcel").unwrap();
+        let merged = merge(&network, &view, "marcel").unwrap().network;
         assert!(merged.site("x").is_none());
 
         // An older view with changes still gets a newer revision.
@@ -319,10 +352,12 @@ mod tests {
             .find(|s| s.name == "site2")
             .unwrap()
             .vlans = Some(VlanSet::from_range(13, 13));
-        let merged = merge(&network, &view, "site2").unwrap();
+        let merged = merge(&network, &view, "site2").unwrap().network;
         assert_eq!(merged.revision, 8);
         // Nothing changed: the revision is not raised.
-        let same = merge(&network, &view_for(&network, "site2"), "site2").unwrap();
+        let same = merge(&network, &view_for(&network, "site2"), "site2")
+            .unwrap()
+            .network;
         assert_eq!(same, network);
     }
 
@@ -393,7 +428,7 @@ mod tests {
             .find(|s| s.name == "site2")
             .unwrap()
             .own_vlans = Some(VlanSet::from_range(50, 50));
-        let merged = merge(&network, &view, "site2").unwrap();
+        let merged = merge(&network, &view, "site2").unwrap().network;
         assert_eq!(
             merged.site("site2").unwrap().own_vlans,
             Some(VlanSet::from_range(50, 50))
@@ -415,7 +450,9 @@ mod tests {
         );
         let mut changed = view.clone();
         changed.set_tunnel_limit("marcel", "alex", Some(VlanSet::from_range(14, 14)));
-        let merged = merge(&network, &changed, "marcel").expect("its own tunnel");
+        let merged = merge(&network, &changed, "marcel")
+            .expect("its own tunnel")
+            .network;
         assert_eq!(
             merged.tunnel_limit("alex", "marcel"),
             Some(&VlanSet::from_range(14, 14))
@@ -433,5 +470,58 @@ mod tests {
         foreign.set_tunnel_limit("alex", "nobody", Some(VlanSet::new()));
         let err = merge(&network, &foreign, "marcel").unwrap_err();
         assert!(err.contains("its own tunnels"), "{err}");
+    }
+
+    #[test]
+    fn a_client_renames_itself_and_the_whole_network_follows() {
+        let mut network = full();
+        // y (a client of dc) was invited by marcel: outside marcel's view.
+        network.sites[5].managed_by = Some("marcel".into());
+        let mut view = view_for(&network, "marcel");
+        view.rename_site("marcel", "marcel2");
+        view.revision += 1;
+        let merged = merge(&network, &view, "marcel").unwrap();
+        assert_eq!(
+            merged.renamed,
+            [("marcel".to_string(), "marcel2".to_string())]
+        );
+        let n = &merged.network;
+        assert!(n.site("marcel").is_none());
+        assert_eq!(n.site("marcel2").unwrap().uplink.as_deref(), Some("alex"));
+        assert_eq!(n.site("x").unwrap().uplink.as_deref(), Some("marcel2"));
+        assert_eq!(n.site("y").unwrap().managed_by.as_deref(), Some("marcel2"));
+        assert!(n.maps.iter().any(|m| m.site == "marcel2"));
+        assert_eq!(n.revision, view.revision);
+        // Merged again: nothing more to do.
+        let again = merge(n, &view_for(n, "marcel2"), "marcel2").unwrap();
+        assert!(again.renamed.is_empty());
+        assert_eq!(&again.network, n);
+    }
+
+    #[test]
+    fn a_client_renames_its_own_client_only_with_its_consent() {
+        let network = full();
+        let mut view = view_for(&network, "marcel");
+        view.rename_site("x", "x2");
+        view.revision += 1;
+        let err = merge(&network, &view, "marcel").unwrap_err();
+        assert!(err.contains("may not rename site \"x\""), "{err}");
+        let mut allowing = network.clone();
+        allowing.sites[4].rename_by_manager = true;
+        let mut view = view_for(&allowing, "marcel");
+        view.rename_site("x", "x2");
+        view.revision += 1;
+        let merged = merge(&allowing, &view, "marcel").unwrap();
+        assert!(merged.network.site("x2").is_some());
+    }
+
+    #[test]
+    fn a_new_name_must_be_free_in_the_whole_network() {
+        let network = full();
+        let mut view = view_for(&network, "marcel");
+        // y is a client of dc, not in marcel's view.
+        view.rename_site("marcel", "y");
+        let err = merge(&network, &view, "marcel").unwrap_err();
+        assert!(err.contains("\"y\" is already used"), "{err}");
     }
 }

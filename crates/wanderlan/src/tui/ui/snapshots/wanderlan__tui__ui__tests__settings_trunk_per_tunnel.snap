@@ -1,14 +1,12 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 182
 expression: render(&app)
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
 "┌ Settings (Enter: change, Up/Down: more) ─────────────────────────────────────┐"
-"│  Path MTU check       every 5m                                               ║"
 "│  TCP MSS              from the path MTU                                      ║"
-"│  Control port         51821                                                  █"
-"│This host                                                                     █"
+"│  Control port         51821                                                  ║"
+"│This host                                                                     ║"
 "│  This site            heim                                                   █"
 "│  Trunk                ens19                                                  █"
 "│Role and rights        who may change VLANs: Sites (2), Enter, Changes        █"
@@ -16,6 +14,7 @@ expression: render(&app)
 "│  Clients              haus6                                                  █"
 "│  Managed by           - (not managed by another site)                        █"
 "│  Manages              -                                                      █"
+"│  Renamed by           this site only                                         █"
 "│Trunk per tunnel       this host only; another trunk = own segment            █"
 "│  to buero             default (ens19)                                        ║"
 "│  to haus2             ens20 (own segment wl-ens20)                           ║"
