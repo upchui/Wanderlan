@@ -93,6 +93,14 @@ fn refusal(text: &str) -> Option<&str> {
     text.lines().next()?.strip_prefix(REFUSED_MARKER)
 }
 
+/// Why the last change of a client was refused here, and when.
+#[derive(Debug, Clone)]
+struct Refusal {
+    reason: String,
+    /// On the clock of the probe table (compared with its announces).
+    at: std::time::Instant,
+}
+
 /// Fingerprints of configurations that were rejected and are not fetched
 /// again for [`REJECT_TTL`]; after that they get another chance.
 #[derive(Debug, Default)]
@@ -261,7 +269,7 @@ struct Controller {
     /// Fingerprints not to fetch again, until when.
     rejected: Rejected,
     /// Clients whose last change was refused here, with the reason.
-    refused: BTreeMap<String, String>,
+    refused: BTreeMap<String, Refusal>,
     /// Since when the uplink has not taken over a change of this site.
     diverged_since: Option<Instant>,
     /// Why the last change of this site was not taken over by its uplink.
@@ -1122,9 +1130,9 @@ impl Controller {
                         expected.insert(name.clone(), Version::of(&v));
                         // A refused change: the client learns why.
                         let text = match self.refused.get(name) {
-                            Some(reason) => format!(
+                            Some(r) => format!(
                                 "{REFUSED_MARKER}{}\n{}",
-                                reason.replace('\n', " "),
+                                r.reason.replace('\n', " "),
                                 render_network_wire(&v)
                             ),
                             None => render_network_wire(&v),
@@ -1540,7 +1548,16 @@ impl Controller {
                         continue;
                     };
                     if theirs.fingerprint == expected.fingerprint {
-                        in_sync_again.push(name.clone());
+                        // Back in sync only by an announce made after a
+                        // refusal: a pushed change arrives before the
+                        // client's next probe announces it.
+                        if self
+                            .refused
+                            .get(name)
+                            .is_none_or(|r| probe.announced_at.is_some_and(|t| t > r.at))
+                        {
+                            in_sync_again.push(name.clone());
+                        }
                     } else if client_changes.is_none()
                         && theirs.revision >= expected.revision
                         // A client with a key sends its changes itself.
@@ -1711,7 +1728,7 @@ impl Controller {
         self.take_over(peer.to_string(), FetchMode::Merge, text)
             .await;
         match self.refused.get(peer) {
-            Some(reason) => sync_net::PushAnswer::Refused(reason.clone()),
+            Some(r) => sync_net::PushAnswer::Refused(r.reason.clone()),
             None => sync_net::PushAnswer::Ok,
         }
     }
@@ -1793,8 +1810,15 @@ impl Controller {
                             Some(&peer),
                             format!("Not taking over the changes of client \"{peer}\": {e}"),
                         );
-                        // The client learns why with its next fetch.
-                        self.refused.insert(peer, e);
+                        // The client learns why from the answer to its
+                        // push or with its next fetch.
+                        self.refused.insert(
+                            peer,
+                            Refusal {
+                                reason: e,
+                                at: std::time::Instant::now(),
+                            },
+                        );
                         self.publish();
                         return;
                     }
@@ -1802,7 +1826,10 @@ impl Controller {
             }
             FetchMode::Resync => {
                 let Some(reason) = refusal(&text) else {
-                    // Not refused: the uplink may still take it over.
+                    // Not refused: the uplink may still take it over. A
+                    // change for an uplink with a key is sent again (it may
+                    // have forgotten a refusal, e.g. by a restart).
+                    self.pushed = None;
                     return;
                 };
                 self.events.emit(
@@ -3185,7 +3212,7 @@ impl Controller {
                             theirs == confirmed_fp
                         }
                     }),
-                    refused: self.refused.get(&t.peer.name).cloned(),
+                    refused: self.refused.get(&t.peer.name).map(|r| r.reason.clone()),
                     identity: t.peer.id.map(|id| id.fingerprint()),
                     identity_state: self.peer_keys.contains_key(&t.peer.name).then(|| {
                         self.runtime

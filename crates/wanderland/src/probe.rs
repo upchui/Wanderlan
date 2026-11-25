@@ -153,6 +153,9 @@ pub struct PeerProbe {
     /// What the peer announced last.
     #[serde(skip)]
     pub announce: Option<wire::Announce>,
+    /// When an announce of the peer arrived last (also an unchanged one).
+    #[serde(skip)]
+    pub announced_at: Option<Instant>,
     /// Last answered probe on the monotonic clock (a clock step at boot
     /// does not move it). For a peer with a key only valid answers count.
     #[serde(skip)]
@@ -587,6 +590,7 @@ async fn note_announce(
             let entry = t.entry(peer.to_string()).or_default();
             let changed = entry.announce != Some(announce);
             entry.announce = Some(announce);
+            entry.announced_at = Some(Instant::now());
             changed
         }
         Err(_) => false,
