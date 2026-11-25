@@ -268,6 +268,9 @@ impl Local {
         tunnel: Option<&str>,
         ports: Vec<String>,
     ) -> Result<Vec<String>, String> {
+        // The same ports in another order are the same segment.
+        let same =
+            |a: &[String], b: &[String]| a.len() == b.len() && a.iter().all(|p| b.contains(p));
         let mut notes = Vec::new();
         let list = |p: &[String]| p.join(", ");
         match tunnel {
@@ -276,9 +279,15 @@ impl Local {
                     return Err("the default trunk needs at least one port".into());
                 }
                 for (site, own) in &mut self.tunnel_trunks {
+                    if same(own, &ports) {
+                        notes.push(format!(
+                            "the tunnel to {site} has the same ports and uses the default trunk then"
+                        ));
+                        continue;
+                    }
                     let taken: Vec<String> =
                         own.iter().filter(|p| ports.contains(p)).cloned().collect();
-                    if taken.is_empty() || *own == ports {
+                    if taken.is_empty() {
                         continue;
                     }
                     own.retain(|p| !ports.contains(p));
@@ -297,10 +306,16 @@ impl Local {
                 }
                 self.trunk = ports;
             }
-            Some(site) if ports.is_empty() || ports == self.trunk => {
+            Some(site) if ports.is_empty() || same(&ports, &self.trunk) => {
                 self.tunnel_trunks.remove(site);
             }
             Some(site) => {
+                // Shared with another tunnel: its list, in its order.
+                let ports = self
+                    .tunnel_trunks
+                    .iter()
+                    .find(|(other, own)| *other != site && same(own, &ports))
+                    .map_or(ports, |(_, own)| own.clone());
                 let taken: Vec<String> = self
                     .trunk
                     .iter()
@@ -320,17 +335,25 @@ impl Local {
                             list(&taken)
                         ));
                     }
+                    let main = if self.trunk.first() == left.first() {
+                        String::new()
+                    } else {
+                        format!("; {} becomes its main port", left[0])
+                    };
                     notes.push(format!(
-                        "{} moves from the default trunk, which keeps {} for the other tunnels",
+                        "{} moves from the default trunk, which keeps {} for the other tunnels{main}",
                         list(&taken),
                         list(&left)
                     ));
                     self.trunk = left;
                 }
                 for (other, own) in &mut self.tunnel_trunks {
+                    if other == site || same(own, &ports) {
+                        continue;
+                    }
                     let taken: Vec<String> =
                         own.iter().filter(|p| ports.contains(p)).cloned().collect();
-                    if other == site || taken.is_empty() || *own == ports {
+                    if taken.is_empty() {
                         continue;
                     }
                     own.retain(|p| !ports.contains(p));
@@ -354,7 +377,7 @@ impl Local {
         // default trunk.
         let default = self.trunk.clone();
         self.tunnel_trunks
-            .retain(|_, own| !own.is_empty() && *own != default);
+            .retain(|_, own| !own.is_empty() && !same(own, &default));
         Ok(notes)
     }
 }
@@ -362,6 +385,57 @@ impl Local {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ports(p: &[&str]) -> Vec<String> {
+        p.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn the_order_of_the_chosen_ports_does_not_split_a_segment() {
+        let mut local = Local {
+            trunk: ports(&["ens19", "ens20"]),
+            ..Local::default()
+        };
+        local
+            .tunnel_trunks
+            .insert("lab".into(), ports(&["ens21", "ens22"]));
+        // The default ports in another order: the default trunk.
+        local
+            .assign_trunk(Some("dc"), ports(&["ens20", "ens19"]))
+            .unwrap();
+        assert!(!local.tunnel_trunks.contains_key("dc"));
+        // The ports of lab in another order: lab's segment, in lab's order.
+        local
+            .assign_trunk(Some("dc"), ports(&["ens22", "ens21"]))
+            .unwrap();
+        assert_eq!(local.tunnel_trunks["dc"], ports(&["ens21", "ens22"]));
+        assert_eq!(local.tunnel_trunks["lab"], ports(&["ens21", "ens22"]));
+        // The default trunk with lab's ports: lab merges into it, said so.
+        let notes = local
+            .assign_trunk(None, ports(&["ens22", "ens21"]))
+            .unwrap();
+        assert!(local.tunnel_trunks.is_empty(), "{:?}", local.tunnel_trunks);
+        assert!(
+            notes
+                .iter()
+                .any(|n| n.contains("the tunnel to lab has the same ports")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn taking_the_main_port_says_which_one_follows() {
+        let mut local = Local {
+            trunk: ports(&["ens19", "ens20"]),
+            ..Local::default()
+        };
+        let notes = local.assign_trunk(Some("dc"), ports(&["ens19"])).unwrap();
+        assert_eq!(local.trunk, ports(&["ens20"]));
+        assert!(
+            notes[0].contains("ens20 becomes its main port"),
+            "{notes:?}"
+        );
+    }
 
     #[test]
     fn network_lookups_and_site_vlans() {

@@ -182,9 +182,13 @@ fn draw_tunnels(frame: &mut Frame, app: &App, draft: &Draft, area: Rect, detail:
     let title = format!(" Tunnels: {} ({limited} limited; t: mappings) ", rows.len());
     if table_rows.is_empty() {
         frame.render_widget(
-            Paragraph::new(" No tunnels: this site is alone in the network.")
-                .style(theme::dim())
-                .block(titled(title)),
+            Paragraph::new(if app.tunnels_filter.is_shown() {
+                " No tunnel matches the search (/ changes it)."
+            } else {
+                " No tunnels: this site is alone in the network."
+            })
+            .style(theme::dim())
+            .block(titled(title)),
             area,
         );
     } else {

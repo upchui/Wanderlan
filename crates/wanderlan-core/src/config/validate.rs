@@ -390,6 +390,18 @@ impl Validator {
                     ),
                 );
             }
+            let own_vlans = network.site(site).map(|s| network.own_vlans(s));
+            if let LocalVid::Vid(local) = map.local
+                && own_vlans.as_ref().is_some_and(|v| v.contains(local))
+            {
+                self.warning(
+                    FieldPath::map_field(i, "local"),
+                    format!(
+                        "site \"{site}\": local VLAN {local} is one of its own VLANs; at this site it carries shared VLAN {} instead, so the own VLAN {local} does not reach its trunk",
+                        map.shared
+                    ),
+                );
+            }
             if let LocalVid::Vid(local) = map.local
                 && site_vlans.is_some_and(|v| v.contains(local))
             {
@@ -433,6 +445,13 @@ impl Validator {
         }
         // Every port: a valid name, not ours, once per list.
         let mut check_ports = |path: &str, what: &str, ports: &[String]| {
+            // The default trunk's own message is above.
+            if ports.is_empty() && path != "trunk" {
+                push(
+                    path,
+                    format!("{what} is empty; remove the entry to use the default trunk"),
+                );
+            }
             let mut seen = BTreeSet::new();
             for port in ports {
                 if let Some(msg) = ifname_error(port) {
@@ -466,9 +485,20 @@ impl Validator {
                 )
                 .collect();
         for (i, (path, ports)) in segments.iter().enumerate() {
-            for (_, other) in &segments[..i] {
+            for (other_path, other) in &segments[..i] {
                 let same: BTreeSet<&String> = ports.iter().collect();
                 let theirs: BTreeSet<&String> = other.iter().collect();
+                // One segment needs one list: the order names the bridge
+                // (after the first port) and the main port.
+                if same == theirs && ports != other {
+                    push(
+                        path,
+                        format!(
+                            "the same ports as {other_path} in another order; write them in the same order (the first is the main port)"
+                        ),
+                    );
+                    break;
+                }
                 if same != theirs
                     && let Some(port) = same.intersection(&theirs).next()
                 {
@@ -492,7 +522,12 @@ impl Validator {
                     format!("the trunk of the tunnel to \"{site}\" is the default trunk anyway"),
                 ));
             }
-            if network.site(site).is_none() || Some(site.as_str()) == me {
+            let is_peer = me.is_some_and(|me| {
+                crate::topology::tunnels_for(network, me)
+                    .iter()
+                    .any(|t| t.peer.name == *site)
+            });
+            if !is_peer {
                 unused.push((
                     path,
                     format!("there is no tunnel to \"{site}\" (not a peer of this site); this trunk is not used"),

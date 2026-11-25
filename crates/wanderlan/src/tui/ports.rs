@@ -158,9 +158,16 @@ impl PortPicker {
                 wanderlan_core::BRIDGE_NAME,
                 list(&self.chosen)
             ),
-            PortTarget::Tunnel(site) if self.chosen.is_empty() || self.chosen == *default => {
+            PortTarget::Tunnel(site) if self.chosen.is_empty() => format!(
+                "Nothing chosen: the tunnel to {site} uses the default trunk ({}).",
+                default.join(", ")
+            ),
+            PortTarget::Tunnel(site)
+                if self.chosen.len() == default.len()
+                    && self.chosen.iter().all(|p| default.contains(p)) =>
+            {
                 format!(
-                    "Nothing chosen: the tunnel to {site} uses the default trunk ({}).",
+                    "The ports of the default trunk: the tunnel to {site} uses it ({}).",
                     default.join(", ")
                 )
             }
@@ -273,7 +280,7 @@ impl PortPicker {
     }
 
     /// Adds the name typed for "other:".
-    pub fn add_manual(&mut self) {
+    pub fn add_manual(&mut self, interfaces: &[Interface]) {
         self.error = None;
         let name = self.manual.value().trim().to_string();
         if name.is_empty() {
@@ -281,6 +288,11 @@ impl PortPicker {
         }
         if let Some(msg) = ifname_error(&name) {
             self.error = Some(format!("{name}: {msg}"));
+            return;
+        }
+        // Typed, the same rules as chosen from the list.
+        if let Some(why) = interfaces.iter().find(|i| i.name == name).and_then(blocked) {
+            self.error = Some(format!("{name} cannot be a trunk port here: {why}"));
             return;
         }
         if !self.chosen.contains(&name) {
@@ -414,7 +426,7 @@ mod tests {
             Some("in the default trunk")
         );
         picker.manual.set("usb0");
-        picker.add_manual();
+        picker.add_manual(&fixtures::interfaces());
         assert_eq!(picker.chosen, ["usb0"]);
         let saved = picker.apply(&d).expect("valid");
         assert_eq!(saved.local.tunnel_trunks.get("haus2").unwrap(), &["usb0"]);
@@ -449,7 +461,7 @@ mod tests {
         // A different list takes the port: buero keeps nothing and uses
         // the default trunk then.
         picker.manual.set("usb0");
-        picker.add_manual();
+        picker.add_manual(&fixtures::interfaces());
         assert!(picker.effects(&d)[0].contains("moves from the tunnel to buero"));
         let moved = picker.apply(&d).expect("moved");
         assert!(!moved.local.tunnel_trunks.contains_key("buero"));
@@ -475,7 +487,7 @@ mod tests {
         // The same for a tunnel of its own, and when typed.
         let mut tunnel = PortPicker::new(PortTarget::Tunnel("haus2".into()), &d);
         tunnel.manual.set("ens18");
-        tunnel.add_manual();
+        tunnel.add_manual(&fixtures::interfaces());
         assert_eq!(tunnel.chosen, ["ens18"]);
         assert!(tunnel.warning(&interfaces).is_some());
     }
@@ -485,8 +497,12 @@ mod tests {
         let d = draft();
         let mut picker = PortPicker::new(PortTarget::Default, &d);
         picker.manual.set("this-name-is-too-long");
-        picker.add_manual();
+        picker.add_manual(&fixtures::interfaces());
         assert!(picker.error.is_some());
+        // eth1 is in br-lan: not a trunk port, typed or chosen.
+        picker.manual.set("eth1");
+        picker.add_manual(&fixtures::interfaces());
+        assert!(picker.error.as_deref().unwrap().contains("in br-lan"));
         assert_eq!(picker.chosen, ["ens19"]);
     }
 

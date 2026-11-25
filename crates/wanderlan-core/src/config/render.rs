@@ -116,18 +116,25 @@ pub fn render_local(local: &Local) -> String {
         let _ = writeln!(out, "trunk = {}", ports(&local.trunk));
     }
     for (site, trunk) in &local.tunnel_trunks {
-        // Site names are valid bare keys; anything else is quoted.
-        let key = if site
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        // Site names are valid bare keys; anything else (also an empty
+        // name) is quoted.
+        let key = if !site.is_empty()
+            && site
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         {
             site.clone()
         } else {
             quote(site)
         };
+        // The comment is one line, whatever the name holds.
+        let shown: String = site
+            .chars()
+            .map(|c| if c.is_control() { '?' } else { c })
+            .collect();
         let _ = write!(
             out,
-            "\n# The tunnel to \"{site}\" has its own trunk (a segment of its own).\n[tunnels.{key}]\ntrunk = {}\n",
+            "\n# The tunnel to \"{shown}\" has its own trunk (a segment of its own).\n[tunnels.{key}]\ntrunk = {}\n",
             ports(trunk)
         );
     }

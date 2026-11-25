@@ -53,18 +53,15 @@ pub fn vlan_total(traffic: &VlanTraffic, vid: u16) -> (u64, u64) {
 /// The VLAN after or before `vid` (`step` +1 or -1), staying at the ends.
 pub fn next_vlan(traffic: &VlanTraffic, vid: u16, step: isize) -> u16 {
     let ids = vlan_ids(traffic);
-    let at = ids
-        .iter()
-        .position(|v| *v >= vid)
-        .unwrap_or(ids.len().saturating_sub(1));
-    let at = if ids.get(at) == Some(&vid) || step < 0 {
-        at.saturating_add_signed(step)
-    } else {
-        at
+    let pick = match (ids.binary_search(&vid), step >= 0) {
+        // On the list: its neighbour.
+        (Ok(at), true) => ids.get(at + 1),
+        (Ok(at), false) => at.checked_sub(1).and_then(|i| ids.get(i)),
+        // Not (any more) on the list: the next one after or before it.
+        (Err(at), true) => ids.get(at),
+        (Err(at), false) => at.checked_sub(1).and_then(|i| ids.get(i)),
     };
-    ids.get(at.min(ids.len().saturating_sub(1)))
-        .copied()
-        .unwrap_or(vid)
+    pick.copied().unwrap_or(vid)
 }
 
 #[cfg(test)]
@@ -117,5 +114,8 @@ mod tests {
         assert_eq!(next_vlan(&t, 10, -1), 10);
         assert_eq!(next_vlan(&t, 15, 1), 20, "a VLAN not on a port");
         assert_eq!(next_vlan(&t, 15, -1), 10);
+        // Gone at the end: Up is the last one, Down stays.
+        assert_eq!(next_vlan(&t, 40, -1), 30);
+        assert_eq!(next_vlan(&t, 40, 1), 40);
     }
 }

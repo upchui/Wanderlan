@@ -181,6 +181,15 @@ async fn event_loop(terminal: &mut Term, socket: &Path, mouse: bool) -> Result<(
                             let result = perform(&client, request.clone()).await;
                             let _ = tx.send((generation, Msg::Response { request, result }));
                         });
+                    } else {
+                        // Not connected: answered at once, so nothing waits
+                        // for an answer that never comes.
+                        let _ = local_tx.send(Msg::Response {
+                            request,
+                            result: Err(ClientError::Api(api::ApiError::new(
+                                "not connected to the daemon",
+                            ))),
+                        });
                     }
                 }
             }

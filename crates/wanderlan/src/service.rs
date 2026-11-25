@@ -40,7 +40,7 @@ impl Diagnosis {
         let state = self.state.as_deref()?;
         Some(match state {
             "active" => format!(
-                "The service {SERVICE} is running, but its socket is missing; it creates it again within seconds (or: systemctl restart {SERVICE})."
+                "The service {SERVICE} is running; the message above says why the connection fails (a missing socket is created again within seconds, or: systemctl restart {SERVICE})."
             ),
             "activating" | "reloading" => format!("The service {SERVICE} is starting."),
             "failed" => format!(

@@ -161,13 +161,18 @@ pub enum Setting {
 pub fn settings(draft: Option<&Draft>) -> Vec<Setting> {
     let mut out: Vec<Setting> = (0..ROWS.len()).map(Setting::Fixed).collect();
     if let Some(d) = draft {
-        let me = d.local.self_name.as_deref();
+        // Only the sites this site has a tunnel to.
+        let me = d.local.self_name.as_deref().unwrap_or_default();
+        let peers: Vec<String> = wanderlan_core::topology::tunnels_for(&d.network, me)
+            .iter()
+            .map(|t| t.peer.name.clone())
+            .collect();
         out.extend(
             d.network
                 .sites
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| Some(s.name.as_str()) != me)
+                .filter(|(_, s)| peers.contains(&s.name))
                 .map(|(i, _)| Setting::TunnelTrunk(i)),
         );
     }

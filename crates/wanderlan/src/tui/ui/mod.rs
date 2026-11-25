@@ -214,11 +214,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         usize::from(left_area.width.saturating_sub(3)),
     );
     let head = lines.first().cloned().unwrap_or_default();
-    let rest = text
-        .trim_start()
-        .get(head.len()..)
-        .unwrap_or_default()
-        .trim_start();
+    // The rest from the wrapped lines (wrapping folds spaces, so no byte
+    // offsets into the text).
+    let rest = lines.get(1..).unwrap_or_default().join(" ");
+    let rest = rest.as_str();
     let room = usize::from(second.width.saturating_sub(1));
     let tail = if rest.chars().count() > room {
         let cut: String = rest.chars().take(room.saturating_sub(14)).collect();

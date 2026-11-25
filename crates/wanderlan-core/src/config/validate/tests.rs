@@ -718,6 +718,16 @@ fn a_trunk_port_belongs_to_one_segment() {
             "self = \"haus2\"\ntrunk = [\"ens19\", \"br0\"]\n",
             "managed by wanderlan",
         ),
+        // One segment, one list: the same ports in another order would
+        // name another bridge.
+        (
+            "self = \"haus2\"\ntrunk = [\"ens19\", \"ens20\"]\n\n[tunnels.heim]\ntrunk = [\"ens20\", \"ens19\"]\n",
+            "the same ports as trunk in another order",
+        ),
+        (
+            "self = \"haus2\"\ntrunk = \"ens19\"\n\n[tunnels.heim]\ntrunk = []\n",
+            "is empty; remove the entry",
+        ),
     ] {
         let errs = errors(EXAMPLE_NETWORK, local);
         assert!(

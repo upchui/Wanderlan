@@ -835,6 +835,71 @@ fn deleting_an_invitation_asks() {
 }
 
 #[test]
+fn deleting_a_site_removes_that_site_even_if_the_draft_changed_meanwhile() {
+    let mut app = connected();
+    app.update(ch('2'));
+    let at = |app: &App, name: &str| {
+        app.draft
+            .as_ref()
+            .unwrap()
+            .network
+            .sites
+            .iter()
+            .position(|s| s.name == name)
+    };
+    app.sites_selected = at(&app, "haus3").unwrap();
+    app.update(ch('d'));
+    assert!(matches!(
+        &app.modal,
+        Some(Modal::Ask(a)) if a.action == AskAction::DeleteSite("haus3".into())
+    ));
+    // Meanwhile another site goes (e.g. a sync): the indices move.
+    let buero = at(&app, "buero").unwrap();
+    app.draft.as_mut().unwrap().remove_site(buero);
+    app.update(ch('y'));
+    assert_eq!(at(&app, "haus3"), None, "haus3 is gone");
+    assert!(at(&app, "haus2").is_some(), "not the site at its old index");
+}
+
+#[test]
+fn the_tunnel_search_can_be_changed_when_nothing_matches() {
+    let mut app = connected();
+    app.update(ch('3'));
+    app.update(ch('t'));
+    app.update(ch('/'));
+    for c in "zzz".chars() {
+        app.update(ch(c));
+    }
+    app.update(key(KeyCode::Enter));
+    assert!(app.visible_tunnels().is_empty());
+    assert!(!app.tunnels_filter.editing);
+    app.update(ch('/'));
+    assert!(app.tunnels_filter.editing, "/ works without a row");
+}
+
+#[test]
+fn joining_ends_with_a_message_when_the_connection_is_lost() {
+    let mut app = connected();
+    app.wizard.step = Step::Joining;
+    app.update(Msg::Disconnected(ClientError::Closed));
+    assert_eq!(app.wizard.step, Step::Summary);
+    assert!(app.wizard.error.as_deref().unwrap().contains("connection"));
+}
+
+#[test]
+fn an_unanswered_request_is_sent_again_after_a_while() {
+    let mut app = connected();
+    let fx = app.update(ch('4'));
+    assert!(requests(&fx).contains(&&Request::MacTable));
+    // No answer: after a few seconds it is asked again.
+    let again = (0..6)
+        .flat_map(|_| app.update(Msg::Tick))
+        .filter(|e| matches!(e, Effect::Request(Request::MacTable)))
+        .count();
+    assert!(again >= 1, "asked again");
+}
+
+#[test]
 fn the_peer_details_go_to_the_next_peer() {
     let mut app = connected();
     app.update(key(KeyCode::Enter));

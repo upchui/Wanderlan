@@ -47,6 +47,9 @@ const MAC_REFRESH_TICKS: u64 = 2;
 const VLAN_REFRESH_TICKS: u64 = 2;
 /// Ticks after which an unanswered status request is sent again.
 const STATUS_TIMEOUT_TICKS: u64 = 5;
+/// Ticks after which an unanswered request (config, MACs, interfaces,
+/// VLAN traffic) may be sent again.
+const REQUEST_TIMEOUT_TICKS: u64 = 5;
 /// Seconds left at which the countdown banner turns red.
 pub const URGENT_SECS: u64 = 10;
 
@@ -184,10 +187,11 @@ pub enum AskAction {
     Quit,
     /// Throw the draft away.
     Discard,
-    /// Remove a site from the draft.
-    DeleteSite(usize),
-    /// Remove a VLAN mapping from the draft.
-    DeleteMap(usize),
+    /// Remove a site from the draft (by name: the draft may change while
+    /// the question is open).
+    DeleteSite(String),
+    /// Remove a VLAN mapping from the draft (by its content).
+    DeleteMap(wanderlan_core::config::VlanMap),
     /// Re-enable a port blocked by the loop guard.
     Unblock(String),
     /// Remove everything wanderlan set up on this site.
@@ -281,7 +285,12 @@ impl Review {
     }
 
     fn scroll_key(&mut self, code: KeyCode) -> bool {
-        let max = u16::try_from(self.lines.len().saturating_sub(1)).unwrap_or(u16::MAX);
+        // What is shown: after applying the changes made, before it the diff.
+        let shown = match &self.state {
+            ReviewState::Applied(a) => a.changes.len().max(1) + 2 + a.warnings.len(),
+            _ => self.lines.len(),
+        };
+        let max = u16::try_from(shown.saturating_sub(1)).unwrap_or(u16::MAX);
         self.scroll = match code {
             KeyCode::Up | KeyCode::Char('k') => self.scroll.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => self.scroll.saturating_add(1),
@@ -439,10 +448,12 @@ pub enum Effect {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct InFlight {
     status: Option<u64>,
-    config: bool,
-    macs: bool,
-    interfaces: bool,
-    vlans: bool,
+    // The tick a request was sent at; after REQUEST_TIMEOUT_TICKS without
+    // an answer it may be sent again.
+    config: Option<u64>,
+    macs: Option<u64>,
+    interfaces: Option<u64>,
+    vlans: Option<u64>,
 }
 
 /// Scroll positions of the lists (see [`list::Scroll`]).
@@ -498,6 +509,7 @@ fn bar_key(label: &str) -> Option<KeyCode> {
     let first = label.split('/').next().unwrap_or(label);
     match first {
         "Enter" => Some(KeyCode::Enter),
+        "Space" => Some(KeyCode::Char(' ')),
         "Esc" => Some(KeyCode::Esc),
         "Tab" => Some(KeyCode::Tab),
         "End" => Some(KeyCode::End),
@@ -750,8 +762,17 @@ impl App {
         self.request_status(fx);
         self.request_config(fx);
         fx.push(Effect::Request(Request::Subscribe));
-        if self.view == View::Setup {
+        if self.view == View::Setup || matches!(self.modal, Some(Modal::Ports(_))) {
             self.request_interfaces(fx);
+        }
+        // Nothing sent before is answered on the new connection.
+        if self.busy.take().is_some()
+            && let Some(Modal::Review(review)) = &mut self.modal
+            && review.state == ReviewState::Applying
+        {
+            review.state = ReviewState::Failed(ApiError::new(
+                "the connection to the daemon was lost; check the overview",
+            ));
         }
     }
 
@@ -771,6 +792,12 @@ impl App {
         {
             review.state = ReviewState::Failed(ApiError::new(
                 "the connection to the daemon was lost; check the overview after reconnecting",
+            ));
+        }
+        if self.wizard.step == Step::Joining {
+            self.wizard.step = Step::Summary;
+            self.wizard.error = Some(format!(
+                "the connection to the daemon was lost while joining ({error}); check the overview, then try again"
             ));
         }
     }
@@ -821,29 +848,34 @@ impl App {
     }
 
     fn request_config(&mut self, fx: &mut Vec<Effect>) {
-        if !self.in_flight.config {
-            self.in_flight.config = true;
+        if self.may_send(self.in_flight.config) {
+            self.in_flight.config = Some(self.ticks);
             fx.push(Effect::Request(Request::GetConfig));
         }
     }
 
     fn request_macs(&mut self, fx: &mut Vec<Effect>) {
-        if self.is_connected() && !self.in_flight.macs {
-            self.in_flight.macs = true;
+        if self.is_connected() && self.may_send(self.in_flight.macs) {
+            self.in_flight.macs = Some(self.ticks);
             fx.push(Effect::Request(Request::MacTable));
         }
     }
 
+    /// True if a request sent at `sent` (if at all) may be sent again.
+    fn may_send(&self, sent: Option<u64>) -> bool {
+        sent.is_none_or(|t| self.ticks.saturating_sub(t) >= REQUEST_TIMEOUT_TICKS)
+    }
+
     fn request_vlan_traffic(&mut self, fx: &mut Vec<Effect>) {
-        if self.is_connected() && !self.in_flight.vlans {
-            self.in_flight.vlans = true;
+        if self.is_connected() && self.may_send(self.in_flight.vlans) {
+            self.in_flight.vlans = Some(self.ticks);
             fx.push(Effect::Request(Request::VlanTraffic));
         }
     }
 
     fn request_interfaces(&mut self, fx: &mut Vec<Effect>) {
-        if self.is_connected() && !self.in_flight.interfaces {
-            self.in_flight.interfaces = true;
+        if self.is_connected() && self.may_send(self.in_flight.interfaces) {
+            self.in_flight.interfaces = Some(self.ticks);
             fx.push(Effect::Request(Request::Interfaces));
         }
     }
@@ -867,7 +899,7 @@ impl App {
             (_, Ok(Reply::History(events))) => self.log.set_history(events),
             (_, Ok(Reply::Interfaces(list))) => self.on_interfaces(list, fx),
             (_, Ok(Reply::Macs(entries))) => {
-                self.in_flight.macs = false;
+                self.in_flight.macs = None;
                 self.macs.set_entries(entries);
             }
             (_, Ok(Reply::VlanTraffic(traffic))) => self.on_vlan_traffic(traffic),
@@ -923,21 +955,21 @@ impl App {
                 "status"
             }
             Request::GetConfig => {
-                self.in_flight.config = false;
+                self.in_flight.config = None;
                 "reading the configuration"
             }
             Request::MacTable => {
-                self.in_flight.macs = false;
+                self.in_flight.macs = None;
                 self.macs.error = Some(error.to_string());
                 return;
             }
             Request::VlanTraffic => {
-                self.in_flight.vlans = false;
+                self.in_flight.vlans = None;
                 self.vlan_traffic_error = Some(error.to_string());
                 return;
             }
             Request::Interfaces => {
-                self.in_flight.interfaces = false;
+                self.in_flight.interfaces = None;
                 self.interfaces_error = Some(error.to_string());
                 return;
             }
@@ -1041,7 +1073,7 @@ impl App {
     }
 
     fn on_config(&mut self, texts: &ConfigTexts) {
-        self.in_flight.config = false;
+        self.in_flight.config = None;
         let running = match Running::parse(texts) {
             Ok(r) => r,
             Err(e) => {
@@ -1066,12 +1098,17 @@ impl App {
     }
 
     fn on_interfaces(&mut self, list: Vec<Interface>, fx: &mut Vec<Effect>) {
-        self.in_flight.interfaces = false;
+        self.in_flight.interfaces = None;
         self.interfaces = list;
         self.interfaces_loaded = true;
         self.interfaces_error = None;
         if std::mem::take(&mut self.cleanup_after_reset) {
             fx.push(Effect::KernelCleanup(self.interfaces.clone()));
+        }
+        // The list may be shorter now: the cursor stays on it ("other").
+        if let (Some(Modal::Ports(picker)), Some(draft)) = (&mut self.modal, &self.draft) {
+            let rows = picker.rows(draft, &self.interfaces).len();
+            picker.cursor = picker.cursor.min(rows);
         }
     }
 
@@ -1167,7 +1204,7 @@ impl App {
 
     /// Stores the traffic per VLAN and records one sample per VLAN.
     fn on_vlan_traffic(&mut self, traffic: VlanTraffic) {
-        self.in_flight.vlans = false;
+        self.in_flight.vlans = None;
         self.vlan_traffic_error = None;
         let ids = traffic::vlan_ids(&traffic);
         for &vid in &ids {
@@ -1406,6 +1443,8 @@ impl App {
         self.tunnels_selected = self
             .tunnels_selected
             .min(self.visible_tunnels().len().saturating_sub(1));
+        let settings = super::ui::settings::settings(self.draft.as_ref()).len();
+        self.settings_selected = self.settings_selected.min(settings.saturating_sub(1));
     }
 
     // ----- keys -------------------------------------------------------
@@ -1915,7 +1954,9 @@ impl App {
                     scroll: scroll.saturating_sub(1),
                 }),
                 KeyCode::Down | KeyCode::Char('j') => Some(Modal::Messages {
-                    scroll: scroll.saturating_add(1),
+                    scroll: scroll.saturating_add(1).min(
+                        u16::try_from(self.messages.len().saturating_sub(1)).unwrap_or(u16::MAX),
+                    ),
                 }),
                 _ => Some(Modal::Messages { scroll }),
             },
@@ -2106,7 +2147,7 @@ impl App {
             KeyCode::Esc => return None,
             // Added above "other", which keeps the cursor for the next name.
             KeyCode::Enter if typing && !picker.manual.value().trim().is_empty() => {
-                picker.add_manual();
+                picker.add_manual(&self.interfaces);
                 picker.cursor = picker.rows(draft, &self.interfaces).len();
             }
             KeyCode::Enter => match picker.apply(draft) {
@@ -2252,8 +2293,12 @@ impl App {
                 self.clamp_selection();
                 self.say(MessageKind::Info, "Draft discarded.");
             }
-            AskAction::DeleteSite(index) => {
-                if let Some(site) = self.draft.as_mut().and_then(|d| d.remove_site(index)) {
+            AskAction::DeleteSite(name) => {
+                let index = self
+                    .draft
+                    .as_ref()
+                    .and_then(|d| d.network.sites.iter().position(|s| s.name == name));
+                if let Some(site) = index.and_then(|i| self.draft.as_mut()?.remove_site(i)) {
                     self.say(
                         MessageKind::Info,
                         format!("Site {} removed from the draft.", site.name),
@@ -2261,11 +2306,20 @@ impl App {
                 }
                 self.clamp_selection();
             }
-            AskAction::DeleteMap(index) => {
-                if self.draft.as_mut().is_some_and(|d| d.remove_map(index)) {
+            AskAction::DeleteMap(map) => {
+                let index = self
+                    .draft
+                    .as_ref()
+                    .and_then(|d| d.network.maps.iter().position(|m| *m == map));
+                if let Some(index) = index
+                    && self.draft.as_mut().is_some_and(|d| d.remove_map(index))
+                {
                     self.say(
                         MessageKind::Info,
-                        format!("VLAN mapping #{} removed from the draft.", index + 1),
+                        format!(
+                            "VLAN mapping {} {} = shared {} removed from the draft.",
+                            map.site, map.local, map.shared
+                        ),
                     );
                 }
                 self.clamp_selection();
@@ -2664,7 +2718,7 @@ impl App {
                 self.modal = Some(Modal::Ask(Ask {
                     title: "Delete site".into(),
                     text: format!("Remove site {} from the draft?{extra}", site.name),
-                    action: AskAction::DeleteSite(selected),
+                    action: AskAction::DeleteSite(site.name.clone()),
                 }));
             }
             KeyCode::Char('u') if selected < count => {
@@ -2758,11 +2812,13 @@ impl App {
                 self.modal = Some(Modal::Form(Form::map(draft, Some(selected), None)));
             }
             KeyCode::Char('d') | KeyCode::Delete if selected < count => {
-                self.modal = Some(Modal::Ask(Ask {
-                    title: "Delete VLAN mapping".into(),
-                    text: format!("Remove VLAN mapping #{} from the draft?", selected + 1),
-                    action: AskAction::DeleteMap(selected),
-                }));
+                if let Some(map) = draft.network.maps.get(selected) {
+                    self.modal = Some(Modal::Ask(Ask {
+                        title: "Delete VLAN mapping".into(),
+                        text: format!("Remove VLAN mapping #{} from the draft?", selected + 1),
+                        action: AskAction::DeleteMap(map.clone()),
+                    }));
+                }
             }
             _ => {}
         }
@@ -2775,6 +2831,11 @@ impl App {
             return;
         };
         let _ = draft;
+        // Also when the search matches nothing.
+        if key.code == KeyCode::Char('/') {
+            self.tunnels_filter.start();
+            return;
+        }
         let rows = self.visible_tunnels();
         let count = rows.len();
         let selected = self.tunnels_selected.min(count.saturating_sub(1));
@@ -2787,7 +2848,6 @@ impl App {
             return;
         }
         match key.code {
-            KeyCode::Char('/') => self.tunnels_filter.start(),
             KeyCode::Enter | KeyCode::Char('e') => {
                 if row.servers.is_none() {
                     self.say(

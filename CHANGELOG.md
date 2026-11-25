@@ -35,6 +35,39 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 - Fix: an interface that is no longer a trunk port is taken off the bridge;
   before, it stayed bridged after the trunk was changed.
 
+### Faster and more robust
+
+- Forwarding: every bridged frame of the host passes one nftables rule;
+  only TCP SYNs go on to the MSS rules (before: four rules per tunnel for
+  every frame). All VLAN translations of a direction share one tc
+  priority: one lookup per frame instead of one per translation. Both
+  are rebuilt once after the update.
+- MSS clamping from the start (from the MTU of the interface towards the
+  peer until the path is measured), kept when a re-measurement fails.
+- New VLANs reach the tunnel ports only after the split horizon covers
+  them; teardown removes the tunnels before the split horizon; without
+  nftables only the MSS clamping is missing.
+- Loop guard: blocks of further trunk ports survive configuration
+  changes and automatic confirmations; it works after a failed reconcile
+  too; threshold 20 moves per 10 s (roaming devices and duplicated MAC
+  addresses no longer cut a tunnel); bounded memory in a broadcast storm.
+- The daemon restarts itself (through systemd) when its netlink
+  connection dies; the sync server and the API have limits (connections,
+  time, size); timeouts and revisions from the network are range-checked;
+  a rolled back client change is not fetched again at once; the status
+  is computed again only after a change; files are synced to disk.
+- TUI: a request while the daemon is away no longer hangs ("Applying"
+  forever); the tunnel search can be changed when it matches nothing; a
+  delete question removes exactly the site or mapping it named; the trunk
+  port window reloads after a reconnect and refuses typed ports of a
+  foreign bridge; several small fixes (VLAN window navigation, scrolling,
+  the second status line, Space in the key bar).
+- Configuration: the same ports in another order for two segments, and an
+  empty trunk list for a tunnel, are errors; a warning for an own VLAN
+  that is also the local side of a mapping; tunnel trunks are checked
+  against the real tunnels; `wanderlan vlan native`; `wanderlan status`
+  shows all trunk ports; `wanderlan trunk` drops duplicate ports.
+
 ### Live traffic per VLAN
 
 - The peer details (Overview, `Enter`) list the VLANs of the tunnel with

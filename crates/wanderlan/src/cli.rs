@@ -88,8 +88,8 @@ pub enum Command {
     /// Show the live traffic of one VLAN on every port of this site and
     /// the MAC addresses in it.
     Vlan {
-        /// The VLAN (shared ID), e.g. 20.
-        vid: u16,
+        /// The VLAN (shared ID), e.g. 20, or `native` (the untagged traffic).
+        vid: String,
         /// Print JSON.
         #[arg(long)]
         json: bool,
@@ -350,7 +350,7 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Log { follow }) => log(&socket, follow).await,
-        Some(Command::Vlan { vid, json }) => vlan(&socket, vid, json).await,
+        Some(Command::Vlan { vid, json }) => vlan(&socket, &vid, json).await,
         Some(Command::Probe) => {
             let client = connect(&socket).await?;
             let _: Done = client.call(Request::ProbeNow).await?;
@@ -663,12 +663,13 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
     if network.site(site).is_none() {
         bail!("there is no site \"{site}\"");
     }
-    let ports: Vec<String> = interface
-        .split([',', ' '])
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-        .map(str::to_string)
-        .collect();
+    let mut ports: Vec<String> = Vec::new();
+    for port in interface.split([',', ' ']).map(str::trim) {
+        // Once each, in the order given.
+        if !port.is_empty() && !ports.iter().any(|p| p == port) {
+            ports.push(port.to_string());
+        }
+    }
     let back = interface == "default";
     if own && back {
         bail!("\"default\" is for the tunnel to another site; give the ports of the default trunk");
@@ -1064,7 +1065,11 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
             role_text(own_uplink),
             if st.online { "" } else { " (OFFLINE)" },
             st.address.as_deref().unwrap_or("?"),
-            st.trunk.as_deref().unwrap_or("?"),
+            if st.trunk_ports.is_empty() {
+                st.trunk.clone().unwrap_or_else(|| "?".into())
+            } else {
+                st.trunk_ports.join(", ")
+            },
             st.vlans.as_deref().unwrap_or("?"),
         ),
         None => println!(
@@ -1191,7 +1196,21 @@ fn bytes(n: u64) -> String {
 }
 
 /// `wanderlan vlan <vid>`: the traffic of one VLAN per port and its MACs.
-async fn vlan(socket: &Path, vid: u16, json: bool) -> Result<ExitCode> {
+async fn vlan(socket: &Path, vid: &str, json: bool) -> Result<ExitCode> {
+    let vid = match vid.trim() {
+        "native" => config::NATIVE_VID,
+        text => text
+            .parse::<u16>()
+            .ok()
+            .filter(|v| (config::VID_MIN..=config::VID_MAX).contains(v))
+            .ok_or_else(|| {
+                anyhow!(
+                    "{text}: a VLAN ID between {} and {}, or native",
+                    config::VID_MIN,
+                    config::VID_MAX
+                )
+            })?,
+    };
     let client = connect(socket).await?;
     let traffic: VlanTraffic = client.call(Request::VlanTraffic).await?;
     let macs: Vec<MacEntry> = client.call(Request::MacTable).await?;
@@ -1209,7 +1228,8 @@ async fn vlan(socket: &Path, vid: u16, json: bool) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     if let Some(note) = &traffic.note {
-        println!("NOTE: no traffic per VLAN: {note}");
+        println!("No traffic per VLAN: {note}.");
+        return Ok(ExitCode::FAILURE);
     }
     if ports.is_empty() {
         println!("VLAN {vid} is on no port of this site.");
