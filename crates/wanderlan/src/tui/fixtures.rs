@@ -244,6 +244,7 @@ fn iface(name: &str, kind: &str, up: bool, master: Option<&str>, managed: bool) 
         master: master.map(str::to_string),
         mtu: 1500,
         managed,
+        carries: Vec::new(),
     }
 }
 
@@ -251,7 +252,10 @@ fn iface(name: &str, kind: &str, up: bool, master: Option<&str>, managed: bool) 
 pub fn interfaces() -> Vec<Interface> {
     vec![
         iface("lo", "", true, None, false),
-        iface("ens18", "", true, None, false),
+        Interface {
+            carries: vec!["buero".into()],
+            ..iface("ens18", "", true, None, false)
+        },
         iface("ens19", "", true, None, false),
         iface("eth1", "", false, Some("br-lan"), false),
         iface("br-lan", "bridge", true, None, false),

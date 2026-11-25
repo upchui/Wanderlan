@@ -146,7 +146,9 @@ pub const SECTIONS: &[Section] = &[
             ("Enter", "save the choice in the draft"),
         ],
         text: "Grey interfaces cannot be a trunk port here, the note says why: \
-               the tunnels run over it, it is in another bridge, or it is in another segment. \
+               it is in another bridge or in another segment. A yellow note names the \
+               tunnels that run over an interface: it can be chosen, but bridged it no \
+               longer carries this host's own traffic. If the tunnels drop, do not confirm. \
                For a tunnel, nothing chosen means the default trunk.",
     },
     Section {

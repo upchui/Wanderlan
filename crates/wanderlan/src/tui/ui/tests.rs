@@ -534,7 +534,6 @@ fn the_mouse_selects_opens_and_scrolls() {
 #[test]
 fn several_trunk_ports_in_the_settings() {
     let mut app = connected();
-    app.route_of = |a| (a == std::net::Ipv4Addr::new(10, 8, 0, 2)).then(|| "ens18".to_string());
     key(&mut app, KeyCode::Char('7'));
     // The trunk row: the fixed network rows, then "This site", then "Trunk".
     let trunk_row = super::settings::ROWS
@@ -565,9 +564,24 @@ fn several_trunk_ports_in_the_settings() {
 }
 
 #[test]
+fn the_interface_of_the_tunnels_as_a_trunk_port() {
+    let mut app = connected();
+    reply(
+        &mut app,
+        Request::Interfaces,
+        Reply::Interfaces(fixtures::interfaces()),
+    );
+    key(&mut app, KeyCode::Char('2'));
+    key(&mut app, KeyCode::Char('l'));
+    // ens18 carries the tunnel to buero: marked, chosen anyway.
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Char(' '));
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
 fn trunk_ports_of_a_tunnel() {
     let mut app = connected();
-    app.route_of = |_| None;
     reply(
         &mut app,
         Request::Interfaces,

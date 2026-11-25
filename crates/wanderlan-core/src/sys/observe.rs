@@ -68,4 +68,13 @@ pub trait ObserveOps: Send + Sync {
 
     /// The per-VLAN counters of all bridge ports.
     fn vlan_stats(&self) -> impl Future<Output = SysResult<Vec<VlanCounters>>> + Send;
+
+    /// The index of the interface a packet from `src` to `dst` leaves by,
+    /// as the kernel routes it (`ip route get <dst> from <src>`, with the
+    /// policy rules); `None` if there is no route.
+    fn output_interface(
+        &self,
+        dst: std::net::Ipv4Addr,
+        src: Option<std::net::Ipv4Addr>,
+    ) -> impl Future<Output = SysResult<Option<u32>>> + Send;
 }

@@ -32,12 +32,20 @@ begin "Trunk per tunnel: the tunnel to site2 gets its own trunk at site1"
 
 client_vlan c-site1b 20 10.20.0.31/24
 uplink=$(x site1 "ip -o route get 10.100.2.10 | sed -n 's/.* dev \([^ ]*\).*/\1/p'")
-out=$(x site1 "wanderlan trunk site2 $uplink" 2>&1)
-if grep -q 'would cut the connection' <<<"$out"; then
-  pass "the interface towards site2 ($uplink) is refused as its trunk"
+# The interface the tunnels run over may be a trunk port, with a warning;
+# --confirm then does not confirm, so the rollback can save the site.
+out=$(x site1 "wanderlan trunk site2 $uplink --confirm" 2>&1)
+if grep -q "WARNING: $uplink carries the tunnels to site2" <<<"$out" && grep -q 'not confirmed' <<<"$out"; then
+  pass "the interface towards site2 ($uplink) is taken with a warning, not confirmed right away"
 else
   fail "unexpected output for the transport interface: $out"
 fi
+check "the change waits for confirmation" test "$(jqs site1 '.pending != null')" = true
+x site1 "wanderlan rollback" >/dev/null
+wait_for 20 "rolled back: $uplink is no bridge port" \
+  x site1 "! ip -j link show $uplink | jq -e '.[0].master'"
+wait_for 30 "the tunnel to site2 is up again" \
+  eval '[ "$(jqs site1 '"'"'.peers[] | select(.name == "site2") | .reachable'"'"')" = true ]'
 out=$(x site1 "wanderlan trunk site2 trunk1 --confirm" 2>&1)
 if grep -q 'The tunnel to site2 uses its own trunk trunk1' <<<"$out"; then
   pass "wanderlan trunk site2 trunk1"

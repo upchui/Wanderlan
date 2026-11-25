@@ -1,6 +1,6 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 560
+assertion_line: 559
 expression: render(&app)
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
@@ -12,7 +12,7 @@ expression: render(&app)
 "│ ┌ Trunk ports of this host ────────────────────────────────────────────────┐ █"
 "│ │    #  INTERFACE       KIND      STATE MTU   NOTE                         │ █"
 "│T│[ ]    br-lan          bridge    up    1500  a bridge                     │ █"
-"│ │[ ]    ens18           physical  up    1500  leads to buero               │ █"
+"│ │[ ]    ens18           physical  up    1500  tunnels to buero             │ █"
 "│ │[x] 2  ens19           physical  up    1500                               │ █"
 "│R│[ ]    eth1            physical  down  1500  in br-lan                    │ █"
 "│ │[x] 1  ens20                                 not on this host (now)       │ ║"
@@ -22,7 +22,7 @@ expression: render(&app)
 "└─│ loop between two ports shuts the further one down, never the main port.  │─┘"
 " T└──────────────────────────────────────────────────────────────────────────┘; "
 " Enter lists those of this host). Several act like switch ports, the first is   "
-" the main port; never the one that leads to the other sites.                    "
+" the main port. The one the tunnels run over is marked.                         "
 " Changes go into the draft; a reviews and applies them, c confirms.             "
 "                                                                                "
 "                                  1 blocked (see 1)  draft: no changes  heim r7 "

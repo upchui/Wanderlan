@@ -1,11 +1,12 @@
 //! [`ObserveOps`] with rtnetlink (RTM_GETNEIGH dumps and RTNLGRP_NEIGH,
-//! RTM_GETSTATS dumps for the per-VLAN counters).
+//! RTM_GETSTATS dumps for the per-VLAN counters, RTM_GETROUTE lookups).
 
 use futures_util::StreamExt as _;
 use rtnetlink::packet_core::{NLM_F_DUMP, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload};
 use rtnetlink::packet_route::neighbour::{
     NeighbourAddress, NeighbourAttribute, NeighbourFlags, NeighbourMessage, NeighbourState,
 };
+use rtnetlink::packet_route::route::{RouteAddress, RouteAttribute, RouteMessage};
 use rtnetlink::packet_route::stats::{
     BridgeXstat, LinkXstatGroup, StatsAttribute, StatsFilterMask, StatsMessage,
 };
@@ -95,7 +96,50 @@ fn parse_vlan_stats(msg: &StatsMessage) -> Vec<VlanCounters> {
         .collect()
 }
 
+/// The output interface of a route lookup answer.
+fn oif_of(msg: &RouteMessage) -> Option<u32> {
+    msg.attributes.iter().find_map(|a| match a {
+        RouteAttribute::Oif(index) => Some(*index),
+        _ => None,
+    })
+}
+
 impl ObserveOps for Netlink {
+    async fn output_interface(
+        &self,
+        dst: std::net::Ipv4Addr,
+        src: Option<std::net::Ipv4Addr>,
+    ) -> SysResult<Option<u32>> {
+        let mut msg = RouteMessage::default();
+        msg.header.address_family = AddressFamily::Inet;
+        msg.header.destination_prefix_length = 32;
+        msg.attributes
+            .push(RouteAttribute::Destination(RouteAddress::Inet(dst)));
+        if let Some(src) = src {
+            msg.header.source_prefix_length = 32;
+            msg.attributes
+                .push(RouteAttribute::Source(RouteAddress::Inet(src)));
+        }
+        // A lookup, not a dump: one answer.
+        let mut req = NetlinkMessage::from(RouteNetlinkMessage::GetRoute(msg));
+        req.header.flags = NLM_F_REQUEST;
+        let mut handle = self.handle().clone();
+        let mut responses = handle
+            .request(req)
+            .map_err(|e| SysError::new(format!("look up the route to {dst}"), e))?;
+        while let Some(resp) = responses.next().await {
+            match resp.payload {
+                // No route (unreachable, a source that is not ours, ...).
+                NetlinkPayload::Error(err) if err.code.is_some() => return Ok(None),
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(m)) => {
+                    return Ok(oif_of(&m));
+                }
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+
     async fn vlan_stats(&self) -> SysResult<Vec<VlanCounters>> {
         let _dump = self.dump_guard().await;
         let mut msg = StatsMessage::default();
@@ -210,6 +254,14 @@ impl ObserveOps for LinuxSystem {
         self.net.vlan_stats().await
     }
 
+    async fn output_interface(
+        &self,
+        dst: std::net::Ipv4Addr,
+        src: Option<std::net::Ipv4Addr>,
+    ) -> SysResult<Option<u32>> {
+        self.net.output_interface(dst, src).await
+    }
+
     fn watch_fdb(&self) -> SysResult<mpsc::UnboundedReceiver<FdbEvent>> {
         self.net.watch_fdb()
     }
@@ -221,7 +273,17 @@ mod tests {
         BridgeVlanXstats, BridgeXstat, LinkXstatGroup, StatsAttribute, StatsMessage,
     };
 
-    use super::{VlanCounters, parse_vlan_stats};
+    use rtnetlink::packet_route::route::{RouteAttribute, RouteMessage};
+
+    use super::{VlanCounters, oif_of, parse_vlan_stats};
+
+    #[test]
+    fn the_output_interface_of_a_lookup() {
+        let mut msg = RouteMessage::default();
+        assert_eq!(oif_of(&msg), None);
+        msg.attributes = vec![RouteAttribute::Table(254), RouteAttribute::Oif(4)];
+        assert_eq!(oif_of(&msg), Some(4));
+    }
 
     #[test]
     fn vlan_counters_of_a_port() {

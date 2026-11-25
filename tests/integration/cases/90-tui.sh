@@ -24,8 +24,8 @@ wait_for 10 "Enter on Trunk lists the interfaces of site1, trunk0 is the main po
   x site1 "tmux capture-pane -p -t wl | grep -q 'Trunk ports of this host' && tmux capture-pane -p -t wl | grep -q '\[x\] 1  trunk0 '"
 check "trunk1 can be chosen as a further port" \
   x site1 "tmux capture-pane -p -t wl | grep -Eq '\[ \] +trunk1 '"
-check "the interface towards site2 ($uplink) cannot: the tunnels run over it" \
-  x site1 "tmux capture-pane -p -t wl | grep -Eq '\[ \] +$uplink .*leads to site2'"
+check "the interface towards site2 ($uplink) is marked: the tunnels run over it (asked from the kernel)" \
+  x site1 "tmux capture-pane -p -t wl | grep -Eq '\[ \] +$uplink .*tunnels to site2'"
 x site1 "tmux send-keys -t wl Escape"
 wait_for 10 "Esc closes the window (nothing changed, no question)" \
   x site1 "! tmux capture-pane -p -t wl | grep -q 'Trunk ports of this host'"

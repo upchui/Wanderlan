@@ -31,11 +31,13 @@ fn table_row(picker: &PortPicker, row: &PortRow) -> Row<'static> {
             row.mtu.to_string(),
         )
     };
-    let note = match (&row.blocked, &row.note, position) {
-        (Some(why), _, _) => why.clone(),
-        (None, Some(note), _) => note.clone(),
-        (None, None, Some(0)) => "main port".into(),
-        (None, None, _) => String::new(),
+    // The tunnels that run over it: a warning, in its own colour.
+    let note = match (&row.blocked, &row.warning, &row.note, position) {
+        (Some(why), ..) => Cell::from(why.clone()),
+        (None, Some(warning), ..) => Cell::from(warning.clone()).style(theme::warn()),
+        (None, None, Some(note), _) => Cell::from(note.clone()),
+        (None, None, None, Some(0)) => Cell::from("main port"),
+        (None, None, None, _) => Cell::from(""),
     };
     let style = match (&row.blocked, position) {
         // Chosen although it cannot be: the draft has it, Space takes it out.
@@ -51,7 +53,7 @@ fn table_row(picker: &PortPicker, row: &PortRow) -> Row<'static> {
         Cell::from(row.kind.clone()),
         Cell::from(state),
         Cell::from(mtu),
-        Cell::from(note),
+        note,
     ])
     .style(style)
 }
@@ -66,6 +68,11 @@ pub fn draw(frame: &mut Frame, app: &App, picker: &PortPicker, area: Rect) {
     let mut info: Vec<Line> = Vec::new();
     for part in format::wrap(&picker.summary(draft), text_width) {
         info.push(Line::styled(format!(" {part}"), theme::dim()));
+    }
+    if let Some(warning) = picker.warning(&app.interfaces) {
+        for part in format::wrap(&warning, text_width) {
+            info.push(Line::styled(format!(" {part}"), theme::warn()));
+        }
     }
     let problem = picker
         .error

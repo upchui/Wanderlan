@@ -516,11 +516,6 @@ fn settings_open_the_form_at_the_chosen_setting() {
     }
 }
 
-/// The tunnel to buero runs over ens18.
-fn fake_routes(address: std::net::Ipv4Addr) -> Option<String> {
-    (address == std::net::Ipv4Addr::new(10, 8, 0, 2)).then(|| "ens18".to_string())
-}
-
 fn picker(app: &App) -> &PortPicker {
     match &app.modal {
         Some(Modal::Ports(p)) => p,
@@ -531,7 +526,6 @@ fn picker(app: &App) -> &PortPicker {
 #[test]
 fn a_tunnel_gets_its_own_trunk_in_the_settings() {
     let mut app = connected();
-    app.route_of = fake_routes;
     app.update(ch('7'));
     // The fixed settings come first, then one row per tunnel (buero, haus2, ...).
     app.settings_selected = crate::tui::ui::settings::ROWS.len() + 1;
@@ -545,16 +539,14 @@ fn a_tunnel_gets_its_own_trunk_in_the_settings() {
         Request::Interfaces,
         Reply::Interfaces(fixtures::interfaces()),
     ));
-    // Rows: br-lan, ens18, ens19, eth1, then "other".
+    // Rows: br-lan, ens18, ens19, eth1, then "other". The tunnel to buero
+    // runs over ens18: it can be chosen all the same, with a warning.
     app.update(key(KeyCode::Down));
     app.update(ch(' '));
-    assert!(picker(&app).chosen.is_empty(), "ens18 carries a tunnel");
-    assert!(
-        picker(&app)
-            .error
-            .as_deref()
-            .is_some_and(|e| e.contains("leads to buero"))
-    );
+    assert_eq!(picker(&app).chosen, ["ens18"]);
+    assert!(picker(&app).warning(&app.interfaces).is_some());
+    app.update(ch(' '));
+    assert!(picker(&app).chosen.is_empty(), "and taken out again");
     // The default trunk belongs to another segment.
     app.update(key(KeyCode::Down));
     app.update(ch(' '));
@@ -587,7 +579,6 @@ fn a_tunnel_gets_its_own_trunk_in_the_settings() {
 #[test]
 fn several_trunk_ports_with_a_main_port() {
     let mut app = connected();
-    app.route_of = fake_routes;
     app.update(reply(
         Request::Interfaces,
         Reply::Interfaces(fixtures::interfaces()),

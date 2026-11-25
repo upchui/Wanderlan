@@ -1879,6 +1879,7 @@ impl Controller {
     async fn interfaces(&self) -> Result<Vec<Interface>, ApiError> {
         let links = self.sys.links().await.map_err(api_err)?;
         let name_of = |i: u32| links.iter().find(|l| l.index == i).map(|l| l.name.clone());
+        let carries = self.tunnel_interfaces().await;
         Ok(links
             .iter()
             .map(|l| Interface {
@@ -1892,8 +1893,28 @@ impl Controller {
                 master: l.master.and_then(name_of),
                 mtu: l.mtu,
                 managed: l.alias.as_deref() == Some(OWNER_ALIAS),
+                carries: carries.get(&l.index).cloned().unwrap_or_default(),
             })
             .collect())
+    }
+
+    /// Interface index → the peers whose tunnel leaves through it, as the
+    /// kernel routes the tunnel packets (from our address, with the policy
+    /// rules, e.g. of a VPN).
+    async fn tunnel_interfaces(&self) -> BTreeMap<u32, Vec<String>> {
+        let mut out: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+        let Some(cfg) = &self.config else {
+            return out;
+        };
+        let local = cfg.self_site().map(|s| s.address);
+        for tunnel in topology::tunnels_for(&cfg.network, cfg.self_name()) {
+            match self.sys.output_interface(tunnel.peer.address, local).await {
+                Ok(Some(index)) => out.entry(index).or_default().push(tunnel.peer.name.clone()),
+                Ok(None) => {}
+                Err(e) => debug!("{e}"),
+            }
+        }
+        out
     }
 
     /// The traffic per VLAN on the ports of our bridges.

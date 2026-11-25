@@ -1,0 +1,29 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+assertion_line: 579
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+"┌ Sites (draft): 6 ────────────────────────────────────────────────────────────┐"
+"│  NAME         ADDRESS         VLANS     ROLE            MANAGED BY TUNNEL    │"
+"│  heim         10.8.0.1        10-50     server          anyone     this site │"
+"│  └ haus6      10.8.0.16       10-50     client of heim  buero      offline   │"
+"│ ┌ Trunk ports of this host ────────────────────────────────────────────────┐ │"
+"│ │    #  INTERFACE       KIND      STATE MTU   NOTE                         │ │"
+"│ │[ ]    br-lan          bridge    up    1500  a bridge                     │ │"
+"│ │[x] 2  ens18           physical  up    1500  tunnels to buero             │ │"
+"│ │[x] 1  ens19           physical  up    1500  main port                    │ │"
+"│ │[ ]    eth1            physical  down  1500  in br-lan                    │ │"
+"│ │ other:                   an interface that is not there yet              │ │"
+"│ │                                                                          │ │"
+"│ │ br0: ens19 (main port), ens18, bridged like the ports of a switch. A     │ │"
+"│ │ loop between two ports shuts the further one down, never the main port.  │ │"
+"│ │ ens18 carries the tunnels to buero. As a bridge port it no longer        │ │"
+"│ │ carries this host's own traffic; if the tunnels drop, do not confirm     │ │"
+"│ │ (c): the change is rolled back by itself.                                │ │"
+"└─└──────────────────────────────────────────────────────────────────────────┘─┘"
+" heim: server; changed by anyone (Enter: details, e: edit).                     "
+"                                                                                "
+"                                                                                "
+"                                  1 blocked (see 1)  draft: no changes  heim r7 "
+" Space  choose   m  main port   Enter  save to draft   Esc  cancel              "

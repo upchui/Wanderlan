@@ -161,6 +161,7 @@ dead0\t0000090A\t00000000\t0000\t0\t0\t0\t0000FFFF\t0\t0\t0\n";
             master: master.map(Into::into),
             mtu: 1500,
             managed: kind == "gretap",
+            carries: Vec::new(),
         }
     }
 

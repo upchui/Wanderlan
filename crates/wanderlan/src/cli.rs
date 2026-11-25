@@ -677,22 +677,26 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
         if ports.is_empty() {
             bail!("no interface given");
         }
-        // A port towards a peer would cut the connection when bridged.
         for port in &ports {
             if let Some(msg) = config::ifname_error(port) {
                 bail!("{port}: {msg}");
             }
-            if let Some(peer) = network.sites.iter().find(|s| {
-                Some(s.name.as_str()) != local.self_name.as_deref()
-                    && hostinfo::route_interface(s.address).as_deref() == Some(port.as_str())
-            }) {
-                bail!(
-                    "{port} leads to {} ({}); bridging it would cut the connection",
-                    peer.name,
-                    peer.address
-                );
-            }
         }
+    }
+    // Ports the tunnels run over (as the kernel routes them): allowed, but
+    // bridged they no longer carry this host's own traffic.
+    let interfaces: Vec<Interface> = client.call(Request::Interfaces).await?;
+    let risky: Vec<String> = ports
+        .iter()
+        .filter_map(|p| interfaces.iter().find(|i| i.name == *p))
+        .filter(|i| !i.carries.is_empty())
+        .map(|i| format!("{} carries the tunnels to {}", i.name, i.carries.join(", ")))
+        .collect();
+    if !back && !risky.is_empty() {
+        eprintln!(
+            "WARNING: {}. As a bridge port it no longer carries this host's own traffic; if the tunnels drop, do not confirm: the change is rolled back by itself.",
+            risky.join("; ")
+        );
     }
     let before = local.clone();
     if own {
@@ -731,9 +735,15 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
     } else {
         format!("The tunnel to {site} uses its own trunk {now} (a segment of its own)")
     };
-    if confirm {
+    if confirm && risky.is_empty() {
         let _: Confirmed = client.call(Request::Confirm).await?;
         println!("{done}.");
+    } else if confirm {
+        // Confirming now would keep a change that cuts this site off.
+        println!(
+            "{done} now, not confirmed: the tunnels run over it. Check that they stay up, then run `wanderlan confirm` within {} seconds, otherwise it is rolled back.",
+            applied.confirm_within_secs
+        );
     } else {
         println!(
             "{done} now. Run `wanderlan confirm` within {} seconds to keep it, otherwise it is rolled back.",

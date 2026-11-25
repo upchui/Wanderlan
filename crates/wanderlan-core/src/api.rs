@@ -620,6 +620,11 @@ pub struct Interface {
     pub mtu: u32,
     /// True if the interface was created by wanderlan.
     pub managed: bool,
+    /// The peers whose tunnel leaves this host through this interface, as
+    /// the kernel routes it. Bridged, it no longer carries this host's own
+    /// traffic, so these tunnels would drop.
+    #[serde(default)]
+    pub carries: Vec<String>,
 }
 
 /// Devices the kernel creates by itself when a tunnel module is loaded

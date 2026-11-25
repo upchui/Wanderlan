@@ -2,8 +2,6 @@
 //! interfaces in a list, several selectable; the first chosen is the main
 //! port. For a tunnel, nothing chosen means the default trunk.
 
-use std::collections::BTreeMap;
-
 use crossterm::event::KeyEvent;
 use wanderlan_core::api::Interface;
 use wanderlan_core::config::{FieldPath, ifname_error};
@@ -38,6 +36,8 @@ pub struct PortRow {
     pub blocked: Option<String>,
     /// Something worth knowing that does not stop it.
     pub note: Option<String>,
+    /// A risk that does not stop it: the tunnels that run over it.
+    pub warning: Option<String>,
     /// Chosen but not on this host (e.g. an unplugged adapter).
     pub missing: bool,
 }
@@ -55,17 +55,21 @@ pub struct PortPicker {
     pub manual: TextInput,
     /// Why the last action did not work.
     pub error: Option<String>,
-    /// Interface → the peers whose tunnels run over it (display text).
-    leads: BTreeMap<String, String>,
     initial: Vec<String>,
 }
 
+/// The peers of tunnels for display: `buero`, `buero, haus2`, or
+/// `buero, haus2 and 3 more`.
+fn peers_text(peers: &[String]) -> String {
+    match peers {
+        [a, b, rest @ ..] if !rest.is_empty() => format!("{a}, {b} and {} more", rest.len()),
+        _ => peers.join(", "),
+    }
+}
+
 impl PortPicker {
-    /// The window for `target`, with the ports the draft has now. `leads`
-    /// maps interfaces to the peers reached through them, as text
-    /// (`buero, haus2`): never a trunk port, bridging them would cut the
-    /// tunnels.
-    pub fn new(target: PortTarget, draft: &Draft, leads: BTreeMap<String, String>) -> Self {
+    /// The window for `target`, with the ports the draft has now.
+    pub fn new(target: PortTarget, draft: &Draft) -> Self {
         let chosen = match &target {
             PortTarget::Default => draft.local.trunk.clone(),
             PortTarget::Tunnel(site) => draft
@@ -82,7 +86,6 @@ impl PortPicker {
             cursor: 0,
             manual: TextInput::default(),
             error: None,
-            leads,
         }
     }
 
@@ -98,6 +101,30 @@ impl PortPicker {
     /// typed but not added.
     pub fn changed(&self) -> bool {
         self.chosen != self.initial || !self.manual.value().trim().is_empty()
+    }
+
+    /// For chosen ports the tunnels run over: what happens when they are
+    /// bridged.
+    pub fn warning(&self, interfaces: &[Interface]) -> Option<String> {
+        let risky: Vec<String> = self
+            .chosen
+            .iter()
+            .filter_map(|name| interfaces.iter().find(|i| i.name == *name))
+            .filter(|i| !i.carries.is_empty())
+            .map(|i| {
+                format!(
+                    "{} carries the tunnels to {}",
+                    i.name,
+                    peers_text(&i.carries)
+                )
+            })
+            .collect();
+        (!risky.is_empty()).then(|| {
+            format!(
+                "{}. As a bridge port it no longer carries this host's own traffic; if the tunnels drop, do not confirm (c): the change is rolled back by itself.",
+                risky.join("; ")
+            )
+        })
     }
 
     /// What the choice means, one sentence below the list.
@@ -148,6 +175,8 @@ impl PortPicker {
                 mtu: i.mtu,
                 blocked: self.blocked(draft, i),
                 note: self.note(draft, &i.name),
+                warning: (!i.carries.is_empty())
+                    .then(|| format!("tunnels to {}", peers_text(&i.carries))),
                 missing: false,
             })
             .collect();
@@ -160,6 +189,7 @@ impl PortPicker {
                     mtu: 0,
                     blocked: None,
                     note: Some("not on this host (now)".into()),
+                    warning: None,
                     missing: true,
                 });
             }
@@ -191,9 +221,6 @@ impl PortPicker {
     /// Why `interface` cannot be a port of this trunk.
     fn blocked(&self, draft: &Draft, interface: &Interface) -> Option<String> {
         let name = interface.name.as_str();
-        if let Some(peers) = self.leads.get(name) {
-            return Some(format!("leads to {peers}"));
-        }
         if let Some(master) = interface
             .master
             .as_deref()
@@ -263,12 +290,6 @@ impl PortPicker {
             self.error = Some(format!("{name}: {msg}"));
             return;
         }
-        if let Some(peers) = self.leads.get(&name) {
-            self.error = Some(format!(
-                "{name} leads to {peers}; bridging it would cut the connection"
-            ));
-            return;
-        }
         if !self.chosen.contains(&name) {
             self.chosen.push(name);
         }
@@ -323,10 +344,6 @@ mod tests {
         Draft::from_running(&Running::parse(&fixtures::config_texts()).unwrap()).unwrap()
     }
 
-    fn leads() -> BTreeMap<String, String> {
-        BTreeMap::from([("ens18".to_string(), "buero".to_string())])
-    }
-
     fn row<'a>(rows: &'a [PortRow], name: &str) -> &'a PortRow {
         rows.iter().find(|r| r.name == name).expect(name)
     }
@@ -334,7 +351,7 @@ mod tests {
     #[test]
     fn the_list_marks_what_cannot_be_a_port() {
         let d = draft();
-        let picker = PortPicker::new(PortTarget::Default, &d, leads());
+        let picker = PortPicker::new(PortTarget::Default, &d);
         let rows = picker.rows(&d, &fixtures::interfaces());
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(
@@ -342,9 +359,11 @@ mod tests {
             ["br-lan", "ens18", "ens19", "eth1"],
             "no lo, br0, gt-*"
         );
+        // The tunnel to buero runs over ens18: marked, not refused.
+        assert_eq!(row(&rows, "ens18").blocked, None);
         assert_eq!(
-            row(&rows, "ens18").blocked.as_deref(),
-            Some("leads to buero")
+            row(&rows, "ens18").warning.as_deref(),
+            Some("tunnels to buero")
         );
         assert_eq!(row(&rows, "eth1").blocked.as_deref(), Some("in br-lan"));
         assert_eq!(row(&rows, "br-lan").blocked.as_deref(), Some("a bridge"));
@@ -362,19 +381,17 @@ mod tests {
             list.push(extra);
             list
         };
-        let mut picker = PortPicker::new(PortTarget::Default, &d, leads());
+        let mut picker = PortPicker::new(PortTarget::Default, &d);
         let rows = picker.rows(&d, &interfaces);
         picker.toggle(row(&rows, "ens20"));
         assert_eq!(picker.chosen, ["ens19", "ens20"]);
         picker.make_main("ens20");
         assert_eq!(picker.chosen, ["ens20", "ens19"]);
-        picker.toggle(row(&rows, "ens18"));
-        assert!(picker.error.as_deref().unwrap().contains("leads to buero"));
-        assert_eq!(picker.chosen.len(), 2, "not chosen");
+        assert_eq!(picker.warning(&interfaces), None);
         d = picker.apply(&d).expect("valid");
         assert_eq!(d.local.trunk, ["ens20", "ens19"]);
         // Nothing chosen is not a trunk.
-        let mut empty = PortPicker::new(PortTarget::Default, &d, leads());
+        let mut empty = PortPicker::new(PortTarget::Default, &d);
         empty.chosen.clear();
         assert!(empty.apply(&d).is_err());
     }
@@ -382,7 +399,7 @@ mod tests {
     #[test]
     fn a_tunnel_without_ports_uses_the_default_trunk() {
         let d = draft();
-        let mut picker = PortPicker::new(PortTarget::Tunnel("haus2".into()), &d, leads());
+        let mut picker = PortPicker::new(PortTarget::Tunnel("haus2".into()), &d);
         assert!(picker.chosen.is_empty());
         let rows = picker.rows(&d, &fixtures::interfaces());
         assert_eq!(
@@ -395,7 +412,7 @@ mod tests {
         let saved = picker.apply(&d).expect("valid");
         assert_eq!(saved.local.tunnel_trunks.get("haus2").unwrap(), &["usb0"]);
         // usb0 is not on the host: listed as missing, can be taken out.
-        let mut again = PortPicker::new(PortTarget::Tunnel("haus2".into()), &saved, leads());
+        let mut again = PortPicker::new(PortTarget::Tunnel("haus2".into()), &saved);
         let rows = again.rows(&saved, &fixtures::interfaces());
         assert!(row(&rows, "usb0").missing);
         again.toggle(row(&rows, "usb0"));
@@ -413,7 +430,7 @@ mod tests {
             .tunnel_trunks
             .insert("buero".into(), vec!["ens18".into()]);
         d.revalidate();
-        let mut picker = PortPicker::new(PortTarget::Tunnel("haus2".into()), &d, BTreeMap::new());
+        let mut picker = PortPicker::new(PortTarget::Tunnel("haus2".into()), &d);
         let rows = picker.rows(&d, &fixtures::interfaces());
         let ens18 = row(&rows, "ens18");
         assert_eq!(ens18.blocked, None);
@@ -430,21 +447,45 @@ mod tests {
     }
 
     #[test]
+    fn the_interface_of_the_tunnels_can_be_chosen_with_a_warning() {
+        let d = draft();
+        let interfaces = fixtures::interfaces();
+        let mut picker = PortPicker::new(PortTarget::Default, &d);
+        let rows = picker.rows(&d, &interfaces);
+        picker.toggle(row(&rows, "ens18"));
+        assert_eq!(picker.error, None);
+        assert_eq!(picker.chosen, ["ens19", "ens18"]);
+        let warning = picker.warning(&interfaces).expect("a warning");
+        assert!(
+            warning.starts_with("ens18 carries the tunnels to buero."),
+            "{warning}"
+        );
+        assert!(warning.contains("rolled back"), "{warning}");
+        let saved = picker.apply(&d).expect("saved");
+        assert_eq!(saved.local.trunk, ["ens19", "ens18"]);
+        // The same for a tunnel of its own, and when typed.
+        let mut tunnel = PortPicker::new(PortTarget::Tunnel("haus2".into()), &d);
+        tunnel.manual.set("ens18");
+        tunnel.add_manual();
+        assert_eq!(tunnel.chosen, ["ens18"]);
+        assert!(tunnel.warning(&interfaces).is_some());
+    }
+
+    #[test]
     fn typed_names_are_checked() {
         let d = draft();
-        let mut picker = PortPicker::new(PortTarget::Default, &d, leads());
+        let mut picker = PortPicker::new(PortTarget::Default, &d);
         picker.manual.set("this-name-is-too-long");
         picker.add_manual();
         assert!(picker.error.is_some());
-        picker.manual.set("ens18");
-        picker.add_manual();
-        assert!(
-            picker
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("cut the connection")
-        );
         assert_eq!(picker.chosen, ["ens19"]);
+    }
+
+    #[test]
+    fn many_peers_in_short() {
+        let names = |n: &[&str]| n.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(peers_text(&names(&["a"])), "a");
+        assert_eq!(peers_text(&names(&["a", "b"])), "a, b");
+        assert_eq!(peers_text(&names(&["a", "b", "c", "d"])), "a, b and 2 more");
     }
 }

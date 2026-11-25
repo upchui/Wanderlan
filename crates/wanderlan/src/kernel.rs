@@ -149,6 +149,7 @@ mod tests {
             master: None,
             mtu: 1476,
             managed: false,
+            carries: Vec::new(),
         }
     }
 

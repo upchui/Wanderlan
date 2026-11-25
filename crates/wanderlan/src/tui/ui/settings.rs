@@ -69,7 +69,7 @@ pub const ROWS: [SettingRow; 7] = [
         key: "trunk",
         label: "Trunk",
         local: true,
-        help: "The interfaces that carry the VLANs to the switch or hypervisor (ports of br0; Enter lists those of this host). Several act like switch ports, the first is the main port; never the one that leads to the other sites.",
+        help: "The interfaces that carry the VLANs to the switch or hypervisor (ports of br0; Enter lists those of this host). Several act like switch ports, the first is the main port. The one the tunnels run over is marked.",
     },
 ];
 

@@ -36,6 +36,8 @@ pub struct FakeState {
     pub calls: Vec<String>,
     /// Per-VLAN counters reported by [`ObserveOps::vlan_stats`].
     pub vlan_counters: Vec<VlanCounters>,
+    /// Routes for [`ObserveOps::output_interface`]: destination → link name.
+    pub routes: BTreeMap<std::net::Ipv4Addr, String>,
     /// A kernel without per-VLAN counters per port: bridges come without.
     pub no_vlan_stats: bool,
     /// A bridge asked for counters came without them.
@@ -99,6 +101,11 @@ impl FakeNet {
     /// Sets what [`ObserveOps::vlan_stats`] reports.
     pub fn set_vlan_counters(&self, counters: Vec<VlanCounters>) {
         self.lock().vlan_counters = counters;
+    }
+
+    /// Routes packets to `dst` over the link `interface`.
+    pub fn set_route(&self, dst: std::net::Ipv4Addr, interface: &str) {
+        self.lock().routes.insert(dst, interface.to_string());
     }
 
     /// Behaves like a kernel without per-VLAN counters per port.
@@ -518,5 +525,16 @@ impl ObserveOps for FakeNet {
 
     async fn vlan_stats(&self) -> SysResult<Vec<VlanCounters>> {
         Ok(self.lock().vlan_counters.clone())
+    }
+
+    async fn output_interface(
+        &self,
+        dst: std::net::Ipv4Addr,
+        _src: Option<std::net::Ipv4Addr>,
+    ) -> SysResult<Option<u32>> {
+        let s = self.lock();
+        Ok(s.routes
+            .get(&dst)
+            .and_then(|name| s.links.values().find(|l| l.name == *name).map(|l| l.index)))
     }
 }

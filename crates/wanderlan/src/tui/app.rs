@@ -548,8 +548,6 @@ pub struct App {
     pub interfaces_loaded: bool,
     /// Error listing the interfaces.
     pub interfaces_error: Option<String>,
-    /// The interface the host routes an address over (tests replace it).
-    pub route_of: fn(std::net::Ipv4Addr) -> Option<String>,
     /// What systemd says about the daemon while it is not reachable.
     pub diagnosis: Option<Diagnosis>,
     /// Remove the kernel's GRE fallback devices once the interface list
@@ -625,7 +623,6 @@ impl App {
             interfaces: Vec::new(),
             interfaces_loaded: false,
             interfaces_error: None,
-            route_of: hostinfo::route_interface,
             diagnosis: None,
             cleanup_after_reset: false,
             invite_after_setup: false,
@@ -2062,45 +2059,14 @@ impl App {
         Some(Modal::Invites { selected })
     }
 
-    /// Opens the window to choose trunk ports. Interfaces that carry a
-    /// tunnel of this site cannot be chosen: bridging them would cut it.
+    /// Opens the window to choose trunk ports (the interfaces come from
+    /// the daemon, with the tunnels that run over each).
     fn open_ports(&mut self, target: PortTarget, fx: &mut Vec<Effect>) {
         let Some(draft) = &self.draft else {
             self.not_configured();
             return;
         };
-        let network = &draft.network;
-        let me = draft.local.self_name.as_deref().unwrap_or_default();
-        let peers: Vec<&wanderlan_core::config::Site> = if network.site(me).is_some() {
-            topology::tunnels_for(network, me)
-                .into_iter()
-                .map(|t| t.peer)
-                .collect()
-        } else {
-            network.sites.iter().filter(|s| s.name != me).collect()
-        };
-        let mut by_interface: BTreeMap<String, Vec<&str>> = BTreeMap::new();
-        for peer in peers {
-            if let Some(interface) = (self.route_of)(peer.address) {
-                by_interface
-                    .entry(interface)
-                    .or_default()
-                    .push(peer.name.as_str());
-            }
-        }
-        let leads = by_interface
-            .into_iter()
-            .map(|(interface, names)| {
-                let text = match names.as_slice() {
-                    [a] => (*a).to_string(),
-                    [a, b] => format!("{a}, {b}"),
-                    [a, b, rest @ ..] => format!("{a}, {b} and {} more", rest.len()),
-                    [] => String::new(),
-                };
-                (interface, text)
-            })
-            .collect();
-        self.modal = Some(Modal::Ports(PortPicker::new(target, draft, leads)));
+        self.modal = Some(Modal::Ports(PortPicker::new(target, draft)));
         self.request_interfaces(fx);
     }
 

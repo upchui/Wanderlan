@@ -1,6 +1,6 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 582
+assertion_line: 596
 expression: render(&app)
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
@@ -13,7 +13,7 @@ expression: render(&app)
 "│ ┌ Trunk ports of the tunnel to haus2 ──────────────────────────────────────┐ █"
 "│R│    #  INTERFACE       KIND      STATE MTU   NOTE                         │ █"
 "│ │[ ]    br-lan          bridge    up    1500  a bridge                     │ █"
-"│ │[ ]    ens18           physical  up    1500                               │ █"
+"│ │[ ]    ens18           physical  up    1500  tunnels to buero             │ █"
 "│ │[ ]    ens19           physical  up    1500  in the default trunk         │ █"
 "│ │[ ]    eth1            physical  down  1500  in br-lan                    │ █"
 "│T│ other:                   an interface that is not there yet              │ █"
