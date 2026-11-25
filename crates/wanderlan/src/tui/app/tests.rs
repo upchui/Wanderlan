@@ -527,9 +527,8 @@ fn picker(app: &App) -> &PortPicker {
 fn a_tunnel_gets_its_own_trunk_in_the_settings() {
     let mut app = connected();
     app.update(ch('7'));
-    // The fixed settings come first, then who may rename this site, then
-    // one row per tunnel (buero, haus2, ...).
-    app.settings_selected = crate::tui::ui::settings::ROWS.len() + 2;
+    // The fixed settings come first, then one row per tunnel (buero, haus2, ...).
+    app.settings_selected = crate::tui::ui::settings::ROWS.len() + 1;
     let fx = app.update(key(KeyCode::Enter));
     assert!(
         requests(&fx).contains(&&Request::Interfaces),

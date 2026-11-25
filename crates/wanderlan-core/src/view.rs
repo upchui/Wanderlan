@@ -250,7 +250,6 @@ mod tests {
             online: true,
             managed_by: uplink.map(Into::into),
             self_managed: true,
-            rename_by_manager: false,
             uplink: uplink.map(Into::into),
         }
     }
@@ -499,20 +498,22 @@ mod tests {
     }
 
     #[test]
-    fn a_client_renames_its_own_client_only_with_its_consent() {
+    fn a_client_renames_its_own_client_if_it_manages_it() {
+        // x is a client of marcel and managed by it.
         let network = full();
         let mut view = view_for(&network, "marcel");
         view.rename_site("x", "x2");
         view.revision += 1;
-        let err = merge(&network, &view, "marcel").unwrap_err();
-        assert!(err.contains("may not rename site \"x\""), "{err}");
-        let mut allowing = network.clone();
-        allowing.sites[4].rename_by_manager = true;
-        let mut view = view_for(&allowing, "marcel");
+        let merged = merge(&network, &view, "marcel").unwrap();
+        assert!(merged.network.site("x2").is_some());
+        // Managed by another site: not by marcel.
+        let mut other = network.clone();
+        other.sites[4].managed_by = Some("alex".into());
+        let mut view = view_for(&other, "marcel");
         view.rename_site("x", "x2");
         view.revision += 1;
-        let merged = merge(&allowing, &view, "marcel").unwrap();
-        assert!(merged.network.site("x2").is_some());
+        let err = merge(&other, &view, "marcel").unwrap_err();
+        assert!(err.contains("may not rename site \"x\""), "{err}");
     }
 
     #[test]

@@ -1,8 +1,8 @@
 # shellcheck shell=bash
 # Renaming sites: a client renames itself (also a restricted one), its
-# manager only with its consent, a server renames itself. Every site
-# follows: the network, local.toml (self, the trunk per tunnel), the tunnels,
-# and the sync settles without loops.
+# manager (managed_by) renames it, other sites may not, a server renames
+# itself. Every site follows: the network, local.toml (self, the trunk per
+# tunnel), the tunnels, and the sync settles without loops.
 
 names() { jqs "$1" '[.sites[].name] | sort | join(" ")'; }
 revisions() { for s in site1 site2 site3 site4 site5; do jqs "$s" .revision; done | sort -u | wc -l; }
@@ -44,38 +44,18 @@ else
 fi
 expect_ping c-site5 10.20.0.1 "VLAN 20: lab5 reaches site1's client"
 
-begin "Rename: the manager needs the consent of the site"
+begin "Rename: its manager renames it, other sites may not"
 
-out=$(x "$manager" "wanderlan rename lab5 lab6 --confirm" 2>&1)
-if grep -q 'only "lab5" itself may' <<<"$out"; then
-  pass "its manager $manager may not rename lab5 (no consent)"
-else
-  fail "unexpected output when $manager renames lab5: $out"
-fi
-check "lab5 is still lab5" test "$(names site1)" = "lab5 site1 site2 site3 site4"
-out=$(x "$manager" "wanderlan manage lab5 --rename-by-manager yes --confirm" 2>&1)
-if grep -q 'only "lab5" itself decides' <<<"$out"; then
-  pass "only lab5 itself decides whether its manager may rename it"
-else
-  fail "unexpected output when $manager allows itself to rename lab5: $out"
-fi
-out=$(x site5 "wanderlan manage lab5 --rename-by-manager yes --confirm" 2>&1)
-if grep -q 'its manager may rename it' <<<"$out"; then
-  pass "lab5 allows its manager to rename it"
-else
-  fail "unexpected output of wanderlan manage --rename-by-manager: $out"
-fi
-wait_for 30 "$manager sees the consent" \
-  x "$manager" "grep -A8 '^\[site.lab5\]' /etc/wanderlan/network.toml | grep -q 'rename_by_manager = true'"
 out=$(x "$other" "wanderlan rename lab5 lab7 --confirm" 2>&1)
-if grep -q "only \"lab5\" itself and its manager \"$manager\" may" <<<"$out"; then
-  pass "$other (not its manager) still may not rename lab5"
+if grep -q "\"lab5\" itself and its manager \"$manager\" may" <<<"$out"; then
+  pass "$other (not its manager) may not rename lab5"
 else
   fail "unexpected output when $other renames lab5: $out"
 fi
+check "lab5 is still lab5" test "$(names site1)" = "lab5 site1 site2 site3 site4"
 out=$(x "$manager" "wanderlan rename lab5 site5 --confirm" 2>&1)
 if grep -q 'Site "lab5" is called "site5"' <<<"$out"; then
-  pass "$manager renames lab5 back to site5"
+  pass "its manager $manager renames lab5 back to site5"
 else
   fail "unexpected output when $manager renames lab5: $out"
 fi
@@ -84,10 +64,6 @@ wait_for 30 "site5 follows: self = site5 in its local.toml" \
 wait_eq 30 "site5 knows itself as site5" "site1 site5" names site5
 wait_eq 30 "all sites have the same revision" 1 revisions
 expect_ping c-site5 10.20.0.1 "VLAN 20: site5 reaches site1's client again"
-out=$(x site5 "wanderlan manage site5 --rename-by-manager no --confirm" 2>&1)
-check "site5 withdraws its consent" grep -q 'only it may rename itself' <<<"$out"
-wait_for 30 "$manager sees the consent withdrawn" \
-  x "$manager" "! grep -q 'rename_by_manager' /etc/wanderlan/network.toml"
 
 begin "Rename: a server renames itself; the others and their trunks follow"
 

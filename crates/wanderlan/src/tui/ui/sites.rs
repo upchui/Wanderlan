@@ -51,12 +51,24 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         "TUNNEL",
     ])
     .style(theme::header());
+    // A renamed site (the same address under a new name) is changed, not
+    // new; its old name is not removed.
+    let renamed = running.map_or_else(Vec::new, |m| {
+        wanderlan_core::rename::renames(m, &draft.network)
+    });
+    let old_name = |name: &str| -> String {
+        renamed
+            .iter()
+            .find(|(_, new)| new == name)
+            .map_or_else(|| name.to_string(), |(old, _)| old.clone())
+    };
     let order = app.visible_sites();
     let rows: Vec<Row> = order
         .iter()
         .filter_map(|(i, depth)| draft.network.sites.get(*i).map(|s| (*i, *depth, s)))
         .map(|(i, depth, site)| {
-            let marker = match running.and_then(|m| m.site(&site.name)) {
+            let before = old_name(&site.name);
+            let marker = match running.and_then(|m| m.site(&before)) {
                 None => Span::styled("+", theme::ok()),
                 Some(old) if old != site => Span::styled("*", theme::warn()),
                 Some(_) => Span::raw(" "),
@@ -66,7 +78,7 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
             } else if Some(site.name.as_str()) == own {
                 ("this site".to_string(), theme::bold())
             } else {
-                match app.peer(&site.name) {
+                match app.peer(&before) {
                     Some(peer) => (port_state(peer.port_state).to_string(), health_style(peer)),
                     None => {
                         match own.and_then(|me| topology::via(&draft.network, me, &site.name)) {
@@ -105,6 +117,7 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         m.sites
             .iter()
             .filter(|s| draft.network.site(&s.name).is_none())
+            .filter(|s| !renamed.iter().any(|(old, _)| *old == s.name))
             .count()
     });
     let mut title = format!(" Sites (draft): {} ", draft.network.sites.len());

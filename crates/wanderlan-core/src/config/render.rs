@@ -111,9 +111,6 @@ pub fn render_network(network: &Network) -> String {
             if site.self_managed {
                 out.push_str("self_managed = true\n");
             }
-            if site.rename_by_manager {
-                out.push_str("rename_by_manager = true\n");
-            }
             if !site.online {
                 out.push_str("online = false\n");
             }
@@ -217,10 +214,6 @@ fn render_network_inner(network: &Network, with_revision: bool) -> String {
         }
         if site.self_managed {
             out.push_str("self_managed = true\n");
-        }
-        // Only when set: otherwise the form older sites read stays as it was.
-        if site.rename_by_manager {
-            out.push_str("rename_by_manager = true\n");
         }
         match &site.uplink {
             Some(up) => {

@@ -60,9 +60,9 @@ pub enum Rejection {
     /// This site is not part of it.
     #[error("the received configuration does not contain this site (\"{0}\")")]
     SelfMissing(String),
-    /// Another site renamed this one, which it does not allow.
+    /// Another site renamed this one, which only its manager may.
     #[error(
-        "the received configuration renames this site (\"{0}\") to \"{1}\", which it does not allow (only it may rename itself, unless it allows its manager to)"
+        "the received configuration renames this site (\"{0}\") to \"{1}\", but only it and its manager may rename it, and it has none"
     )]
     RenamedWithoutConsent(String, String),
 }
@@ -86,9 +86,14 @@ pub fn accept(
     if let Some(previous) = previous {
         let me = local.self_name.clone().unwrap_or_default();
         let renamed = crate::rename::renames(previous, &received);
+        // Only its manager may rename it (see `policy::may_rename`).
+        let manager_may = previous
+            .site(&me)
+            .and_then(|s| crate::policy::manager(previous, s))
+            .is_some_and(|m| m != me && crate::policy::may_rename(previous, &me, m));
         if let Some((_, new)) = renamed.iter().find(|(old, _)| *old == me)
             && !taken_back
-            && !previous.site(&me).is_some_and(|s| s.rename_by_manager)
+            && !manager_may
         {
             return Err(Rejection::RenamedWithoutConsent(me, new.clone()));
         }
@@ -195,7 +200,8 @@ mod tests {
         let cfg = accept(received, &local, Some(&previous), false).unwrap();
         assert!(cfg.local.tunnel_trunks.contains_key("home"));
         assert!(!cfg.local.tunnel_trunks.contains_key("heim"));
-        // This site renamed by another: only if it allows it.
+        // This site renamed by another: only if it has a manager (haus2 has
+        // none in the example).
         let mut received = previous.clone();
         received.rename_site("haus2", "h2");
         assert_eq!(
@@ -204,14 +210,18 @@ mod tests {
         );
         let cfg = accept(received.clone(), &local, Some(&previous), true).unwrap();
         assert_eq!(cfg.local.self_name.as_deref(), Some("h2"), "taken back");
-        let mut allowing = previous.clone();
-        allowing
+        let mut managed = previous.clone();
+        managed
             .sites
             .iter_mut()
             .find(|s| s.name == "haus2")
             .unwrap()
-            .rename_by_manager = true;
-        let cfg = accept(received, &local, Some(&allowing), false).unwrap();
-        assert_eq!(cfg.local.self_name.as_deref(), Some("h2"));
+            .managed_by = Some("heim".into());
+        let cfg = accept(received, &local, Some(&managed), false).unwrap();
+        assert_eq!(
+            cfg.local.self_name.as_deref(),
+            Some("h2"),
+            "managed by heim"
+        );
     }
 }

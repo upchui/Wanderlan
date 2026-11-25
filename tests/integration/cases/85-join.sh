@@ -257,8 +257,8 @@ wait_for 30 "site5 has no tunnel to the made-up site" x site5 "! ip link show gt
 begin "Sync: a new revision without new content is taken over silently"
 
 mark=$(daemon_log_lines site5)
-check "site1 lets only itself change site3" x site1 "wanderlan manage site3 --by site1 --confirm"
-check "and anyone again" x site1 "wanderlan manage site3 --anyone --confirm"
+check "site1 gives site3 own VLAN 99" x site1 "wanderlan own-vlans site3 99 --confirm"
+check "and takes it back" x site1 "wanderlan own-vlans site3 none --confirm"
 rev=$(jqs site1 .revision)
 wait_eq 60 "site5 has revision $rev too (site3 is not in its view)" "$rev" jqs site5 .revision
 applied=$(daemon_log_since site5 "$mark" | grep -c 'was applied' || true)

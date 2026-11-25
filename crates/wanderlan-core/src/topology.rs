@@ -279,7 +279,6 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
-            rename_by_manager: false,
             uplink: None,
         }
     }

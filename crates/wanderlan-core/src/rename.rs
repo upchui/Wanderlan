@@ -100,7 +100,6 @@ mod tests {
             online: true,
             managed_by: uplink.map(Into::into),
             self_managed: false,
-            rename_by_manager: false,
             uplink: uplink.map(Into::into),
         }
     }

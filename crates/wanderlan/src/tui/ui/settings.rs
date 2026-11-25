@@ -153,8 +153,6 @@ fn permissions(draft: &Draft) -> [(&'static str, String); 4] {
 pub enum Setting {
     /// One of [`ROWS`].
     Fixed(usize),
-    /// Whether the manager of this site may rename it.
-    Renaming,
     /// The trunk of the tunnel to a site (index in the network).
     TunnelTrunk(usize),
 }
@@ -163,10 +161,6 @@ pub enum Setting {
 pub fn settings(draft: Option<&Draft>) -> Vec<Setting> {
     let mut out: Vec<Setting> = (0..ROWS.len()).map(Setting::Fixed).collect();
     if let Some(d) = draft {
-        let me = d.local.self_name.as_deref().unwrap_or_default();
-        if d.network.site(me).is_some() {
-            out.push(Setting::Renaming);
-        }
         // Only the sites this site has a tunnel to.
         let me = d.local.self_name.as_deref().unwrap_or_default();
         let peers: Vec<String> = wanderlan_core::topology::tunnels_for(&d.network, me)
@@ -198,26 +192,9 @@ fn tunnel_trunk(draft: &Draft, site: &str) -> String {
     }
 }
 
-/// Who may rename this site, for display.
-fn renaming(draft: &Draft) -> String {
-    let me = draft.local.self_name.as_deref().unwrap_or_default();
-    let Some(site) = draft.network.site(me) else {
-        return "-".into();
-    };
-    match (
-        site.rename_by_manager,
-        policy::manager(&draft.network, site),
-    ) {
-        (false, _) => "this site only".into(),
-        (true, Some(m)) if m != me => format!("this site and its manager {m}"),
-        (true, _) => "this site and its manager (it has none)".into(),
-    }
-}
-
 fn help_text(draft: &Draft, setting: Option<Setting>) -> String {
     match setting {
         Some(Setting::Fixed(i)) => ROWS.get(i).map_or("", |r| r.help).to_string(),
-        Some(Setting::Renaming) => "Who may rename this site: it may always rename itself (Sites, N). Enter allows or forbids its manager (the site that invited it) to rename it too; only this site decides that.".to_string(),
         Some(Setting::TunnelTrunk(i)) => {
             let name = draft.network.sites.get(i).map_or("", |s| s.name.as_str());
             format!(
@@ -277,15 +254,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             Cell::from(Span::styled(value, theme::dim())),
         ]));
     }
-    if selectable.contains(&Setting::Renaming) {
-        if selected == Some(Setting::Renaming) {
-            selected_row = rows.len();
-        }
-        rows.push(Row::new(vec![
-            Cell::from("  Renamed by"),
-            Cell::from(renaming(draft)),
-        ]));
-    }
+
     rows.push(Row::new(vec![
         Cell::from(Span::styled("Trunk per tunnel", theme::header())),
         Cell::from(Span::styled(

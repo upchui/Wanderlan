@@ -141,19 +141,13 @@ pub enum Command {
     Manage {
         /// The site.
         site: String,
-        /// The managing site (default: the current one, or this site).
-        #[arg(long, conflicts_with = "anyone")]
-        by: Option<String>,
-        /// No manager: every site that is not managed by another may change it.
+        /// The managing site (default: the current one, or this site). It
+        /// may also rename the site.
         #[arg(long)]
-        anyone: bool,
+        by: Option<String>,
         /// Whether the site may change its own VLANs too (yes/no).
         #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
         self_managed: Option<bool>,
-        /// Whether its manager may rename it (yes/no); only the site itself
-        /// decides this.
-        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
-        rename_by_manager: Option<bool>,
         /// Confirm the change right away.
         #[arg(long)]
         confirm: bool,
@@ -457,51 +451,27 @@ pub async fn run(args: Args) -> Result<ExitCode> {
         Some(Command::Manage {
             site,
             by,
-            anyone,
             self_managed,
-            rename_by_manager,
             confirm,
         }) => {
             edit_site(&socket, &site, confirm, |entry, me| {
-                let before = (
-                    entry.managed_by.clone(),
-                    entry.self_managed,
-                    entry.rename_by_manager,
-                );
-                if let Some(v) = rename_by_manager {
-                    entry.rename_by_manager = v;
+                let before = (entry.managed_by.clone(), entry.self_managed);
+                let manager = by
+                    .or_else(|| entry.managed_by.clone())
+                    .unwrap_or_else(|| me.to_string());
+                entry.managed_by = Some(manager);
+                if let Some(v) = self_managed {
+                    entry.self_managed = v;
                 }
-                if anyone {
-                    entry.managed_by = None;
-                    entry.self_managed = false;
-                } else {
-                    let manager = by
-                        .or_else(|| entry.managed_by.clone())
-                        .unwrap_or_else(|| me.to_string());
-                    entry.managed_by = Some(manager);
-                    if let Some(v) = self_managed {
-                        entry.self_managed = v;
-                    }
-                }
-                let mut who = match (&entry.managed_by, entry.self_managed) {
+                let who = match (&entry.managed_by, entry.self_managed) {
                     (None, _) => "every site may change it".to_string(),
-                    (Some(m), false) => format!("only \"{m}\" may change it"),
-                    (Some(m), true) => {
-                        format!("\"{m}\" and \"{}\" itself may change it", entry.name)
-                    }
+                    (Some(m), false) => format!("only \"{m}\" may change and rename it"),
+                    (Some(m), true) => format!(
+                        "\"{m}\" and \"{}\" itself may change it, \"{m}\" may rename it",
+                        entry.name
+                    ),
                 };
-                who.push_str(if entry.rename_by_manager {
-                    "; its manager may rename it"
-                } else {
-                    "; only it may rename itself"
-                });
-                if before
-                    == (
-                        entry.managed_by.clone(),
-                        entry.self_managed,
-                        entry.rename_by_manager,
-                    )
-                {
+                if before == (entry.managed_by.clone(), entry.self_managed) {
                     Err(format!("Nothing to change: {who}."))
                 } else {
                     Ok(format!("{}: {who}", entry.name))

@@ -1,0 +1,28 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+expression: screen
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+"┌ Sites (draft): 6 ────────────────────────────────────────────────────────────┐"
+"│  NAME         ADDRESS         VLANS     ROLE            MANAGED BY TUNNEL    │"
+"│  heim         10.8.0.1        10-50     server          anyone     this site │"
+"│  └ haus6      10.8.0.16       10-50     client of heim  buero      offline   │"
+"│  buero        10.8.0.2        10-50     server          anyone     up        │"
+"│  haus2        10.8.0.11       20,30     server          anyone     BLOCKED   │"
+"│* hausx        10.8.0.12       10-50     server          anyone     up        │"
+"│  haus5        10.8.0.15       10-50     server          anyone     up        │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+" heim: server; changed by anyone (Enter: details, e: edit).                     "
+"                                                                                "
+"                                                                                "
+"                                    1 blocked (see 1)  draft: 1 change  heim r7 "
+" Enter  details   e  edit   n  new   a  apply   x  discard   ?  help   q  quit  "

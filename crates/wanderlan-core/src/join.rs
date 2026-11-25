@@ -214,7 +214,6 @@ pub fn add_site(
         online: false,
         managed_by: Some(inviter.to_string()),
         self_managed: rules.allow_self,
-        rename_by_manager: false,
         // Plugged into the inviting site: its only tunnel leads there.
         uplink: Some(inviter.to_string()),
     });
@@ -345,7 +344,6 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
-            rename_by_manager: false,
             uplink: None,
         });
         network
@@ -463,7 +461,6 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
-            rename_by_manager: false,
             uplink: None,
         });
         let moved = add_site(&base, "site3", "site2", false, NEW, &none()).unwrap();
@@ -500,7 +497,6 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
-            rename_by_manager: false,
             uplink: Some("site2".into()),
         });
         let no_loop = add_site(&chain, "site4", "site2", false, NEW, &none()).unwrap();

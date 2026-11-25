@@ -190,10 +190,17 @@ impl Draft {
     /// sites, mappings, tunnel limits and local settings (an edited mapping
     /// or limit counts once).
     pub fn changes(&self, running: Option<&Running>) -> usize {
-        let Some(old) = running.and_then(|r| r.network.as_ref()) else {
+        let Some(before) = running.and_then(|r| r.network.as_ref()) else {
             return 0;
         };
         let new = &self.network;
+        // A rename is one change of its site; what names the site follows.
+        let renamed = wanderlan_core::rename::renames(before, new);
+        let mut base = before.clone();
+        for (from, to) in &renamed {
+            base.rename_site(from, to);
+        }
+        let old = &base;
         let settings = [
             old.vlans != new.vlans,
             old.control_port != new.control_port,
@@ -207,7 +214,9 @@ impl Draft {
         let sites = new
             .sites
             .iter()
-            .filter(|s| old.site(&s.name) != Some(*s))
+            .filter(|s| {
+                old.site(&s.name) != Some(*s) || renamed.iter().any(|(_, to)| *to == s.name)
+            })
             .count()
             + old
                 .sites

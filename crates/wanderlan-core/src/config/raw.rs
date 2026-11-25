@@ -717,12 +717,9 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
     let self_managed = lw
         .take(&FieldPath::site_field(i, "self_managed"), s.self_managed)
         .unwrap_or(false);
-    let rename_by_manager = lw
-        .take(
-            &FieldPath::site_field(i, "rename_by_manager"),
-            s.rename_by_manager,
-        )
-        .unwrap_or(false);
+    // Written by 1.0.22; renaming follows `managed_by` now.
+    let rename_path = FieldPath::site_field(i, "rename_by_manager");
+    let rename_by_manager = lw.take(&rename_path, s.rename_by_manager).is_some();
     // `uplink = ""` marks a server explicitly.
     let uplink_given = s.uplink.is_some();
     let uplink = lw
@@ -743,6 +740,14 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
                 ),
             );
         }
+    }
+    if rename_by_manager {
+        lw.warning(
+            rename_path,
+            format!(
+                "{label}: `rename_by_manager` is no longer used and is ignored; its manager (`managed_by`) may rename it"
+            ),
+        );
     }
     let name = lw.required(name_path, name, &format!("{label}: name"));
     let vlans = vlans.and_then(|v| match v {
@@ -788,7 +793,6 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
             online,
             managed_by,
             self_managed,
-            rename_by_manager,
             uplink,
         },
         uplink_given,

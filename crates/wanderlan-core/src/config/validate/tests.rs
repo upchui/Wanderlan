@@ -1020,3 +1020,23 @@ fn errors_in_format_2_name_the_line() {
     assert!(err.message.contains("is limited at both sites"), "{err}");
     assert_eq!(err.line, Some(line_of(&both, "[site.buero]", "heim = ")));
 }
+
+#[test]
+fn rename_by_manager_of_1_0_22_is_read_and_ignored() {
+    let text = edit(
+        EXAMPLE_NETWORK_2,
+        "[site.haus2]\naddress = \"10.8.0.11\"\n",
+        "[site.haus2]\naddress = \"10.8.0.11\"\nrename_by_manager = true\n",
+    );
+    let outcome = load(&text, EXAMPLE_LOCAL).expect("still loads");
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.message.contains("`rename_by_manager` is no longer used")),
+        "{:?}",
+        outcome.warnings
+    );
+    let network = parse_network(&text).unwrap().network.unwrap();
+    assert!(!render_network(&network).contains("rename_by_manager"));
+}

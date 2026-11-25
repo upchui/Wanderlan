@@ -204,8 +204,9 @@ impl Form {
             Some(s) => {
                 let manager = policy::manager(&draft.network, s).map(str::to_string);
                 let choices = changes_choices(manager.as_deref().unwrap_or(&me), &s.name);
+                // Without a manager yet: this site from now on.
                 let current = match (manager, s.self_managed) {
-                    (None, _) => ANY_SITE.to_string(),
+                    (None, _) => format!("only {me}"),
                     (Some(m), false) => format!("only {m}"),
                     (Some(m), true) => format!("{m} and {}", s.name),
                 };
@@ -243,16 +244,6 @@ impl Form {
                 &current,
             ),
             own_vlans_field(existing),
-            Field::choice(
-                "uplink",
-                "Connected to",
-                "a client has one tunnel, to its server; servers connect with each other",
-                connection_choices(draft, existing.map(|s| s.name.as_str())),
-                &match existing {
-                    Some(s) => connection_value(s.uplink.as_deref()),
-                    None => connection_value(Some(&me)),
-                },
-            ),
         ];
         Self::new(FormKind::Site(index), title, fields, draft)
     }
@@ -700,27 +691,26 @@ impl Form {
             FormKind::Site(index) => {
                 let site = self.parse_site()?;
                 let (managed_by, self_managed) = parse_changes(&self.value("changes"));
-                let uplink = parse_connection(&self.value("uplink"));
                 let own_vlans = self.parse_own_vlans()?;
                 match index.and_then(|i| candidate.network.sites.get_mut(i)) {
                     Some(slot) => {
                         let mut site = site;
                         site.online = slot.online;
-                        // Only the site itself decides this (Settings).
-                        site.rename_by_manager = slot.rename_by_manager;
                         site.managed_by = managed_by;
                         site.self_managed = self_managed;
-                        site.uplink = uplink;
+                        // Its role stays (`wanderlan role` changes it).
+                        site.uplink = slot.uplink.clone();
                         site.own_vlans = own_vlans;
                         let old = std::mem::replace(slot, site.clone());
                         if old.name != site.name {
                             candidate.rename_references(&old.name, &site.name);
                         }
                     }
+                    // A new site is a client of this one.
                     None => candidate.network.sites.push(Site {
                         managed_by,
                         self_managed,
-                        uplink,
+                        uplink: candidate.local.self_name.clone(),
                         own_vlans,
                         ..site
                     }),
@@ -869,7 +859,6 @@ impl Form {
             managed_by: candidate.local.self_name.clone(),
             uplink: candidate.local.self_name.clone(),
             self_managed: false,
-            rename_by_manager: false,
         });
         if let Some(shared) = native {
             candidate.network.maps.push(VlanMap {
@@ -932,7 +921,6 @@ impl Form {
             online: true,
             managed_by: None,
             self_managed: false,
-            rename_by_manager: false,
             uplink: None,
         })
     }
@@ -1113,51 +1101,18 @@ fn own_vlans_field(site: Option<&Site>) -> Field {
     )
 }
 
-/// The "Connected to" choice of a server.
-const SERVER: &str = "server (with the other servers)";
-
-/// Choices of the "Connected to" field: server, or client of another site.
-fn connection_choices(draft: &Draft, site: Option<&str>) -> Vec<String> {
-    let mut choices = vec![SERVER.to_string()];
-    choices.extend(
-        draft
-            .network
-            .sites
-            .iter()
-            .filter(|s| Some(s.name.as_str()) != site)
-            .map(|s| format!("client of {}", s.name)),
-    );
-    choices
-}
-
-fn connection_value(uplink: Option<&str>) -> String {
-    uplink.map_or_else(|| SERVER.to_string(), |u| format!("client of {u}"))
-}
-
-/// The uplink from a "Connected to" choice.
-fn parse_connection(value: &str) -> Option<String> {
-    value.strip_prefix("client of ").map(str::to_string)
-}
-
-/// The "Changes" choice that lets every site change a site.
-const ANY_SITE: &str = "any site";
-
-/// Choices of the "Changes" field of a site: only its manager, the manager
-/// and the site itself, or every site.
+/// Choices of the "Changes" field of a site: only its manager, or the
+/// manager and the site itself.
 fn changes_choices(manager: &str, site: &str) -> Vec<String> {
     let mut choices = vec![format!("only {manager}")];
     if manager != site {
         choices.push(format!("{manager} and {site}"));
     }
-    choices.push(ANY_SITE.to_string());
     choices
 }
 
 /// `managed_by` and `self_managed` from a "Changes" choice.
 fn parse_changes(value: &str) -> (Option<String>, bool) {
-    if value == ANY_SITE {
-        return (None, false);
-    }
     if let Some(manager) = value.strip_prefix("only ") {
         return (Some(manager.to_string()), false);
     }
@@ -1202,7 +1157,7 @@ mod tests {
         let form = Form::site(&d, None);
         assert_eq!(
             form.fields.iter().map(|f| f.key).collect::<Vec<_>>(),
-            ["name", "address", "vlans", "changes", "own_vlans", "uplink"]
+            ["name", "address", "vlans", "changes", "own_vlans"]
         );
         assert_eq!(form.value("changes"), "only heim", "managed by this site");
         // Empty required fields are errors, but hidden until touched.
@@ -1229,17 +1184,20 @@ mod tests {
         assert_eq!(form.value("changes"), "only buero");
         assert_eq!(
             changes_choices("buero", "haus6"),
-            ["only buero", "buero and haus6", "any site"]
+            ["only buero", "buero and haus6"]
         );
         let heim = Form::site(&d, Some(0));
-        assert_eq!(heim.value("changes"), "any site", "no manager yet");
-        assert_eq!(changes_choices("heim", "heim"), ["only heim", "any site"]);
+        assert_eq!(
+            heim.value("changes"),
+            "only heim",
+            "no manager yet: this site"
+        );
+        assert_eq!(changes_choices("heim", "heim"), ["only heim"]);
         assert_eq!(parse_changes("only buero"), (Some("buero".into()), false));
         assert_eq!(
             parse_changes("buero and haus6"),
             (Some("buero".into()), true)
         );
-        assert_eq!(parse_changes("any site"), (None, false));
         // A new site: managed by this site unless chosen otherwise.
         let mut form = Form::site(&d, None);
         type_text(&mut form, &d, "neu");
@@ -1252,7 +1210,7 @@ mod tests {
     }
 
     #[test]
-    fn the_connected_to_field_makes_servers_and_clients() {
+    fn a_new_site_is_a_client_of_this_site_and_an_edit_keeps_the_role() {
         let d = draft();
         let haus6 = d
             .network
@@ -1260,19 +1218,19 @@ mod tests {
             .iter()
             .position(|s| s.name == "haus6")
             .unwrap();
-        let form = Form::site(&d, Some(haus6));
-        assert_eq!(form.value("uplink"), "client of heim");
-        let buero = Form::site(&d, Some(1));
-        assert_eq!(buero.value("uplink"), SERVER);
-        assert!(
-            !connection_choices(&d, Some("buero")).contains(&"client of buero".to_string()),
-            "never a client of itself"
-        );
-        assert_eq!(parse_connection(SERVER), None);
-        assert_eq!(parse_connection("client of heim"), Some("heim".into()));
-        // A new site is a client of this site unless chosen otherwise.
+        assert!(Form::site(&d, Some(haus6)).field("uplink").is_none());
+        // Editing keeps the role: haus6 a client of heim, buero a server.
+        for (index, uplink) in [(haus6, Some("heim")), (1, None)] {
+            let mut form = Form::site(&d, Some(index));
+            let name = d.network.sites[index].name.clone();
+            let candidate = form.submit(&d).unwrap();
+            assert_eq!(
+                candidate.network.site(&name).unwrap().uplink.as_deref(),
+                uplink
+            );
+        }
+        // A new site is a client of this site.
         let mut form = Form::site(&d, None);
-        assert_eq!(form.value("uplink"), "client of heim");
         type_text(&mut form, &d, "neu");
         press(&mut form, &d, KeyCode::Tab);
         type_text(&mut form, &d, "10.8.0.99");

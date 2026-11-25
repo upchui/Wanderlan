@@ -1340,33 +1340,6 @@ impl App {
         );
     }
 
-    /// Allows or forbids the manager of this site to rename it.
-    fn toggle_rename_by_manager(&mut self) {
-        let Some(draft) = &mut self.draft else { return };
-        let Some(me) = draft.local.self_name.clone() else {
-            return;
-        };
-        let manager = draft
-            .network
-            .site(&me)
-            .and_then(|s| policy::manager(&draft.network, s))
-            .filter(|m| *m != me)
-            .map(str::to_string);
-        let Some(site) = draft.network.sites.iter_mut().find(|s| s.name == me) else {
-            return;
-        };
-        site.rename_by_manager = !site.rename_by_manager;
-        let text = match (site.rename_by_manager, manager) {
-            (true, Some(m)) => {
-                format!("{m} may rename this site too once the draft is applied (a).")
-            }
-            (true, None) => "The manager of this site may rename it too once the draft is applied (a); it has none at the moment.".to_string(),
-            (false, _) => "Only this site may rename itself once the draft is applied (a).".to_string(),
-        };
-        draft.revalidate();
-        self.say(MessageKind::Info, text);
-    }
-
     /// True if this site may rename `site`; otherwise says why not.
     fn may_rename(&mut self, site: &str) -> bool {
         let Some(running) = self.running.as_ref().and_then(|r| r.network.as_ref()) else {
@@ -2673,7 +2646,6 @@ impl App {
                         form.focus_on(row.key);
                         self.modal = Some(Modal::Form(form));
                     }
-                    Some(Setting::Renaming) => self.toggle_rename_by_manager(),
                     Some(Setting::TunnelTrunk(site)) => {
                         let Some(name) = self
                             .draft

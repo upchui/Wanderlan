@@ -16,8 +16,9 @@
 //! manager that left the network can no longer decide: its sites are open
 //! again and no longer restricted.
 //!
-//! A site may always rename itself; its manager may rename it only if the
-//! site allows it (`rename_by_manager`, which only the site itself sets).
+//! A site may always rename itself. Another site may rename it only if it
+//! is its manager (`managed_by`) and may change it; a client never renames
+//! its server.
 //!
 //! Every wanderland checks this when a change is made on it (TUI, CLI,
 //! edited files). It is an agreement between the daemons, not a
@@ -194,26 +195,40 @@ fn restricted_reason(manager: &str) -> String {
     )
 }
 
-/// True if `editor` may rename `site`: the site itself always, its manager
-/// if the site allows it.
+/// True if `editor` may rename `site`: the site itself always; its manager
+/// (`managed_by`) if it may change it, so a client never renames its server.
 pub fn may_rename(network: &Network, site: &str, editor: &str) -> bool {
     site == editor
         || network
             .site(site)
-            .is_some_and(|s| s.rename_by_manager && manager(network, s) == Some(editor))
+            .is_some_and(|s| manager(network, s) == Some(editor) && may_change(network, s, editor))
+}
+
+/// Who may rename `site`, for displays: `"x" itself and "m"` or
+/// `only "x" itself`.
+pub fn renamers(network: &Network, site: &Site) -> String {
+    match manager(network, site).filter(|m| *m != site.name && may_change(network, site, m)) {
+        Some(m) => format!("\"{}\" itself and its manager \"{m}\"", site.name),
+        None => format!("only \"{}\" itself", site.name),
+    }
 }
 
 /// Why `editor` may not rename `site`; only meaningful if it may not.
 pub fn why_not_rename(network: &Network, site: &str, editor: &str) -> String {
-    match network.site(site) {
-        Some(s) if s.rename_by_manager => format!(
-            "this site (\"{editor}\") may not rename site \"{site}\": only \"{site}\" itself and its manager{} may",
-            manager(network, s).map_or_else(String::new, |m| format!(" \"{m}\""))
-        ),
-        _ => format!(
-            "this site (\"{editor}\") may not rename site \"{site}\": only \"{site}\" itself may (it does not allow its manager to rename it)"
-        ),
+    let who = network.site(site).map_or_else(
+        || format!("only \"{site}\" itself"),
+        |s| renamers(network, s),
+    );
+    if let Some(up) = client_of(network, editor)
+        && network
+            .site(site)
+            .is_some_and(|s| s.uplink.as_deref() != Some(editor))
+    {
+        return format!(
+            "this site (\"{editor}\") is a client of \"{up}\": it may only rename itself and its own clients, not site \"{site}\" ({who} may)"
+        );
     }
+    format!("this site (\"{editor}\") may not rename site \"{site}\": {who} may")
 }
 
 /// Checks that `editor` only changes what it may: renames (a site with the
@@ -241,18 +256,6 @@ pub fn check_edit(old: &Network, new: &Network, editor: &str) -> Result<(), Stri
 
 /// [`check_edit`] for two networks with the same names.
 fn check_changes(old: &Network, new: &Network, editor: &str) -> Result<(), String> {
-    // Whether its manager may rename it: only the site itself.
-    for site in &old.sites {
-        if let Some(now) = new.site(&site.name)
-            && now.rename_by_manager != site.rename_by_manager
-            && editor != site.name
-        {
-            return Err(format!(
-                "this site (\"{editor}\") may not decide whether \"{}\" may be renamed by its manager: only \"{}\" itself decides that",
-                site.name, site.name
-            ));
-        }
-    }
     if old.vlans != new.vlans && !may_change_network_vlans(old, editor) {
         return Err(why_not_network(old, editor));
     }
@@ -321,7 +324,6 @@ mod tests {
             online: true,
             managed_by: managed_by.map(Into::into),
             self_managed,
-            rename_by_manager: false,
             uplink: None,
         }
     }
@@ -548,7 +550,7 @@ mod tests {
     }
 
     #[test]
-    fn a_site_renames_itself_its_manager_only_with_consent() {
+    fn a_site_renames_itself_its_manager_renames_it_a_client_never_its_server() {
         let mut old = network();
         // c (restricted) is a client of a and has a client e of its own.
         old.sites[2].uplink = Some("a".into());
@@ -563,37 +565,34 @@ mod tests {
             check_edit(&old, &renamed, "c").is_ok(),
             "its name is its own, also when restricted"
         );
-        let err = check_edit(&old, &renamed, "a").unwrap_err();
+        assert!(check_edit(&old, &renamed, "a").is_ok(), "its manager");
+        let err = check_edit(&old, &renamed, "b").unwrap_err();
         assert!(
-            err.contains("may not rename site \"c\": only \"c\" itself may"),
+            err.contains("\"c\" itself and its manager \"a\" may"),
             "{err}"
         );
-        // With its consent its manager may, another site still not.
-        let mut allowing = old.clone();
-        allowing.sites[2].rename_by_manager = true;
-        let mut renamed = allowing.clone();
-        renamed.rename_site("c", "c2");
-        assert!(check_edit(&allowing, &renamed, "a").is_ok());
-        let err = check_edit(&allowing, &renamed, "b").unwrap_err();
-        assert!(
-            err.contains("only \"c\" itself and its manager \"a\" may"),
-            "{err}"
-        );
+        // c manages its own client e.
+        let mut client = old.clone();
+        client.rename_site("e", "e2");
+        assert!(check_edit(&old, &client, "c").is_ok());
+        // A server without a manager: only itself.
+        let mut server = old.clone();
+        server.rename_site("b", "b2");
+        assert!(check_edit(&old, &server, "b").is_ok());
+        let err = check_edit(&old, &server, "a").unwrap_err();
+        assert!(err.contains("only \"b\" itself may"), "{err}");
+        // A client never renames its server, not even as its manager.
+        let mut odd = old.clone();
+        odd.sites[0].managed_by = Some("c".into());
+        let mut renamed = odd.clone();
+        renamed.rename_site("a", "a2");
+        let err = check_edit(&odd, &renamed, "c").unwrap_err();
+        assert!(err.contains("is a client of \"a\""), "{err}");
         // A rename and another change of the site at once: the change is
         // judged as always.
         let mut both = old.clone();
         both.rename_site("c", "c2");
         both.sites[2].vlans = Some(VlanSet::from_range(10, 20));
         assert!(check_edit(&old, &both, "c").is_err(), "c is restricted");
-    }
-
-    #[test]
-    fn only_the_site_itself_allows_its_manager_to_rename_it() {
-        let old = network();
-        let mut new = old.clone();
-        new.sites[2].rename_by_manager = true;
-        assert!(check_edit(&old, &new, "c").is_ok());
-        let err = check_edit(&old, &new, "a").unwrap_err();
-        assert!(err.contains("only \"c\" itself decides"), "{err}");
     }
 }

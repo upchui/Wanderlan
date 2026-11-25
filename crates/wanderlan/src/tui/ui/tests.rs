@@ -175,8 +175,8 @@ fn settings_trunk_per_tunnel() {
             .insert("haus2".into(), vec!["ens20".into()]);
     }
     key(&mut app, KeyCode::Char('7'));
-    // Down to "to haus2": the fixed rows, "Renamed by", buero, haus2.
-    for _ in 0..super::settings::ROWS.len() + 2 {
+    // Down to "to haus2": the fixed rows, then buero, then haus2.
+    for _ in 0..super::settings::ROWS.len() + 1 {
         key(&mut app, KeyCode::Down);
     }
     insta::assert_snapshot!(render(&app));
@@ -322,6 +322,19 @@ fn tunnel_vlans_form() {
     key(&mut app, KeyCode::Char('t'));
     key(&mut app, KeyCode::Enter);
     insta::assert_snapshot!(render(&app));
+}
+
+#[test]
+fn a_renamed_site_is_changed_not_new() {
+    let mut app = connected();
+    if let Some(d) = &mut app.draft {
+        d.rename_references("haus3", "hausx");
+        d.revalidate();
+    }
+    key(&mut app, KeyCode::Char('2'));
+    let screen = render(&app);
+    assert!(!screen.contains("removed"), "{screen}");
+    insta::assert_snapshot!(screen);
 }
 
 #[test]
@@ -615,7 +628,7 @@ fn trunk_ports_of_a_tunnel() {
     );
     key(&mut app, KeyCode::Char('7'));
     // "to haus2": the fixed rows, then buero, then haus2.
-    for _ in 0..super::settings::ROWS.len() + 2 {
+    for _ in 0..=super::settings::ROWS.len() {
         key(&mut app, KeyCode::Down);
     }
     key(&mut app, KeyCode::Enter);

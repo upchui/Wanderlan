@@ -38,11 +38,11 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 ### Renaming sites
 
 - A site can always rename itself, also a client that is restricted:
-  Sites (2), `N`, or `wanderlan rename <site> <new-name>`. Its manager may
-  rename it only if the site allows it (Settings, "Renamed by", or
-  `wanderlan manage <site> --rename-by-manager yes` on the site itself;
-  `rename_by_manager = true` in network.toml). Before, a client could not
-  rename itself at all, and its server could rename it without asking.
+  Sites (2), `N` (a window with only the new name), or `wanderlan rename
+  <site> <new-name>`. Its manager (`managed_by`, "Changes") may rename it
+  too; other sites may not, and a client never renames its server. Before,
+  a client could not rename itself at all. (`rename_by_manager` of 1.0.22
+  is read and ignored with a warning.)
 - The rename reaches every site: a renamed site is recognised by its
   address. The server takes over the new name of its client (also where
   others refer to it, e.g. `managed_by`), the client follows a rename by
@@ -53,8 +53,12 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 - Fix: after a site was renamed (or replaced by one with the same
   address), its old name kept answering for the address, so the renamed
   site was given an empty network and fetched it again every second.
-- A site that is renamed is checked like any other change: whoever may
-  not rename it gets "only <site> itself may".
+- A renamed site shows as changed (`*`) in the draft, not as a new site
+  and a removed one.
+- The site window no longer offers "any site" under "Changes" and has no
+  "Connected to" any more: a site added by hand is a client of this site,
+  an edit keeps the role (`wanderlan role` changes it). `wanderlan manage
+  --anyone` is gone too.
 
 ### A more readable network.toml
 
