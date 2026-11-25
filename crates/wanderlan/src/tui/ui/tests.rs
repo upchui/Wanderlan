@@ -325,6 +325,14 @@ fn tunnel_vlans_form() {
 }
 
 #[test]
+fn vlan_mappings_wide() {
+    // With room to spare, three spaces between the columns.
+    let mut app = connected();
+    key(&mut app, KeyCode::Char('3'));
+    insta::assert_snapshot!(render_size(&app, 120, 24));
+}
+
+#[test]
 fn edit_vlan_mapping_form() {
     // Site, then the source VLAN, then the mapped VLAN.
     let mut app = connected();

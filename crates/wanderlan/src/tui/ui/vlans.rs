@@ -254,13 +254,14 @@ fn draw_tunnels(frame: &mut Frame, app: &App, draft: &Draft, area: Rect, detail:
 }
 
 fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
+    // The marker of a change and the number share a column ("* 2").
+    let number_width = draft.network.maps.len().max(1).to_string().len();
     let header = Row::new(vec![
-        "",
-        "#",
-        "SITE",
-        "SOURCE VLAN",
-        "MAPPED VLAN",
-        "MEANING",
+        format!("  {:>number_width$}", "#"),
+        "SITE".into(),
+        "SOURCE VLAN".into(),
+        "MAPPED VLAN".into(),
+        "MEANING".into(),
     ])
     .style(theme::header());
     let running = app.running.as_ref().and_then(|r| r.network.as_ref());
@@ -303,8 +304,10 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
                 None => Span::raw(" "),
             };
             Row::new(vec![
-                Cell::from(marker),
-                Cell::from(format!("{}", i + 1)),
+                Cell::from(Line::from(vec![
+                    marker,
+                    Span::raw(format!(" {:>number_width$}", i + 1)),
+                ])),
                 marked(site_text(map), at("site")),
                 marked(map.shared.to_string(), at("shared")),
                 marked(map.local.to_string(), at("local")),
@@ -314,11 +317,13 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         })
         .collect();
     let empty = rows.is_empty();
-    // SITE as wide as its longest entry (with " !"), # as its largest number:
-    // the meaning ("source VLAN 1234 = VLAN 1234 at <site>") keeps the rest.
-    let site_width = shown
+    // SITE as wide as its longest entry (with " !"), # as its largest
+    // number, over all mappings (the columns stay put while filtering).
+    let site_width = draft
+        .network
+        .maps
         .iter()
-        .filter_map(|&i| draft.network.maps.get(i).map(|m| (i, m)))
+        .enumerate()
         .map(|(i, map)| {
             let mark = draft
                 .worst_at(&FieldPath::map_field(i, "site"))
@@ -328,10 +333,23 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         .max()
         .unwrap_or_default()
         .clamp(4, 21);
-    let number_width = draft.network.maps.len().max(1).to_string().len();
+    let meaning_width = draft
+        .network
+        .maps
+        .iter()
+        .map(|m| effect(m).chars().count())
+        .max()
+        .unwrap_or_default();
+    // Room between the columns: up to three spaces, as long as the longest
+    // meaning still fits (in 80 columns that leaves one).
+    let fixed = 2 + number_width + site_width + 11 + 11 + meaning_width;
+    let inner = usize::from(area.width.saturating_sub(2));
+    let spacing: u16 = (1..=3)
+        .rev()
+        .find(|&s| fixed + 4 * usize::from(s) <= inner)
+        .unwrap_or(1);
     let widths = [
-        Constraint::Length(1),
-        Constraint::Length(u16::try_from(number_width).unwrap_or(3)),
+        Constraint::Length(u16::try_from(2 + number_width).unwrap_or(5)),
         Constraint::Length(u16::try_from(site_width).unwrap_or(21)),
         Constraint::Length(11),
         Constraint::Length(11),
@@ -350,6 +368,7 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
     };
     let total = rows.len();
     let table = Table::new(rows, widths)
+        .column_spacing(spacing)
         .header(header)
         .block(titled(title))
         .row_highlight_style(theme::selected());
