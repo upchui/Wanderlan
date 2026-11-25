@@ -132,6 +132,15 @@ impl Validator {
                 ),
             );
         }
+        if network.tunnel_port() == network.control_port {
+            self.error(
+                FieldPath::network("tunnel_port"),
+                format!(
+                    "network.tunnel_port must differ from the control port ({})",
+                    network.control_port
+                ),
+            );
+        }
         if let Some(mss) = network.mss.filter(|m| !(MSS_MIN..=MSS_MAX).contains(m)) {
             self.error(
                 FieldPath::network("mss"),
@@ -174,7 +183,12 @@ impl Validator {
                     format!("site \"{name}\": {addr} is not a usable unicast address"),
                 );
             }
-            if let Some(other) = addresses.insert(addr, name) {
+            // Boxes with an identity are told apart by it: several clients
+            // behind one NAT share its address. Servers (and sites of older
+            // versions) need their own.
+            if let Some(other) = addresses.insert(addr, name)
+                && !shares_address(network, name, other)
+            {
                 self.error(
                     FieldPath::site_field(i, "address"),
                     format!("site \"{name}\": address {addr} is already used by site \"{other}\""),
@@ -564,6 +578,15 @@ fn is_managed_name(name: &str) -> bool {
     name.starts_with(GRETAP_PREFIX)
         || name == crate::BRIDGE_NAME
         || name.starts_with(crate::desired::SEGMENT_PREFIX)
+}
+
+/// True if two sites may have the same address: both have an identity and
+/// at least one of them is a client (behind the same NAT, say).
+fn shares_address(network: &Network, a: &str, b: &str) -> bool {
+    let (Some(a), Some(b)) = (network.site(a), network.site(b)) else {
+        return false;
+    };
+    a.id.is_some() && b.id.is_some() && (a.uplink.is_some() || b.uplink.is_some())
 }
 
 #[cfg(test)]

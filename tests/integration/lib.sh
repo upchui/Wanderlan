@@ -144,6 +144,17 @@ network_toml() {
   fi
 }
 
+# keyed <site>...: waits until each site has confirmed the identity of all
+# its peers (after a new network every site claims its identity; until the
+# claims have spread, the tunnels get their keys one by one).
+keyed() {
+  local s
+  for s in "$@"; do
+    wait_eq 90 "$s confirmed the identities of all its peers" true \
+      jqs "$s" '[.peers[] | .identity_state == "confirmed" and .port_state == "up"] | (length > 0 and all)'
+  done
+}
+
 # renew <network-file>: gives a previously generated network a new, higher revision
 # (reusing an old file would let the sync bring back a newer configuration).
 renew() {

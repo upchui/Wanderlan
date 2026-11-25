@@ -10,7 +10,9 @@
 #                                      software (Docker) needs them
 set -euo pipefail
 cd "$(dirname "$0")/.."
-MODULES=(bridge 8021q ip_gre gre sch_ingress cls_flower act_vlan act_gact nf_tables veth)
+MODULES=(bridge 8021q ip_gre gre fou sch_ingress cls_flower act_vlan act_gact nf_tables veth)
+# For the NAT router of the integration tests; built in on some kernels.
+NAT_MODULES=(nf_conntrack nf_nat nft_masq nft_chain_nat nft_ct)
 GRE=(ip_gre gre)
 
 modprobe_host() { # modprobe_host <modprobe arguments...>
@@ -36,3 +38,6 @@ if [ "${1:-}" = --unload ]; then
 fi
 modprobe_host -a "${MODULES[@]}"
 echo "loaded: ${MODULES[*]}"
+for module in "${NAT_MODULES[@]}"; do
+  modprobe_host "$module" 2>/dev/null || true
+done

@@ -38,6 +38,7 @@ use wanderlan_core::sync::{self, Version};
 use wanderlan_core::sys::linux::LinuxSystem;
 use wanderlan_core::sys::nft::NftOps as _;
 use wanderlan_core::sys::nft::PortDir;
+use wanderlan_core::sys::nft_ip::LearnOps as _;
 use wanderlan_core::sys::observe::ObserveOps as _;
 use wanderlan_core::sys::{LinkKind, NetOps as _};
 use wanderlan_core::topology::{self, ForwardingKey, GRETAP_PREFIX, TunnelKind};
@@ -49,6 +50,7 @@ use crate::events::EventLog;
 use crate::fdb_guard::{self, LoopReport, PortMap};
 use crate::files::Paths;
 use crate::invites::{Invite, Invites};
+use crate::keepalive;
 use crate::probe::{self, Me, PeerKeys, ProbeConfig, ProbeEvent, ProbeTable};
 use crate::stats::{self, Rates, VlanRates};
 use crate::sync_net::{self, Offer};
@@ -63,6 +65,8 @@ const GRACE: Duration = Duration::from_secs(300);
 const FETCH_BACKOFF: Duration = Duration::from_secs(30);
 /// How long a rejected configuration is not fetched again.
 const REJECT_TTL: Duration = Duration::from_secs(600);
+/// How long a client waits after a push that failed (no answer).
+const PUSH_RETRY: Duration = Duration::from_secs(5);
 /// How long a client waits for its uplink to take over a change before it
 /// asks whether the uplink refused it.
 const RESYNC_AFTER: Duration = Duration::from_secs(15);
@@ -154,6 +158,23 @@ pub enum Input {
         /// Where to send the answer.
         reply: oneshot::Sender<JoinReply>,
     },
+    /// A client pushed its network (it is never fetched from: it may be
+    /// behind NAT).
+    SyncPush {
+        /// The client.
+        peer: String,
+        /// Its network.
+        text: String,
+        /// Where the decision goes.
+        reply: oneshot::Sender<sync_net::PushAnswer>,
+    },
+    /// The uplink answered a push of this site's network.
+    Pushed {
+        /// The uplink.
+        peer: String,
+        /// The answer, or why there is none.
+        result: Result<sync_net::PushAnswer, String>,
+    },
     /// The inviting site answered our join request.
     JoinAnswer {
         /// What the user asked for.
@@ -165,6 +186,13 @@ pub enum Input {
     },
 }
 
+/// Exists while connection tracking is loaded (in this network namespace).
+const CONNTRACK_MAX: &str = "/proc/sys/net/netfilter/nf_conntrack_max";
+/// How often the learned client endpoints are read while one is missing.
+const LEARN_WAITING: Duration = Duration::from_secs(2);
+/// How often once all are known (a NAT that rebinds is noticed with the
+/// next keepalive, then within this time).
+const LEARN_KNOWN: Duration = Duration::from_secs(10);
 /// A site that answered probes within this time (three probe rounds)
 /// counts as running: a join does not take over its entry.
 const ALIVE_WINDOW: Duration = Duration::from_secs(15);
@@ -267,6 +295,19 @@ struct Controller {
     keyring: Option<Keyring>,
     /// The keys towards the direct peers whose identity is known.
     peer_keys: BTreeMap<String, PeerKeys>,
+    /// Where the control traffic of the clients comes from (confirmed by a
+    /// challenge): the address their tunnel packets must come from too.
+    control_endpoints: BTreeMap<String, SocketAddrV4>,
+    /// When to read the learned tunnel endpoints of the clients next.
+    learn_next: Instant,
+    /// A push to the uplink is running.
+    pushing: bool,
+    /// After a failed push: not before then again.
+    push_retry_at: Instant,
+    /// The fingerprint of the network last pushed to the uplink.
+    pushed: Option<String>,
+    /// The tunnels this site sends keepalives through.
+    keepalive: watch::Sender<keepalive::Keepalives>,
 }
 
 /// Runs the daemon until SIGTERM or SIGINT.
@@ -284,6 +325,7 @@ pub async fn run(args: Args) -> Result<()> {
     let probes: ProbeTable = Arc::new(RwLock::new(BTreeMap::new()));
     let (offer_tx, offer_rx) = watch::channel(Offer::default());
     let (ports_tx, ports_rx) = watch::channel(PortMap::default());
+    let (keepalive_tx, keepalive_rx) = watch::channel(keepalive::Keepalives::default());
     let rates: Rates = Arc::new(RwLock::new(BTreeMap::new()));
     let vlan_rates: VlanRates = Arc::new(RwLock::new(stats::VlanTraffic::default()));
 
@@ -293,6 +335,7 @@ pub async fn run(args: Args) -> Result<()> {
             probe::spawn(probe_rx, probes.clone(), probe_event_tx),
         ),
         ("sync", sync_net::spawn(offer_rx, inputs_tx.clone())),
+        ("keepalive", keepalive::spawn(keepalive_rx)),
         (
             "statistics",
             stats::spawn(sys.clone(), rates.clone(), vlan_rates.clone()),
@@ -356,6 +399,12 @@ pub async fn run(args: Args) -> Result<()> {
         identity: None,
         keyring: None,
         peer_keys: BTreeMap::new(),
+        control_endpoints: BTreeMap::new(),
+        learn_next: Instant::now(),
+        pushing: false,
+        push_retry_at: Instant::now(),
+        pushed: None,
+        keepalive: keepalive_tx,
     };
     ctl.startup();
     ctl.seed_measurements().await;
@@ -791,6 +840,27 @@ impl Controller {
                     .insert(peer.clone(), PeerIdentity::Confirmed);
             }
         }
+        // A client tunnel that ran keeps its endpoint until the next
+        // keepalive tells otherwise.
+        let clients: Vec<String> = self.config.as_ref().map_or_else(Vec::new, |cfg| {
+            topology::tunnels_for(&cfg.network, cfg.self_name())
+                .into_iter()
+                .filter(|t| t.kind == TunnelKind::Client)
+                .map(|t| t.peer.name.clone())
+                .collect()
+        });
+        for peer in clients {
+            if let Some(link) = actual.links.get(&topology::gretap_name(&peer))
+                && link.admin_up
+                && let LinkKind::Gretap(p) = link.kind
+                && let Some(encap) = p.encap
+                && self.runtime.identity.get(&peer) == Some(&PeerIdentity::Confirmed)
+            {
+                self.runtime
+                    .endpoints
+                    .insert(peer, SocketAddrV4::new(p.remote, encap.dport));
+            }
+        }
     }
 
     /// Loads and validates the files; logs problems.
@@ -1004,9 +1074,27 @@ impl Controller {
             })
             .map(|(n, (a, _))| (n.clone(), *a))
             .collect();
+        // A client listens on every address: behind NAT the address in the
+        // network (its NAT's) is not its own. A server on its address.
         let bind = self.config.as_ref().and_then(|cfg| {
-            cfg.self_site()
-                .map(|s| SocketAddrV4::new(s.address, cfg.network.control_port))
+            cfg.self_site().map(|s| {
+                let ip = if s.uplink.is_some() {
+                    Ipv4Addr::UNSPECIFIED
+                } else {
+                    s.address
+                };
+                SocketAddrV4::new(ip, cfg.network.control_port)
+            })
+        });
+        // The clients with a key are never contacted first: they come.
+        let passive: BTreeSet<String> = self.config.as_ref().map_or_else(BTreeSet::new, |cfg| {
+            topology::tunnels_for(&cfg.network, cfg.self_name())
+                .into_iter()
+                .filter(|t| {
+                    t.kind == TunnelKind::Client && self.peer_keys.contains_key(&t.peer.name)
+                })
+                .map(|t| t.peer.name.clone())
+                .collect()
         });
         let version = |m: &Network| Announce {
             revision: m.revision,
@@ -1016,6 +1104,7 @@ impl Controller {
         // site (and a removed site) only its own view of the network.
         let mut announce_to = BTreeMap::new();
         let mut views = BTreeMap::new();
+        let mut texts: BTreeMap<String, String> = BTreeMap::new();
         let mut expected = BTreeMap::new();
         let announce = match &self.confirmed {
             None => Announce::default(),
@@ -1040,8 +1129,10 @@ impl Controller {
                             ),
                             None => render_network_wire(&v),
                         };
+                        texts.insert(name.clone(), text.clone());
                         views.insert(*addr, text);
                     } else {
+                        texts.insert(name.clone(), own.clone());
                         views.insert(*addr, own.clone());
                     }
                 }
@@ -1065,8 +1156,16 @@ impl Controller {
             announce_to,
             me: self.identity.clone().map(Me),
             keys: self.peer_keys.clone(),
+            passive,
         });
         let addresses = self.direct_peers();
+        let clients: BTreeSet<String> = self.config.as_ref().map_or_else(BTreeSet::new, |cfg| {
+            topology::tunnels_for(&cfg.network, cfg.self_name())
+                .into_iter()
+                .filter(|t| t.kind == TunnelKind::Client)
+                .map(|t| t.peer.name.clone())
+                .collect()
+        });
         let keyed = self
             .peer_keys
             .iter()
@@ -1075,7 +1174,10 @@ impl Controller {
                 Some((
                     k.id,
                     sync_net::Keyed {
+                        name: name.clone(),
                         address,
+                        client: clients.contains(name),
+                        view: Arc::from(texts.get(name)?.as_str()),
                         keys: k.keys.clone(),
                     },
                 ))
@@ -1086,6 +1188,23 @@ impl Controller {
             views: Arc::new(views),
             me: self.own_id(),
             keyed: Arc::new(keyed),
+        });
+        // Keepalives through the tunnel to the uplink when it runs in UDP.
+        let interfaces: Vec<String> = self.config.as_ref().map_or_else(Vec::new, |cfg| {
+            topology::tunnels_for(&cfg.network, cfg.self_name())
+                .into_iter()
+                .filter(|t| {
+                    t.kind == TunnelKind::Uplink && self.peer_keys.contains_key(&t.peer.name)
+                })
+                .map(|t| t.ifname())
+                .collect()
+        });
+        let fingerprint = self.own_id().map(|id| id.fingerprint()).unwrap_or_default();
+        self.keepalive.send_if_modified(|k| {
+            let changed = k.interfaces != interfaces || k.fingerprint != fingerprint;
+            k.interfaces = interfaces;
+            k.fingerprint = fingerprint;
+            changed
         });
     }
 
@@ -1132,6 +1251,11 @@ impl Controller {
             Input::Probe(ProbeEvent::Identity { peer, state }) => {
                 self.peer_identity(&peer, state).await;
             }
+            Input::Probe(ProbeEvent::Endpoint { peer, addr }) => {
+                self.control_endpoints.insert(peer, addr);
+                // Its tunnel packets come from the same NAT: look at once.
+                self.learn_next = Instant::now();
+            }
             Input::Probe(ProbeEvent::Announce { peer, announce }) => {
                 debug!(
                     "Peer \"{peer}\" announces network revision {}",
@@ -1140,6 +1264,11 @@ impl Controller {
                 self.maybe_sync();
             }
             Input::Fetched { peer, mode, result } => self.fetched(peer, mode, result).await,
+            Input::SyncPush { peer, text, reply } => {
+                let answer = self.pushed_to_us(&peer, text).await;
+                let _ = reply.send(answer);
+            }
+            Input::Pushed { peer, result } => self.push_answered(&peer, result),
             Input::Loop(report) => {
                 if self.runtime.blocked.insert(report.port.clone()) {
                     let peer = report.port.strip_prefix(GRETAP_PREFIX).map(str::to_string);
@@ -1168,11 +1297,13 @@ impl Controller {
             .get(peer)
             .map_or_else(String::new, ToString::to_string);
         match state {
-            PeerIdentity::Confirmed => self.events.emit(
-                Level::Info,
-                Some(peer),
-                format!("Site \"{peer}\" proved its identity; its tunnel may come up"),
-            ),
+            PeerIdentity::Confirmed => {
+                self.events.emit(
+                    Level::Info,
+                    Some(peer),
+                    format!("Site \"{peer}\" proved its identity; its tunnel may come up"),
+                );
+            }
             PeerIdentity::WrongKey => self.events.emit(
                 Level::Warn,
                 Some(peer),
@@ -1183,6 +1314,11 @@ impl Controller {
             PeerIdentity::Waiting => {}
         }
         self.reconcile().await;
+        // The tunnel to the uplink just came up: its keepalive at once, so
+        // that the uplink learns where this site is.
+        if state == PeerIdentity::Confirmed {
+            self.keepalive.send_modify(|k| k.kick += 1);
+        }
     }
 
     /// An error of a step that is retried every second: logged when it is
@@ -1194,8 +1330,76 @@ impl Controller {
         }
     }
 
+    /// Reads where the tunnel packets of the clients come from (the sets of
+    /// table `ip wanderlan`) and points their tunnels there. Often while a
+    /// client tunnel waits for its endpoint, rarely once all are known.
+    async fn learn_endpoints(&mut self) {
+        let Some(desired) = self.derived().desired else {
+            return;
+        };
+        if desired.learn.is_empty() || Instant::now() < self.learn_next {
+            if desired.learn.is_empty() && !self.runtime.endpoints.is_empty() {
+                self.runtime.endpoints.clear();
+            }
+            return;
+        }
+        let learned = match self.sys.learned().await {
+            Ok(l) => l,
+            Err(e) => {
+                self.error_once(format!(
+                    "Cannot read where the clients are (table ip wanderlan): {e}"
+                ));
+                self.learn_next = Instant::now() + LEARN_WAITING;
+                return;
+            }
+        };
+        let mut endpoints = BTreeMap::new();
+        for rule in &desired.learn {
+            let control = self.control_endpoints.get(&rule.client).map(|e| *e.ip());
+            match wanderlan_core::nat::choose_endpoint(
+                learned.get(&rule.client).map_or(&[][..], Vec::as_slice),
+                control,
+            ) {
+                Ok(addr) => {
+                    endpoints.insert(rule.client.clone(), addr);
+                }
+                Err(wanderlan_core::nat::NatProblem::OtherAddress(ip)) => {
+                    self.error_once(format!(
+                        "The tunnel packets of client \"{}\" come from {ip}, its control traffic from another address; not used",
+                        rule.client
+                    ));
+                }
+                // Nothing learned (yet, or expired): the last endpoint stays.
+                Err(wanderlan_core::nat::NatProblem::Nothing) => {
+                    if let Some(addr) = self.runtime.endpoints.get(&rule.client) {
+                        endpoints.insert(rule.client.clone(), *addr);
+                    }
+                }
+            }
+        }
+        let waiting = desired
+            .learn
+            .iter()
+            .any(|r| !endpoints.contains_key(&r.client));
+        self.learn_next = Instant::now() + if waiting { LEARN_WAITING } else { LEARN_KNOWN };
+        if endpoints != self.runtime.endpoints {
+            for (client, addr) in &endpoints {
+                if self.runtime.endpoints.get(client) != Some(addr) {
+                    self.events.emit(
+                        Level::Info,
+                        Some(client),
+                        format!("The tunnel packets of client \"{client}\" come from {addr}"),
+                    );
+                }
+            }
+            self.runtime.endpoints = endpoints;
+            self.reconcile().await;
+        }
+    }
+
     /// Housekeeping: automatic confirmation of synced changes, sync retries.
     async fn every_second(&mut self) {
+        self.learn_endpoints().await;
         if let Some(p) = &self.pending
             && let ChangeSource::Sync { peer } = &p.source
         {
@@ -1276,6 +1480,7 @@ impl Controller {
         let mut client_changes: Option<(String, Version)> = None;
         let mut adopt: Option<(String, u64)> = None;
         let mut resync: Option<String> = None;
+        let mut push: Option<String> = None;
         let mut in_sync_again: Vec<String> = Vec::new();
         for (name, kind) in &tunnels {
             if self.fetch_backoff.get(name).is_some_and(|t| *t > now) {
@@ -1316,8 +1521,16 @@ impl Controller {
                 }
                 TunnelKind::Uplink => {
                     // A change of this site that the uplink has not taken
-                    // over (yet): after a while, ask whether it refused it.
+                    // over (yet): sent to it at once (its uplink never
+                    // fetches from a client with a key), and after a while
+                    // ask whether it refused it.
                     let since = *self.diverged_since.get_or_insert(now);
+                    if self.peer_keys.contains_key(name)
+                        && probe.reachable
+                        && self.pushed.as_deref() != Some(ours.fingerprint.as_str())
+                    {
+                        push = Some(name.clone());
+                    }
                     if probe.reachable && now.duration_since(since) >= RESYNC_AFTER {
                         resync = Some(name.clone());
                     }
@@ -1328,7 +1541,11 @@ impl Controller {
                     };
                     if theirs.fingerprint == expected.fingerprint {
                         in_sync_again.push(name.clone());
-                    } else if client_changes.is_none() && theirs.revision >= expected.revision {
+                    } else if client_changes.is_none()
+                        && theirs.revision >= expected.revision
+                        // A client with a key sends its changes itself.
+                        && !self.peer_keys.contains_key(name)
+                    {
                         client_changes = Some((name.clone(), theirs));
                     }
                 }
@@ -1345,6 +1562,16 @@ impl Controller {
         if let Some((peer, revision)) = adopt {
             self.adopt_revision(&peer, revision);
             return;
+        }
+        if let Some(peer) = push.filter(|_| {
+            !self.pushing && upstream.is_empty() && Instant::now() >= self.push_retry_at
+        }) {
+            self.push_to(&peer, &ours.fingerprint);
+        }
+        // Not asked while the uplink decides on a push: its answer could be
+        // older than its decision. A refusal is fetched right after it.
+        if self.pushing {
+            resync = None;
         }
         // Newer versions from servers or the uplink first, then changes of
         // a client, then the question whether the uplink refused ours.
@@ -1400,6 +1627,30 @@ impl Controller {
         });
     }
 
+    /// Sends this site's network to its uplink (`SYNC` with a body).
+    fn push_to(&mut self, peer: &str, fingerprint: &str) {
+        let Some(cfg) = &self.confirmed else { return };
+        let Some(addr) = self.direct_peers().get(peer).copied() else {
+            return;
+        };
+        let (Some(me), Some(k)) = (self.own_id(), self.peer_keys.get(peer).cloned()) else {
+            return;
+        };
+        let target = SocketAddrV4::new(addr, cfg.network.control_port);
+        let text = render_network_wire(&cfg.network);
+        self.pushing = true;
+        self.pushed = Some(fingerprint.to_string());
+        debug!("Sending the changes of this site to \"{peer}\"");
+        let inputs = self.inputs.clone();
+        let peer = peer.to_string();
+        tokio::spawn(async move {
+            let result = sync_net::push_sync(target, me, k.id, &k.keys, &text)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = inputs.send(Input::Pushed { peer, result }).await;
+        });
+    }
+
     /// Remembers a fingerprint that is not fetched again for a while.
     fn reject(&mut self, fingerprint: String) {
         self.rejected.insert(fingerprint, Instant::now());
@@ -1440,6 +1691,60 @@ impl Controller {
                 return;
             }
         };
+        self.take_over(peer, mode, text).await;
+    }
+
+    /// A client pushed its network: taken over like a fetched one (what the
+    /// client may change), if nothing else is pending.
+    async fn pushed_to_us(&mut self, peer: &str, text: String) -> sync_net::PushAnswer {
+        if self.pending.is_some() || self.fetching {
+            return sync_net::PushAnswer::Busy;
+        }
+        if !self.peer_keys.contains_key(peer) {
+            return sync_net::PushAnswer::Refused("not a client with a key".into());
+        }
+        self.events.emit(
+            Level::Info,
+            Some(peer),
+            format!("Client \"{peer}\" sent changes"),
+        );
+        self.take_over(peer.to_string(), FetchMode::Merge, text)
+            .await;
+        match self.refused.get(peer) {
+            Some(reason) => sync_net::PushAnswer::Refused(reason.clone()),
+            None => sync_net::PushAnswer::Ok,
+        }
+    }
+
+    /// The uplink answered the push of this site's network.
+    fn push_answered(&mut self, peer: &str, result: Result<sync_net::PushAnswer, String>) {
+        self.pushing = false;
+        match result {
+            Ok(sync_net::PushAnswer::Ok) => {
+                debug!("\"{peer}\" took over the change of this site");
+            }
+            // Pushed again soon.
+            Ok(sync_net::PushAnswer::Busy) => self.pushed = None,
+            // The uplink's view says why (`refused`): fetched at once, its
+            // configuration applies again.
+            Ok(sync_net::PushAnswer::Refused(reason)) => {
+                debug!("\"{peer}\" refused the change of this site: {reason}");
+                self.diverged_since = Instant::now().checked_sub(RESYNC_AFTER);
+            }
+            Err(e) => {
+                self.pushed = None;
+                self.push_retry_at = Instant::now() + PUSH_RETRY;
+                self.events.emit(
+                    Level::Warn,
+                    Some(peer),
+                    format!("Cannot send the changes of this site to \"{peer}\": {e}"),
+                );
+            }
+        }
+    }
+
+    /// Takes over a network from `peer` (fetched, or pushed by a client).
+    async fn take_over(&mut self, peer: String, mode: FetchMode, text: String) {
         let Some(local) = self.confirmed.as_ref().map(|c| c.local.clone()) else {
             return;
         };
@@ -2437,6 +2742,8 @@ impl Controller {
     }
 
     async fn reconcile_once(&mut self) -> Result<Vec<Change>, reconcile::ReconcileError> {
+        // Loaded by a firewall at any time: looked at before every round.
+        self.runtime.conntrack = std::path::Path::new(CONNTRACK_MAX).exists();
         let Some(cfg) = self.config.clone() else {
             return Ok(Vec::new());
         };
@@ -2888,11 +3195,19 @@ impl Controller {
                             .unwrap_or_default()
                             .into()
                     }),
-                    tunnel: if self.runtime.gre_keys.contains_key(&t.peer.name) {
-                        TunnelKindLabel::GreKey
-                    } else {
-                        TunnelKindLabel::Gre
+                    tunnel: match (
+                        self.runtime.gre_keys.contains_key(&t.peer.name),
+                        matches!(t.kind, TunnelKind::Uplink | TunnelKind::Client),
+                    ) {
+                        (true, true) => TunnelKindLabel::GreUdp,
+                        (true, false) => TunnelKindLabel::GreKey,
+                        (false, _) => TunnelKindLabel::Gre,
                     },
+                    endpoint: self
+                        .runtime
+                        .endpoints
+                        .get(&t.peer.name)
+                        .map(ToString::to_string),
                 }
             })
             .collect();

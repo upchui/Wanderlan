@@ -6,14 +6,15 @@ use futures_util::TryStreamExt as _;
 use rtnetlink::packet_core::{DefaultNla, Nla as _};
 use rtnetlink::packet_route::AddressFamily;
 use rtnetlink::packet_route::link::{
-    BridgeStpState, BridgeVlanInfoFlags, GreIOFlags, InfoBridge, InfoBridgePort, InfoData, InfoGre,
-    InfoPortData, LinkAttribute, LinkExtentMask, LinkFlags, LinkInfo, LinkMessage, State,
+    BridgeStpState, BridgeVlanInfoFlags, GreEncapFlags, GreEncapType, GreIOFlags, InfoBridge,
+    InfoBridgePort, InfoData, InfoGre, InfoPortData, LinkAttribute, LinkExtentMask, LinkFlags,
+    LinkInfo, LinkMessage, State,
 };
 use rtnetlink::{Handle, LinkBridge, LinkBridgePort, LinkBridgeVlan, LinkGre, LinkUnspec};
 
 use super::{
-    BridgeOptions, GretapParams, LinkKind, LinkState, LinkUpdate, NetOps, PortVlans, SysError,
-    SysResult, VlanFlags, vlan_ranges,
+    BridgeOptions, FouEncap, GretapParams, LinkKind, LinkState, LinkUpdate, NetOps, PortVlans,
+    SysError, SysResult, VlanFlags, vlan_ranges,
 };
 
 /// `IFLA_GRE_IGNORE_DF`, not modelled by netlink-packet-route.
@@ -180,9 +181,12 @@ fn parse_gretap(opts: &[InfoGre]) -> GretapParams {
         ignore_df: false,
         pmtudisc: true,
         key: None,
+        encap: None,
     };
     let mut keyed = false;
     let mut ikey = 0;
+    let mut fou = false;
+    let (mut sport, mut dport) = (0, 0);
     for opt in opts {
         match opt {
             InfoGre::Local(a) => out.local = *a,
@@ -190,6 +194,9 @@ fn parse_gretap(opts: &[InfoGre]) -> GretapParams {
             InfoGre::PathMTUDiscovery(v) => out.pmtudisc = *v,
             InfoGre::IFlags(flags) => keyed = flags.contains(GreIOFlags::Key),
             InfoGre::IKey(k) => ikey = *k,
+            InfoGre::EncapType(t) => fou = *t == GreEncapType::Fou,
+            InfoGre::SourcePort(p) => sport = *p,
+            InfoGre::DestinationPort(p) => dport = *p,
             InfoGre::Other(nla) if nla.kind() == IFLA_GRE_IGNORE_DF => {
                 let mut buf = vec![0u8; nla.value_len()];
                 nla.emit_value(&mut buf);
@@ -199,6 +206,7 @@ fn parse_gretap(opts: &[InfoGre]) -> GretapParams {
         }
     }
     out.key = keyed.then_some(ikey);
+    out.encap = fou.then_some(FouEncap { sport, dport });
     out
 }
 
@@ -222,6 +230,17 @@ fn gretap_info(params: &GretapParams) -> Vec<InfoGre> {
             InfoGre::OKey(key),
         ]);
     }
+    // Without a UDP checksum (no encap flags): GSO and GRO for UDP tunnels.
+    let (kind, sport, dport) = match params.encap {
+        Some(e) => (GreEncapType::Fou, e.sport, e.dport),
+        None => (GreEncapType::None, 0, 0),
+    };
+    info.extend([
+        InfoGre::EncapType(kind),
+        InfoGre::EncapFlags(GreEncapFlags::empty()),
+        InfoGre::SourcePort(sport),
+        InfoGre::DestinationPort(dport),
+    ]);
     info
 }
 

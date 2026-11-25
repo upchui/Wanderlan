@@ -40,8 +40,9 @@ done
 k1=$(x site1 "ip -d link show gt-site2 | grep -o 'ikey [0-9.]* okey [0-9.]*'")
 k2=$(x site2 "ip -d link show gt-site1 | grep -o 'ikey [0-9.]* okey [0-9.]*'")
 check "the tunnel has a GRE key, the same at both ends ($k1)" test -n "$k1" -a "$k1" = "$k2"
-check "site1's network.toml lists both identities" \
-  test "$(x site1 "grep -c '^id = ' /etc/wanderlan/network.toml")" = 2
+# Written once the synced change is confirmed (a moment after it applies).
+wait_for 30 "site1's network.toml lists both identities" \
+  eval '[ "$(x site1 "grep -c \"^id = \" /etc/wanderlan/network.toml")" = 2 ]'
 check "the probes are authenticated (version 2)" \
   x site1 "timeout 8 tcpdump -c 1 -nli any -A 'udp port 51821' 2>/dev/null | grep -q WLP2"
 

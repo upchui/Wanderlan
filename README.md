@@ -95,11 +95,14 @@ UI (`wanderlan`) to set it up and watch it; see [Concepts](#concepts) and
   VLANs tagged (and the untagged network) to the switch or hypervisor. It
   must not be part of another bridge or bond.
 * An **existing transport network** in which every site has an IPv4 address.
-  Between each client and its server, and between all servers, it must carry
-  * GRE (IP protocol 47), and
-  * UDP and TCP on the control port (default 51821): probes, configuration
-    sync, joining.
-* The kernel modules `bridge`, `ip_gre`, `sch_ingress`, `cls_flower`,
+  * **Servers** must reach each other and be reachable by their clients:
+    GRE (IP protocol 47) between the servers, UDP and TCP on the control
+    port (default 51821: probes, configuration sync, joining) and UDP on the
+    tunnel port (default 51822: the tunnels of the clients).
+  * **Clients** only need to reach their server, outgoing: TCP and UDP to
+    its control port, UDP to its tunnel port. A client may sit behind NAT,
+    several behind the same one (see [Clients behind NAT](#clients-behind-nat)).
+* The kernel modules `bridge`, `ip_gre`, `fou`, `sch_ingress`, `cls_flower`,
   `act_vlan`, `act_gact` and `nf_tables` (standard kernels have them; the
   service loads them when it starts).
 
@@ -230,6 +233,34 @@ must reach each other.
 A client can invite sites too; they become its own clients. A site can be
 made a server or the client of another site later. Every view shows the role
 (`server`, `client of hq`).
+
+### Clients behind NAT
+
+A client opens every connection to its server itself, and its server never
+opens one towards it: the server only answers, and sends to where the
+client's packets come from. So a client works behind NAT, at home behind a
+router or on a mobile connection with a changing public address; several
+clients behind the same NAT share its address and are told apart by their
+identity.
+
+The tunnel between a client and its server runs **inside UDP** (GRE in UDP,
+FOU, on the tunnel port 51822), because a NAT passes GRE for one box at most,
+if at all. Every 15 s the client sends a small keepalive frame through its
+tunnel; it keeps the NAT's mapping open and shows the server which address
+and port the NAT uses for the client (nftables table `ip wanderlan`). When
+the NAT changes the port (it forgot the mapping, the router restarted), the
+server follows with the next keepalive; the tunnel is changed in place.
+Where connection tracking is loaded (a firewall), a server exempts the
+tunnel packets from it (`notrack`, table `ip wanderlan`): tracking them
+would cost every packet. A stateful firewall on a server must therefore
+accept UDP to the tunnel port by its port, not only as an established
+connection.
+
+A site with clients of its own must be reachable for them, so it cannot sit
+behind NAT itself. A carrier-grade NAT that gives the control traffic and the
+tunnel packets of one box different public addresses is not supported (the
+status says so). **Without a VPN the traffic crosses the internet
+unencrypted:** the keys of the tunnels authenticate, they do not encrypt.
 
 ### VLANs like a switch trunk
 
@@ -528,6 +559,7 @@ sites with older and newer versions keep working together.
 | `network.mtu_probe_interval` | `5m` | Interval of the path MTU measurement (at least 10 s). |
 | `network.mss` | unset | Fixed TCP MSS (536 to 1460) instead of the measured value. |
 | `network.control_port` | `51821` | UDP and TCP port of the daemons on the site addresses. |
+| `network.tunnel_port` | control port + 1 (`51822`) | UDP port of the tunnels between a client and its server (GRE in UDP). |
 | `network.revision` | `0` | Revision counter of the sync; raised by the daemon. |
 | `[site.<name>]` | | One table per site. The name is unique; `a-z`, `0-9` and `-`, at most 12 characters (it is part of the interface name `gt-<name>`). |
 | `site.<name>.address` | | Unique IPv4 address of the site in the transport network. |
@@ -580,7 +612,10 @@ the kernel module `ip_gre` and with it its devices `gre0`, `gretap0` and
 * `wl-<interface>`: the same for every further trunk ("trunk per tunnel");
 * `gt-<peer>`: a GRETAP tunnel (`ignore-df`, `nopmtudisc`, MTU 1500, with
   the GRE key of the two identities) to its
-  server, to each of its clients and, on a server, to every other server. The
+  server, to each of its clients and, on a server, to every other server;
+  between a client and its server inside UDP (FOU, without UDP checksum, so
+  the kernel's GSO and GRO for UDP tunnels apply), the client from any of its
+  addresses (`local any`). The
   ports between servers are `isolated` (split horizon: a frame from one
   server is never forwarded to another server); the ports of clients and
   uplinks are ordinary ports, a tree that is loop-free by itself;
@@ -592,7 +627,12 @@ the kernel module `ip_gre` and with it its devices `gre0`, `gretap0` and
   translations there are;
 * the nftables table `bridge wanderlan` for MSS clamping: every bridged
   frame of the host passes one rule there, only TCP SYNs go on to the MSS
-  rules (chain `wl-mss`).
+  rules (chain `wl-mss`);
+* with client tunnels: the FOU port (`ip fou show`, UDP 51822) and, on a
+  server, the nftables table `ip wanderlan`: a tunnel packet to that port
+  costs one compare of its inner ethertype (data frames always carry a VLAN
+  tag), only the keepalives of the clients go on and put their source
+  address and port into the set of their client (`ep-<client>`).
 
 Everything it creates carries the interface alias `wanderlan`; foreign
 interfaces are never touched (a foreign `br0` or `gt-*` stops the
@@ -640,8 +680,9 @@ tunnel port are clamped to
 
 `MSS = path MTU − 20 (outer IP) − 4 (GRE) − 4 (GRE key) − 18 (Ethernet + VLAN tag) − 40 (inner IP + TCP)`
 
-(a tunnel to a site without identity has no key: 4 bytes more; IPv6: 20
-bytes less; ports without a measurement use the smallest measured path). GRE fragmentation stays on as a safety net, so non-TCP packets larger
+(a tunnel inside UDP, between a client and its server: 8 bytes less; a
+tunnel to a site without identity has no key: 4 bytes more; IPv6: 20 bytes
+less; ports without a measurement use the smallest measured path). GRE fragmentation stays on as a safety net, so non-TCP packets larger
 than the path still arrive.
 
 ### Loops
@@ -664,7 +705,8 @@ the TUI) or the configuration changes.
 ### Operation
 
 `wanderland` runs as the systemd service `wanderland`, as root with
-`CAP_NET_ADMIN` as its only capability and a hardened unit. systemd restarts
+`CAP_NET_ADMIN` and `CAP_NET_RAW` (for the keepalive frames of the client
+tunnels) as its only capabilities and a hardened unit. systemd restarts
 it after a crash: the cleanup removes what the crashed daemon left, the new
 one builds the network again within seconds. An update restarts it the
 same way. Only one daemon
@@ -765,6 +807,10 @@ or `WANDERLAN_SOCKET`.
   come up within the commit timeout is removed again; its code works again.
 * **A neighbour "does not answer control probes"**: allow UDP and TCP on the
   control port between the site addresses.
+* **"waiting for client … to connect"** on a server: no keepalive of the
+  client arrived yet; UDP to the tunnel port (51822) must pass from the
+  client to the server (a firewall in front of the server?). The client
+  sends one every 15 s once its own tunnel is up.
 * **"identity not confirmed yet"**: the tunnel waits for an answer to the
   control probes with the neighbour's key; the probes do not get through
   (see above), or the neighbour runs an older version (update it).
@@ -796,6 +842,11 @@ or `WANDERLAN_SOCKET`.
 * **No VPN inside wanderlan.** Transport and encryption belong to the existing
   VPN; wanderlan only does layer 2 and VLANs, and GRE runs unencrypted on top
   of that trusted network.
+* **The client opens every flow.** A server never contacts a client first,
+  so clients work behind NAT; the tunnels between a client and its server run
+  inside UDP (FOU) and the server learns the NAT's port from the client's
+  keepalives in the kernel (nftables), so nothing per packet runs in user
+  space. Between servers, which reach each other, plain GRE with a key.
 * **A site is a box with a key, not an address.** Every box has an X25519
   identity; the keys of a tunnel are derived from the two identities
   (Diffie-Hellman, HKDF-SHA256), so they never travel and no third site knows
@@ -821,8 +872,9 @@ or `WANDERLAN_SOCKET`.
 * **Changes must be confirmed**, so nobody locks themselves out through the
   tunnel they are changing.
 * **UDP probes instead of ICMP** for reachability and path MTU (DF set via
-  `IP_PMTUDISC_PROBE`): no `CAP_NET_RAW`, and the same probes carry the sync
-  announcements.
+  `IP_PMTUDISC_PROBE`): no raw sockets for them, and the same probes carry
+  the sync announcements (`CAP_NET_RAW` is only for the keepalive frames of
+  the client tunnels).
 * **MSS clamping on entering and leaving SYNs** per tunnel port, so both
   directions get the smaller value.
 * **netlink everywhere except nftables**: links, bridges, VLANs, GRETAP and tc

@@ -12,7 +12,9 @@ use std::fmt;
 
 use crate::config::VlanSet;
 use crate::desired::{Desired, GRETAP_MTU, OWNER_ALIAS};
+use crate::sys::fou::IPPROTO_GRE;
 use crate::sys::nft::{MssRule, NftState, SplitRule};
+use crate::sys::nft_ip::{LearnRule, LearnState};
 use crate::sys::tc::{IfTc, TcRule};
 use crate::sys::{
     BridgeOptions, GretapParams, LinkKind, LinkState, LinkUpdate, PortVlans, SysError, System,
@@ -38,6 +40,12 @@ pub struct Actual {
     pub vlan_stats_supported: bool,
     /// Why the nftables rules could not be read (e.g. no `nft`).
     pub nft_error: Option<String>,
+    /// The FOU ports for GRE (taken as wanderlan's).
+    pub fou_ports: BTreeSet<u16>,
+    /// The table `ip wanderlan`, `None` if it does not exist.
+    pub learn: Option<LearnState>,
+    /// Why the FOU ports or the table `ip wanderlan` could not be read.
+    pub nat_error: Option<String>,
 }
 
 impl Actual {
@@ -57,6 +65,7 @@ impl Actual {
             Ok(nft) => (nft, None),
             Err(e) => (None, Some(e.to_string())),
         };
+        let (fou_ports, learn, nat_error) = observe_nat(net).await;
         Ok(Self {
             links,
             vlans,
@@ -64,6 +73,9 @@ impl Actual {
             nft,
             vlan_stats_supported: net.vlan_stats_supported(),
             nft_error,
+            fou_ports,
+            learn,
+            nat_error,
         })
     }
 
@@ -74,6 +86,31 @@ impl Actual {
     fn vlans_of(&self, link: &LinkState) -> PortVlans {
         self.vlans.get(&link.index).cloned().unwrap_or_default()
     }
+}
+
+/// The FOU ports for GRE and the table `ip wanderlan`; what cannot be read
+/// counts as absent (with the reason).
+async fn observe_nat<N: System>(net: &N) -> (BTreeSet<u16>, Option<LearnState>, Option<String>) {
+    let mut error = None;
+    let fou_ports = match net.fou_ports().await {
+        Ok(ports) => ports
+            .into_iter()
+            .filter(|p| p.ipproto == IPPROTO_GRE)
+            .map(|p| p.port)
+            .collect(),
+        Err(e) => {
+            error = Some(e.to_string());
+            BTreeSet::new()
+        }
+    };
+    let learn = match net.learn_state().await {
+        Ok(learn) => learn,
+        Err(e) => {
+            error = Some(e.to_string());
+            None
+        }
+    };
+    (fou_ports, learn, error)
 }
 
 /// Returns true if wanderlan created this link.
@@ -106,6 +143,18 @@ pub enum Change {
         params: GretapParams,
         reason: String,
     },
+    /// Open the FOU port of the tunnels inside UDP.
+    AddFouPort { port: u16 },
+    /// Close a FOU port.
+    DelFouPort { port: u16 },
+    /// Write the rules that learn where the clients are.
+    SetLearn {
+        port: u16,
+        rules: BTreeSet<LearnRule>,
+        notrack: bool,
+    },
+    /// Delete the table `ip wanderlan`.
+    DeleteLearn,
     /// Delete a link created by wanderlan.
     DeleteLink { name: String, reason: String },
     /// Set the MTU of a link.
@@ -264,6 +313,24 @@ impl fmt::Display for Change {
                 }
             }
             Self::DeleteNftTable => write!(f, "Deleting nftables table bridge wanderlan"),
+            Self::AddFouPort { port } => write!(
+                f,
+                "Opening UDP port {port} for the tunnels inside UDP (FOU)"
+            ),
+            Self::DelFouPort { port } => write!(f, "Closing the FOU port {port}"),
+            Self::SetLearn { port, rules, .. } => {
+                let clients: Vec<&str> = rules.iter().map(|r| r.client.as_str()).collect();
+                write!(
+                    f,
+                    "Learning where the clients are on UDP {port}: {}",
+                    if clients.is_empty() {
+                        "none".to_string()
+                    } else {
+                        clients.join(", ")
+                    }
+                )
+            }
+            Self::DeleteLearn => write!(f, "Deleting nftables table ip wanderlan"),
         }
     }
 }
@@ -556,10 +623,48 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
         )
     });
 
+    // The FOU port opens before the tunnels that use it and closes after
+    // they are gone; the learn rules follow the clients.
+    let mut fou_adds = Vec::new();
+    let mut fou_dels = Vec::new();
+    if actual.nat_error.is_none() || desired.fou_port.is_some() {
+        for port in &actual.fou_ports {
+            if Some(*port) != desired.fou_port {
+                fou_dels.push(Change::DelFouPort { port: *port });
+            }
+        }
+        if let Some(port) = desired.fou_port
+            && !actual.fou_ports.contains(&port)
+        {
+            fou_adds.push(Change::AddFouPort { port });
+        }
+    }
+    let learn_changes = match (&actual.learn, desired.fou_port) {
+        (Some(_), _) if desired.learn.is_empty() => vec![Change::DeleteLearn],
+        (_, Some(port)) if !desired.learn.is_empty() => {
+            let same = actual.learn.as_ref().is_some_and(|l| {
+                l.port == Some(port) && l.rules == desired.learn && l.notrack == desired.notrack
+            });
+            if same {
+                Vec::new()
+            } else {
+                vec![Change::SetLearn {
+                    port,
+                    rules: desired.learn.clone(),
+                    notrack: desired.notrack,
+                }]
+            }
+        }
+        _ => Vec::new(),
+    };
+
     let mut out = deletes;
+    out.extend(fou_dels);
+    out.extend(fou_adds);
     out.extend(tunnel_changes);
     out.extend(bridge_changes);
     out.extend(creates);
+    out.extend(learn_changes);
     out.extend(settings);
     out.extend(vlan_dels);
     // The split horizon covers a new VLAN before the VLAN reaches the ports.
@@ -768,6 +873,15 @@ pub fn plan_teardown(actual: &Actual) -> Vec<Change> {
     if actual.nft.is_some() {
         out.push(Change::DeleteNftTable);
     }
+    if actual.learn.is_some() {
+        out.push(Change::DeleteLearn);
+    }
+    out.extend(
+        actual
+            .fou_ports
+            .iter()
+            .map(|port| Change::DelFouPort { port: *port }),
+    );
     out.extend(tc);
     out.extend(bridges);
     out
@@ -867,6 +981,14 @@ pub async fn apply<N: System>(net: &N, actual: &Actual, change: &Change) -> Resu
         Change::DelTcRule { dev, rule } => net.del_tc_rule(index_of(dev)?, rule).await?,
         Change::SetNft { mss, split } => net.set_nft_rules(mss, split).await?,
         Change::DeleteNftTable => net.delete_table().await?,
+        Change::AddFouPort { port } => net.add_fou_port(*port).await?,
+        Change::DelFouPort { port } => net.del_fou_port(*port).await?,
+        Change::SetLearn {
+            port,
+            rules,
+            notrack,
+        } => net.set_learn(*port, rules, *notrack).await?,
+        Change::DeleteLearn => net.delete_learn().await?,
     }
     Ok(())
 }
@@ -892,19 +1014,34 @@ pub async fn reconcile<N: System>(
     // everything else is applied, the error is returned at the end.
     let mut nft_failed: Option<SysError> = None;
     let is_nft = |c: &Change| matches!(c, Change::SetNft { .. } | Change::DeleteNftTable);
+    // FOU and the table `ip wanderlan` only concern the tunnels inside UDP:
+    // the rest goes on without them.
+    let is_nat = |c: &Change| {
+        matches!(
+            c,
+            Change::AddFouPort { .. }
+                | Change::DelFouPort { .. }
+                | Change::SetLearn { .. }
+                | Change::DeleteLearn
+        )
+    };
+    let mut nat_failed: Option<SysError> = None;
     for _ in 0..MAX_ROUNDS {
         let mut actual = Actual::observe(net).await?;
         let mut changes = plan(desired, &actual)?;
         if nft_failed.is_some() {
             changes.retain(|c| !is_nft(c));
         }
+        if nat_failed.is_some() {
+            changes.retain(|c| !is_nat(c));
+        }
         if changes.is_empty() {
-            return match (nft_failed, actual.nft_error) {
-                (Some(e), _) => Err(e.into()),
-                (None, Some(e)) => {
+            return match (nft_failed, actual.nft_error, nat_failed) {
+                (Some(e), _, _) | (None, None, Some(e)) => Err(e.into()),
+                (None, Some(e), _) => {
                     Err(SysError::new("read nftables table bridge wanderlan", e).into())
                 }
-                (None, None) => Ok(applied),
+                (None, None, None) => Ok(applied),
             };
         }
         for change in changes {
@@ -913,6 +1050,10 @@ pub async fn reconcile<N: System>(
                 Ok(()) => {}
                 Err(e) if is_nft(&change) && desired.split.is_empty() => {
                     nft_failed = Some(e);
+                    continue;
+                }
+                Err(e) if is_nat(&change) => {
+                    nat_failed = Some(e);
                     continue;
                 }
                 Err(e) => return Err(e.into()),
@@ -1052,6 +1193,10 @@ async fn observe_for_teardown<N: System>(net: &N) -> Result<(Actual, Vec<String>
         Ok(nft) => (nft, None),
         Err(e) => (None, Some(e.to_string())),
     };
+    let (fou_ports, learn, nat_error) = observe_nat(net).await;
+    if let Some(e) = &nat_error {
+        problems.push(e.clone());
+    }
     let actual = Actual {
         links,
         vlans: BTreeMap::new(),
@@ -1059,6 +1204,9 @@ async fn observe_for_teardown<N: System>(net: &N) -> Result<(Actual, Vec<String>
         nft,
         vlan_stats_supported: net.vlan_stats_supported(),
         nft_error,
+        fou_ports,
+        learn,
+        nat_error,
     };
     Ok((actual, problems))
 }

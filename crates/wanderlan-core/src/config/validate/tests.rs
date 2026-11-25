@@ -1105,3 +1105,54 @@ fn two_sites_with_the_same_id() {
     let fine = network.replacen(ID_A, ID_B, 2).replacen(ID_B, ID_A, 1);
     assert!(load(&fine, LOCAL).is_ok());
 }
+
+#[test]
+fn clients_with_identities_may_share_an_address() {
+    // Two clients of haus2 behind the same NAT.
+    let mut network = parse_network(EXAMPLE_NETWORK).unwrap().network.unwrap();
+    let id = |n: u8| Some(crate::identity::SiteId::from_bytes([n; 32]));
+    let address = network.sites[1].address;
+    let server = network.sites[1].name.clone();
+    for (i, n) in [(2usize, 3u8), (3, 4)] {
+        let site = &mut network.sites[i];
+        site.address = address;
+        site.uplink = Some(server.clone());
+        site.id = id(n);
+    }
+    let text = render_network(&network);
+    let errs = errors(&text, LOCAL);
+    assert!(
+        errs.iter().any(|e| e.message.contains("already used")),
+        "the server has no identity: {errs:?}"
+    );
+    network.sites[1].id = id(2);
+    assert!(load(&render_network(&network), LOCAL).is_ok());
+    // Without identities they must not.
+    network.sites[2].id = None;
+    let errs = errors(&render_network(&network), LOCAL);
+    assert!(
+        errs.iter().any(|e| e.message.contains("already used")),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn the_tunnel_port_follows_the_control_port_unless_set() {
+    let mut network = parse_network(EXAMPLE_NETWORK).unwrap().network.unwrap();
+    assert_eq!(network.tunnel_port(), 51822);
+    assert!(!render_network(&network).contains("tunnel_port"));
+    network.tunnel_port = Some(4000);
+    let text = render_network(&network);
+    assert!(text.contains("tunnel_port = 4000"), "{text}");
+    assert_eq!(
+        parse_network(&text).unwrap().network.unwrap().tunnel_port(),
+        4000
+    );
+    network.tunnel_port = Some(network.control_port);
+    let errs = errors(&render_network(&network), LOCAL);
+    assert!(
+        errs.iter()
+            .any(|e| e.message.contains("tunnel_port must differ")),
+        "{errs:?}"
+    );
+}

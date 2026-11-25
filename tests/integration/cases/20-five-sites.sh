@@ -21,6 +21,7 @@ done
 check "every tunnel port is isolated (split horizon)" \
   x site3 "for p in gt-site1 gt-site2 gt-site4 gt-site5; do bridge -d link show dev \$p | grep -q 'isolated on' || exit 1; done"
 check "the trunk is not isolated" x site3 "bridge -d link show dev trunk0 | grep -q 'isolated off'"
+keyed site1 site2 site3 site4 site5
 
 for s in site3 site4 site5; do
   client_vlan "c-$s" 20 "10.20.0.${HOSTNUM[$s]}/24"

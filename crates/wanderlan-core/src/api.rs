@@ -505,6 +505,9 @@ pub struct PeerStatus {
     /// How the tunnel is built.
     #[serde(default)]
     pub tunnel: TunnelKindLabel,
+    /// For a client (behind NAT): where its tunnel packets come from.
+    #[serde(default)]
+    pub endpoint: Option<String>,
 }
 
 /// Whether a peer proved its identity (tunnels with a key).
@@ -549,6 +552,9 @@ pub enum TunnelKindLabel {
     Gre,
     /// GRETAP with the key of both identities.
     GreKey,
+    /// GRETAP with a key inside UDP (FOU): between a client and its
+    /// server, through NAT.
+    GreUdp,
 }
 
 impl TunnelKindLabel {
@@ -557,6 +563,7 @@ impl TunnelKindLabel {
         match self {
             Self::Gre => "GRE",
             Self::GreKey => "GRE with key",
+            Self::GreUdp => "GRE in UDP",
         }
     }
 }

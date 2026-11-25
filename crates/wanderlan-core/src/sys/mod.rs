@@ -6,11 +6,13 @@
 //! tested without root privileges.
 
 pub mod fake;
+pub mod fou;
 pub mod linux;
 pub mod netlink;
 mod netlink_observe;
 mod netlink_tc;
 pub mod nft;
+pub mod nft_ip;
 pub mod observe;
 pub mod tc;
 
@@ -78,6 +80,19 @@ pub struct GretapParams {
     /// GRE key (the same in both directions); `None` for a tunnel to a
     /// site without identity.
     pub key: Option<u32>,
+    /// GRE inside UDP (FOU): the tunnels between a client and its server,
+    /// which pass NAT. `None`: plain GRE.
+    pub encap: Option<FouEncap>,
+}
+
+/// The UDP ports of a GRE tunnel inside UDP (FOU, without UDP checksum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct FouEncap {
+    /// Source port of the packets.
+    pub sport: u16,
+    /// Destination port: the FOU port of the peer, or the port its NAT
+    /// maps the peer's packets to.
+    pub dport: u16,
 }
 
 /// Kind of a link as far as wanderlan cares.
@@ -256,9 +271,15 @@ pub trait NetOps: Send + Sync {
 }
 
 /// Everything the daemon needs from the system.
-pub trait System: NetOps + tc::TcOps + nft::NftOps + observe::ObserveOps {}
+pub trait System:
+    NetOps + tc::TcOps + nft::NftOps + observe::ObserveOps + fou::FouOps + nft_ip::LearnOps
+{
+}
 
-impl<T: NetOps + tc::TcOps + nft::NftOps + observe::ObserveOps> System for T {}
+impl<T> System for T where
+    T: NetOps + tc::TcOps + nft::NftOps + observe::ObserveOps + fou::FouOps + nft_ip::LearnOps
+{
+}
 
 /// Groups VLAN entries into ranges of consecutive IDs with equal flags.
 /// Entries with the PVID flag are never part of a range (the kernel rejects

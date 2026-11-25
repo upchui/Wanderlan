@@ -15,7 +15,7 @@ Type=simple
 ExecStartPre=-+/usr/bin/wanderland --cleanup
 # The kernel modules only while wanderlan runs ("+": with full rights, the
 # daemon itself may not load modules; "-": not possible in a container).
-ExecStartPre=-+/sbin/modprobe -a bridge ip_gre sch_ingress cls_flower act_vlan act_gact nf_tables
+ExecStartPre=-+/sbin/modprobe -a bridge ip_gre fou sch_ingress cls_flower act_vlan act_gact nf_tables
 ExecStart=/usr/bin/wanderland
 ExecReload=/bin/kill -HUP $MAINPID
 # After every end of the service (stop, restart, update, crash, kill):
@@ -29,12 +29,14 @@ RestartSec=2s
 LimitNOFILE=8192
 TimeoutStopSec=30s
 
-# Runs as root but with CAP_NET_ADMIN as its only capability.
+# Runs as root but with CAP_NET_ADMIN and CAP_NET_RAW as its only
+# capabilities (CAP_NET_RAW and AF_PACKET: a client sends a keepalive frame
+# through its tunnel inside UDP, so that its NAT stays open).
 User=root
 Group=wanderlan
 UMask=0007
-CapabilityBoundingSet=CAP_NET_ADMIN
-AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
 NoNewPrivileges=yes
 
 RuntimeDirectory=wanderlan
@@ -53,7 +55,7 @@ ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
-RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6 AF_PACKET
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes

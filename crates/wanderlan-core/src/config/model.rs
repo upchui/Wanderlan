@@ -33,6 +33,9 @@ pub struct Network {
     pub revision: u64,
     /// Daemon control port (UDP probes, TCP config sync) on the site addresses.
     pub control_port: u16,
+    /// UDP port of the tunnels between a client and its server (GRE in UDP,
+    /// through NAT); `None`: the port after the control port.
+    pub tunnel_port: Option<u16>,
     /// VLANs of every site that does not list its own (`[[site]] vlans`).
     pub vlans: VlanSet,
     /// Interval between path MTU measurements.
@@ -55,6 +58,7 @@ impl Network {
         Self {
             revision: 0,
             control_port: DEFAULT_CONTROL_PORT,
+            tunnel_port: None,
             vlans,
             mtu_probe_interval: DEFAULT_MTU_PROBE_INTERVAL,
             mss: None,
@@ -80,6 +84,17 @@ impl Network {
                 None => self.tunnels.push(TunnelVlans::new(a, b, vlans)),
             },
         }
+    }
+
+    /// The UDP port of the client tunnels: the configured one, or the port
+    /// after the control port (before it for the last port).
+    pub fn tunnel_port(&self) -> u16 {
+        self.tunnel_port
+            .unwrap_or(if self.control_port == u16::MAX {
+                u16::MAX - 1
+            } else {
+                self.control_port + 1
+            })
     }
 
     /// Looks up a site by name.

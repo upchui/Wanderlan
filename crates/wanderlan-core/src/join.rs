@@ -104,7 +104,7 @@ pub enum JoinError {
     },
     /// Another box at the address of a site that still answers.
     #[error(
-        "the address {address} belongs to site \"{site}\", which is still running there; every box needs its own address in the transport network (a second box behind the same NAT? give it its own address, e.g. with a VPN)"
+        "site \"{site}\" at {address} is still running; a second box there (behind the same NAT?) needs a name of its own: join with --name <name>"
     )]
     StillRunning {
         /// The address.
@@ -290,22 +290,33 @@ pub fn add_site(
         }
         return checked(join_again(network, inviter, &existing.name, id, address));
     }
-    // Another box at the address of a site.
-    if let Some(existing) = network.sites.iter().find(|s| s.address == address) {
-        let wants_it = existing.name == name || name_is_default;
-        if !wants_it {
+    // Another box at the address of a site: the site of that name first
+    // (several clients may sit behind one NAT).
+    let at_address = network
+        .sites
+        .iter()
+        .find(|s| s.address == address && s.name == name)
+        .or_else(|| network.sites.iter().find(|s| s.address == address));
+    if let Some(existing) = at_address {
+        // A client with an identity shares its address with other boxes
+        // behind the same NAT: only its name claims its entry.
+        let shared = existing.id.is_some() && existing.uplink.is_some();
+        let wants_it = existing.name == name || (name_is_default && !shared);
+        if wants_it {
+            if existing.id.is_some() && alive.contains(&existing.name) {
+                return Err(JoinError::StillRunning {
+                    address,
+                    site: existing.name.clone(),
+                });
+            }
+            return checked(join_again(network, inviter, &existing.name, id, address));
+        }
+        if !shared {
             return Err(JoinError::AddressTaken {
                 address,
                 site: existing.name.clone(),
             });
         }
-        if existing.id.is_some() && alive.contains(&existing.name) {
-            return Err(JoinError::StillRunning {
-                address,
-                site: existing.name.clone(),
-            });
-        }
-        return checked(join_again(network, inviter, &existing.name, id, address));
     }
     let name = match network.site(name) {
         None => name.to_string(),
@@ -775,6 +786,59 @@ mod tests {
         assert_eq!(claimed.network.site("site2").unwrap().id, Some(reset));
         assert_eq!(claimed.took_over, None);
         assert!(claimed.changed);
+    }
+
+    #[test]
+    fn boxes_behind_one_nat_become_clients_of_their_own() {
+        let nat = Ipv4Addr::new(203, 0, 113, 7);
+        let first = Joiner {
+            name: "box",
+            name_is_default: true,
+            address: nat,
+            id: SiteId::from_bytes([31; 32]),
+        };
+        let nobody = BTreeSet::new();
+        let one = add_site(&network(), "site1", first, &nobody, &none()).unwrap();
+        // A second box behind the same NAT with another host name.
+        let second = Joiner {
+            name: "other",
+            id: SiteId::from_bytes([32; 32]),
+            ..first
+        };
+        let two = add_site(&one.network, "site1", second, &nobody, &none()).unwrap();
+        assert!(two.added);
+        assert_eq!(two.name, "other");
+        assert_eq!(two.network.site("other").unwrap().address, nat);
+        assert_eq!(
+            two.network.site("box").unwrap().id,
+            Some(first.id),
+            "untouched"
+        );
+        // With the same host name: the name says it.
+        let alive: BTreeSet<String> = ["box".to_string()].into();
+        let twin = Joiner {
+            id: SiteId::from_bytes([33; 32]),
+            ..first
+        };
+        let err = add_site(&two.network, "site1", twin, &alive, &none()).unwrap_err();
+        assert!(matches!(err, JoinError::StillRunning { .. }), "{err}");
+        assert!(err.to_string().contains("--name"), "{err}");
+        let named = Joiner {
+            name: "box2",
+            name_is_default: false,
+            ..twin
+        };
+        let three = add_site(&two.network, "site1", named, &alive, &none()).unwrap();
+        assert!(three.added);
+        // The second box joins again after a reset: its own entry.
+        let reset = Joiner {
+            id: SiteId::from_bytes([34; 32]),
+            ..second
+        };
+        let again = add_site(&three.network, "site1", reset, &nobody, &none()).unwrap();
+        assert_eq!(again.name, "other");
+        assert_eq!(again.took_over, Some(second.id));
+        assert_eq!(again.network.sites.len(), three.network.sites.len());
     }
 
     #[test]

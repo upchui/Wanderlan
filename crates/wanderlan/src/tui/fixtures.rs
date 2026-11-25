@@ -119,6 +119,7 @@ fn peer(name: &str, address: &str) -> PeerStatus {
         identity: Some(format!("{}Ab3dE", &name[..name.len().min(3)])),
         identity_state: Some(wanderlan_core::api::IdentityState::Confirmed),
         tunnel: wanderlan_core::api::TunnelKindLabel::GreKey,
+        endpoint: None,
     }
 }
 

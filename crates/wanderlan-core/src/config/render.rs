@@ -51,6 +51,9 @@ pub fn render_network(network: &Network) -> String {
     let _ = writeln!(out, "revision = {}", network.revision);
     let _ = writeln!(out, "vlans = {}", quote(&network.vlans.to_string()));
     let _ = writeln!(out, "control_port = {}", network.control_port);
+    if let Some(port) = network.tunnel_port {
+        let _ = writeln!(out, "tunnel_port = {port}");
+    }
     let _ = writeln!(
         out,
         "mtu_probe_interval = {}",
@@ -190,6 +193,9 @@ fn render_network_inner(network: &Network, with_revision: bool) -> String {
     }
     let _ = writeln!(out, "vlans = {}", quote(&network.vlans.to_string()));
     let _ = writeln!(out, "control_port = {}", network.control_port);
+    if let Some(port) = network.tunnel_port {
+        let _ = writeln!(out, "tunnel_port = {port}");
+    }
     let _ = writeln!(
         out,
         "mtu_probe_interval = {}",

@@ -4,6 +4,8 @@
 # underlay stands in for the transport network (usually a VPN) that wanderlan
 # expects to exist. Every site also has a trunk network with one client;
 # site1 has a second trunk (trunk1) with a client for "trunk per tunnel".
+# natc1 and natc2 sit behind one NAT (the container nat, masquerading with
+# random ports): they reach the others, nobody reaches them.
 name: wanderlan-it
 
 x-common: &common
@@ -31,6 +33,62 @@ services:
       ul-site3: { ipv4_address: 10.100.11.254 }
       ul-site4: { ipv4_address: 10.100.12.254 }
       ul-site5: { ipv4_address: 10.100.13.254 }
+      ul-nat: { ipv4_address: 10.100.20.254 }
+
+  nat:
+    <<: *common
+    hostname: nat
+    environment:
+      ROLE: nat
+      WAN_NET: "10.100.20."
+      GATEWAY: 10.100.20.254
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
+    networks:
+      ul-nat: { ipv4_address: 10.100.20.10 }
+      lan-nat: { ipv4_address: 192.168.77.254 }
+
+  natc1:
+    <<: *common
+    hostname: natc1
+    environment:
+      ROLE: site
+      TRUNK_NET: "10.200.31."
+      GATEWAY: 192.168.77.254
+    networks:
+      lan-nat: { ipv4_address: 192.168.77.11 }
+      tr-natc1: { ipv4_address: 10.200.31.10 }
+
+  c-natc1:
+    <<: *common
+    hostname: c-natc1
+    environment:
+      ROLE: client
+      TRUNK_NET: "10.200.31."
+    networks:
+      tr-natc1: { ipv4_address: 10.200.31.20 }
+
+  natc2:
+    <<: *common
+    hostname: natc2
+    environment:
+      ROLE: site
+      TRUNK_NET: "10.200.32."
+      GATEWAY: 192.168.77.254
+    networks:
+      lan-nat: { ipv4_address: 192.168.77.12 }
+      tr-natc2: { ipv4_address: 10.200.32.10 }
+
+  c-natc2:
+    <<: *common
+    hostname: c-natc2
+    environment:
+      ROLE: client
+      TRUNK_NET: "10.200.32."
+    networks:
+      tr-natc2: { ipv4_address: 10.200.32.20 }
 
   site1:
     <<: *common
@@ -179,6 +237,22 @@ networks:
       com.docker.network.driver.mtu: "1400"
     ipam:
       config: [{ subnet: 10.100.13.0/24 }]
+  ul-nat:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.100.20.0/24 }]
+  lan-nat:
+    internal: true
+    ipam:
+      config: [{ subnet: 192.168.77.0/24 }]
+  tr-natc1:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.200.31.0/24 }]
+  tr-natc2:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.200.32.0/24 }]
   tr-site1:
     internal: true
     ipam:

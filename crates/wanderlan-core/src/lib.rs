@@ -14,6 +14,7 @@ pub mod join;
 pub mod kernel;
 pub mod loopguard;
 pub mod mtu;
+pub mod nat;
 pub mod policy;
 pub mod reconcile;
 pub mod rename;

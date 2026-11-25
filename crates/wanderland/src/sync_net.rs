@@ -16,9 +16,13 @@
 //!   ```text
 //!   C: SYNC <client id> <client nonce>
 //!   S: OK <server id> <server nonce>        (or: NO <reason>)
-//!   C: <tag> <length>\n<body>               (body: empty, for now)
-//!   S: <tag> <length>\n<body>               (the network as the client may see it)
+//!   C: <tag> <length>\n<body>               (empty: a pull; else its network: a push)
+//!   S: <tag> <length>\n<body>               (pull: the network as the client may see
+//!                                           it; push: ok, busy or refused: <reason>)
 //!   ```
+//!
+//!   A client pushes its changes this way: its server never connects to it
+//!   (it may be behind NAT).
 
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -71,8 +75,15 @@ pub struct Offer {
 /// A peer whose identity is known.
 #[derive(Debug, Clone)]
 pub struct Keyed {
-    /// Its address (its view in [`Offer::views`]).
+    /// Its name.
+    pub name: String,
+    /// Its address in the network.
     pub address: Ipv4Addr,
+    /// A client of this site: it may ask from anywhere (behind NAT, with a
+    /// changing address); its key proves who it is.
+    pub client: bool,
+    /// What it gets: the network as it may see it.
+    pub view: Arc<str>,
     /// The keys of the tunnel to it.
     pub keys: Arc<PairKeys>,
 }
@@ -80,11 +91,43 @@ pub struct Keyed {
 impl PartialEq for Keyed {
     // The keys follow from the identities.
     fn eq(&self, other: &Self) -> bool {
-        self.address == other.address
+        self.name == other.name
+            && self.address == other.address
+            && self.client == other.client
+            && self.view == other.view
     }
 }
 
 impl Eq for Keyed {}
+
+/// The answer to a push.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushAnswer {
+    /// Taken over (applied; confirmed once the client follows).
+    Ok,
+    /// Another change is pending; push again shortly.
+    Busy,
+    /// Not taken over, and why.
+    Refused(String),
+}
+
+impl PushAnswer {
+    fn text(&self) -> String {
+        match self {
+            Self::Ok => "ok".into(),
+            Self::Busy => "busy".into(),
+            Self::Refused(reason) => format!("refused: {reason}"),
+        }
+    }
+
+    fn parse(text: &str) -> Self {
+        match text.trim() {
+            "ok" => Self::Ok,
+            "busy" => Self::Busy,
+            other => Self::Refused(other.strip_prefix("refused: ").unwrap_or(other).to_string()),
+        }
+    }
+}
 
 /// Starts the server; it follows changes of the offer.
 pub fn spawn(offer: watch::Receiver<Offer>, inputs: mpsc::Sender<Input>) -> JoinHandle<()> {
@@ -171,7 +214,7 @@ async fn serve(
     let line = read_line(&mut reader).await?;
     let line = line.trim();
     if let Some(args) = line.strip_prefix("SYNC ") {
-        return serve_sync(args, from, offer, &mut reader, &mut write).await;
+        return serve_sync(args, from, offer, inputs, &mut reader, &mut write).await;
     }
     if line == "NETWORK" {
         let Some(view) = offer.views.get(from.ip()) else {
@@ -234,6 +277,7 @@ async fn serve_sync<R, W>(
     args: &str,
     from: SocketAddrV4,
     offer: &Offer,
+    inputs: &mpsc::Sender<Input>,
     reader: &mut R,
     write: &mut W,
 ) -> Result<()>
@@ -250,7 +294,7 @@ where
         write.write_all(b"NO unknown identity\n").await?;
         bail!("{from} asked with an unknown identity");
     };
-    if keyed.address != *from.ip() {
+    if !keyed.client && keyed.address != *from.ip() {
         write
             .write_all(b"NO not from the address of that site\n")
             .await?;
@@ -271,18 +315,38 @@ where
     {
         bail!("{from} sent a wrong sync tag");
     }
-    let Some(view) = offer.views.get(from.ip()) else {
-        bail!("{from} is not a peer");
+    let reply: String = if body.is_empty() {
+        keyed.view.to_string()
+    } else {
+        let text = String::from_utf8(body).context("the pushed network is not text")?;
+        push_to_controller(&keyed.name, text, inputs).await.text()
     };
     let tag = keyed
         .keys
-        .sync_tag(&[LABEL_REPLY, &client_nonce, &server_nonce, view.as_bytes()]);
+        .sync_tag(&[LABEL_REPLY, &client_nonce, &server_nonce, reply.as_bytes()]);
     write
-        .write_all(format!("{} {}\n", hex_encode(&tag), view.len()).as_bytes())
+        .write_all(format!("{} {}\n", hex_encode(&tag), reply.len()).as_bytes())
         .await?;
-    write.write_all(view.as_bytes()).await?;
+    write.write_all(reply.as_bytes()).await?;
     write.shutdown().await?;
     Ok(())
+}
+
+/// Hands a pushed network to the controller and waits for its decision.
+async fn push_to_controller(peer: &str, text: String, inputs: &mpsc::Sender<Input>) -> PushAnswer {
+    let (reply, answer) = oneshot::channel();
+    let input = Input::SyncPush {
+        peer: peer.to_string(),
+        text,
+        reply,
+    };
+    if inputs.send(input).await.is_err() {
+        return PushAnswer::Busy;
+    }
+    match tokio::time::timeout(JOIN_TIMEOUT, answer).await {
+        Ok(Ok(answer)) => answer,
+        _ => PushAnswer::Busy,
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -368,6 +432,34 @@ pub async fn fetch_sync(
     expect: SiteId,
     keys: &PairKeys,
 ) -> Result<String> {
+    let text = exchange(peer, me, expect, keys, "").await?;
+    if text.trim().is_empty() {
+        bail!("{peer} sent an empty configuration");
+    }
+    Ok(text)
+}
+
+/// Pushes this site's network to its server (`SYNC` with a body).
+pub async fn push_sync(
+    peer: SocketAddrV4,
+    me: SiteId,
+    expect: SiteId,
+    keys: &PairKeys,
+    network: &str,
+) -> Result<PushAnswer> {
+    exchange(peer, me, expect, keys, network)
+        .await
+        .map(|text| PushAnswer::parse(&text))
+}
+
+/// One authenticated exchange: `body` there, the answer back.
+async fn exchange(
+    peer: SocketAddrV4,
+    me: SiteId,
+    expect: SiteId,
+    keys: &PairKeys,
+    body: &str,
+) -> Result<String> {
     let stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(peer))
         .await
         .context("timeout while connecting")?
@@ -399,19 +491,16 @@ pub async fn fetch_sync(
             expect.fingerprint()
         );
     }
-    let tag = keys.sync_tag(&[LABEL_REQUEST, &client_nonce, &server_nonce, b""]);
+    let tag = keys.sync_tag(&[LABEL_REQUEST, &client_nonce, &server_nonce, body.as_bytes()]);
     write
-        .write_all(format!("{} 0\n", hex_encode(&tag)).as_bytes())
+        .write_all(format!("{} {}\n", hex_encode(&tag), body.len()).as_bytes())
         .await?;
-    let (tag, body) = read_tagged(&mut reader).await?;
-    if !keys.sync_verify(&[LABEL_REPLY, &client_nonce, &server_nonce, &body], &tag) {
-        bail!("{peer} sent the network with a wrong tag; not used");
+    write.write_all(body.as_bytes()).await?;
+    let (tag, answer) = read_tagged(&mut reader).await?;
+    if !keys.sync_verify(&[LABEL_REPLY, &client_nonce, &server_nonce, &answer], &tag) {
+        bail!("{peer} answered with a wrong tag; not used");
     }
-    let text = String::from_utf8(body).context("the network is not text")?;
-    if text.trim().is_empty() {
-        bail!("{peer} sent an empty configuration");
-    }
-    Ok(text)
+    String::from_utf8(answer).context("the answer is not text")
 }
 
 /// Fetches the network configuration from a peer.
@@ -456,7 +545,10 @@ mod tests {
                 [(
                     a.id(),
                     Keyed {
+                        name: "a".into(),
                         address: Ipv4Addr::LOCALHOST,
+                        client: false,
+                        view: Arc::from("the network\n"),
                         keys: Arc::new(b.pair(&a.id()).unwrap()),
                     },
                 )]

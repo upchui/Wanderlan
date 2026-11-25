@@ -150,7 +150,13 @@ fn identity_line(peer: &PeerStatus) -> Line<'static> {
         label("Identity"),
         Span::raw(format!("{id}   ")),
         Span::styled(state, style),
-        Span::styled(format!("   tunnel {}", peer.tunnel.label()), theme::dim()),
+        Span::styled(
+            match &peer.endpoint {
+                Some(at) => format!("   tunnel {} from {at}", peer.tunnel.label()),
+                None => format!("   tunnel {}", peer.tunnel.label()),
+            },
+            theme::dim(),
+        ),
     ])
 }
 

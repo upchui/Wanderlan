@@ -46,6 +46,7 @@ struct RawNetworkFile {
 struct RawNetworkSection {
     revision: Option<Spanned<i64>>,
     control_port: Option<Spanned<i64>>,
+    tunnel_port: Option<Spanned<i64>>,
     vlans: Option<Spanned<RawVlans>>,
     mtu_probe_interval: Option<Spanned<String>>,
     mss: Option<Spanned<i64>>,
@@ -647,6 +648,13 @@ fn lower_section(lw: &mut Lowering, s: RawNetworkSection, network: &mut Network)
             .unwrap_or(DEFAULT_CONTROL_PORT),
         None => DEFAULT_CONTROL_PORT,
     };
+
+    let path = FieldPath::network("tunnel_port");
+    if let Some(v) = lw.take(&path, s.tunnel_port) {
+        network.tunnel_port = lw
+            .int_in_range(&path, v, 1, 65535)
+            .and_then(|v| u16::try_from(v).ok());
+    }
 
     // Without (or with an empty) `vlans` every VLAN and the untagged
     // traffic pass, like on a trunk between two switches.

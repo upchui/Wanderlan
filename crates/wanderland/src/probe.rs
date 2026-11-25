@@ -12,7 +12,7 @@
 //! up); an answer with a wrong tag means another box answers at its address.
 //! A peer with a key counts as reachable only with valid answers.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -102,18 +102,38 @@ pub struct ProbeConfig {
     /// The keys towards the peers whose identity is known: probed with
     /// version 2; every other peer with version 1.
     pub keys: BTreeMap<String, PeerKeys>,
+    /// Peers this site never sends anything to first (its clients with a
+    /// key, maybe behind NAT): probed only where their authenticated probes
+    /// come from, once that place answered a challenge.
+    pub passive: BTreeSet<String>,
 }
 
 impl ProbeConfig {
-    /// What to announce to the peer at `addr`.
-    fn announce_for(&self, addr: Ipv4Addr) -> wire::Announce {
+    /// What to announce to `peer`.
+    fn announce_of(&self, peer: &str) -> wire::Announce {
+        self.announce_to.get(peer).copied().unwrap_or(self.announce)
+    }
+
+    /// The peer (or responder, `false`) at `ip`.
+    fn peer_at(&self, ip: Ipv4Addr) -> Option<(String, bool)> {
         self.peers
             .iter()
-            .chain(self.responders.iter())
-            .find(|(_, a)| **a == addr)
-            .and_then(|(name, _)| self.announce_to.get(name))
-            .copied()
-            .unwrap_or(self.announce)
+            .find(|(_, a)| **a == ip)
+            .map(|(n, _)| (n.clone(), true))
+            .or_else(|| {
+                self.responders
+                    .iter()
+                    .find(|(_, a)| **a == ip)
+                    .map(|(n, _)| (n.clone(), false))
+            })
+    }
+
+    /// The peer with identity `id`.
+    fn peer_with(&self, id: SiteId) -> Option<String> {
+        self.keys
+            .iter()
+            .find(|(_, k)| k.id == id)
+            .map(|(n, _)| n.clone())
     }
 }
 
@@ -196,6 +216,9 @@ pub enum ProbeEvent {
     /// The probes found something about the identity of a peer with a key:
     /// it answered with a valid tag (confirmed), or with a wrong one.
     Identity { peer: String, state: PeerIdentity },
+    /// A passive peer (a client) answered a challenge at this address: its
+    /// control traffic comes from there (its NAT's address and port).
+    Endpoint { peer: String, addr: SocketAddrV4 },
 }
 
 /// A probe waiting for its reply: from that peer, with that sequence number.
@@ -225,6 +248,11 @@ struct Shared {
     /// Keys for identities claimed in requests of peers whose identity this
     /// site does not know yet (bounded).
     claimed: Mutex<HashMap<SiteId, Option<Arc<PairKeys>>>>,
+    /// Where the passive peers are probed (confirmed by a challenge).
+    endpoints: Mutex<HashMap<String, SocketAddrV4>>,
+    /// Where authenticated requests of passive peers came from lately, to be
+    /// confirmed by a challenge.
+    candidates: Mutex<HashMap<String, SocketAddrV4>>,
 }
 
 impl Shared {
@@ -289,6 +317,8 @@ async fn run(
             config: config.clone(),
             nonce,
             claimed: Mutex::new(HashMap::new()),
+            endpoints: Mutex::new(HashMap::new()),
+            candidates: Mutex::new(HashMap::new()),
         });
         let receiver = tokio::spawn(receive(shared.clone(), table.clone(), events.clone()));
         let mut prober: BTreeMap<String, (Target, JoinHandle<()>)> = BTreeMap::new();
@@ -396,20 +426,24 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
         };
         let SocketAddr::V4(from) = from else { continue };
         let Some(packet) = buf.get(..n) else { continue };
-        let (peer, announce_self) = {
+        let v2 = wire2::decode(packet);
+        // A request of a peer with a key names it by its identity (several
+        // clients behind one NAT share an address); everything else by the
+        // address.
+        let (peer, announce_self, passive) = {
             let cfg = shared.config.borrow();
-            let peer = cfg
-                .peers
-                .iter()
-                .find(|(_, a)| **a == *from.ip())
-                .map(|(n, _)| (n.clone(), true))
-                .or_else(|| {
-                    cfg.responders
-                        .iter()
-                        .find(|(_, a)| **a == *from.ip())
-                        .map(|(n, _)| (n.clone(), false))
-                });
-            (peer, cfg.announce_for(*from.ip()))
+            let peer = match v2 {
+                Some(wire2::Probe::Request(r)) => cfg
+                    .peer_with(r.sender)
+                    .map(|n| (n, true))
+                    .or_else(|| cfg.peer_at(*from.ip())),
+                _ => cfg.peer_at(*from.ip()),
+            };
+            let announce = peer
+                .as_ref()
+                .map_or(cfg.announce, |(n, _)| cfg.announce_of(n));
+            let passive = peer.as_ref().is_some_and(|(n, _)| cfg.passive.contains(n));
+            (peer, announce, passive)
         };
         let Some((peer, direct)) = peer else {
             debug!("ignoring probe from {from}, not a peer");
@@ -438,7 +472,7 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
                     }
                 }
             }
-        } else if let Some(msg) = wire2::decode(packet) {
+        } else if let Some(msg) = v2 {
             match msg {
                 wire2::Probe::Request(request) => {
                     let me = shared.config.borrow().me.clone();
@@ -462,6 +496,20 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
                     }
                     if direct && verified {
                         note_announce(&table, &events, &peer, request.announce).await;
+                    }
+                    // A client asks from where its NAT sends: the place to
+                    // probe it, once it answers a challenge there.
+                    if passive && verified {
+                        let known = shared
+                            .endpoints
+                            .lock()
+                            .ok()
+                            .and_then(|e| e.get(&peer).copied());
+                        if known != Some(from)
+                            && let Ok(mut c) = shared.candidates.lock()
+                        {
+                            c.insert(peer.clone(), from);
+                        }
                     }
                 }
                 wire2::Probe::Reply(reply) => {
@@ -586,7 +634,7 @@ async fn probe_once(
     let (announce, me, keys) = {
         let cfg = shared.config.borrow();
         (
-            cfg.announce_for(*peer.ip()),
+            cfg.announce_of(name),
             cfg.me.clone(),
             cfg.keys.get(name).cloned(),
         )
@@ -642,8 +690,23 @@ async fn probe_peer(
     table: ProbeTable,
     events: mpsc::Sender<ProbeEvent>,
 ) {
-    let port = shared.config.borrow().bind.map_or(0, |b| b.port());
-    let target = SocketAddrV4::new(addr, port);
+    let (port, passive) = {
+        let cfg = shared.config.borrow();
+        (
+            cfg.bind.map_or(0, |b| b.port()),
+            cfg.passive.contains(&name),
+        )
+    };
+    // A passive peer is probed only where it was confirmed.
+    let mut target = if passive {
+        shared
+            .endpoints
+            .lock()
+            .ok()
+            .and_then(|e| e.get(&name).copied())
+    } else {
+        Some(SocketAddrV4::new(addr, port))
+    };
     let mut next_mtu: Option<Instant> = Some(Instant::now());
     let mut last_pmtu: Option<u16> = None;
     let mut generation = shared.config.borrow().generation;
@@ -653,6 +716,37 @@ async fn probe_peer(
             generation = current;
             next_mtu = Some(Instant::now());
         }
+        if passive {
+            let candidate = shared
+                .candidates
+                .lock()
+                .ok()
+                .and_then(|mut c| c.remove(&name));
+            if let Some(candidate) = candidate.filter(|c| Some(*c) != target)
+                && matches!(
+                    probe_once(&shared, &name, candidate, RTT_SIZE, RTT_TIMEOUT).await,
+                    Outcome::Answered(_)
+                )
+            {
+                info!("Client \"{name}\" is at {candidate}");
+                target = Some(candidate);
+                if let Ok(mut e) = shared.endpoints.lock() {
+                    e.insert(name.clone(), candidate);
+                }
+                next_mtu = Some(Instant::now());
+                let _ = events
+                    .send(ProbeEvent::Endpoint {
+                        peer: name.clone(),
+                        addr: candidate,
+                    })
+                    .await;
+            }
+        }
+        let Some(target) = target else {
+            // Not contacted yet: nothing is sent to it.
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            continue;
+        };
         let outcome = probe_once(&shared, &name, target, RTT_SIZE, RTT_TIMEOUT).await;
         let rtt = outcome.rtt();
         let became_reachable = update_reachability(&table, &name, rtt);
@@ -854,6 +948,8 @@ mod tests {
             config: rx,
             nonce: crate::random::bytes().unwrap(),
             claimed: Mutex::new(HashMap::new()),
+            endpoints: Mutex::new(HashMap::new()),
+            candidates: Mutex::new(HashMap::new()),
         });
         let table: ProbeTable = Arc::new(RwLock::new(BTreeMap::new()));
         let (events, _) = mpsc::channel(16);

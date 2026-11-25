@@ -1,7 +1,7 @@
 //! Desired system state derived from the configuration.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddrV4};
 
 use crate::BRIDGE_NAME;
 use crate::config::{Config, LocalVid, NATIVE_VID};
@@ -9,9 +9,10 @@ use crate::forwarding;
 use crate::identity::PeerIdentity;
 use crate::mtu;
 use crate::sys::nft::{MssRule, PortDir, SplitRule};
+use crate::sys::nft_ip::LearnRule;
 use crate::sys::tc::{Direction, TcAction, TcRule};
-use crate::sys::{BridgeOptions, GretapParams, PortVlans, VlanFlags};
-use crate::topology;
+use crate::sys::{BridgeOptions, FouEncap, GretapParams, PortVlans, VlanFlags};
+use crate::topology::{self, TunnelKind};
 
 /// Alias that marks interfaces created by wanderlan.
 pub const OWNER_ALIAS: &str = "wanderlan";
@@ -91,6 +92,14 @@ pub struct Desired {
     /// Split horizon in nftables instead of `isolated` ports, where this
     /// site passes VLANs on between server tunnels (see [`forwarding`]).
     pub split: BTreeSet<SplitRule>,
+    /// The FOU port of the tunnels inside UDP (to the uplink and the
+    /// clients), if this site has one.
+    pub fou_port: Option<u16>,
+    /// The clients whose endpoints are learned (table `ip wanderlan`).
+    pub learn: BTreeSet<LearnRule>,
+    /// The tunnel packets of the clients skip connection tracking (only
+    /// where it is loaded).
+    pub notrack: bool,
 }
 
 impl Desired {
@@ -143,6 +152,12 @@ pub struct Runtime {
     /// What the probes found about the identity of the peers with a key. A
     /// tunnel with a key comes up only once its peer is confirmed.
     pub identity: BTreeMap<String, PeerIdentity>,
+    /// Where the tunnel packets of the clients of this site come from (the
+    /// NAT in front of them chooses the port), learned from their
+    /// keepalives.
+    pub endpoints: BTreeMap<String, SocketAddrV4>,
+    /// Connection tracking is loaded (it would cost every tunnel packet).
+    pub conntrack: bool,
 }
 
 /// Computes the desired state.
@@ -179,6 +194,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
     let default_trunk = cfg.trunk();
 
     let self_online = cfg.self_site().is_none_or(|s| s.online);
+    let tunnel_port = network.tunnel_port();
     let passing = forwarding::forwarding(network, me);
     let tunnels: Vec<TunnelSpec> = topology::tunnels_for(network, me)
         .into_iter()
@@ -203,6 +219,38 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
             } else {
                 None
             };
+            // Between a client and its server the tunnel runs inside UDP,
+            // so that it passes NAT. The client sends from any of its
+            // addresses (the kernel picks it); its server answers where the
+            // client's packets come from.
+            let endpoint = runtime.endpoints.get(&t.peer.name);
+            let (local, remote, encap) = match (t.kind, key) {
+                (TunnelKind::Uplink, Some(_)) => (
+                    Ipv4Addr::UNSPECIFIED,
+                    t.peer.address,
+                    Some(FouEncap {
+                        sport: tunnel_port,
+                        dport: tunnel_port,
+                    }),
+                ),
+                (TunnelKind::Client, Some(_)) => (
+                    local_address,
+                    endpoint.map_or(t.peer.address, |e| *e.ip()),
+                    Some(FouEncap {
+                        sport: tunnel_port,
+                        dport: endpoint.map_or(tunnel_port, SocketAddrV4::port),
+                    }),
+                ),
+                _ => (local_address, t.peer.address, None),
+            };
+            let down_reason = down_reason.or_else(|| {
+                (t.kind == TunnelKind::Client && key.is_some() && endpoint.is_none()).then(|| {
+                    format!(
+                        "waiting for client \"{}\" to connect (its tunnel packets, UDP {tunnel_port})",
+                        t.peer.name
+                    )
+                })
+            });
             TunnelSpec {
                 enabled: down_reason.is_none(),
                 down_reason,
@@ -210,11 +258,12 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
                 peer: t.peer.name.clone(),
                 bridge: bridge_for(cfg.trunk_for(&t.peer.name), default_trunk),
                 params: GretapParams {
-                    local: local_address,
-                    remote: t.peer.address,
+                    local,
+                    remote,
                     ignore_df: true,
                     pmtudisc: false,
                     key,
+                    encap,
                 },
                 isolated: passing.isolated.contains(&t.peer.name),
                 vlans: carried.iter().map(|v| (v, VlanFlags::TAGGED)).collect(),
@@ -254,7 +303,25 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
         }
     }
 
+    let fou_port = tunnels
+        .iter()
+        .any(|t| t.params.encap.is_some())
+        .then_some(tunnel_port);
+    let learn: BTreeSet<LearnRule> = topology::tunnels_for(network, me)
+        .into_iter()
+        .filter(|t| t.kind == TunnelKind::Client)
+        .filter_map(|t| {
+            Some(LearnRule {
+                client: t.peer.name.clone(),
+                key: *runtime.gre_keys.get(&t.peer.name)?,
+            })
+        })
+        .collect();
+    let notrack = runtime.conntrack && !learn.is_empty();
     Desired {
+        fou_port,
+        notrack,
+        learn,
         bridge_options: BRIDGE_OPTIONS,
         trunks,
         mss: mss_rules(cfg, &tunnels, runtime),
@@ -286,7 +353,7 @@ fn identity_reason(peer: &str, address: Ipv4Addr, state: PeerIdentity) -> Option
 
 /// The overhead between path MTU and MSS of a tunnel.
 fn tunnel_overhead(tunnel: &TunnelSpec) -> u16 {
-    mtu::overhead(tunnel.params.key.is_some(), false)
+    mtu::overhead(tunnel.params.key.is_some(), tunnel.params.encap.is_some())
 }
 
 /// MSS clamping per tunnel port: a fixed value from the configuration, or

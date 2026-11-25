@@ -7,6 +7,34 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
+### Clients behind NAT
+
+Open UDP 51822 (the tunnel port, `network.tunnel_port`) towards the servers:
+the tunnels between a client and its server move into UDP.
+
+- A client opens every connection to its server; a server never contacts a
+  client first, it answers and sends where the client's packets come from.
+  Clients work behind NAT, several behind the same one, also with a changing
+  public address.
+- The tunnel between a client and its server is GRE inside UDP (FOU, port
+  51822), the client sending from any of its addresses. A keepalive frame
+  every 15 s keeps the NAT open; the server learns the NAT's port from it in
+  the kernel (nftables table `ip wanderlan`) and follows a new port in place.
+- Cheap per packet: only the keepalives reach the learning rule (data frames
+  stop at one compare of their inner ethertype), and where connection
+  tracking is loaded the server exempts the tunnel packets from it
+  (`notrack`). The table is written in the syntax of `nft -f`, so nftables
+  1.0 (Debian 12) works too.
+- A client sends its changes to its server itself (`SYNC` with a body); the
+  server no longer fetches them. Its probes are answered, and the server
+  probes it only where its authenticated probes come from, once that place
+  answered a challenge.
+- Several clients may share an address when they have identities; a box
+  that joins behind the NAT of a client becomes a client of its own (with the
+  same host name it needs `--name`).
+- The service also has `CAP_NET_RAW` and `AF_PACKET` (for the keepalives)
+  and loads the module `fou`.
+
 ### Identities and keyed tunnels
 
 Update all sites: an older version cannot read a `network.toml` with

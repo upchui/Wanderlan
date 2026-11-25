@@ -963,3 +963,124 @@ fn a_tunnel_with_several_ports_has_a_segment_of_its_own() {
     let buero = d.tunnels.iter().find(|t| t.peer == "buero").unwrap();
     assert_eq!(buero.bridge, "wl-ens21");
 }
+
+/// The test network with haus3 as a client of heim.
+fn with_client() -> String {
+    NETWORK.replacen(
+        "address = \"10.8.0.12\"",
+        "address = \"10.8.0.12\"\nuplink = \"heim\"",
+        1,
+    )
+}
+
+#[tokio::test]
+async fn a_client_tunnel_runs_inside_udp_and_follows_the_learned_endpoint() {
+    use crate::identity::PeerIdentity;
+    use crate::sys::FouEncap;
+    let network = with_client();
+    let key = 0x0102_0304;
+
+    // The client: its tunnel to its server inside UDP, from any address.
+    let mut runtime = Runtime::default();
+    runtime.gre_keys.insert("heim".into(), key);
+    runtime
+        .identity
+        .insert("heim".into(), PeerIdentity::Confirmed);
+    let client = derive(&config_from(&network, "haus3"), &runtime);
+    assert_eq!(client.fou_port, Some(51822));
+    assert!(client.learn.is_empty(), "a client learns nothing");
+    let net = fresh();
+    run(&net, &client).await;
+    assert!(net.state().calls.iter().any(|c| c == "add_fou_port 51822"));
+    let LinkKind::Gretap(p) = net.link("gt-heim").unwrap().kind else {
+        panic!("a GRETAP tunnel");
+    };
+    assert_eq!(p.local, Ipv4Addr::UNSPECIFIED);
+    assert_eq!(p.key, Some(key));
+    assert_eq!(
+        p.encap,
+        Some(FouEncap {
+            sport: 51822,
+            dport: 51822
+        })
+    );
+    assert!(run(&net, &client).await.is_empty(), "nothing more to do");
+
+    // The server: down until the client's packets showed where it is.
+    let mut runtime = Runtime::default();
+    runtime.gre_keys.insert("haus3".into(), key);
+    runtime
+        .identity
+        .insert("haus3".into(), PeerIdentity::Confirmed);
+    let server = derive(&config_from(&network, "heim"), &runtime);
+    let tunnel = server.tunnels.iter().find(|t| t.peer == "haus3").unwrap();
+    assert!(!tunnel.enabled);
+    assert!(
+        tunnel
+            .down_reason
+            .as_deref()
+            .is_some_and(|r| r.contains("waiting for client \"haus3\" to connect")),
+        "{:?}",
+        tunnel.down_reason
+    );
+    assert_eq!(server.learn.len(), 1);
+    let net = fresh();
+    run(&net, &server).await;
+    assert!(net.state().calls.iter().any(|c| c == "set_learn 51822 1"));
+    let index = net.link("gt-haus3").unwrap().index;
+
+    // Learned: the tunnel is changed in place and comes up.
+    let endpoint: std::net::SocketAddrV4 = "203.0.113.7:40001".parse().unwrap();
+    runtime.endpoints.insert("haus3".into(), endpoint);
+    let learned = derive(&config_from(&network, "heim"), &runtime);
+    let changes: Vec<String> = run(&net, &learned)
+        .await
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        changes
+            .iter()
+            .any(|c| c.contains("Changing GRETAP tunnel gt-haus3")),
+        "{changes:?}"
+    );
+    let link = net.link("gt-haus3").unwrap();
+    assert_eq!(link.index, index);
+    assert!(link.admin_up);
+    let LinkKind::Gretap(p) = link.kind else {
+        panic!("a GRETAP tunnel");
+    };
+    assert_eq!(p.remote, *endpoint.ip());
+    assert_eq!(p.encap.map(|e| e.dport), Some(40001));
+    // The MSS of a tunnel inside UDP: 8 bytes less again.
+    let mss = learned
+        .mss
+        .iter()
+        .find(|r| r.port == "gt-haus3" && !r.ipv6)
+        .map(|r| r.mss);
+    assert_eq!(mss, None, "nothing measured yet, no underlay MTU");
+
+    // Without the client tunnel the port and the table go.
+    let plain = derive(&config_from(NETWORK, "heim"), &Runtime::default());
+    run(&net, &plain).await;
+    assert!(net.state().calls.iter().any(|c| c == "delete_learn"));
+    assert!(net.state().calls.iter().any(|c| c == "del_fou_port 51822"));
+
+    // The teardown removes them too.
+    let net = fresh();
+    run(&net, &server).await;
+    let removed: Vec<String> = teardown(&net, |_| {})
+        .await
+        .unwrap()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(
+        removed.iter().any(|c| c.contains("table ip wanderlan")),
+        "{removed:?}"
+    );
+    assert!(
+        removed.iter().any(|c| c.contains("FOU port 51822")),
+        "{removed:?}"
+    );
+}

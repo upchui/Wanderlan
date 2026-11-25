@@ -46,6 +46,12 @@ pub struct FakeState {
     pub nft_delete_fails: bool,
     /// Reading the tc state fails.
     pub tc_state_fails: bool,
+    /// FOU receive ports.
+    pub fou: BTreeSet<super::fou::FouPort>,
+    /// The table `ip wanderlan`, if it exists.
+    pub learn: Option<super::nft_ip::LearnState>,
+    /// What its sets hold.
+    pub learned: BTreeMap<String, Vec<super::nft_ip::Learned>>,
     /// A bridge asked for counters came without them.
     vlan_stats_missed: bool,
     next_index: u32,
@@ -581,6 +587,81 @@ impl NftOps for FakeNet {
             return Err(err("delete table", "No such file or directory"));
         }
         Ok(())
+    }
+}
+
+impl super::fou::FouOps for FakeNet {
+    async fn fou_ports(&self) -> SysResult<Vec<super::fou::FouPort>> {
+        Ok(self.lock().fou.iter().copied().collect())
+    }
+
+    async fn add_fou_port(&self, port: u16) -> SysResult<()> {
+        let mut s = self.lock();
+        s.calls.push(format!("add_fou_port {port}"));
+        let entry = super::fou::FouPort {
+            port,
+            ipproto: super::fou::IPPROTO_GRE,
+        };
+        if !s.fou.insert(entry) {
+            return Err(err("open a FOU port", "File exists"));
+        }
+        Ok(())
+    }
+
+    async fn del_fou_port(&self, port: u16) -> SysResult<()> {
+        let mut s = self.lock();
+        s.calls.push(format!("del_fou_port {port}"));
+        let entry = super::fou::FouPort {
+            port,
+            ipproto: super::fou::IPPROTO_GRE,
+        };
+        if !s.fou.remove(&entry) {
+            return Err(err("close a FOU port", "No such file or directory"));
+        }
+        Ok(())
+    }
+}
+
+impl super::nft_ip::LearnOps for FakeNet {
+    async fn learn_state(&self) -> SysResult<Option<super::nft_ip::LearnState>> {
+        Ok(self.lock().learn.clone())
+    }
+
+    async fn set_learn(
+        &self,
+        port: u16,
+        rules: &BTreeSet<super::nft_ip::LearnRule>,
+        notrack: bool,
+    ) -> SysResult<()> {
+        let mut s = self.lock();
+        s.calls.push(format!("set_learn {port} {}", rules.len()));
+        let sets = rules
+            .iter()
+            .map(|r| format!("ep-{}", r.client))
+            .collect::<BTreeSet<_>>();
+        s.learned
+            .retain(|client, _| sets.contains(&format!("ep-{client}")));
+        s.learn = Some(super::nft_ip::LearnState {
+            port: Some(port),
+            rules: rules.clone(),
+            sets,
+            notrack,
+        });
+        Ok(())
+    }
+
+    async fn delete_learn(&self) -> SysResult<()> {
+        let mut s = self.lock();
+        s.calls.push("delete_learn".into());
+        s.learned.clear();
+        match s.learn.take() {
+            Some(_) => Ok(()),
+            None => Err(err("delete table", "No such file or directory")),
+        }
+    }
+
+    async fn learned(&self) -> SysResult<BTreeMap<String, Vec<super::nft_ip::Learned>>> {
+        Ok(self.lock().learned.clone())
     }
 }
 

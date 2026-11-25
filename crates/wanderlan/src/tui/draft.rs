@@ -204,6 +204,7 @@ impl Draft {
         let settings = [
             old.vlans != new.vlans,
             old.control_port != new.control_port,
+            old.tunnel_port != new.tunnel_port,
             old.mtu_probe_interval != new.mtu_probe_interval,
             old.mss != new.mss,
             old.commit_timeout != new.commit_timeout,
@@ -327,6 +328,7 @@ fn worst<'a>(diags: impl Iterator<Item = &'a Diagnostic>) -> Option<Severity> {
 /// Compares two networks ignoring the revision counter.
 pub fn same_network(a: &Network, b: &Network) -> bool {
     a.control_port == b.control_port
+        && a.tunnel_port == b.tunnel_port
         && a.vlans == b.vlans
         && a.mtu_probe_interval == b.mtu_probe_interval
         && a.mss == b.mss
