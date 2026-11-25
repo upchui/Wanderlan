@@ -24,10 +24,11 @@ use wanderlan_core::topology::{self, gretap_name};
 use super::diff::{self, DiffLine};
 use super::draft::{Draft, Running, TunnelRow};
 use super::filter::Filter;
-use super::form::{Form, FormEvent, FormKind, trunk_hint, tunnel_trunk_hint};
+use super::form::{Form, FormEvent, FormKind};
 use super::format;
 use super::log::LogState;
 use super::macs::MacState;
+use super::ports::{PortPicker, PortTarget};
 use super::ui::list;
 use super::wizard::{self, Mode, Step, Wizard};
 use crate::client::ClientError;
@@ -198,6 +199,8 @@ pub enum AskAction {
     },
     /// Close a form and lose its input (no: back to the form).
     DiscardInput(Box<Form>),
+    /// Close the trunk port window and lose the choice (no: back to it).
+    DiscardPorts(Box<PortPicker>),
 }
 
 impl AskAction {
@@ -323,6 +326,8 @@ pub enum Modal {
         /// The peer.
         name: String,
     },
+    /// Choosing trunk ports from the interfaces of this host.
+    Ports(PortPicker),
 }
 
 /// Samples kept per peer for the traffic graphs (one per status answer).
@@ -443,6 +448,8 @@ pub struct Scrolls {
     pub settings: list::Scroll,
     /// Open invitations.
     pub invites: list::Scroll,
+    /// Interfaces in the trunk port window.
+    pub ports: list::Scroll,
     /// Largest scroll offset of the help screen at its last size.
     pub help_max: std::cell::Cell<u16>,
     /// Keys of the help bar as drawn: first and last column, label.
@@ -461,6 +468,7 @@ enum ListId {
     Tunnels,
     Macs,
     Invites,
+    Ports,
 }
 
 /// The key a label of the help bar stands for; `None` for labels that
@@ -519,6 +527,8 @@ pub struct App {
     pub interfaces_loaded: bool,
     /// Error listing the interfaces.
     pub interfaces_error: Option<String>,
+    /// The interface the host routes an address over (tests replace it).
+    pub route_of: fn(std::net::Ipv4Addr) -> Option<String>,
     /// What systemd says about the daemon while it is not reachable.
     pub diagnosis: Option<Diagnosis>,
     /// Remove the kernel's GRE fallback devices once the interface list
@@ -588,6 +598,7 @@ impl App {
             interfaces: Vec::new(),
             interfaces_loaded: false,
             interfaces_error: None,
+            route_of: hostinfo::route_interface,
             diagnosis: None,
             cleanup_after_reset: false,
             invite_after_setup: false,
@@ -1013,16 +1024,6 @@ impl App {
         self.interfaces_error = None;
         if std::mem::take(&mut self.cleanup_after_reset) {
             fx.push(Effect::KernelCleanup(self.interfaces.clone()));
-        }
-        if let Some(Modal::Form(form)) = &mut self.modal
-            && form.kind == FormKind::Local
-        {
-            form.set_hint("trunk", trunk_hint(&self.interfaces));
-        }
-        if let (Some(Modal::Form(form)), Some(draft)) = (&mut self.modal, &self.draft)
-            && let FormKind::TunnelTrunk(_) = form.kind
-        {
-            form.set_hint("trunk", tunnel_trunk_hint(draft, &self.interfaces));
         }
     }
 
@@ -1498,6 +1499,7 @@ impl App {
     fn lists(&self) -> Vec<(ListId, &list::Scroll)> {
         match (&self.modal, self.view) {
             (Some(Modal::Invites { .. }), _) => vec![(ListId::Invites, &self.scrolls.invites)],
+            (Some(Modal::Ports(_)), _) => vec![(ListId::Ports, &self.scrolls.ports)],
             (Some(_), _) => Vec::new(),
             (None, View::Overview) => vec![
                 (ListId::Peers, &self.scrolls.peers),
@@ -1571,6 +1573,18 @@ impl App {
             }
             ListId::Invites => {
                 self.modal = Some(Modal::Invites { selected: index });
+                false
+            }
+            // A click on the row under the cursor ticks it.
+            ListId::Ports => {
+                let Some(Modal::Ports(picker)) = &mut self.modal else {
+                    return;
+                };
+                let again = picker.cursor == index;
+                picker.cursor = index;
+                if again {
+                    self.on_key(&KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), fx);
+                }
                 false
             }
         };
@@ -1783,6 +1797,7 @@ impl App {
                 match (yes, ask.action) {
                     // No: back where the question came from.
                     (false, AskAction::DiscardInput(form)) => Some(Modal::Form(*form)),
+                    (false, AskAction::DiscardPorts(picker)) => Some(Modal::Ports(*picker)),
                     (false, AskAction::DeleteInvite { selected, .. }) => {
                         Some(Modal::Invites { selected })
                     }
@@ -1831,6 +1846,7 @@ impl App {
             }
             Modal::Site { name } => self.on_site_key(name, key),
             Modal::Review(review) => self.on_review_key(review, key, fx),
+            Modal::Ports(picker) => self.on_ports_key(picker, key),
         }
     }
 
@@ -1866,6 +1882,119 @@ impl App {
         Some(Modal::Invites { selected })
     }
 
+    /// Opens the window to choose trunk ports. Interfaces that carry a
+    /// tunnel of this site cannot be chosen: bridging them would cut it.
+    fn open_ports(&mut self, target: PortTarget, fx: &mut Vec<Effect>) {
+        let Some(draft) = &self.draft else {
+            self.not_configured();
+            return;
+        };
+        let network = &draft.network;
+        let me = draft.local.self_name.as_deref().unwrap_or_default();
+        let peers: Vec<&wanderlan_core::config::Site> = if network.site(me).is_some() {
+            topology::tunnels_for(network, me)
+                .into_iter()
+                .map(|t| t.peer)
+                .collect()
+        } else {
+            network.sites.iter().filter(|s| s.name != me).collect()
+        };
+        let mut by_interface: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+        for peer in peers {
+            if let Some(interface) = (self.route_of)(peer.address) {
+                by_interface
+                    .entry(interface)
+                    .or_default()
+                    .push(peer.name.as_str());
+            }
+        }
+        let leads = by_interface
+            .into_iter()
+            .map(|(interface, names)| {
+                let text = match names.as_slice() {
+                    [a] => (*a).to_string(),
+                    [a, b] => format!("{a}, {b}"),
+                    [a, b, rest @ ..] => format!("{a}, {b} and {} more", rest.len()),
+                    [] => String::new(),
+                };
+                (interface, text)
+            })
+            .collect();
+        self.modal = Some(Modal::Ports(PortPicker::new(target, draft, leads)));
+        self.request_interfaces(fx);
+    }
+
+    fn on_ports_key(&mut self, mut picker: PortPicker, key: &KeyEvent) -> Option<Modal> {
+        let Some(draft) = &self.draft else {
+            return None;
+        };
+        if !self.interfaces_loaded && self.interfaces_error.is_none() {
+            // Still loading: only Esc.
+            return (key.code != KeyCode::Esc).then_some(Modal::Ports(picker));
+        }
+        let rows = picker.rows(draft, &self.interfaces);
+        // The rows and "other" below them.
+        let count = rows.len() + 1;
+        let typing = picker.cursor >= rows.len();
+        let moves = if typing {
+            matches!(
+                key.code,
+                KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+            )
+        } else {
+            true
+        };
+        if moves && let Some(n) = nav(key.code, picker.cursor, count, self.scrolls.ports.page()) {
+            picker.cursor = n;
+            return Some(Modal::Ports(picker));
+        }
+        match key.code {
+            KeyCode::Esc if picker.changed() => {
+                return Some(Modal::Ask(Ask {
+                    title: "Discard the choice".into(),
+                    text: "Close the window and lose the changed trunk ports? n goes back to it."
+                        .into(),
+                    action: AskAction::DiscardPorts(Box::new(picker)),
+                }));
+            }
+            KeyCode::Esc => return None,
+            // Added above "other", which keeps the cursor for the next name.
+            KeyCode::Enter if typing && !picker.manual.value().trim().is_empty() => {
+                picker.add_manual();
+                picker.cursor = picker.rows(draft, &self.interfaces).len();
+            }
+            KeyCode::Enter => match picker.apply(draft) {
+                Ok(new) => {
+                    self.draft = Some(new);
+                    let text = if self.draft.as_ref().is_some_and(|d| d.errors() > 0) {
+                        "Saved in the draft. The draft still has errors (marked red)."
+                    } else {
+                        "Saved in the draft. Press a to review and apply the changes."
+                    };
+                    self.say(MessageKind::Info, text);
+                    return None;
+                }
+                Err(e) => picker.error = Some(e),
+            },
+            _ if typing => picker.type_key(key),
+            KeyCode::Char(' ') => {
+                if let Some(row) = rows.get(picker.cursor) {
+                    picker.toggle(row);
+                }
+                // A port not on this host leaves the list when taken out.
+                let count = picker.rows(draft, &self.interfaces).len();
+                picker.cursor = picker.cursor.min(count);
+            }
+            KeyCode::Char('m') => {
+                if let Some(row) = rows.get(picker.cursor) {
+                    picker.make_main(&row.name);
+                }
+            }
+            _ => {}
+        }
+        Some(Modal::Ports(picker))
+    }
+
     fn on_form_key(
         &mut self,
         mut form: Form,
@@ -1899,10 +2028,6 @@ impl App {
                     }
                 }
             }
-            FormEvent::Submit if self.trunk_leads_to_peer(&form).is_some() => {
-                let msg = self.trunk_leads_to_peer(&form).unwrap_or_default();
-                form.reject("trunk", msg);
-            }
             FormEvent::Submit => {
                 if let Some(new) = form.submit(draft) {
                     match form.kind {
@@ -1926,23 +2051,6 @@ impl App {
             }
         }
         Some(Modal::Form(form))
-    }
-
-    /// For the trunk form of a tunnel: why the chosen interface cannot be
-    /// the trunk because the transport to the peer runs over it.
-    fn trunk_leads_to_peer(&self, form: &Form) -> Option<String> {
-        let FormKind::TunnelTrunk(site) = form.kind else {
-            return None;
-        };
-        let peer = self.draft.as_ref()?.network.sites.get(site)?;
-        let trunk = form.field("trunk")?.value().trim().to_string();
-        let route = hostinfo::route_interface(peer.address)?;
-        (route == trunk).then(|| {
-            format!(
-                "{trunk} leads to {} ({}); bridging it would cut the connection",
-                peer.name, peer.address
-            )
-        })
     }
 
     fn on_review_key(
@@ -2026,7 +2134,7 @@ impl App {
                     code,
                 })));
             }
-            AskAction::DiscardInput(_) => {}
+            AskAction::DiscardInput(_) | AskAction::DiscardPorts(_) => {}
         }
     }
 
@@ -2288,15 +2396,16 @@ impl App {
                 match all.get(self.settings_selected).copied() {
                     Some(Setting::Fixed(i)) => {
                         let Some(row) = ROWS.get(i) else { return };
-                        if row.local {
-                            self.request_interfaces(fx);
+                        if row.key == "trunk" {
+                            self.open_ports(PortTarget::Default, fx);
+                            return;
                         }
                         if row.key == "vlans" && !self.may_change_network_vlans() {
                             return;
                         }
                         let Some(draft) = &self.draft else { return };
                         let mut form = if row.local {
-                            Form::local(draft, &self.interfaces)
+                            Form::local(draft)
                         } else {
                             Form::network(draft)
                         };
@@ -2304,13 +2413,15 @@ impl App {
                         self.modal = Some(Modal::Form(form));
                     }
                     Some(Setting::TunnelTrunk(site)) => {
-                        self.request_interfaces(fx);
-                        let Some(draft) = &self.draft else { return };
-                        self.modal = Some(Modal::Form(Form::tunnel_trunk(
-                            draft,
-                            site,
-                            &self.interfaces,
-                        )));
+                        let Some(name) = self
+                            .draft
+                            .as_ref()
+                            .and_then(|d| d.network.sites.get(site))
+                            .map(|s| s.name.clone())
+                        else {
+                            return;
+                        };
+                        self.open_ports(PortTarget::Tunnel(name), fx);
                     }
                     None => {}
                 }
@@ -2386,17 +2497,14 @@ impl App {
             KeyCode::Char('i') => self.invite(),
             KeyCode::Char('I') => self.show_invites(fx),
             KeyCode::Char('o') if selected < count => self.toggle_online(),
-            KeyCode::Char('l') => {
-                self.modal = Some(Modal::Form(Form::local(draft, &self.interfaces)));
-                self.request_interfaces(fx);
-            }
+            KeyCode::Char('l') => self.open_ports(PortTarget::Default, fx),
             KeyCode::Char('d') | KeyCode::Delete if selected < count => {
                 let Some(site) = draft.network.sites.get(selected) else {
                     return;
                 };
                 if draft.local.self_name.as_deref() == Some(site.name.as_str()) {
                     let text = format!(
-                        "{} is this site and cannot be removed (change `self` with l first).",
+                        "{} is this site and cannot be removed (change \"This site\" in the settings, 7, first).",
                         site.name
                     );
                     self.say(MessageKind::Error, text);

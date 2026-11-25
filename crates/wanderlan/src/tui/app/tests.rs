@@ -516,37 +516,129 @@ fn settings_open_the_form_at_the_chosen_setting() {
     }
 }
 
+/// The tunnel to buero runs over ens18.
+fn fake_routes(address: std::net::Ipv4Addr) -> Option<String> {
+    (address == std::net::Ipv4Addr::new(10, 8, 0, 2)).then(|| "ens18".to_string())
+}
+
+fn picker(app: &App) -> &PortPicker {
+    match &app.modal {
+        Some(Modal::Ports(p)) => p,
+        other => panic!("expected the trunk port window, got {other:?}"),
+    }
+}
+
 #[test]
 fn a_tunnel_gets_its_own_trunk_in_the_settings() {
     let mut app = connected();
+    app.route_of = fake_routes;
     app.update(ch('7'));
     // The fixed settings come first, then one row per tunnel (buero, haus2, ...).
     app.settings_selected = crate::tui::ui::settings::ROWS.len() + 1;
-    app.update(key(KeyCode::Enter));
-    assert!(matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::TunnelTrunk(2)));
+    let fx = app.update(key(KeyCode::Enter));
+    assert!(
+        requests(&fx).contains(&&Request::Interfaces),
+        "the list is read"
+    );
+    assert_eq!(picker(&app).target, PortTarget::Tunnel("haus2".into()));
+    app.update(reply(
+        Request::Interfaces,
+        Reply::Interfaces(fixtures::interfaces()),
+    ));
+    // Rows: br-lan, ens18, ens19, eth1, then "other".
+    app.update(key(KeyCode::Down));
+    app.update(ch(' '));
+    assert!(picker(&app).chosen.is_empty(), "ens18 carries a tunnel");
+    assert!(
+        picker(&app)
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("leads to buero"))
+    );
+    // The default trunk belongs to another segment.
+    app.update(key(KeyCode::Down));
+    app.update(ch(' '));
+    assert!(picker(&app).chosen.is_empty(), "ens19 is the default trunk");
+    // A name that is not there yet: typed in the last row.
+    app.update(key(KeyCode::End));
     for c in "ens20".chars() {
         app.update(ch(c));
     }
     app.update(key(KeyCode::Enter));
+    assert_eq!(picker(&app).chosen, ["ens20"], "Enter adds it");
+    app.update(key(KeyCode::Enter));
     assert!(app.modal.is_none(), "saved");
     let draft = app.draft.as_ref().unwrap();
     assert_eq!(
-        draft
-            .local
-            .tunnel_trunks
-            .get("haus2")
-            .and_then(|p| p.first())
-            .map(String::as_str),
-        Some("ens20")
+        draft.local.tunnel_trunks.get("haus2").map(Vec::as_slice),
+        Some(&["ens20".to_string()][..])
     );
     assert!(app.draft_dirty());
-    // Empty again: back to the default trunk.
+    // Taken out again: back to the default trunk. ens20 is listed last
+    // (not on this host), right above "other".
     app.update(key(KeyCode::Enter));
-    for _ in 0..5 {
-        app.update(key(KeyCode::Backspace));
-    }
+    app.update(key(KeyCode::End));
+    app.update(key(KeyCode::Up));
+    app.update(ch(' '));
     app.update(key(KeyCode::Enter));
     assert!(app.draft.as_ref().unwrap().local.tunnel_trunks.is_empty());
+}
+
+#[test]
+fn several_trunk_ports_with_a_main_port() {
+    let mut app = connected();
+    app.route_of = fake_routes;
+    app.update(reply(
+        Request::Interfaces,
+        Reply::Interfaces(fixtures::interfaces()),
+    ));
+    app.update(ch('2'));
+    app.update(ch('l'));
+    assert_eq!(picker(&app).target, PortTarget::Default);
+    assert_eq!(picker(&app).chosen, ["ens19"]);
+    // eth1 is in br-lan: not a port.
+    app.update(key(KeyCode::Down));
+    app.update(key(KeyCode::Down));
+    app.update(key(KeyCode::Down));
+    app.update(ch(' '));
+    assert!(picker(&app).error.as_deref().unwrap().contains("in br-lan"));
+    app.update(key(KeyCode::Down));
+    for c in "usb0".chars() {
+        app.update(ch(c));
+    }
+    app.update(key(KeyCode::Enter));
+    // usb0 now sits above "other"; m makes it the main port.
+    app.update(key(KeyCode::Up));
+    app.update(ch('m'));
+    assert_eq!(picker(&app).chosen, ["usb0", "ens19"]);
+    // Esc asks first; n goes back to the window.
+    app.update(key(KeyCode::Esc));
+    assert!(matches!(
+        &app.modal,
+        Some(Modal::Ask(a)) if matches!(a.action, AskAction::DiscardPorts(_))
+    ));
+    app.update(ch('n'));
+    assert_eq!(picker(&app).chosen, ["usb0", "ens19"], "nothing lost");
+    app.update(key(KeyCode::Enter));
+    assert!(app.modal.is_none());
+    assert_eq!(app.draft.as_ref().unwrap().local.trunk, ["usb0", "ens19"]);
+    // The default trunk needs a port. Rows: br-lan, ens18, ens19, eth1, usb0.
+    app.update(ch('l'));
+    app.update(key(KeyCode::Down));
+    app.update(key(KeyCode::Down));
+    app.update(ch(' '));
+    app.update(key(KeyCode::Down));
+    app.update(key(KeyCode::Down));
+    app.update(ch(' '));
+    assert!(picker(&app).chosen.is_empty());
+    app.update(key(KeyCode::Enter));
+    assert!(
+        picker(&app)
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("at least one port")
+    );
 }
 
 #[test]

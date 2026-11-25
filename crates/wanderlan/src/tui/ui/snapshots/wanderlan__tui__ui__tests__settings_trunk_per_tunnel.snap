@@ -1,5 +1,6 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
+assertion_line: 182
 expression: render(&app)
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
@@ -19,9 +20,9 @@ expression: render(&app)
 "│  to buero             default (ens19)                                        ║"
 "│  to haus2             ens20 (own segment wl-ens20)                           ║"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-" The local interface the tunnel to haus2 is bridged with; empty: the default    "
-" trunk. Another interface makes it a segment of its own here (bridge            "
-" wl-<interface>): only that network reaches haus2.                              "
+" Local interfaces bridged with the tunnel to haus2 (Enter lists those of this   "
+" host); none: the default trunk. Others make it a segment of its own (bridge    "
+" wl-<first>): only their network reaches haus2.                                 "
 " Changes go into the draft; a reviews and applies them, c confirms.             "
 "                                                                                "
 "                                    1 blocked (see 1)  draft: 1 change  heim r7 "

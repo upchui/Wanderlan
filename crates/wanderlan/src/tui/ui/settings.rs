@@ -69,7 +69,7 @@ pub const ROWS: [SettingRow; 7] = [
         key: "trunk",
         label: "Trunk",
         local: true,
-        help: "The local interfaces that carry the VLANs to the switch or hypervisor (ports of br0, e.g. \"ens19, ens20\": bridged like the ports of a switch, the first is the main port); never the one that leads to the other sites. Tunnel MTU: fixed 1500, GRE fragments if the path is smaller.",
+        help: "The interfaces that carry the VLANs to the switch or hypervisor (ports of br0; Enter lists those of this host). Several act like switch ports, the first is the main port; never the one that leads to the other sites.",
     },
 ];
 
@@ -193,7 +193,7 @@ fn help_text(draft: &Draft, setting: Option<Setting>) -> String {
         Some(Setting::TunnelTrunk(i)) => {
             let name = draft.network.sites.get(i).map_or("", |s| s.name.as_str());
             format!(
-                "The local interface the tunnel to {name} is bridged with; empty: the default trunk. Another interface makes it a segment of its own here (bridge wl-<interface>): only that network reaches {name}."
+                "Local interfaces bridged with the tunnel to {name} (Enter lists those of this host); none: the default trunk. Others make it a segment of its own (bridge wl-<first>): only their network reaches {name}."
             )
         }
         None => String::new(),

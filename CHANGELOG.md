@@ -14,8 +14,14 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
   The same for a tunnel with a trunk of its own (`[tunnels.<site>] trunk =
   [...]`), so a server says for each site exactly which ports carry it and
   a client which ports are its trunk. A port belongs to one segment.
-- Settings (7) takes lists (`ens19, ens20`); `wanderlan trunk <site>
-  ens20,ens21`, with this site's own name for the default trunk.
+- Settings (7) and Sites `l` list the interfaces of the host to choose the
+  trunk ports from, several at once (`Space`, `m` for the main port, a
+  name that is not there yet in the last row). Interfaces the tunnels run
+  over, ports of another bridge and ports of another segment are grey with
+  the reason; the check is per port now (typing "ens18, ens19" used to slip
+  past the check for the interface towards the peer).
+  `wanderlan trunk <site> ens20,ens21`, with this site's own name for the
+  default trunk.
 - A further port that is missing (unplugged) is shown and left out instead
   of stopping the site; a loop between two trunk ports shuts the further
   one down (BLOCKED, `wanderlan unblock <port>`), never the main port.

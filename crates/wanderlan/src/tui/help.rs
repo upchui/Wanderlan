@@ -62,7 +62,7 @@ pub const SECTIONS: &[Section] = &[
                 "m",
                 "network settings (VLANs, port, MTU probe, timeout, MSS)",
             ),
-            ("l", "local settings of this host: self, trunk"),
+            ("l", "trunk ports of this host"),
             ("u", "unblock the tunnel port to the site"),
         ],
         text: "Servers are connected with each other; a client has one tunnel, to its \
@@ -131,7 +131,23 @@ pub const SECTIONS: &[Section] = &[
     Section {
         title: "7 Settings",
         keys: &[("Up/Down", "choose a setting"), ("Enter", "change it")],
-        text: "Every setting of the network and of this host, with an explanation.",
+        text: "Every setting of the network and of this host, with an explanation. \
+               Trunk and the trunk per tunnel open a list of the interfaces of this host.",
+    },
+    Section {
+        title: "Trunk ports",
+        keys: &[
+            (
+                "Space",
+                "choose an interface or take it out; several are fine",
+            ),
+            ("m", "main port (number 1, never shut by the loop guard)"),
+            ("other", "last row: a name not there yet, Enter adds it"),
+            ("Enter", "save the choice in the draft"),
+        ],
+        text: "Grey interfaces cannot be a trunk port here, the note says why: \
+               the tunnels run over it, it is in another bridge, or it is in another segment. \
+               For a tunnel, nothing chosen means the default trunk.",
     },
     Section {
         title: "Windows",
@@ -229,6 +245,12 @@ pub fn bar(app: &App) -> Vec<Binding> {
             ],
             Modal::Peer { .. } => vec![("Up/Down", "next peer"), ("Esc", "close")],
             Modal::Site { .. } => vec![("Up/Down", "next site"), ("e", "edit"), ("Esc", "close")],
+            Modal::Ports(_) => vec![
+                ("Space", "choose"),
+                ("m", "main port"),
+                ("Enter", "save to draft"),
+                ("Esc", "cancel"),
+            ],
             Modal::Form(_) => vec![
                 ("Tab", "next field"),
                 ("Left/Right", "choose"),
@@ -279,7 +301,7 @@ pub fn bar(app: &App) -> Vec<Binding> {
                 ("d", "delete"),
                 ("I", "invites"),
                 ("m", "network"),
-                ("l", "this host"),
+                ("l", "trunk ports"),
                 ("/", "search"),
             ],
             View::Settings => vec![("Enter", "change"), ("Up/Down", "choose")],

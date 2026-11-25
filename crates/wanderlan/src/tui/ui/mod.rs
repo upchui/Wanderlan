@@ -10,6 +10,7 @@ mod log;
 mod macs;
 mod overview;
 mod popup;
+mod ports;
 mod review;
 pub mod settings;
 mod sites;
@@ -72,6 +73,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Modal::Invites { selected } => details::invites(frame, app, *selected, body),
             Modal::Peer { name } => details::peer(frame, app, name, body),
             Modal::Site { name } => details::site(frame, app, name, body),
+            Modal::Ports(p) => ports::draw(frame, app, p, body),
         }
     }
 }

@@ -14,7 +14,7 @@ use crossterm::event::{KeyCode, KeyEvent};
 use wanderlan_core::api::{Interface, SiteRules, Translation};
 use wanderlan_core::config::{
     Diagnostic, FieldPath, LocalVid, Severity, Site, VID_MAX, VID_MIN, VlanMap, VlanSet,
-    ifname_error, site_name_error,
+    site_name_error,
 };
 
 use wanderlan_core::policy;
@@ -38,8 +38,6 @@ pub enum FormKind {
     Local,
     /// Rules for a new invitation (the draft is not changed).
     Invite,
-    /// The trunk of the tunnel to one site (index in the network), local.toml.
-    TunnelTrunk(usize),
     /// The own VLANs of one site (index in the network): on its trunk and
     /// towards its own clients only.
     OwnVlans(usize),
@@ -458,65 +456,24 @@ impl Form {
         Self::new(FormKind::Vlans, "VLANs of the network", fields, draft)
     }
 
-    /// Form for `local.toml`.
-    pub fn local(draft: &Draft, interfaces: &[Interface]) -> Self {
+    /// Form for `local.toml`: which site this host is. The trunk ports
+    /// have a window of their own (`ports.rs`).
+    pub fn local(draft: &Draft) -> Self {
         let sites: Vec<String> = draft.network.sites.iter().map(|s| s.name.clone()).collect();
         let own = draft.local.self_name.clone().unwrap_or_default();
-        let fields = vec![
-            Field::choice(
-                "self",
-                "This site",
-                "which site of the network this host is",
-                sites,
-                &own,
-            ),
-            Field::text(
-                "trunk",
-                "Trunk",
-                trunk_hint(interfaces),
-                draft.local.trunk.join(", "),
-            ),
-        ];
-        Self::new(FormKind::Local, "This site (local.toml)", fields, draft)
-    }
-
-    /// Form for the trunk of the tunnel to the site `site` (local.toml).
-    pub fn tunnel_trunk(draft: &Draft, site: usize, interfaces: &[Interface]) -> Self {
-        let name = draft
-            .network
-            .sites
-            .get(site)
-            .map(|s| s.name.clone())
-            .unwrap_or_default();
-        let fields = vec![Field::text(
-            "trunk",
-            "Trunk",
-            tunnel_trunk_hint(draft, interfaces),
-            draft
-                .local
-                .tunnel_trunks
-                .get(&name)
-                .map(|ports| ports.join(", "))
-                .unwrap_or_default(),
+        let fields = vec![Field::choice(
+            "self",
+            "This site",
+            "which site of the network this host is",
+            sites,
+            &own,
         )];
-        Self::new(
-            FormKind::TunnelTrunk(site),
-            format!("Trunk of the tunnel to {name}"),
-            fields,
-            draft,
-        )
+        Self::new(FormKind::Local, "This site (local.toml)", fields, draft)
     }
 
     /// Looks up a field by key.
     pub fn field(&self, key: &str) -> Option<&Field> {
         self.fields.iter().find(|f| f.key == key)
-    }
-
-    /// Replaces the help text of a field.
-    pub fn set_hint(&mut self, key: &str, hint: String) {
-        if let Some(f) = self.field_mut(key) {
-            f.hint = hint;
-        }
     }
 
     fn field_mut(&mut self, key: &str) -> Option<&mut Field> {
@@ -527,13 +484,6 @@ impl Form {
         self.field(key)
             .map(|f| f.value().trim().to_string())
             .unwrap_or_default()
-    }
-
-    /// Marks a field as wrong for a reason only the caller knows (e.g. the
-    /// interface leads to the other sites); shown right away.
-    pub fn reject(&mut self, key: &str, message: impl Into<String>) {
-        self.set_error(key, message);
-        self.submitted = true;
     }
 
     fn set_error(&mut self, key: &str, message: impl Into<String>) {
@@ -683,9 +633,7 @@ impl Form {
                         .unwrap_or(draft.network.tunnels.len()),
                 )
             }
-            FormKind::Network | FormKind::Vlans | FormKind::Local | FormKind::TunnelTrunk(_) => {
-                None
-            }
+            FormKind::Network | FormKind::Vlans | FormKind::Local => None,
         }
     }
 
@@ -697,9 +645,7 @@ impl Form {
             }
             FormKind::Map(_) => Some(FieldPath::map(i)),
             FormKind::TunnelVlans(..) => Some(FieldPath::tunnel(i)),
-            FormKind::Network | FormKind::Vlans | FormKind::Local | FormKind::TunnelTrunk(_) => {
-                None
-            }
+            FormKind::Network | FormKind::Vlans | FormKind::Local => None,
         }
     }
 
@@ -714,34 +660,7 @@ impl Form {
             FormKind::TunnelVlans(..) => FieldPath::tunnel_field(i, key),
             FormKind::Network | FormKind::Vlans => FieldPath::network(key),
             FormKind::Local => FieldPath::local(key),
-            FormKind::TunnelTrunk(site) => {
-                let name = draft
-                    .network
-                    .sites
-                    .get(site)
-                    .map_or("", |s| s.name.as_str());
-                FieldPath::local(&format!("tunnels.{name}.{key}"))
-            }
         }
-    }
-
-    /// The trunk ports of the field "trunk": names separated by commas or
-    /// spaces; an invalid name is marked on the field.
-    fn parse_ports(&mut self) -> Option<Vec<String>> {
-        let text = self.value("trunk");
-        let ports: Vec<String> = text
-            .split([',', ' '])
-            .map(str::trim)
-            .filter(|p| !p.is_empty())
-            .map(str::to_string)
-            .collect();
-        for port in &ports {
-            if let Some(msg) = ifname_error(port) {
-                self.set_error("trunk", format!("{port}: {msg}"));
-                return None;
-            }
-        }
-        Some(ports)
     }
 
     /// True once something was typed or chosen in the form.
@@ -828,20 +747,9 @@ impl Form {
                 };
                 candidate.network.set_tunnel_limit(&a, &b, limit);
             }
-            FormKind::TunnelTrunk(site) => {
-                let name = candidate.network.sites.get(site)?.name.clone();
-                let ports = self.parse_ports()?;
-                if ports.is_empty() || ports == candidate.local.trunk {
-                    candidate.local.tunnel_trunks.remove(&name);
-                } else {
-                    candidate.local.tunnel_trunks.insert(name, ports);
-                }
-            }
             FormKind::Local => {
                 let own = self.value("self");
-                let ports = self.parse_ports()?;
                 candidate.local.self_name = (!own.is_empty()).then_some(own);
-                candidate.local.trunk = ports;
             }
         }
         candidate.revalidate();
@@ -1212,28 +1120,6 @@ fn parse_changes(value: &str) -> (Option<String>, bool) {
     }
 }
 
-/// Help text of the trunk field of a tunnel.
-pub fn tunnel_trunk_hint(draft: &Draft, interfaces: &[Interface]) -> String {
-    format!(
-        "empty: the default trunk ({}); several: ens20, ens21; {}",
-        draft.local.trunk.join(", "),
-        trunk_hint(interfaces)
-    )
-}
-
-/// Help text of the trunk field: the usable interfaces.
-pub fn trunk_hint(interfaces: &[Interface]) -> String {
-    let names: Vec<&str> = trunk_candidates(interfaces)
-        .into_iter()
-        .map(|i| i.name.as_str())
-        .collect();
-    if names.is_empty() {
-        "local interface carrying the VLANs (tagged)".to_string()
-    } else {
-        format!("interfaces: {}", names.join(", "))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use crossterm::event::KeyModifiers;
@@ -1476,24 +1362,14 @@ mod tests {
     }
 
     #[test]
-    fn local_form_rejects_bad_trunk() {
+    fn the_local_form_only_chooses_the_site() {
         let d = draft();
-        let mut form = Form::local(&d, &fixtures::interfaces());
-        assert_eq!(
-            form.field("trunk").unwrap().hint,
-            "interfaces: br-lan, ens18, ens19, eth1"
-        );
-        form.focus = 1;
-        let ctrl_u = KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL);
-        form.handle_key(&ctrl_u);
-        type_text(&mut form, &d, "gt-x");
-        assert!(
-            form.field("trunk")
-                .unwrap()
-                .error
-                .as_deref()
-                .unwrap()
-                .contains("managed by wanderlan")
-        );
+        let mut form = Form::local(&d);
+        assert_eq!(form.fields.len(), 1, "the trunk has a window of its own");
+        assert_eq!(form.value("self"), "heim");
+        form.handle_key(&KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
+        let saved = form.submit(&d).expect("valid");
+        assert_ne!(saved.local.self_name.as_deref(), Some("heim"));
+        assert_eq!(saved.local.trunk, d.local.trunk, "the trunk is kept");
     }
 }

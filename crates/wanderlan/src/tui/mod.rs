@@ -19,6 +19,7 @@ mod input;
 mod localtime;
 mod log;
 mod macs;
+mod ports;
 mod theme;
 mod ui;
 mod wizard;

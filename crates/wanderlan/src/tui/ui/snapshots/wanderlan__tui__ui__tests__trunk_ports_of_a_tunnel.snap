@@ -1,0 +1,29 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+assertion_line: 582
+expression: render(&app)
+---
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+"┌ Settings (Enter: change, Up/Down: more) ─────────────────────────────────────┐"
+"│  Path MTU check       every 5m                                               ║"
+"│  TCP MSS              from the path MTU                                      ║"
+"│  Control port         51821                                                  █"
+"│This host                                                                     █"
+"│  This site            heim                                                   █"
+"│ ┌ Trunk ports of the tunnel to haus2 ──────────────────────────────────────┐ █"
+"│R│    #  INTERFACE       KIND      STATE MTU   NOTE                         │ █"
+"│ │[ ]    br-lan          bridge    up    1500  a bridge                     │ █"
+"│ │[ ]    ens18           physical  up    1500                               │ █"
+"│ │[ ]    ens19           physical  up    1500  in the default trunk         │ █"
+"│ │[ ]    eth1            physical  down  1500  in br-lan                    │ █"
+"│T│ other:                   an interface that is not there yet              │ █"
+"│ │                                                                          │ ║"
+"│ │ Nothing chosen: the tunnel to haus2 uses the default trunk (ens19).      │ ║"
+"└─└──────────────────────────────────────────────────────────────────────────┘─┘"
+" Local interfaces bridged with the tunnel to haus2 (Enter lists those of this   "
+" host); none: the default trunk. Others make it a segment of its own (bridge    "
+" wl-<first>): only their network reaches haus2.                                 "
+" Changes go into the draft; a reviews and applies them, c confirms.             "
+"                                                                                "
+"                                  1 blocked (see 1)  draft: no changes  heim r7 "
+" Space  choose   m  main port   Enter  save to draft   Esc  cancel              "

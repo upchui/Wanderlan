@@ -249,8 +249,11 @@ change one of the two sites may limit their tunnel.
 
 **Use several trunk ports.** The trunk can be several local interfaces;
 they are bridged like the ports of a switch and all carry the same VLANs and
-mappings (the first is the main port). Settings (`7`), "Trunk"
-(`ens19, ens20`), or `wanderlan trunk <this site> ens19,ens20`. A missing
+mappings (the first is the main port). Settings (`7`), "Trunk", lists the
+interfaces of the host: `Space` chooses one or more, `m` makes one the main
+port, a name that is not there yet goes in the last row; interfaces that
+cannot be a trunk port are grey with the reason (the tunnels run over it, it
+is in another bridge). Or `wanderlan trunk <this site> ens19,ens20`. A missing
 further port (e.g. an unplugged adapter) is shown and left out; a loop
 between two ports shuts down the further one, never the main port.
 
@@ -260,8 +263,8 @@ its own at this site (bridge `wl-<first interface>`, same VLANs and
 mappings): only the network on those interfaces reaches the other site
 through this one. So a server says for each site exactly which ports carry
 it, and a client which ports are its trunk. Settings (`7`), "Trunk per
-tunnel", or `wanderlan trunk <site> ens20` / `ens20,ens21` (`default` to
-undo).
+tunnel" (the same list of interfaces; nothing chosen is the default trunk),
+or `wanderlan trunk <site> ens20` / `ens20,ens21` (`default` to undo).
 
 ```
 hq
@@ -494,12 +497,12 @@ clicked.
 | Key | View |
 |-----|------|
 | `1` | Overview: this site with its role, the tunnel neighbours live (reply, round trip, path MTU, MSS, port state, MAC addresses, throughput, config in sync or `refused`), traffic of the tunnels and of every trunk, and all known sites with role and link (`via hq` for sites without a tunnel from here), each server with its clients indented below. One cursor runs through the neighbours and the sites. `Enter` on a neighbour: traffic graph, round-trip history, min/avg/max round trip, jitter, probe loss, latency, counters (Up/Down: the next neighbour); on a site: its details. |
-| `2` | Sites: name, address, VLANs, role, manager, tunnel; clients indented below their server. `Enter`: details (role, VLANs, every tunnel with what it carries, mappings, who may change it; Up/Down: the next site). Invite (`i`), open invitations (`I`), online/offline (`o`), new (`n`), edit (`e`: VLANs, "Changes", "Connected to"), delete (`d`), network and host settings (`m`, `l`). |
+| `2` | Sites: name, address, VLANs, role, manager, tunnel; clients indented below their server. `Enter`: details (role, VLANs, every tunnel with what it carries, mappings, who may change it; Up/Down: the next site). Invite (`i`), open invitations (`I`), online/offline (`o`), new (`n`), edit (`e`: VLANs, "Changes", "Connected to"), delete (`d`), network settings (`m`), trunk ports of this host (`l`). |
 | `3` | VLANs: the VLANs of the network (`v`), the own VLANs of this site (`o`) and the mappings (`n`, `Enter`, `d`) with their site and its role; conflicts are marked right away. `t` switches to the tunnels: what each carries, its limit (`Enter`, `d`). |
 | `4` | MAC addresses: filter (`/`), sort (`s`, `o`). |
 | `5` | Log: live events in local time (`t`: UTC), filter by level (`l`), site (`p`) and text (`/`). |
 | `6` | Setup: new network or join; on a configured site invite (`i`) and reset (`R`). |
-| `7` | Settings: every setting with an explanation, the trunk of every tunnel, and the role and rights of this site. |
+| `7` | Settings: every setting with an explanation, the trunk of every tunnel, and the role and rights of this site. `Enter` on a trunk lists the interfaces of the host to choose from (`Space`, `m`: main port). |
 
 Changes are collected in a draft; the status line says how many it holds,
 and new or changed rows are marked `+` or `*`. `a` shows the difference to

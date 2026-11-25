@@ -534,6 +534,7 @@ fn the_mouse_selects_opens_and_scrolls() {
 #[test]
 fn several_trunk_ports_in_the_settings() {
     let mut app = connected();
+    app.route_of = |a| (a == std::net::Ipv4Addr::new(10, 8, 0, 2)).then(|| "ens18".to_string());
     key(&mut app, KeyCode::Char('7'));
     // The trunk row: the fixed network rows, then "This site", then "Trunk".
     let trunk_row = super::settings::ROWS
@@ -544,13 +545,39 @@ fn several_trunk_ports_in_the_settings() {
         key(&mut app, KeyCode::Down);
     }
     key(&mut app, KeyCode::Enter);
-    // Replace the field with two ports and save.
-    for _ in 0..10 {
-        key(&mut app, KeyCode::Backspace);
-    }
-    typed(&mut app, "ens19, ens20");
+    assert!(render(&app).contains("Loading the interfaces"));
+    reply(
+        &mut app,
+        Request::Interfaces,
+        Reply::Interfaces(fixtures::interfaces()),
+    );
+    // A second port typed in "other", then made the main port.
+    key(&mut app, KeyCode::End);
+    typed(&mut app, "ens20");
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Up);
+    key(&mut app, KeyCode::Char('m'));
+    insta::assert_snapshot!(render(&app));
     key(&mut app, KeyCode::Enter);
     let d = app.draft.as_ref().expect("draft");
-    assert_eq!(d.local.trunk, ["ens19", "ens20"]);
-    assert!(render(&app).contains("ens19, ens20"));
+    assert_eq!(d.local.trunk, ["ens20", "ens19"]);
+    assert!(render(&app).contains("ens20, ens19"));
+}
+
+#[test]
+fn trunk_ports_of_a_tunnel() {
+    let mut app = connected();
+    app.route_of = |_| None;
+    reply(
+        &mut app,
+        Request::Interfaces,
+        Reply::Interfaces(fixtures::interfaces()),
+    );
+    key(&mut app, KeyCode::Char('7'));
+    // "to haus2": the fixed rows, then buero, then haus2.
+    for _ in 0..=super::settings::ROWS.len() {
+        key(&mut app, KeyCode::Down);
+    }
+    key(&mut app, KeyCode::Enter);
+    insta::assert_snapshot!(render(&app));
 }
