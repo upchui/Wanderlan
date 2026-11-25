@@ -18,9 +18,9 @@ failed=()
 begin() { printf '\n== %s\n' "$*"; }
 pass() { echo "  ok    $*"; }
 fail() { echo "  FAIL  $*"; failures=$((failures + 1)); failed+=("$*"); }
-# On GitHub also as error annotations, 25 lines each: the job log needs a
-# login, the annotations of a check run are public.
-annotate() { # annotate <title> <text>
+# On GitHub also as annotations, 25 lines each: the job log needs a login,
+# the annotations of a check run are public.
+annotate() { # annotate <title> <text> [error|notice]
   [ "${GITHUB_ACTIONS:-}" = true ] || return 0
   local -a lines
   local i text
@@ -30,7 +30,7 @@ annotate() { # annotate <title> <text>
     text=${text//'%'/'%25'}
     text=${text//$'\r'/'%0D'}
     text=${text//$'\n'/'%0A'}
-    echo "::error title=$1 ($((i / 25 + 1)))::$text"
+    echo "::${3:-error} title=$1 ($((i / 25 + 1)))::$text"
   done
 }
 check() {
@@ -193,17 +193,27 @@ begin "A crash: the cleanup removes what is left, the restart builds it anew"
 before=$(br0_index)
 cursor=$(journal_cursor alpha)
 failures_before=$failures
+# systemd's debug messages show what became of ExecStopPost.
+x alpha "systemd-analyze log-level debug"
 x alpha "systemctl kill -s KILL wanderland"
 RESTARTS[alpha]=1
 wait_for 20 "systemd restarted wanderland" \
   x alpha "systemctl is-active wanderland | grep -qx active && wanderlan status --json | jq -e '.state == \"running\"'"
 wait_for 10 "the cleanup after the crash removed the interfaces of the dead daemon" \
-  eval 'journal_since alpha "$cursor" | grep -q "Cleanup: .* changes undone"'
+  eval 'journal_since alpha "$cursor" | grep "Cleanup: .* changes undone" >/dev/null'
 wait_for 30 "the new daemon built br0 anew" eval '[ -n "$(br0_index)" ] && [ "$(br0_index)" != "'"$before"'" ]'
+x alpha "systemd-analyze log-level info"
+# Which hook cleaned up: ExecStopPost, or (where the kernel killed it at
+# once) the ExecStartPre of the restart.
+hooks=$(x alpha "journalctl -b --no-pager -o cat --after-cursor='$cursor' UNIT=wanderland.service \
+  | grep -E 'Control process exited|stop-post|start-pre' | grep -v 'Got notification'")
+echo "  info  the hooks after the kill:"
+sed 's/^/          /' <<<"$hooks"
+annotate "hooks after the kill" "$hooks" notice
 if [ "$failures" -gt "$failures_before" ]; then
   report=$(
-    echo "--- journal of alpha since the kill (all units)"
-    x alpha "journalctl -b --no-pager -o short-monotonic --after-cursor='$cursor' | grep -v 'modprobe: WARNING'"
+    echo "--- journal of alpha since the kill (all units, without debug messages)"
+    x alpha "journalctl -b -p info --no-pager -o short-monotonic --after-cursor='$cursor' | grep -v 'modprobe: WARNING'"
     echo "--- links of alpha"
     x alpha "ip -br link"
     echo "--- nftables tables of alpha"

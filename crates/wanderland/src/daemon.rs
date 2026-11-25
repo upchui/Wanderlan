@@ -445,9 +445,9 @@ const CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Removes everything a daemon of this host created; also the kernel's GRE
 /// fallback devices when nothing else needs their module. Run by systemd
-/// after every end of the service (also a crash or a kill) and when the
-/// package is removed, so nothing stays behind. Does nothing if nothing is
-/// there.
+/// after every end of the service (also a crash or a kill), before every
+/// start (in case that could not run) and when the package is removed, so
+/// nothing stays behind. Does nothing if nothing is there.
 pub async fn cleanup(args: &Args) -> Result<()> {
     let sys = LinuxSystem::connect().context("Cleanup failed: cannot open a netlink connection")?;
     let result = match tokio::time::timeout(

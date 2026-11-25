@@ -507,10 +507,10 @@ with `managed_by` but without `uplink` is a client of its manager.
 ### On each site
 
 The daemon creates, and removes again whenever the service ends (a stop,
-an update, a crash or a kill: systemd then runs `wanderland --cleanup`,
-which also unloads the kernel module `ip_gre` and with it its devices
-`gre0`, `gretap0` and `erspan0`, unless another GRE tunnel uses it or this
-is a container):
+an update, a crash or a kill: systemd then runs `wanderland --cleanup`, and
+once more before every start in case that could not run; it also unloads
+the kernel module `ip_gre` and with it its devices `gre0`, `gretap0` and
+`erspan0`, unless another GRE tunnel uses it or this is a container):
 
 * `br0`: a bridge with VLAN filtering, STP off, no default VLAN and no
   netfilter calls of its own (if `br_netfilter` is loaded, e.g. by Docker,

@@ -8,6 +8,11 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
+# What an earlier run left behind if its ExecStopPost could not run (some
+# kernels also kill a process started into the unit's cgroup after
+# `systemctl kill`); usually nothing. Before the modules: the cleanup may
+# unload ip_gre.
+ExecStartPre=-+/usr/bin/wanderland --cleanup
 # The kernel modules only while wanderlan runs ("+": with full rights, the
 # daemon itself may not load modules; "-": not possible in a container).
 ExecStartPre=-+/sbin/modprobe -a bridge ip_gre sch_ingress cls_flower act_vlan act_gact nf_tables

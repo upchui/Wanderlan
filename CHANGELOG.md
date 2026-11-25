@@ -42,6 +42,12 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
   table go, also what a crashed daemon left, and the kernel's `gre0`,
   `gretap0` and `erspan0` when nothing else needs `ip_gre`. A start
   builds everything anew; before, a crash left the network running.
+- The cleanup also runs before every start, for when the one after the
+  end could not run: after `systemctl kill`, some kernels kill a process
+  started into the service's cgroup at once.
+- A step of the teardown that fails no longer stops the others: the
+  bridge and the tunnels go anyway, the error lists what failed
+  (`Cleanup failed: ...` in the journal).
 - An internal error removes everything before the daemon exits.
 - The kernel modules are loaded when the service starts, not at every
   boot (no `gre0` while wanderlan does not run).
