@@ -474,7 +474,7 @@ impl Form {
                 "trunk",
                 "Trunk",
                 trunk_hint(interfaces),
-                draft.local.trunk.clone().unwrap_or_default(),
+                draft.local.trunk.join(", "),
             ),
         ];
         Self::new(FormKind::Local, "This site (local.toml)", fields, draft)
@@ -496,7 +496,7 @@ impl Form {
                 .local
                 .tunnel_trunks
                 .get(&name)
-                .cloned()
+                .map(|ports| ports.join(", "))
                 .unwrap_or_default(),
         )];
         Self::new(
@@ -725,6 +725,25 @@ impl Form {
         }
     }
 
+    /// The trunk ports of the field "trunk": names separated by commas or
+    /// spaces; an invalid name is marked on the field.
+    fn parse_ports(&mut self) -> Option<Vec<String>> {
+        let text = self.value("trunk");
+        let ports: Vec<String> = text
+            .split([',', ' '])
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+        for port in &ports {
+            if let Some(msg) = ifname_error(port) {
+                self.set_error("trunk", format!("{port}: {msg}"));
+                return None;
+            }
+        }
+        Some(ports)
+    }
+
     /// True once something was typed or chosen in the form.
     pub fn is_touched(&self) -> bool {
         self.fields.iter().any(|f| f.touched)
@@ -811,25 +830,18 @@ impl Form {
             }
             FormKind::TunnelTrunk(site) => {
                 let name = candidate.network.sites.get(site)?.name.clone();
-                let trunk = self.value("trunk");
-                if trunk.is_empty() || Some(trunk.as_str()) == candidate.local.trunk.as_deref() {
+                let ports = self.parse_ports()?;
+                if ports.is_empty() || ports == candidate.local.trunk {
                     candidate.local.tunnel_trunks.remove(&name);
-                } else if let Some(msg) = ifname_error(&trunk) {
-                    self.set_error("trunk", msg);
-                    return None;
                 } else {
-                    candidate.local.tunnel_trunks.insert(name, trunk);
+                    candidate.local.tunnel_trunks.insert(name, ports);
                 }
             }
             FormKind::Local => {
                 let own = self.value("self");
-                let trunk = self.value("trunk");
-                if let Some(msg) = ifname_error(&trunk) {
-                    self.set_error("trunk", msg);
-                    return None;
-                }
+                let ports = self.parse_ports()?;
                 candidate.local.self_name = (!own.is_empty()).then_some(own);
-                candidate.local.trunk = Some(trunk);
+                candidate.local.trunk = ports;
             }
         }
         candidate.revalidate();
@@ -1203,8 +1215,8 @@ fn parse_changes(value: &str) -> (Option<String>, bool) {
 /// Help text of the trunk field of a tunnel.
 pub fn tunnel_trunk_hint(draft: &Draft, interfaces: &[Interface]) -> String {
     format!(
-        "empty: the default trunk ({}); {}",
-        draft.local.trunk.as_deref().unwrap_or("-"),
+        "empty: the default trunk ({}); several: ens20, ens21; {}",
+        draft.local.trunk.join(", "),
         trunk_hint(interfaces)
     )
 }

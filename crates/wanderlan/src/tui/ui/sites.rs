@@ -166,7 +166,12 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
             policy::managed_label(&draft.network, site)
         );
         lines.push(Line::styled(text, theme::dim()));
-        if let Some(trunk) = draft.local.tunnel_trunks.get(&site.name) {
+        if let Some(trunk) = draft
+            .local
+            .tunnel_trunks
+            .get(&site.name)
+            .map(|p| p.join(", "))
+        {
             lines.push(Line::styled(
                 format!(
                     " The tunnel to {} has its own trunk {trunk} here (Settings, 7).",

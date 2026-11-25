@@ -588,3 +588,94 @@ async fn the_split_horizon_moves_to_nftables_before_isolated_goes() {
     assert!(isolate < gone);
     assert!(net.state().split.is_empty());
 }
+
+fn config_with(local: &str) -> Config {
+    match load(NETWORK, local).unwrap().loaded {
+        Loaded::Configured(cfg) => cfg,
+        Loaded::Unconfigured { .. } => panic!("configured"),
+    }
+}
+
+#[tokio::test]
+async fn several_trunk_ports_join_the_bridge_and_leave_it_again() {
+    let net = fresh();
+    net.add_physical("ens20");
+    let two = derive(
+        &config_with("self = \"heim\"\ntrunk = [\"ens19\", \"ens20\"]\n"),
+        &Runtime::default(),
+    );
+    let specs: Vec<(&str, &str, bool)> = two
+        .trunks
+        .iter()
+        .map(|t| (t.name.as_str(), t.bridge.as_str(), t.required))
+        .collect();
+    assert_eq!(specs, [("ens19", "br0", true), ("ens20", "br0", false)]);
+    run(&net, &two).await;
+    let br = net.link("br0").unwrap().index;
+    assert_eq!(net.link("ens20").unwrap().master, Some(br));
+    assert_eq!(net.vlans("ens20"), net.vlans("ens19"), "the same VLANs");
+    // Back to one port: ens20 leaves the bridge.
+    let changes = run(&net, &desired("heim")).await;
+    assert!(
+        changes
+            .iter()
+            .any(|c| matches!(c, Change::Detach { name } if name == "ens20")),
+        "{changes:?}"
+    );
+    assert_eq!(net.link("ens20").unwrap().master, None);
+    assert!(run(&net, &desired("heim")).await.is_empty(), "stable");
+}
+
+#[tokio::test]
+async fn a_missing_further_port_is_left_out_the_main_port_is_not() {
+    let net = fresh();
+    let d = derive(
+        &config_with("self = \"heim\"\ntrunk = [\"ens19\", \"usb0\"]\n"),
+        &Runtime::default(),
+    );
+    run(&net, &d).await;
+    assert!(net.link("br0").is_some(), "the site runs without usb0");
+    let main_missing = derive(
+        &config_with("self = \"heim\"\ntrunk = [\"usb0\", \"ens19\"]\n"),
+        &Runtime::default(),
+    );
+    assert!(reconcile(&net, &main_missing, |_| {}).await.is_err());
+}
+
+#[tokio::test]
+async fn a_blocked_trunk_port_goes_down() {
+    let net = fresh();
+    net.add_physical("ens20");
+    let cfg = config_with("self = \"heim\"\ntrunk = [\"ens19\", \"ens20\"]\n");
+    run(&net, &derive(&cfg, &Runtime::default())).await;
+    let mut runtime = Runtime::default();
+    runtime.blocked.insert("ens20".into());
+    run(&net, &derive(&cfg, &runtime)).await;
+    assert!(!net.link("ens20").unwrap().admin_up);
+    assert!(net.link("ens19").unwrap().admin_up, "never the main port");
+}
+
+#[test]
+fn a_tunnel_with_several_ports_has_a_segment_of_its_own() {
+    let d = derive(
+        &config_with(
+            "self = \"heim\"\ntrunk = \"ens19\"\n\n[tunnels.buero]\ntrunk = [\"ens21\", \"ens22\"]\n",
+        ),
+        &Runtime::default(),
+    );
+    let specs: Vec<(&str, &str)> = d
+        .trunks
+        .iter()
+        .map(|t| (t.name.as_str(), t.bridge.as_str()))
+        .collect();
+    assert_eq!(
+        specs,
+        [
+            ("ens19", "br0"),
+            ("ens21", "wl-ens21"),
+            ("ens22", "wl-ens21")
+        ]
+    );
+    let buero = d.tunnels.iter().find(|t| t.peer == "buero").unwrap();
+    assert_eq!(buero.bridge, "wl-ens21");
+}

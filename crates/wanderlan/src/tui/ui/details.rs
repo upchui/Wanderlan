@@ -348,6 +348,19 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, area: Rect) {
             Span::raw(maps.join(", ")),
         ]));
     }
+    // Which ports of this host carry the tunnel to the site.
+    if let Some(ports) = app
+        .draft
+        .as_ref()
+        .and_then(|d| d.local.tunnel_trunks.get(name))
+    {
+        lines.push(Line::raw(""));
+        lines.push(Line::from(vec![
+            label("Trunk here"),
+            Span::raw(ports.join(", ")),
+            dim("   a segment of its own on this host (Settings, 7)"),
+        ]));
+    }
     let title = format!(" {name}   Up/Down: next site   e: edit   Esc: close ");
     let block = titled(title);
     let inner = block.inner(area);

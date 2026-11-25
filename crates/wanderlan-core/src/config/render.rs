@@ -112,8 +112,8 @@ pub fn render_local(local: &Local) -> String {
     if let Some(name) = &local.self_name {
         let _ = writeln!(out, "self = {}", quote(name));
     }
-    if let Some(trunk) = &local.trunk {
-        let _ = writeln!(out, "trunk = {}", quote(trunk));
+    if !local.trunk.is_empty() {
+        let _ = writeln!(out, "trunk = {}", ports(&local.trunk));
     }
     for (site, trunk) in &local.tunnel_trunks {
         // Site names are valid bare keys; anything else is quoted.
@@ -128,10 +128,21 @@ pub fn render_local(local: &Local) -> String {
         let _ = write!(
             out,
             "\n# The tunnel to \"{site}\" has its own trunk (a segment of its own).\n[tunnels.{key}]\ntrunk = {}\n",
-            quote(trunk)
+            ports(trunk)
         );
     }
     out
+}
+
+/// One port as a string, several as a list.
+fn ports(ports: &[String]) -> String {
+    match ports {
+        [one] => quote(one),
+        many => format!(
+            "[{}]",
+            many.iter().map(|p| quote(p)).collect::<Vec<_>>().join(", ")
+        ),
+    }
 }
 
 /// SHA-256 over the canonical network form without the revision, hex encoded.

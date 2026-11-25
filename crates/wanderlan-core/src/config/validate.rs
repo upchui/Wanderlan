@@ -420,35 +420,72 @@ impl Validator {
                 ),
             );
         }
-        match local.trunk.as_deref() {
-            None => push(
+        if local.trunk.is_empty() {
+            push(
                 "trunk",
                 "trunk is missing (the local interface carrying the VLANs)".into(),
-            ),
-            Some(trunk) => {
-                if let Some(msg) = ifname_error(trunk) {
-                    push("trunk", format!("trunk: {msg}"));
-                } else if is_managed_name(trunk) {
+            );
+        }
+        // Every port: a valid name, not ours, once per list.
+        let mut check_ports = |path: &str, what: &str, ports: &[String]| {
+            let mut seen = BTreeSet::new();
+            for port in ports {
+                if let Some(msg) = ifname_error(port) {
+                    push(path, format!("{what}: {msg}"));
+                } else if is_managed_name(port) {
                     push(
-                        "trunk",
-                        format!("trunk \"{trunk}\" is an interface managed by wanderlan"),
+                        path,
+                        format!("{what}: \"{port}\" is an interface managed by wanderlan"),
                     );
+                } else if !seen.insert(port.as_str()) {
+                    push(path, format!("{what}: \"{port}\" is listed twice"));
+                }
+            }
+        };
+        check_ports("trunk", "trunk", &local.trunk);
+        for (site, ports) in &local.tunnel_trunks {
+            check_ports(
+                &format!("tunnels.{site}.trunk"),
+                &format!("trunk of the tunnel to \"{site}\""),
+                ports,
+            );
+        }
+        // A port belongs to one segment: lists are equal or apart.
+        let segments: Vec<(String, &Vec<String>)> =
+            std::iter::once(("trunk".to_string(), &local.trunk))
+                .chain(
+                    local
+                        .tunnel_trunks
+                        .iter()
+                        .map(|(site, ports)| (format!("tunnels.{site}.trunk"), ports)),
+                )
+                .collect();
+        for (i, (path, ports)) in segments.iter().enumerate() {
+            for (_, other) in &segments[..i] {
+                let same: BTreeSet<&String> = ports.iter().collect();
+                let theirs: BTreeSet<&String> = other.iter().collect();
+                if same != theirs
+                    && let Some(port) = same.intersection(&theirs).next()
+                {
+                    push(
+                        path,
+                        format!(
+                            "\"{port}\" is a trunk port of two segments; a port belongs to one (the same list, or none of its ports)"
+                        ),
+                    );
+                    break;
                 }
             }
         }
         let me = local.self_name.as_deref();
         let mut unused = Vec::new();
-        for (site, trunk) in &local.tunnel_trunks {
+        for (site, ports) in &local.tunnel_trunks {
             let path = format!("tunnels.{site}.trunk");
-            if let Some(msg) = ifname_error(trunk) {
-                push(&path, format!("trunk of the tunnel to \"{site}\": {msg}"));
-            } else if is_managed_name(trunk) {
-                push(
-                    &path,
-                    format!(
-                        "trunk \"{trunk}\" of the tunnel to \"{site}\" is an interface managed by wanderlan"
-                    ),
-                );
+            if !local.trunk.is_empty() && *ports == local.trunk {
+                unused.push((
+                    path.clone(),
+                    format!("the trunk of the tunnel to \"{site}\" is the default trunk anyway"),
+                ));
             }
             if network.site(site).is_none() || Some(site.as_str()) == me {
                 unused.push((

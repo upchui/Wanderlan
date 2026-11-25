@@ -191,12 +191,16 @@ pub enum Command {
         #[arg(long)]
         confirm: bool,
     },
-    /// Bridge the tunnel to a site with a trunk of its own (a segment of its
-    /// own on this site), or with the default trunk again ("default").
+    /// The trunk ports: of the tunnel to a site (a segment of its own on this
+    /// site; "default": the default trunk again), or with this site's own
+    /// name the ports of the default trunk. Several ports separated by
+    /// commas are bridged like the ports of a switch.
+    ///
+    /// Example: `wanderlan trunk lab ens21,ens22`, `wanderlan trunk hq ens19,ens20`.
     Trunk {
-        /// The site at the other end of the tunnel.
+        /// The site at the other end of the tunnel, or this site.
         site: String,
-        /// Local interface, or "default".
+        /// Local interfaces (e.g. ens20 or ens20,ens21), or "default".
         interface: String,
         /// Confirm the change right away.
         #[arg(long)]
@@ -644,32 +648,56 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
     let mut local = config::parse_local(&running.local)
         .map_err(|_| anyhow!("cannot read the running local.toml"))?
         .local;
-    if network.site(site).is_none() || local.self_name.as_deref() == Some(site) {
-        bail!("there is no tunnel to \"{site}\"");
+    let own = local.self_name.as_deref() == Some(site);
+    if network.site(site).is_none() {
+        bail!("there is no site \"{site}\"");
     }
-    let before = local.tunnel_trunks.clone();
-    let default = local.trunk.clone().unwrap_or_default();
-    if interface == "default" || interface == default {
+    let ports: Vec<String> = interface
+        .split([',', ' '])
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    let back = interface == "default";
+    if own && back {
+        bail!("\"default\" is for the tunnel to another site; give the ports of the default trunk");
+    }
+    if !back {
+        if ports.is_empty() {
+            bail!("no interface given");
+        }
+        // A port towards a peer would cut the connection when bridged.
+        for port in &ports {
+            if let Some(msg) = config::ifname_error(port) {
+                bail!("{port}: {msg}");
+            }
+            if let Some(peer) = network.sites.iter().find(|s| {
+                Some(s.name.as_str()) != local.self_name.as_deref()
+                    && hostinfo::route_interface(s.address).as_deref() == Some(port.as_str())
+            }) {
+                bail!(
+                    "{port} leads to {} ({}); bridging it would cut the connection",
+                    peer.name,
+                    peer.address
+                );
+            }
+        }
+    }
+    let before = local.clone();
+    if own {
+        local.trunk = ports;
+    } else if back || ports == local.trunk {
         local.tunnel_trunks.remove(site);
     } else {
-        if let Some(msg) = config::ifname_error(interface) {
-            bail!("{interface}: {msg}");
-        }
-        if let Some(peer) = network.site(site)
-            && hostinfo::route_interface(peer.address).as_deref() == Some(interface)
-        {
-            bail!(
-                "{interface} leads to {site} ({}); bridging it would cut the connection",
-                peer.address
-            );
-        }
-        local
-            .tunnel_trunks
-            .insert(site.to_string(), interface.to_string());
+        local.tunnel_trunks.insert(site.to_string(), ports);
     }
-    let now = local.trunk_for(site).unwrap_or_default().to_string();
-    if local.tunnel_trunks == before {
-        println!("The tunnel to {site} already uses {now}.");
+    let now = local.trunk_ports_for(site).join(", ");
+    if local == before {
+        if own {
+            println!("The default trunk already is {}.", local.trunk.join(", "));
+        } else {
+            println!("The tunnel to {site} already uses {now}.");
+        }
         return Ok(ExitCode::SUCCESS);
     }
     let applied: Applied = client
@@ -682,8 +710,13 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
             timeout_secs: None,
         }))
         .await?;
-    let done = if now == default {
-        format!("The tunnel to {site} uses the default trunk {default}")
+    let done = if own {
+        format!("The default trunk is {}", local.trunk.join(", "))
+    } else if !local.tunnel_trunks.contains_key(site) {
+        format!(
+            "The tunnel to {site} uses the default trunk {}",
+            local.trunk.join(", ")
+        )
     } else {
         format!("The tunnel to {site} uses its own trunk {now} (a segment of its own)")
     };

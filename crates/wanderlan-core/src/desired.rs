@@ -43,6 +43,11 @@ pub struct TrunkSpec {
     pub vlans: PortVlans,
     /// VLAN translation rules (tc), sorted.
     pub tc: Vec<TcRule>,
+    /// Only the main port of the default segment must exist; a missing
+    /// further port (e.g. an unplugged USB adapter) is left out.
+    pub required: bool,
+    /// Why the port is down (blocked by the loop guard), if it is.
+    pub down_reason: Option<String>,
 }
 
 /// One GRETAP tunnel port.
@@ -87,9 +92,13 @@ pub struct Desired {
 }
 
 impl Desired {
-    /// Names of the bridges.
+    /// Names of the bridges, each once (several trunk ports share one).
     pub fn bridges(&self) -> impl Iterator<Item = &str> {
-        self.trunks.iter().map(|t| t.bridge.as_str())
+        let mut seen = BTreeSet::new();
+        self.trunks
+            .iter()
+            .map(|t| t.bridge.as_str())
+            .filter(move |b| seen.insert(*b))
     }
 
     /// The default trunk.
@@ -197,26 +206,37 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
         })
         .collect();
 
-    // Every trunk carries the same VLANs and mappings; the default trunk
-    // always exists, the others only while a tunnel uses them.
-    let mut trunk_names: Vec<&str> = vec![default_trunk];
-    let mut extra: Vec<&str> = tunnels
+    // Every trunk port carries the same VLANs and mappings; the ports of the
+    // default segment always exist, those of a tunnel's own segment while
+    // the tunnel does. The first port of a list names its segment's bridge.
+    let mut segments: Vec<&[String]> = vec![cfg.local.trunk.as_slice()];
+    let mut extra: Vec<&[String]> = tunnels
         .iter()
-        .map(|t| cfg.trunk_for(&t.peer))
-        .filter(|t| *t != default_trunk)
+        .map(|t| cfg.trunk_ports_for(&t.peer))
+        .filter(|ports| *ports != cfg.local.trunk.as_slice())
         .collect();
     extra.sort_unstable();
     extra.dedup();
-    trunk_names.extend(extra);
-    let trunks = trunk_names
-        .into_iter()
-        .map(|name| TrunkSpec {
-            name: name.to_string(),
-            bridge: bridge_for(name, default_trunk),
-            vlans: trunk_vlans.clone(),
-            tc: tc.clone(),
-        })
-        .collect();
+    segments.extend(extra);
+    let mut trunks: Vec<TrunkSpec> = Vec::new();
+    for (s, ports) in segments.into_iter().enumerate() {
+        let bridge = bridge_for(ports.first().map_or("", String::as_str), default_trunk);
+        for (i, port) in ports.iter().enumerate() {
+            if trunks.iter().any(|t| t.name == *port) {
+                continue;
+            }
+            trunks.push(TrunkSpec {
+                name: port.clone(),
+                bridge: bridge.clone(),
+                vlans: trunk_vlans.clone(),
+                tc: tc.clone(),
+                required: s == 0 && i == 0,
+                down_reason: blocked
+                    .contains(port)
+                    .then(|| "blocked by the loop guard".to_string()),
+            });
+        }
+    }
 
     Desired {
         bridge_options: BRIDGE_OPTIONS,

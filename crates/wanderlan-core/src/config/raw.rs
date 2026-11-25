@@ -102,7 +102,7 @@ enum RawLocalVid {
 struct RawLocal {
     #[serde(rename = "self")]
     self_name: Option<Spanned<String>>,
-    trunk: Option<Spanned<String>>,
+    trunk: Option<Spanned<RawPorts>>,
     tunnels: Option<std::collections::BTreeMap<String, RawLocalTunnel>>,
 }
 
@@ -110,7 +110,24 @@ struct RawLocal {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawLocalTunnel {
-    trunk: Option<Spanned<String>>,
+    trunk: Option<Spanned<RawPorts>>,
+}
+
+/// One interface or a list of them.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RawPorts {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl RawPorts {
+    fn into_vec(self) -> Vec<String> {
+        match self {
+            Self::One(port) => vec![port],
+            Self::Many(ports) => ports,
+        }
+    }
 }
 
 /// Result of parsing `network.toml`.
@@ -563,12 +580,15 @@ pub fn parse_local(text: &str) -> Result<ParsedLocal, Vec<Diagnostic>> {
     let self_path = FieldPath::local("self");
     let self_name = lw.take(&self_path, raw.self_name);
     let trunk_path = FieldPath::local("trunk");
-    let trunk = lw.take(&trunk_path, raw.trunk);
+    let trunk = lw
+        .take(&trunk_path, raw.trunk)
+        .map(RawPorts::into_vec)
+        .unwrap_or_default();
     let mut tunnel_trunks = std::collections::BTreeMap::new();
     for (site, tunnel) in raw.tunnels.unwrap_or_default() {
         let path = FieldPath::local(&format!("tunnels.{site}.trunk"));
         if let Some(t) = lw.take(&path, tunnel.trunk) {
-            tunnel_trunks.insert(site, t);
+            tunnel_trunks.insert(site, t.into_vec());
         }
     }
     let local = Local {

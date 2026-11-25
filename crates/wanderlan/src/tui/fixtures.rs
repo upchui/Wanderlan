@@ -59,7 +59,7 @@ pub fn config_texts() -> ConfigTexts {
     let network = parse_network(NETWORK).unwrap().network.unwrap();
     let local = Local {
         self_name: Some("heim".into()),
-        trunk: Some("ens19".into()),
+        trunk: vec!["ens19".into()],
         ..Default::default()
     };
     ConfigTexts {
@@ -148,6 +148,8 @@ pub fn status() -> Status {
         pending: None,
         last_error: None,
         sync_problem: None,
+        trunk_ports: Vec::new(),
+        missing_ports: Vec::new(),
         peers: vec![
             PeerStatus {
                 macs: 12,
@@ -223,6 +225,8 @@ pub fn unconfigured_status() -> Status {
         pending: None,
         last_error: None,
         sync_problem: None,
+        trunk_ports: Vec::new(),
+        missing_ports: Vec::new(),
         peers: Vec::new(),
         sites: Vec::new(),
         blocked: Vec::new(),

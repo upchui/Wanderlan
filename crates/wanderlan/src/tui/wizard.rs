@@ -449,7 +449,7 @@ impl Wizard {
         });
         let local = Local {
             self_name: Some(name),
-            trunk: Some(self.trunk(interfaces)),
+            trunk: vec![self.trunk(interfaces)],
             ..Default::default()
         };
         let diags = validate(&network, Some(&local));

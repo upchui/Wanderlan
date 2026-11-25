@@ -566,6 +566,12 @@ pub struct Status {
     /// (the server's state applies again).
     #[serde(default)]
     pub sync_problem: Option<String>,
+    /// All ports of the default trunk, the main port first.
+    #[serde(default)]
+    pub trunk_ports: Vec<String>,
+    /// Configured trunk ports that do not exist (e.g. unplugged).
+    #[serde(default)]
+    pub missing_ports: Vec<String>,
 }
 
 fn online_default() -> bool {

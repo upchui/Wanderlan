@@ -170,7 +170,9 @@ fn settings_view() {
 fn settings_trunk_per_tunnel() {
     let mut app = connected();
     if let Some(d) = &mut app.draft {
-        d.local.tunnel_trunks.insert("haus2".into(), "ens20".into());
+        d.local
+            .tunnel_trunks
+            .insert("haus2".into(), vec!["ens20".into()]);
     }
     key(&mut app, KeyCode::Char('7'));
     // Down to "to haus2": the fixed rows, then buero, then haus2.
@@ -527,4 +529,28 @@ fn the_mouse_selects_opens_and_scrolls() {
         23,
     );
     assert!(matches!(app.modal, Some(Modal::Help { .. })));
+}
+
+#[test]
+fn several_trunk_ports_in_the_settings() {
+    let mut app = connected();
+    key(&mut app, KeyCode::Char('7'));
+    // The trunk row: the fixed network rows, then "This site", then "Trunk".
+    let trunk_row = super::settings::ROWS
+        .iter()
+        .position(|r| r.key == "trunk")
+        .unwrap();
+    for _ in 0..trunk_row {
+        key(&mut app, KeyCode::Down);
+    }
+    key(&mut app, KeyCode::Enter);
+    // Replace the field with two ports and save.
+    for _ in 0..10 {
+        key(&mut app, KeyCode::Backspace);
+    }
+    typed(&mut app, "ens19, ens20");
+    key(&mut app, KeyCode::Enter);
+    let d = app.draft.as_ref().expect("draft");
+    assert_eq!(d.local.trunk, ["ens19", "ens20"]);
+    assert!(render(&app).contains("ens19, ens20"));
 }

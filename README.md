@@ -245,16 +245,26 @@ what it carries; `Enter` limits it (e.g. `30-40`, or `none`), `d` lifts the
 limit. CLI: `wanderlan tunnel-vlans dc lab 30-40` (`all` lifts it). Whoever may
 change one of the two sites may limit their tunnel.
 
+**Use several trunk ports.** The trunk can be several local interfaces;
+they are bridged like the ports of a switch and all carry the same VLANs and
+mappings (the first is the main port). Settings (`7`), "Trunk"
+(`ens19, ens20`), or `wanderlan trunk <this site> ens19,ens20`. A missing
+further port (e.g. an unplugged adapter) is shown and left out; a loop
+between two ports shuts down the further one, never the main port.
+
 **Give a tunnel its own trunk.** Normally all tunnels share the trunk. A
-tunnel can be bridged with another local interface instead, as a segment of
-its own at this site (bridge `wl-<interface>`, same VLANs and mappings): only
-the network on that interface reaches the other site through this one.
-Settings (`7`), "Trunk per tunnel", or `wanderlan trunk <site> ens20`
-(`default` to undo).
+tunnel can be bridged with other local interfaces instead, as a segment of
+its own at this site (bridge `wl-<first interface>`, same VLANs and
+mappings): only the network on those interfaces reaches the other site
+through this one. So a server says for each site exactly which ports carry
+it, and a client which ports are its trunk. Settings (`7`), "Trunk per
+tunnel", or `wanderlan trunk <site> ens20` / `ens20,ens21` (`default` to
+undo).
 
 ```
 hq
-  ens19 ── br0 ───────┬── gt-office ══ office
+  ens19 ─┐
+  ens22 ─┴ br0 ───────┬── gt-office ══ office
                       └── gt-lab    ══ lab
   ens20 ── wl-ens20 ───── gt-dc     ══ dc
 ```
@@ -286,7 +296,7 @@ Two files in `/etc/wanderlan/`, both maintained by the daemon:
 
 ```toml
 self = "hq"         # which site of network.toml this host is
-trunk = "ens19"     # the interface carrying the VLANs
+trunk = "ens19"     # the interface carrying the VLANs (several: ["ens19", "ens22"])
 
 # Optional: the tunnel to dc uses a trunk of its own (a segment of its own).
 [tunnels.dc]
@@ -359,8 +369,8 @@ mapping.
 | `tunnel.between` | | The two sites of a tunnel, e.g. `["dc", "lab"]`. |
 | `tunnel.vlans` | | The most this tunnel carries (on top of the VLANs of both sites), e.g. `"30-40"`; `"none"`: no VLAN at all. |
 | `self` (local) | | Which site of `network.toml` this host is. |
-| `trunk` (local) | | The interface carrying the VLANs. |
-| `tunnels.<site>.trunk` (local) | `trunk` | A trunk of its own for the tunnel to `<site>`. |
+| `trunk` (local) | | The interface carrying the VLANs, or several (`["ens19", "ens22"]`, bridged like switch ports, the first is the main port). |
+| `tunnels.<site>.trunk` (local) | `trunk` | A trunk of its own for the tunnel to `<site>`: one interface or several. A port belongs to one segment. |
 
 Every file is checked when it is loaded or applied; problems are reported
 with file and line:
@@ -513,7 +523,7 @@ its last log lines and keeps trying.
 | `wanderlan online <site>` / `wanderlan offline <site>` | Take a site online or offline |
 | `wanderlan manage <site> [--by S \| --anyone] [--self-managed yes\|no]` | Who may change a site |
 | `wanderlan role <site> server\|client <server>` | Make a site a server or a client |
-| `wanderlan trunk <site> <interface\|default>` | Trunk of the tunnel to a site |
+| `wanderlan trunk <site> <interfaces\|default>` | Trunk ports of the tunnel to a site, or (this site's name) of the default trunk; several separated by commas |
 | `wanderlan own-vlans <site> <vlans\|none>` | Own VLANs of a site (trunk and its own clients only) |
 | `wanderlan tunnel-vlans <site> <site> <vlans\|all\|none>` | The most the tunnel between two sites carries |
 | `wanderlan apply [--network F] [--local F] [--timeout 60s]` | Apply files (default: those in `/etc/wanderlan`) |

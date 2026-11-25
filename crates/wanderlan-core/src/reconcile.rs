@@ -95,6 +95,8 @@ pub enum Change {
     SetMtu { name: String, mtu: u32 },
     /// Attach a link to the bridge.
     Attach { name: String, bridge: String },
+    /// Take an interface that is no longer a trunk port off our bridge.
+    Detach { name: String },
     /// Set split-horizon isolation of a bridge port.
     SetIsolated { name: String, isolated: bool },
     /// Bring a link up or down.
@@ -159,6 +161,9 @@ impl fmt::Display for Change {
             Self::DeleteLink { name, reason } => write!(f, "Deleting interface {name} ({reason})"),
             Self::SetMtu { name, mtu } => write!(f, "Setting MTU of {name} to {mtu}"),
             Self::Attach { name, bridge } => write!(f, "Attaching {name} to bridge {bridge}"),
+            Self::Detach { name } => {
+                write!(f, "Taking {name} off its bridge (no longer a trunk port)")
+            }
             Self::SetIsolated {
                 name,
                 isolated: true,
@@ -348,12 +353,29 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
         })
         .collect();
 
+    // Interfaces on our bridges that are no longer trunk ports go first
+    // (ours, the tunnels, are handled above and below).
+    let ports: BTreeSet<&str> = desired.trunks.iter().map(|t| t.name.as_str()).collect();
+    for link in actual.links.values() {
+        if !is_owned(link)
+            && link.master.is_some_and(|m| owned_bridges.contains(&m))
+            && !ports.contains(link.name.as_str())
+        {
+            deletes.push(Change::Detach {
+                name: link.name.clone(),
+            });
+        }
+    }
+
     // Trunks.
     for spec in &desired.trunks {
-        let trunk = actual
-            .links
-            .get(&spec.name)
-            .ok_or_else(|| PlanError::TrunkMissing(spec.name.clone()))?;
+        let Some(trunk) = actual.links.get(&spec.name) else {
+            if spec.required {
+                return Err(PlanError::TrunkMissing(spec.name.clone()));
+            }
+            // A further port that is not there (unplugged): the rest runs.
+            continue;
+        };
         if let Some(master) = trunk.master
             && !owned_bridges.contains(&master)
         {
@@ -370,8 +392,8 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
                 name: &spec.name,
                 mtu: None,
                 isolated: false,
-                up: true,
-                up_reason: None,
+                up: spec.down_reason.is_none(),
+                up_reason: spec.down_reason.clone(),
                 vlans: &spec.vlans,
             },
             trunk,
@@ -709,6 +731,13 @@ pub async fn apply<N: System>(net: &N, actual: &Actual, change: &Change) -> Resu
             };
             net.update_link(index_of(name)?, &update).await?;
         }
+        Change::Detach { name } => {
+            let update = LinkUpdate {
+                master: Some(None),
+                ..LinkUpdate::default()
+            };
+            net.update_link(index_of(name)?, &update).await?;
+        }
         Change::SetIsolated { name, isolated } => {
             net.set_port_isolated(index_of(name)?, *isolated).await?;
         }
@@ -820,7 +849,10 @@ async fn mark_owned<N: System>(net: &N, name: &str) -> Result<(), SysError> {
 /// forward (creation, deletion, isolation, attaching).
 pub fn ports_changed(changes: &[Change]) -> bool {
     changes.iter().any(|c| match c {
-        Change::CreateGretap { .. } | Change::SetIsolated { .. } | Change::Attach { .. } => true,
+        Change::CreateGretap { .. }
+        | Change::SetIsolated { .. }
+        | Change::Attach { .. }
+        | Change::Detach { .. } => true,
         Change::DeleteLink { name, .. } => name.starts_with(GRETAP_PREFIX),
         Change::SetUp { name, .. } => name.starts_with(GRETAP_PREFIX),
         _ => false,

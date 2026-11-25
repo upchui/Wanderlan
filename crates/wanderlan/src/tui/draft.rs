@@ -409,7 +409,7 @@ mod tests {
         draft
             .local
             .tunnel_trunks
-            .insert("haus3".into(), "ens20".into());
+            .insert("haus3".into(), vec!["ens20".into()]);
         let haus3 = draft
             .network
             .sites
@@ -428,7 +428,12 @@ mod tests {
         assert_eq!(draft.local.self_name.as_deref(), Some("home"));
         assert!(draft.network.maps.iter().all(|m| m.site == "haus33"));
         assert_eq!(
-            draft.local.tunnel_trunks.get("haus33").map(String::as_str),
+            draft
+                .local
+                .tunnel_trunks
+                .get("haus33")
+                .and_then(|p| p.first())
+                .map(String::as_str),
             Some("ens20")
         );
         let haus6 = draft.network.site("haus6").unwrap();

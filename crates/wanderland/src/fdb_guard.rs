@@ -21,6 +21,8 @@ pub struct PortMap {
     pub bridges: std::collections::BTreeSet<u32>,
     /// Tunnel ports: index → (name, isolated).
     pub tunnels: BTreeMap<u32, (String, bool)>,
+    /// Further trunk ports (not the first of their list): index → name.
+    pub trunks: BTreeMap<u32, String>,
 }
 
 /// A loop was detected.
@@ -99,15 +101,25 @@ async fn handle(
         return true;
     }
     let guard = guards.entry(bridge).or_default();
+    // Moves count if a tunnel or a further trunk port takes part.
     let detected = guard.learned(Instant::now(), entry.mac, entry.vlan, entry.port, |p| {
-        map.tunnels.contains_key(&p)
+        map.tunnels.contains_key(&p) || map.trunks.contains_key(&p)
     });
     let Some(detected) = detected else {
         return true;
     };
+    // A tunnel first; between trunk ports only, the further one (never
+    // the main trunk port).
     let is_tunnel = |p: u32| map.tunnels.contains_key(&p);
+    let name_of = |p: u32| {
+        map.tunnels
+            .get(&p)
+            .map(|(n, _)| n.clone())
+            .or_else(|| map.trunks.get(&p).cloned())
+    };
     let Some(port) = loopguard::choose_port(&detected, is_tunnel)
-        .and_then(|p| map.tunnels.get(&p).map(|(n, _)| n.clone()))
+        .or_else(|| loopguard::choose_port(&detected, |p| map.trunks.contains_key(&p)))
+        .and_then(name_of)
     else {
         return true;
     };
@@ -115,11 +127,7 @@ async fn handle(
         .moves
         .iter()
         .flat_map(|m| [m.from, m.to])
-        .map(|p| {
-            map.tunnels
-                .get(&p)
-                .map_or_else(|| "the trunk".to_string(), |(n, _)| n.clone())
-        })
+        .map(|p| name_of(p).unwrap_or_else(|| "the trunk".to_string()))
         .collect();
     involved.sort();
     involved.dedup();
@@ -137,4 +145,61 @@ async fn handle(
         .send(Input::Loop(LoopReport { port, message }))
         .await
         .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use wanderlan_core::sys::observe::FdbEntry;
+
+    use super::*;
+
+    /// A MAC that keeps moving between `a` and `b` of bridge 1.
+    async fn moves(map: PortMap, a: u32, b: u32) -> Option<String> {
+        let (_tx, rx) = watch::channel(map);
+        let (inputs, mut out) = mpsc::channel(4);
+        let mut guards = BTreeMap::new();
+        for i in 0..12 {
+            let entry = FdbEntry {
+                mac: [2, 0, 0, 0, 0, 1],
+                vlan: Some(20),
+                port: if i % 2 == 0 { a } else { b },
+                bridge: Some(1),
+                permanent: false,
+                updated_secs: None,
+            };
+            handle(&mut guards, FdbEvent::Learned(entry), &rx, &inputs).await;
+        }
+        match out.try_recv() {
+            Ok(Input::Loop(report)) => Some(report.port),
+            _ => None,
+        }
+    }
+
+    fn map() -> PortMap {
+        PortMap {
+            bridges: [1].into(),
+            tunnels: [(10, ("gt-lab".to_string(), false))].into(),
+            // 2 is the main trunk port ens19, 3 the further port ens20.
+            trunks: [(3, "ens20".to_string())].into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_loop_between_two_trunk_ports_shuts_the_further_one() {
+        assert_eq!(moves(map(), 2, 3).await.as_deref(), Some("ens20"));
+    }
+
+    #[tokio::test]
+    async fn a_tunnel_goes_before_a_trunk_port() {
+        assert_eq!(moves(map(), 3, 10).await.as_deref(), Some("gt-lab"));
+        // Main trunk and tunnel: the tunnel, as always.
+        assert_eq!(moves(map(), 2, 10).await.as_deref(), Some("gt-lab"));
+    }
+
+    #[tokio::test]
+    async fn without_further_ports_the_trunk_is_never_shut() {
+        let mut only_main = map();
+        only_main.trunks.clear();
+        assert_eq!(moves(only_main, 2, 3).await, None);
+    }
 }

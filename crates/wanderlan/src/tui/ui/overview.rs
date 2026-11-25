@@ -92,7 +92,11 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
                 Span::styled("  address ", theme::dim()),
                 Span::raw(value(&status.address)),
                 Span::styled("  trunk ", theme::dim()),
-                Span::raw(value(&status.trunk)),
+                Span::raw(if status.trunk_ports.len() > 1 {
+                    status.trunk_ports.join(", ")
+                } else {
+                    value(&status.trunk)
+                }),
                 Span::styled("  VLANs ", theme::dim()),
                 Span::raw(value(&status.vlans)),
             ]));
@@ -148,9 +152,14 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
             let peers: Vec<&str> = status
                 .peers
                 .iter()
-                .filter(|p| p.trunk == t.name)
+                .filter(|p| p.trunk.split('+').any(|port| port == t.name))
                 .map(|p| p.name.as_str())
                 .collect();
+            let of = if status.trunk_ports.contains(&t.name) {
+                "  a port of the default trunk".to_string()
+            } else {
+                format!("  segment of {}", peers.join(", "))
+            };
             lines.push(Line::from(vec![
                 Span::styled(format!(" trunk {} ", t.name), theme::dim()),
                 Span::raw(format!(
@@ -158,9 +167,18 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
                     format::rate(t.rx_bps),
                     format::rate(t.tx_bps)
                 )),
-                Span::styled(format!("  segment of {}", peers.join(", ")), theme::dim()),
+                Span::styled(of, theme::dim()),
             ]));
         }
+    }
+    if !status.missing_ports.is_empty() {
+        lines.push(Line::styled(
+            format!(
+                " Trunk port {} missing (unplugged?); the other ports keep working",
+                status.missing_ports.join(", ")
+            ),
+            theme::warn(),
+        ));
     }
     match (&app.invitation, status.invites) {
         (_, 0) => {}

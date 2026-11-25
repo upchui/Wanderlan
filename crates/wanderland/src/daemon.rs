@@ -508,7 +508,7 @@ impl Controller {
                             cfg.self_name(),
                             cfg.network.sites.len(),
                             cfg.network.vlans,
-                            cfg.trunk(),
+                            cfg.local.trunk.join(", "),
                             cfg.network.revision
                         ));
                         Some(cfg)
@@ -1353,7 +1353,7 @@ impl Controller {
         .ok_or_else(|| ApiError::new(format!("\"{via}\" sent an empty configuration")))?;
         let local = config::Local {
             self_name: Some(site.clone()),
-            trunk: Some(params.trunk.clone()),
+            trunk: vec![params.trunk.clone()],
             ..Default::default()
         };
         let cfg = sync::accept(network, &local).map_err(|e| {
@@ -1838,7 +1838,25 @@ impl Controller {
             })
             .map(|l| (l.index, (l.name.clone(), l.isolated.unwrap_or(false))))
             .collect();
-        let new = PortMap { bridges, tunnels };
+        // Further trunk ports (not the first of their list): a loop between
+        // two trunk ports shuts the later one down.
+        let further: BTreeSet<&str> = self.config.as_ref().map_or_else(BTreeSet::new, |cfg| {
+            std::iter::once(&cfg.local.trunk)
+                .chain(cfg.local.tunnel_trunks.values())
+                .flat_map(|ports| ports.iter().skip(1))
+                .map(String::as_str)
+                .collect()
+        });
+        let trunks = links
+            .iter()
+            .filter(|l| further.contains(l.name.as_str()))
+            .map(|l| (l.index, l.name.clone()))
+            .collect();
+        let new = PortMap {
+            bridges,
+            tunnels,
+            trunks,
+        };
         self.ports.send_if_modified(|m| {
             let changed = *m != new;
             if changed {
@@ -1953,6 +1971,8 @@ impl Controller {
                 invites: 0,
                 trunk_traffic: None,
                 trunks: Vec::new(),
+                trunk_ports: Vec::new(),
+                missing_ports: Vec::new(),
                 sync_problem: None,
             };
         };
@@ -2008,7 +2028,7 @@ impl Controller {
                     port,
                     port_state,
                     vlans,
-                    trunk: cfg.trunk_for(&t.peer.name).to_string(),
+                    trunk: cfg.trunk_ports_for(&t.peer.name).join("+"),
                     reachable: probe.is_some_and(|p| p.reachable),
                     last_reply_secs: probe
                         .and_then(|p| p.last_reply)
@@ -2098,6 +2118,13 @@ impl Controller {
             trunk_traffic: trunks.first().cloned(),
             trunks,
             sync_problem: self.sync_problem.clone(),
+            trunk_ports: cfg.local.trunk.clone(),
+            missing_ports: desired
+                .trunks
+                .iter()
+                .filter(|t| !links.iter().any(|l| l.name == t.name))
+                .map(|t| t.name.clone())
+                .collect(),
         }
     }
 }

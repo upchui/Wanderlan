@@ -42,9 +42,14 @@ impl Config {
         self.network.site(self.self_name())
     }
 
-    /// Name of the trunk interface.
+    /// Name of the main trunk port.
     pub fn trunk(&self) -> &str {
-        self.local.trunk.as_deref().unwrap_or_default()
+        self.local.main_trunk().unwrap_or_default()
+    }
+
+    /// The trunk ports of the tunnel to `peer`.
+    pub fn trunk_ports_for(&self, peer: &str) -> &[String] {
+        self.local.trunk_ports_for(peer)
     }
 
     /// The trunk of the tunnel to `peer` (its own, or the default trunk).

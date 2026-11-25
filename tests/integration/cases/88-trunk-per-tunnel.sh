@@ -1,7 +1,32 @@
 # shellcheck shell=bash
-# Trunk per tunnel: the tunnel to site2 uses site1's second trunk (trunk1),
+# Several trunk ports, and trunk per tunnel: first trunk1 joins site1's
+# default trunk as a second port, then the tunnel to site2 uses trunk1,
 # which makes it a segment of its own at site1: only trunk1's network reaches
 # site2 through site1, trunk0's network reaches the other sites.
+
+begin "Several trunk ports: trunk1 joins the default trunk of site1"
+
+client_vlan c-site1b 20 10.20.0.31/24
+expect_no_ping c-site1b 10.20.0.2 "VLAN 20: the client at trunk1 has no way out while trunk1 is no trunk port"
+out=$(x site1 "wanderlan trunk site1 trunk0,trunk1 --confirm" 2>&1)
+if grep -q 'The default trunk is trunk0, trunk1' <<<"$out"; then
+  pass "wanderlan trunk site1 trunk0,trunk1"
+else
+  fail "unexpected output of wanderlan trunk: $out"
+fi
+wait_for 20 "trunk1 is a port of br0" \
+  x site1 "[ \"\$(ip -j link show trunk1 | jq -r '.[0].master')\" = br0 ]"
+check "trunk1 carries the same VLANs as trunk0" \
+  test "$(vlan_summary site1 trunk1)" = "$(vlan_summary site1 trunk0)"
+check "local.toml lists both ports" \
+  x site1 "grep -qx 'trunk = \[\"trunk0\", \"trunk1\"\]' /etc/wanderlan/local.toml"
+check "the status lists both ports" test "$(jqs site1 '.trunk_ports | join(" ")')" = "trunk0 trunk1"
+expect_ping c-site1b 10.20.0.2 "VLAN 20: the client at trunk1 reaches site2"
+expect_ping c-site1b 10.20.0.11 "VLAN 20: and site3"
+expect_ping c-site1b 10.20.0.1 "VLAN 20: and the client at trunk0, like two ports of a switch"
+check "site1 takes trunk1 off the default trunk again" x site1 "wanderlan trunk site1 trunk0 --confirm"
+wait_for 20 "trunk1 is no port of br0 any more" x site1 "! ip -j link show trunk1 | jq -e '.[0].master'"
+expect_no_ping c-site1b 10.20.0.2 "VLAN 20: the client at trunk1 is cut off again"
 
 begin "Trunk per tunnel: the tunnel to site2 gets its own trunk at site1"
 

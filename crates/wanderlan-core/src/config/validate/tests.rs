@@ -674,3 +674,66 @@ fn wrong_tunnel_limits_are_errors() {
         "{err}"
     );
 }
+
+#[test]
+fn several_trunk_ports_are_read_written_and_checked() {
+    let local = "self = \"haus2\"\ntrunk = [\"ens19\", \"ens20\"]\n\n[tunnels.heim]\ntrunk = [\"ens21\", \"ens22\"]\n\n[tunnels.buero]\ntrunk = \"ens23\"\n";
+    let outcome = load(EXAMPLE_NETWORK, local).expect("valid");
+    let Loaded::Configured(cfg) = outcome.loaded else {
+        panic!("configured");
+    };
+    assert_eq!(cfg.local.trunk, ["ens19", "ens20"]);
+    assert_eq!(cfg.trunk(), "ens19");
+    assert_eq!(cfg.trunk_ports_for("heim"), ["ens21", "ens22"]);
+    assert_eq!(
+        cfg.trunk_ports_for("haus3"),
+        ["ens19", "ens20"],
+        "the default ports"
+    );
+    let text = render_local(&cfg.local);
+    assert!(text.contains("trunk = [\"ens19\", \"ens20\"]\n"), "{text}");
+    assert!(
+        text.contains("trunk = \"ens23\"\n"),
+        "one port stays a string: {text}"
+    );
+    assert_eq!(
+        crate::config::parse_local(&text).unwrap().local,
+        cfg.local,
+        "round trip"
+    );
+}
+
+#[test]
+fn a_trunk_port_belongs_to_one_segment() {
+    for (local, contains) in [
+        (
+            "self = \"haus2\"\ntrunk = [\"ens19\", \"ens20\"]\n\n[tunnels.heim]\ntrunk = [\"ens20\", \"ens21\"]\n",
+            "\"ens20\" is a trunk port of two segments",
+        ),
+        (
+            "self = \"haus2\"\ntrunk = [\"ens19\", \"ens19\"]\n",
+            "\"ens19\" is listed twice",
+        ),
+        (
+            "self = \"haus2\"\ntrunk = [\"ens19\", \"br0\"]\n",
+            "managed by wanderlan",
+        ),
+    ] {
+        let errs = errors(EXAMPLE_NETWORK, local);
+        assert!(
+            errs.iter().any(|e| e.message.contains(contains)),
+            "{contains}: {errs:#?}"
+        );
+    }
+    // The same list for a tunnel is the default trunk anyway: a warning.
+    let local = "self = \"haus2\"\ntrunk = [\"ens19\", \"ens20\"]\n\n[tunnels.heim]\ntrunk = [\"ens19\", \"ens20\"]\n";
+    let outcome = load(EXAMPLE_NETWORK, local).expect("valid");
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.message.contains("the default trunk anyway")),
+        "{:?}",
+        outcome.warnings
+    );
+}

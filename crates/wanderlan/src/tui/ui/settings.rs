@@ -69,7 +69,7 @@ pub const ROWS: [SettingRow; 7] = [
         key: "trunk",
         label: "Trunk",
         local: true,
-        help: "The local interface that carries the VLANs to the switch or hypervisor (a port of br0); never the one that leads to the other sites. Tunnel MTU: fixed 1500, GRE fragments if the path is smaller.",
+        help: "The local interfaces that carry the VLANs to the switch or hypervisor (ports of br0, e.g. \"ens19, ens20\": bridged like the ports of a switch, the first is the main port); never the one that leads to the other sites. Tunnel MTU: fixed 1500, GRE fragments if the path is smaller.",
     },
 ];
 
@@ -90,7 +90,8 @@ fn value(draft: &Draft, key: &str) -> String {
             .map_or_else(|| "from the path MTU".into(), |v| format!("fixed {v}")),
         "control_port" => m.control_port.to_string(),
         "self" => draft.local.self_name.clone().unwrap_or_else(|| "-".into()),
-        "trunk" => draft.local.trunk.clone().unwrap_or_else(|| "-".into()),
+        "trunk" if draft.local.trunk.is_empty() => "-".into(),
+        "trunk" => draft.local.trunk.join(", "),
         _ => String::new(),
     }
 }
@@ -175,10 +176,14 @@ pub fn settings(draft: Option<&Draft>) -> Vec<Setting> {
 
 /// The trunk of the tunnel to `site`, for display.
 fn tunnel_trunk(draft: &Draft, site: &str) -> String {
-    let default = draft.local.trunk.as_deref().unwrap_or("-");
+    let default = draft.local.main_trunk().unwrap_or("-");
     match draft.local.tunnel_trunks.get(site) {
-        Some(t) if t != default => format!("{t} (own segment {})", bridge_for(t, default)),
-        _ => format!("default ({default})"),
+        Some(ports) if *ports != draft.local.trunk => format!(
+            "{} (own segment {})",
+            ports.join(", "),
+            bridge_for(ports.first().map_or("", String::as_str), default)
+        ),
+        _ => format!("default ({})", draft.local.trunk.join(", ")),
     }
 }
 

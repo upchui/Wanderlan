@@ -531,7 +531,12 @@ fn a_tunnel_gets_its_own_trunk_in_the_settings() {
     assert!(app.modal.is_none(), "saved");
     let draft = app.draft.as_ref().unwrap();
     assert_eq!(
-        draft.local.tunnel_trunks.get("haus2").map(String::as_str),
+        draft
+            .local
+            .tunnel_trunks
+            .get("haus2")
+            .and_then(|p| p.first())
+            .map(String::as_str),
         Some("ens20")
     );
     assert!(app.draft_dirty());

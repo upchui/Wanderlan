@@ -7,6 +7,21 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
+### Several trunk ports
+
+- `trunk = ["ens19", "ens22"]` in `local.toml`: several interfaces form the
+  trunk, bridged like the ports of a switch (the first is the main port).
+  The same for a tunnel with a trunk of its own (`[tunnels.<site>] trunk =
+  [...]`), so a server says for each site exactly which ports carry it and
+  a client which ports are its trunk. A port belongs to one segment.
+- Settings (7) takes lists (`ens19, ens20`); `wanderlan trunk <site>
+  ens20,ens21`, with this site's own name for the default trunk.
+- A further port that is missing (unplugged) is shown and left out instead
+  of stopping the site; a loop between two trunk ports shuts the further
+  one down (BLOCKED, `wanderlan unblock <port>`), never the main port.
+- Fix: an interface that is no longer a trunk port is taken off the bridge;
+  before, it stayed bridged after the trunk was changed.
+
 ### Version numbers
 
 - wanderlan is 1.0.0, and every commit on `main` raises the last number:

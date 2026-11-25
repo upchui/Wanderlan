@@ -226,21 +226,30 @@ pub fn site_pair(a: &str, b: &str) -> [String; 2] {
 pub struct Local {
     /// Name of this site in `network.toml`. `None` means "not configured yet".
     pub self_name: Option<String>,
-    /// Local trunk interface that is added to the bridge.
-    pub trunk: Option<String>,
-    /// Trunks of single tunnels (peer site → interface). Each such trunk is
-    /// a segment of its own at this site (own bridge); all other tunnels use
-    /// `trunk`.
-    pub tunnel_trunks: std::collections::BTreeMap<String, String>,
+    /// Trunk ports of the default segment (`br0`), the main port first:
+    /// local interfaces that carry the VLANs, bridged like the ports of a
+    /// switch.
+    pub trunk: Vec<String>,
+    /// Trunk ports of single tunnels (peer site → interfaces). Each such list
+    /// is a segment of its own at this site (own bridge); all other tunnels
+    /// use `trunk`.
+    pub tunnel_trunks: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl Local {
-    /// The trunk of the tunnel to `peer`.
+    /// The main trunk port.
+    pub fn main_trunk(&self) -> Option<&str> {
+        self.trunk.first().map(String::as_str)
+    }
+
+    /// The trunk ports of the tunnel to `peer`: its own, or the default ones.
+    pub fn trunk_ports_for(&self, peer: &str) -> &[String] {
+        self.tunnel_trunks.get(peer).unwrap_or(&self.trunk)
+    }
+
+    /// The first trunk port of the tunnel to `peer` (it names the segment).
     pub fn trunk_for(&self, peer: &str) -> Option<&str> {
-        self.tunnel_trunks
-            .get(peer)
-            .map(String::as_str)
-            .or(self.trunk.as_deref())
+        self.trunk_ports_for(peer).first().map(String::as_str)
     }
 
     /// Returns true if this site has been configured (`self` is set).
