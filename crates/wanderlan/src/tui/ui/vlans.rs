@@ -6,7 +6,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
-use wanderlan_core::config::{FieldPath, LocalVid, Severity, VlanMap, VlanSet};
+use wanderlan_core::config::{FieldPath, LocalVid, Network, Severity, VlanMap, VlanSet};
 
 use super::{diagnostic_line, list, not_configured, severity_style, titled};
 use crate::tui::app::App;
@@ -82,17 +82,17 @@ fn draw_vlans(frame: &mut Frame, draft: &Draft, restricted_by: Option<&str>, are
         )),
     }
     // The own VLANs of this site: always its own business.
-    let me = draft.local.self_name.as_deref().unwrap_or_default();
-    let own = draft
-        .network
-        .site(me)
+    let me_id = draft.local.self_id;
+    let me_site = me_id.and_then(|id| draft.network.site(id));
+    let me = me_id.map(|id| draft.network.label(id)).unwrap_or_default();
+    let own = me_site
         .and_then(|s| s.own_vlans.as_ref())
         .map_or_else(|| "none".to_string(), ToString::to_string);
-    let up = draft
-        .network
-        .site(me)
-        .and_then(|s| s.uplink.as_deref())
-        .map_or_else(String::new, |u| format!(", never to {u}"));
+    let up = me_site
+        .and_then(|s| s.uplink)
+        .map_or_else(String::new, |u| {
+            format!(", never to {}", draft.network.label(u))
+        });
     lines.push(Line::from(vec![
         Span::styled(format!(" Own VLANs of {me} (o): "), theme::dim()),
         Span::styled(own, theme::bold()),
@@ -114,10 +114,11 @@ fn marked(text: String, severity: Option<Severity>) -> Cell<'static> {
     }
 }
 
-fn effect(map: &VlanMap) -> String {
+fn effect(network: &Network, map: &VlanMap) -> String {
+    let site = network.label(map.site);
     match map.local {
-        LocalVid::Native => format!("source VLAN {} = untagged at {}", map.shared, map.site),
-        LocalVid::Vid(v) => format!("source VLAN {} = VLAN {v} at {}", map.shared, map.site),
+        LocalVid::Native => format!("source VLAN {} = untagged at {site}", map.shared),
+        LocalVid::Vid(v) => format!("source VLAN {} = VLAN {v} at {site}", map.shared),
     }
 }
 
@@ -146,7 +147,8 @@ fn draw_tunnels(frame: &mut Frame, app: &App, draft: &Draft, area: Rect, detail:
     let table_rows: Vec<Row> = rows
         .iter()
         .map(|r| {
-            let [a, b] = &r.sites;
+            let [a_id, b_id] = r.sites;
+            let (a, b) = (draft.network.label(a_id), draft.network.label(b_id));
             let kind = match r.servers {
                 Some(true) => "servers",
                 Some(false) => "client",
@@ -161,7 +163,7 @@ fn draw_tunnels(frame: &mut Frame, app: &App, draft: &Draft, area: Rect, detail:
                 r.entry
                     .and_then(|i| draft.worst_within(&FieldPath::tunnel(i))),
             );
-            let before = running.and_then(|n| n.tunnel_limit(a, b));
+            let before = running.and_then(|n| n.tunnel_limit(a_id, b_id));
             let marker = match (before, r.limit.as_ref()) {
                 (None, Some(_)) => Span::styled("+", theme::ok()),
                 (Some(x), Some(y)) if x != y => Span::styled("*", theme::warn()),
@@ -229,11 +231,20 @@ fn draw_tunnels(frame: &mut Frame, app: &App, draft: &Draft, area: Rect, detail:
             .within(&FieldPath::network("forwarding"))
             .map(diagnostic_line),
     );
-    let me = draft.local.self_name.as_deref().unwrap_or_default();
-    for (vlans, groups) in wanderlan_core::forwarding::forwarding(&draft.network, me).passes {
+    let me_id = draft
+        .local
+        .self_id
+        .unwrap_or_else(|| wanderlan_core::identity::SiteId::provisional(""));
+    let me = draft.network.label(me_id);
+    for (vlans, groups) in wanderlan_core::forwarding::forwarding(&draft.network, me_id).passes {
         let groups: Vec<String> = groups
             .iter()
-            .map(|g| g.iter().cloned().collect::<Vec<_>>().join(", "))
+            .map(|g| {
+                g.iter()
+                    .map(|id| draft.network.label(*id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
             .collect();
         lines.push(Line::styled(
             format!(
@@ -280,10 +291,10 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         .position(|i| *i == app.maps_selected)
         .unwrap_or_default();
     let site_text = |map: &VlanMap| {
-        draft
-            .network
-            .site(&map.site)
-            .map_or_else(|| map.site.clone(), format::site_with_kind)
+        draft.network.site(map.site).map_or_else(
+            || draft.network.label(map.site),
+            |s| format::site_with_kind(&draft.network, s),
+        )
     };
     let rows: Vec<Row> = shown
         .iter()
@@ -311,7 +322,7 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
                 marked(site_text(map), at("site")),
                 marked(map.shared.to_string(), at("shared")),
                 marked(map.local.to_string(), at("local")),
-                Cell::from(effect(map)),
+                Cell::from(effect(&draft.network, map)),
             ])
             .style(severity_style(draft.worst_within(&FieldPath::map(i))))
         })
@@ -337,7 +348,7 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         .network
         .maps
         .iter()
-        .map(|m| effect(m).chars().count())
+        .map(|m| effect(&draft.network, m).chars().count())
         .max()
         .unwrap_or_default();
     // Room between the columns: up to three spaces, as long as the longest

@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use wanderlan_core::api::{RttPoint, TrafficPoint};
-use wanderlan_core::topology::tunnel_name;
+use wanderlan_core::identity::SiteId;
 
 /// How far back the history goes.
 pub const KEEP: Duration = Duration::from_secs(3600);
@@ -23,15 +23,16 @@ pub struct History {
     wanted: BTreeSet<String>,
     series: BTreeMap<String, VecDeque<TrafficPoint>>,
     /// Every probe per peer: its round trip, or lost.
-    rtt: BTreeMap<String, VecDeque<RttPoint>>,
+    rtt: BTreeMap<SiteId, VecDeque<RttPoint>>,
 }
 
 impl History {
-    /// Records only these interfaces from now on.
-    pub fn want(&mut self, names: BTreeSet<String>) {
+    /// Records only these interfaces and the probes of these peers from now
+    /// on. A peer keeps its history when it is renamed: its identity and the
+    /// name of its tunnel stay.
+    pub fn want(&mut self, names: BTreeSet<String>, peers: &BTreeSet<SiteId>) {
         self.series.retain(|name, _| names.contains(name));
-        self.rtt
-            .retain(|peer, _| names.contains(&tunnel_name(peer)));
+        self.rtt.retain(|peer, _| peers.contains(peer));
         self.wanted = names;
     }
 
@@ -66,8 +67,8 @@ impl History {
     }
 
     /// Adds one probe of `peer` at `at_ms`: its round trip in ms, or lost.
-    pub fn record_rtt(&mut self, peer: &str, at_ms: u64, ms: Option<f32>) {
-        let points = self.rtt.entry(peer.to_string()).or_default();
+    pub fn record_rtt(&mut self, peer: SiteId, at_ms: u64, ms: Option<f32>) {
+        let points = self.rtt.entry(peer).or_default();
         if points.back().is_some_and(|last| last.0 > at_ms) {
             points.clear();
         }
@@ -79,8 +80,8 @@ impl History {
     }
 
     /// The probes of `peer` after `since_ms`, oldest first.
-    pub fn rtt_since(&self, peer: &str, since_ms: u64) -> Vec<RttPoint> {
-        self.rtt.get(peer).map_or_else(Vec::new, |points| {
+    pub fn rtt_since(&self, peer: SiteId, since_ms: u64) -> Vec<RttPoint> {
+        self.rtt.get(&peer).map_or_else(Vec::new, |points| {
             let start = points.partition_point(|p| p.0 <= since_ms);
             points.range(start..).copied().collect()
         })
@@ -92,20 +93,6 @@ impl History {
             let start = points.partition_point(|p| p.at() <= since_ms);
             points.range(start..).copied().collect()
         })
-    }
-
-    /// A renamed peer keeps its history (traffic of its tunnel, probes).
-    pub fn rename(&mut self, old: &str, new: &str) {
-        let (old_tunnel, new_tunnel) = (tunnel_name(old), tunnel_name(new));
-        if let Some(points) = self.series.remove(&old_tunnel) {
-            self.series.insert(new_tunnel.clone(), points);
-        }
-        if self.wanted.remove(&old_tunnel) {
-            self.wanted.insert(new_tunnel);
-        }
-        if let Some(points) = self.rtt.remove(old) {
-            self.rtt.insert(new.to_string(), points);
-        }
     }
 }
 
@@ -127,8 +114,9 @@ mod tests {
 
     #[test]
     fn an_hour_of_the_wanted_interfaces() {
+        let a = SiteId::from_bytes([1; 32]);
         let mut h = History::default();
-        h.want(["vx-a".to_string()].into());
+        h.want(["vx-a".to_string()].into(), &[a].into());
         let rates: BTreeMap<String, (u64, u64)> =
             [("vx-a".to_string(), (10, 20)), ("eth9".to_string(), (1, 1))].into();
         let hour = duration_ms(KEEP);
@@ -143,14 +131,13 @@ mod tests {
             h.since("vx-a", 0).first().map(TrafficPoint::at),
             Some(3_000)
         );
-        h.record_rtt("a", 3_000, Some(4.0));
-        h.rename("a", "b");
-        assert_eq!(h.since("vx-b", 0).len(), 2);
-        assert_eq!(h.rtt_since("b", 0).len(), 1, "the probes move along");
+        h.record_rtt(a, 3_000, Some(4.0));
+        assert_eq!(h.rtt_since(a, 0).len(), 1);
         // The clock went back: a new history.
-        h.record(2_000, &[("vx-b".to_string(), (1, 1))].into());
-        assert_eq!(h.since("vx-b", 0), [TrafficPoint(2_000, 1, 1)]);
-        h.want(BTreeSet::new());
-        assert!(h.since("vx-b", 0).is_empty());
+        h.record(2_000, &[("vx-a".to_string(), (1, 1))].into());
+        assert_eq!(h.since("vx-a", 0), [TrafficPoint(2_000, 1, 1)]);
+        h.want(BTreeSet::new(), &BTreeSet::new());
+        assert!(h.since("vx-a", 0).is_empty());
+        assert!(h.rtt_since(a, 0).is_empty());
     }
 }

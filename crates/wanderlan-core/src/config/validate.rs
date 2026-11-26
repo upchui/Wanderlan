@@ -4,8 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use super::diag::{ConfigFile, Diagnostic, FieldPath};
-use super::model::{Local, LocalVid, MAX_SITE_NAME_LEN, Network};
+use super::model::{Local, LocalVid, MAX_SITE_NAME_LEN, Network, Site};
 use super::vlan::NATIVE_VID;
+use crate::identity::SiteId;
 use crate::topology::TUNNEL_PREFIX;
 
 /// Smallest accepted fixed MSS.
@@ -164,19 +165,35 @@ impl Validator {
         }
         let mut names: BTreeMap<&str, usize> = BTreeMap::new();
         // Every site seen at an address: each new one is compared with all.
-        let mut addresses: BTreeMap<std::net::Ipv4Addr, Vec<&str>> = BTreeMap::new();
-        let mut ids: BTreeMap<crate::identity::SiteId, &str> = BTreeMap::new();
+        let mut addresses: BTreeMap<std::net::Ipv4Addr, Vec<&Site>> = BTreeMap::new();
+        let mut ids: BTreeMap<SiteId, &str> = BTreeMap::new();
+        let mut ifnames: BTreeMap<String, &str> = BTreeMap::new();
         for (i, site) in network.sites.iter().enumerate() {
             let name = site.name.as_str();
             if let Some(msg) = site_name_error(name) {
                 self.error(FieldPath::site_field(i, "name"), msg);
             }
-            if let Some(first) = names.insert(name, i) {
+            // Sites with identities are told apart by them; a site of an
+            // older version is known by its name alone.
+            if let Some(first) = names.insert(name, i)
+                && !(site.has_identity() && network.sites[first].has_identity())
+            {
                 self.error(
                     FieldPath::site_field(i, "name"),
                     format!(
-                        "site \"{name}\" is defined twice (also site #{})",
+                        "site \"{name}\" is defined twice (also site #{}); two sites may only share a name once both have an identity (a wanderlan version that has one)",
                         first + 1
+                    ),
+                );
+            }
+            if site.has_identity()
+                && !ids.contains_key(&site.id)
+                && let Some(other) = ifnames.insert(site.id.ifname_part(), name)
+            {
+                self.error(
+                    FieldPath::site_field(i, "id"),
+                    format!(
+                        "sites \"{other}\" and \"{name}\" have identities that start alike and would get the same tunnel interface; one of them joins again with a new one (`wanderlan reset` there, then `wanderlan join`)"
                     ),
                 );
             }
@@ -199,17 +216,19 @@ impl Validator {
             let clash = at
                 .iter()
                 .copied()
-                .find(|other| !shares_address(network, name, other));
-            at.push(name);
+                .find(|other| !shares_address(site, other));
+            at.push(site);
             if let Some(other) = clash {
                 self.error(
                     FieldPath::site_field(i, "address"),
-                    format!("site \"{name}\": address {addr} is already used by site \"{other}\""),
+                    format!(
+                        "site \"{name}\": address {addr} is already used by site \"{}\"",
+                        other.name
+                    ),
                 );
             }
-            if let Some(id) = site.id
-                && let Some(other) = ids.insert(id, name)
-            {
+            let id = site.id;
+            if let Some(other) = ids.insert(id, name) {
                 self.error(
                     FieldPath::site_field(i, "id"),
                     format!(
@@ -222,8 +241,8 @@ impl Validator {
             // Its own ports: the tunnel port and the one above it (NAT)
             // apart from the control port.
             if site.ports != super::model::SitePorts::default() {
-                let control = network.control_port_of(name);
-                let tunnel = network.tunnel_port_of(name);
+                let control = network.control_port_of(site.id);
+                let tunnel = network.tunnel_port_of(site.id);
                 if tunnel == control || tunnel.checked_add(1) == Some(control) {
                     self.error(
                         FieldPath::site_field(i, "tunnel_port"),
@@ -252,7 +271,7 @@ impl Validator {
             if let Some(own) = &site.own_vlans {
                 let path = FieldPath::site_field(i, "own_vlans");
                 let native = network
-                    .maps_of(name)
+                    .maps_of(site.id)
                     .find(|m| m.local == LocalVid::Native)
                     .map(|m| m.shared);
                 if let Some(shared) = native
@@ -284,7 +303,7 @@ impl Validator {
 
     /// The local breakout of a site: only at a client, VLANs of the site,
     /// usable uplink names, not too many exceptions.
-    fn breakout(&mut self, network: &Network, i: usize, site: &super::model::Site) {
+    fn breakout(&mut self, network: &Network, i: usize, site: &Site) {
         let name = &site.name;
         // A server is where the gateways and firewalls of its VLANs are: its
         // devices reach them locally, a breakout would only bypass them.
@@ -348,11 +367,11 @@ impl Validator {
     /// ends at a server (no loop).
     fn uplinks(&mut self, network: &Network) {
         for (i, site) in network.sites.iter().enumerate() {
-            let Some(up) = site.uplink.as_deref() else {
+            let Some(up) = site.uplink else {
                 continue;
             };
             let path = FieldPath::site_field(i, "uplink");
-            if up == site.name {
+            if up == site.id {
                 self.error(
                     path,
                     format!("site \"{}\" cannot be its own server", site.name),
@@ -363,33 +382,39 @@ impl Validator {
                 self.error(
                     path,
                     format!(
-                        "site \"{}\": server \"{up}\" is not a site of the network",
-                        site.name
+                        "site \"{}\": server \"{}\" is not a site of the network",
+                        site.name,
+                        network.label(up)
                     ),
                 );
                 continue;
             }
             // Follow the chain; a loop is reported at each of its sites.
-            let mut chain = vec![site.name.as_str()];
+            let mut chain = vec![site.id];
             let mut current = up;
             loop {
                 if chain.contains(&current) {
                     if chain.first() == Some(&current) {
                         chain.push(current);
+                        let names: Vec<String> =
+                            chain.iter().map(|id| network.label(*id)).collect();
                         self.error(
                             path,
-                            format!("the servers form a loop: {}", chain.join(" -> ")),
+                            format!("the servers form a loop: {}", names.join(" -> ")),
                         );
                     }
                     break;
                 }
                 chain.push(current);
-                match network.site(current).and_then(|s| s.uplink.as_deref()) {
+                match network.site(current).and_then(|s| s.uplink) {
                     Some(next) => current = next,
                     None => break,
                 }
             }
         }
+        // A manager that is not a site any more is allowed (its sites are
+        // open again); one that is a name of a file of an older format the
+        // site keeps as it is.
     }
 
     /// Sites that do not reach each other in a VLAN because the tunnels
@@ -406,14 +431,16 @@ impl Validator {
             };
             // A direct tunnel whose limit leaves these VLANs out: that
             // limit is the fix.
-            let fix = match network.tunnel_limit(&a, &b) {
-                Some(limit) if crate::topology::tunnel_vlans(network, &a, &b).is_some() => {
+            let fix = match network.tunnel_limit(a, b) {
+                Some(limit) if crate::topology::tunnel_vlans(network, a, b).is_some() => {
                     format!(
                         "the limit of their direct tunnel ({limit}) leaves them out; add them to it or break the ring"
                     )
                 }
                 _ => "give them their direct tunnel or break the ring".to_string(),
             };
+            let (a, b) = (network.label(a), network.label(b));
+            let (a, b) = if a <= b { (a, b) } else { (b, a) };
             self.warning(
                 FieldPath::network("forwarding"),
                 format!(
@@ -424,12 +451,14 @@ impl Validator {
     }
 
     fn tunnels(&mut self, network: &Network) {
-        let mut seen: BTreeMap<&[String; 2], usize> = BTreeMap::new();
+        let mut seen: BTreeMap<&[SiteId; 2], usize> = BTreeMap::new();
         for (i, tunnel) in network.tunnels.iter().enumerate() {
             let n = i + 1;
             let path = FieldPath::tunnel_field(i, "between");
-            let [a, b] = &tunnel.sites;
-            if let Some(missing) = tunnel.sites.iter().find(|s| network.site(s).is_none()) {
+            let [a_id, b_id] = tunnel.sites;
+            let (a, b) = (network.label(a_id), network.label(b_id));
+            if let Some(missing) = tunnel.sites.iter().find(|s| network.site(**s).is_none()) {
+                let missing = network.label(*missing);
                 self.error(
                     path,
                     format!("tunnel limit between \"{a}\" and \"{b}\": site \"{missing}\" does not exist"),
@@ -447,7 +476,7 @@ impl Validator {
                 continue;
             }
             seen.insert(&tunnel.sites, i);
-            if crate::topology::tunnel_vlans(network, a, b).is_none() {
+            if crate::topology::tunnel_vlans(network, a_id, b_id).is_none() {
                 self.warning(
                     path,
                     format!(
@@ -460,12 +489,13 @@ impl Validator {
 
     fn maps(&mut self, network: &Network) {
         // Per site: local side -> map index, shared VID -> map index.
-        let mut locals: BTreeMap<(&str, LocalVid), usize> = BTreeMap::new();
-        let mut shareds: BTreeMap<(&str, u16), usize> = BTreeMap::new();
+        let mut locals: BTreeMap<(SiteId, LocalVid), usize> = BTreeMap::new();
+        let mut shareds: BTreeMap<(SiteId, u16), usize> = BTreeMap::new();
         for (i, map) in network.maps.iter().enumerate() {
-            let site = map.site.as_str();
+            let id = map.site;
+            let site = network.label(id);
             let site_vlans = network
-                .site(site)
+                .site(id)
                 .map(|s| (network.vlans_of(s), s.own_vlans.as_ref()));
             match site_vlans {
                 None => self.error(
@@ -527,7 +557,7 @@ impl Validator {
                     format!("map #{}: VLAN {} is mapped onto itself", i + 1, map.shared),
                 );
             }
-            if let Some(first) = locals.insert((site, map.local), i) {
+            if let Some(first) = locals.insert((id, map.local), i) {
                 let what = match map.local {
                     LocalVid::Native => "has more than one native mapping".to_string(),
                     LocalVid::Vid(v) => format!("uses mapped VLAN {v} twice"),
@@ -537,7 +567,7 @@ impl Validator {
                     format!("site \"{site}\" {what} (map #{} and #{})", first + 1, i + 1),
                 );
             }
-            if let Some(first) = shareds.insert((site, map.shared), i) {
+            if let Some(first) = shareds.insert((id, map.shared), i) {
                 self.error(
                     FieldPath::map_field(i, "shared"),
                     format!(
@@ -548,7 +578,7 @@ impl Validator {
                     ),
                 );
             }
-            let own_vlans = network.site(site).map(|s| network.own_vlans(s));
+            let own_vlans = network.site(id).map(|s| network.own_vlans(s));
             if let LocalVid::Vid(local) = map.local
                 && own_vlans.as_ref().is_some_and(|v| v.contains(local))
             {
@@ -582,15 +612,16 @@ impl Validator {
                 msg,
             ));
         };
-        if let Some(name) = local.self_name.as_deref()
-            && network.site(name).is_none()
+        if let Some(id) = local.self_id
+            && network.site(id).is_none()
         {
             let known: BTreeSet<&str> = network.sites.iter().map(|s| s.name.as_str()).collect();
             let known: Vec<&str> = known.into_iter().collect();
             push(
                 "self",
                 format!(
-                    "self = \"{name}\" is not a site in network.toml (known sites: {})",
+                    "self = \"{}\" is not a site in network.toml (known sites: {})",
+                    network.label(id),
                     known.join(", ")
                 ),
             );
@@ -660,7 +691,7 @@ impl Validator {
         for (site, ports) in &local.tunnel_trunks {
             check_ports(
                 &format!("tunnels.{site}.trunk"),
-                &format!("trunk of the tunnel to \"{site}\""),
+                &format!("trunk of the tunnel to \"{}\"", network.label(*site)),
                 ports,
             );
         }
@@ -702,13 +733,13 @@ impl Validator {
                 }
             }
         }
-        let me = local.self_name.as_deref();
+        let me = local.self_id;
         // The uplink of a breakout is never a trunk port.
         if let Some((i, site)) = network
             .sites
             .iter()
             .enumerate()
-            .find(|(_, s)| Some(s.name.as_str()) == me)
+            .find(|(_, s)| Some(s.id) == me)
             .filter(|(_, s)| !crate::topology::is_server(s))
         {
             let trunks: BTreeSet<&String> = local
@@ -729,8 +760,9 @@ impl Validator {
             }
         }
         let mut unused = Vec::new();
-        for (site, ports) in &local.tunnel_trunks {
-            let path = format!("tunnels.{site}.trunk");
+        for (id, ports) in &local.tunnel_trunks {
+            let path = format!("tunnels.{id}.trunk");
+            let site = network.label(*id);
             if !local.trunk.is_empty() && *ports == local.trunk {
                 unused.push((
                     path.clone(),
@@ -740,7 +772,7 @@ impl Validator {
             let is_peer = me.is_some_and(|me| {
                 crate::topology::tunnels_for(network, me)
                     .iter()
-                    .any(|t| t.peer.name == *site)
+                    .any(|t| t.peer.id == *id)
             });
             if !is_peer {
                 unused.push((
@@ -769,11 +801,8 @@ fn is_managed_name(name: &str) -> bool {
 
 /// True if two sites may have the same address: both have an identity and
 /// at least one of them is a client (behind the same NAT, say).
-fn shares_address(network: &Network, a: &str, b: &str) -> bool {
-    let (Some(a), Some(b)) = (network.site(a), network.site(b)) else {
-        return false;
-    };
-    a.id.is_some() && b.id.is_some() && (a.uplink.is_some() || b.uplink.is_some())
+fn shares_address(a: &Site, b: &Site) -> bool {
+    a.has_identity() && b.has_identity() && (a.uplink.is_some() || b.uplink.is_some())
 }
 
 #[cfg(test)]

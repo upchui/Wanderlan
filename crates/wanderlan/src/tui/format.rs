@@ -136,8 +136,12 @@ pub fn kind(uplink: Option<&str>) -> &'static str {
 }
 
 /// A site name with its kind: `marcel (client)`.
-pub fn site_with_kind(site: &wanderlan_core::config::Site) -> String {
-    format!("{} ({})", site.name, kind(site.uplink.as_deref()))
+pub fn site_with_kind(
+    network: &wanderlan_core::config::Network,
+    site: &wanderlan_core::config::Site,
+) -> String {
+    let uplink = site.uplink.map(|up| network.label(up));
+    format!("{} ({})", network.label(site.id), kind(uplink.as_deref()))
 }
 
 /// The role of a site: `server`, or `client of <uplink>`.

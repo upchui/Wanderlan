@@ -22,7 +22,7 @@ done
 check "site3 applied the synced VLAN range (10-60 on trunk0)" test "$(vlan_summary site3 trunk0)" = "10-60"
 check "site3 wrote the synced configuration to its network.toml" \
   x site3 "grep -q '^revision = $want' /etc/wanderlan/network.toml && grep -q '^vlans = \"10-60\"' /etc/wanderlan/network.toml"
-check "site5 kept its own local.toml" x site5 "grep -q '^self = \"site5\"' /etc/wanderlan/local.toml"
+check "site5 kept its own local.toml" x site5 "grep -q '^self = \".*\"  # site5\$' /etc/wanderlan/local.toml"
 wait_for 30 "site1 reports all peers in sync" \
   x site1 "wanderlan status --json | jq -e '[.peers[].in_sync] | all'"
 
@@ -58,13 +58,13 @@ begin "Settings: every site sets its own, nobody those of another"
 
 client_vlan c-site3 20 10.20.0.11/24
 client_vlan c-site4 20 10.20.0.12/24
-site4_entry() { x site1 "sed -n '/^\[site.site4\]/,/^\[/p' /etc/wanderlan/network.toml"; }
+site4_entry() { entry_of site1 site4; }
 check "site4 moves its control port" x site4 "wanderlan settings control-port 52821 --confirm"
 check "and its tunnel port" x site4 "wanderlan settings tunnel-port 52833 --confirm"
 wait_for 90 "site1 learned the ports of site4 (from site4, at its new port)" \
   eval 'site4_entry | grep -q "^control_port = 52821" && site4_entry | grep -q "^tunnel_port = 52833"'
 wait_for 30 "site1 sends to the new tunnel port of site4" \
-  x site1 "bridge fdb show dev vx-site4 | grep -q 'port 52833'"
+  x site1 "bridge fdb show dev \$(tun site4) | grep -q 'port 52833'"
 expect_ping c-site3 10.20.0.12 "VLAN 20: site3 reaches site4 at its new ports"
 x site1 "sed 's/^control_port = 52821/control_port = 52999/' /etc/wanderlan/network.toml > /tmp/ports.toml"
 check "site1 cannot change the ports of site4" \
@@ -89,7 +89,9 @@ begin "CLI: sites, VLANs and mappings by hand"
 
 check "site1 adds the site lab (a client of site1)" \
   x site1 "wanderlan site add lab 10.100.1.99 --vlans 10,20 --confirm"
-wait_for 90 "site3 knows lab (synced)" eval 'entry_of site3 lab | grep -q "^server = \"site1\""'
+# lab has no identity of its own (no box joined as it): known by its name,
+# the file names the sites by theirs again until it has one (format 2).
+wait_for 90 "site3 knows lab (synced)" eval 'entry_of site3 lab | grep -Eq "^server = (\"site1\"|.*  # site1)\$"'
 check "lab cannot be added twice" \
   x site1 "! wanderlan site add lab 10.100.1.98 2>/tmp/add.err && grep -q 'already a site' /tmp/add.err"
 check "site1 maps source VLAN 20 to VLAN 120 at lab" x site1 "wanderlan map add lab 20 120 --confirm"

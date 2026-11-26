@@ -44,12 +44,12 @@ for c in natc1 natc2; do
 done
 check "the NAT gave the two boxes different ports" \
   test "$(peer_of site1 natc1 .endpoint)" != "$(peer_of site1 natc2 .endpoint)"
-check "site1 learned them from the keepalives (table ip wanderlan)" \
-  x site1 "nft list set ip wanderlan ep-natc1 | grep -q '10.100.20.10 . '"
+check "site1 learned them from the keepalives (table ip wanderlan, a set per tunnel)" \
+  x site1 "nft list set ip wanderlan ep-\$(tun natc1) | grep -q '10.100.20.10 . '"
 check "a client tunnel is VXLAN from and to port 51822" \
-  x natc1 "ip -d link show vx-site1 | grep -q 'vxlan id [0-9]* .*srcport 51822 51823 dstport 51822'"
+  x natc1 "ip -d link show \$(tun site1) | grep -q 'vxlan id [0-9]* .*srcport 51822 51823 dstport 51822'"
 check "site1 sends to the NAT, where natc1's packets come from" \
-  x site1 "bridge fdb show dev vx-natc1 | grep -q '^00:00:00:00:00:00 dst 10.100.20.10 '"
+  x site1 "bridge fdb show dev \$(tun natc1) | grep -q '^00:00:00:00:00:00 dst 10.100.20.10 '"
 
 client_vlan c-site1 20 10.20.0.1/24
 client_vlan c-natc1 20 10.20.0.31/24
@@ -63,13 +63,13 @@ check "site1 never opened a flow towards the boxes behind the NAT" \
 begin "NAT: a new mapping (the NAT forgot the flows) is followed"
 
 before=$(peer_of site1 natc1 .endpoint)
-index=$(x site1 "cat /sys/class/net/vx-natc1/ifindex")
+index=$(x site1 "cat /sys/class/net/\$(tun natc1)/ifindex")
 x nat "conntrack -F >/dev/null 2>&1"
 wait_for 60 "site1 follows the new port of natc1 (was $before)" \
   eval "[ \"\$(peer_of site1 natc1 .endpoint)\" != '$before' ]"
 wait_for 60 "VLAN 20: natc1 reaches site1's client again" ping_once c-natc1 10.20.0.1
 check "the tunnel was changed in place (same interface)" \
-  test "$(x site1 "cat /sys/class/net/vx-natc1/ifindex")" = "$index"
+  test "$(x site1 "cat /sys/class/net/\$(tun natc1)/ifindex")" = "$index"
 wait_for 60 "VLAN 20: natc2 reaches site1's client again" ping_once c-natc2 10.20.0.1
 
 begin "NAT: a restart of the server is followed"
@@ -81,5 +81,32 @@ for c in natc1 natc2; do
 done
 wait_for 60 "VLAN 20: natc1 reaches site1's client" ping_once c-natc1 10.20.0.1
 wait_for 60 "VLAN 20: natc2 reaches natc1 through site1" ping_once c-natc2 10.20.0.31
+
+begin "Names: two clients with the same name, told apart by their identities"
+
+fp2=$(jqs natc2 .site_id | cut -c1-8)
+tunnel2=$(tunnel_of site1 natc2)
+check "site1 calls natc2 natc1 too (it manages both)" x site1 "wanderlan rename natc2 natc1 --confirm"
+wait_eq 60 "site1 has two sites called natc1" 2 \
+  jqs site1 '[.sites[] | select(.name | startswith("natc1#"))] | length'
+check "the tunnel to the renamed one stays, named by its identity" \
+  test "$(x site1 "ip -j link show $tunnel2 | jq -r '.[0].ifalias'")" = "wanderlan natc1#$fp2"
+for c in natc1 natc2; do
+  wait_eq 60 "$c: its tunnel to site1 is still up" "up" peer_of "$c" site1 .port_state
+done
+wait_for 60 "VLAN 20: natc2 (now also natc1) reaches natc1 through site1" ping_once c-natc2 10.20.0.31
+check "a name two sites have is refused, with both" \
+  x site1 "! wanderlan online natc1 2>/tmp/ambiguous.err && grep -q 'names 2 sites' /tmp/ambiguous.err"
+check "the name with the start of its identity names one" \
+  x site1 "wanderlan online natc1#$fp2 | grep -q 'already online'"
+check "site1 calls it natc2 again" x site1 "wanderlan rename natc1#$fp2 natc2 --confirm"
+wait_eq 60 "site1 has natc1 and natc2 again" "natc1 natc2" \
+  jqs site1 '[.sites[] | select(.name | startswith("natc")) | .name] | sort | join(" ")'
+# The next change is made elsewhere: it must build on this one (two changes
+# with the same revision at two servers keep only one of them).
+want=$(jqs site1 .revision)
+for s in site2 site3 site4; do
+  wait_eq 60 "$s has network revision $want" "$want" jqs "$s" .revision
+done
 client_vlan_del c-natc1 20
 client_vlan_del c-natc2 20

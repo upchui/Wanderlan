@@ -14,9 +14,12 @@ mod vlan;
 
 pub use diag::{ConfigFile, Diagnostic, FieldPath, LineIndex, Severity, SpanMap, has_errors};
 pub use model::*;
-pub use raw::{ParsedLocal, ParsedNetwork, parse_local, parse_network};
+pub use raw::{
+    ParsedLocal, ParsedNetwork, local_uses_names, parse_local, parse_network, parse_network_in,
+};
 pub use render::{
-    fingerprint, local_fingerprint, render_local, render_network, render_network_wire, unified_diff,
+    disk_format, expressible_by_names, fingerprint, local_fingerprint, render_local,
+    render_network, render_network_wire, unified_diff,
 };
 pub use validate::{
     COMMIT_TIMEOUT_RANGE, IFNAME_MAX, MSS_MAX, MSS_MIN, PROBE_INTERVAL_MIN, ifname_error,
@@ -29,19 +32,26 @@ pub use vlan::{NATIVE_VID, VID_MAX, VID_MIN, VlanSet, VlanSetError};
 pub struct Config {
     /// The shared network configuration.
     pub network: Network,
-    /// The local configuration; `self_name` and `trunk` are guaranteed set.
+    /// The local configuration; `self_id` and `trunk` are guaranteed set.
     pub local: Local,
 }
 
 impl Config {
+    /// Identity of the local site.
+    pub fn self_id(&self) -> crate::identity::SiteId {
+        self.local
+            .self_id
+            .unwrap_or_else(|| crate::identity::SiteId::provisional(""))
+    }
+
     /// Name of the local site.
     pub fn self_name(&self) -> &str {
-        self.local.self_name.as_deref().unwrap_or_default()
+        self.self_site().map_or("", |s| s.name.as_str())
     }
 
     /// The local site entry.
     pub fn self_site(&self) -> Option<&Site> {
-        self.network.site(self.self_name())
+        self.network.site(self.self_id())
     }
 
     /// Time to confirm a change here: this site's, or the network's.
@@ -65,12 +75,12 @@ impl Config {
 
     /// The control port of this site.
     pub fn control_port(&self) -> u16 {
-        self.network.control_port_of(self.self_name())
+        self.network.control_port_of(self.self_id())
     }
 
     /// The tunnel port of this site.
     pub fn tunnel_port(&self) -> u16 {
-        self.network.tunnel_port_of(self.self_name())
+        self.network.tunnel_port_of(self.self_id())
     }
 
     /// Name of the main trunk port.
@@ -79,12 +89,12 @@ impl Config {
     }
 
     /// The trunk ports of the tunnel to `peer`.
-    pub fn trunk_ports_for(&self, peer: &str) -> &[String] {
+    pub fn trunk_ports_for(&self, peer: crate::identity::SiteId) -> &[String] {
         self.local.trunk_ports_for(peer)
     }
 
     /// The trunk of the tunnel to `peer` (its own, or the default trunk).
-    pub fn trunk_for(&self, peer: &str) -> &str {
+    pub fn trunk_for(&self, peer: crate::identity::SiteId) -> &str {
         self.local.trunk_for(peer).unwrap_or_default()
     }
 }
@@ -116,7 +126,13 @@ pub struct LoadOutcome {
 /// (errors and warnings) with line numbers.
 pub fn load(network_text: &str, local_text: &str) -> Result<LoadOutcome, Vec<Diagnostic>> {
     let parsed_network = parse_network(network_text);
-    let parsed_local = parse_local(local_text);
+    let parsed_local = parse_local(
+        local_text,
+        parsed_network
+            .as_ref()
+            .ok()
+            .and_then(|p| p.network.as_ref()),
+    );
     let (parsed_network, parsed_local) = match (parsed_network, parsed_local) {
         (Ok(m), Ok(l)) => (m, l),
         (m, l) => {

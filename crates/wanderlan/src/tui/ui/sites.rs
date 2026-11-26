@@ -6,6 +6,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 use wanderlan_core::config::FieldPath;
+use wanderlan_core::identity::SiteId;
 use wanderlan_core::{policy, topology};
 
 use super::{
@@ -41,7 +42,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 
 fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
     let running = app.running.as_ref().and_then(|r| r.network.as_ref());
-    let own = draft.local.self_name.as_deref();
+    let own = draft.local.self_id;
     let header = Row::new(vec![
         "",
         "NAME",
@@ -52,16 +53,16 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         "TUNNEL",
     ])
     .style(theme::header());
-    // A renamed site (the same address under a new name) is changed, not
-    // new; its old name is not removed.
-    let renamed = running.map_or_else(Vec::new, |m| {
-        wanderlan_core::rename::renames(m, &draft.network)
+    // A site of an older version renamed (a provisional identity of its
+    // new name) is changed, not new; its old entry is not removed.
+    let rekeyed = running.map_or_else(Vec::new, |m| {
+        wanderlan_core::rename::rekeys(m, &draft.network)
     });
-    let old_name = |name: &str| -> String {
-        renamed
+    let before_id = |id: SiteId| -> SiteId {
+        rekeyed
             .iter()
-            .find(|(_, new)| new == name)
-            .map_or_else(|| name.to_string(), |(old, _)| old.clone())
+            .find(|(_, new)| *new == id)
+            .map_or(id, |(old, _)| *old)
     };
     let order = app.visible_sites();
     // The texts first: the columns are as wide as they need, the VLANs get
@@ -70,25 +71,23 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         .iter()
         .filter_map(|(i, depth)| draft.network.sites.get(*i).map(|s| (*i, *depth, s)))
         .map(|(i, depth, site)| {
-            let before = old_name(&site.name);
-            let marker = match running.and_then(|m| m.site(&before)) {
+            let before = before_id(site.id);
+            let marker = match running.and_then(|m| m.site(before)) {
                 None => Span::styled("+", theme::ok()),
                 Some(old) if old != site => Span::styled("*", theme::warn()),
                 Some(_) => Span::raw(" "),
             };
             let (tunnel, tunnel_style) = if !site.online {
                 ("offline".to_string(), theme::warn())
-            } else if Some(site.name.as_str()) == own {
+            } else if Some(site.id) == own {
                 ("this site".to_string(), theme::bold())
             } else {
-                match app.peer(&before) {
+                match app.peer(&app.running_name(before)) {
                     Some(peer) => (port_state(peer.port_state).to_string(), health_style(peer)),
-                    None => {
-                        match own.and_then(|me| topology::via(&draft.network, me, &site.name)) {
-                            Some(hop) => (format!("via {hop}"), theme::dim()),
-                            None => ("-".to_string(), theme::dim()),
-                        }
-                    }
+                    None => match own.and_then(|me| topology::via(&draft.network, me, site.id)) {
+                        Some(hop) => (format!("via {}", draft.network.label(hop)), theme::dim()),
+                        None => ("-".to_string(), theme::dim()),
+                    },
                 }
             };
             let own_vlans = site
@@ -101,12 +100,12 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
             };
             let texts = vec![
                 String::new(),
-                topology::tree_name(&site.name, depth),
+                topology::tree_name(&draft.network.label(site.id), depth),
                 site.address.to_string(),
                 vlans,
                 format::role(
-                    site.uplink.as_deref(),
-                    topology::has_clients(&draft.network, &site.name),
+                    site.uplink.map(|up| draft.network.label(up)).as_deref(),
+                    topology::has_clients(&draft.network, site.id),
                 ),
                 policy::managed_label(&draft.network, site),
                 tunnel,
@@ -156,8 +155,8 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
     let removed = running.map_or(0, |m| {
         m.sites
             .iter()
-            .filter(|s| draft.network.site(&s.name).is_none())
-            .filter(|s| !renamed.iter().any(|(old, _)| *old == s.name))
+            .filter(|s| draft.network.site(s.id).is_none())
+            .filter(|s| !rekeyed.iter().any(|(old, _)| *old == s.id))
             .count()
     });
     let mut title = format!(" Sites (draft): {} ", draft.network.sites.len());
@@ -215,19 +214,19 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
             .map_or_else(String::new, |o| format!(" +own {o}"));
         // The keys are in the bar; offline only the way back.
         let keys = if site.online { "" } else { " (o: take online)" };
+        let name = draft.network.label(site.id);
         let text = format!(
-            " {}: {}; VLANs {vlans}{own}; managed by {}{keys}",
-            site.name,
+            " {name}: {}; VLANs {vlans}{own}; managed by {}{keys}",
             format::role(
-                site.uplink.as_deref(),
-                topology::has_clients(&draft.network, &site.name)
+                site.uplink.map(|up| draft.network.label(up)).as_deref(),
+                topology::has_clients(&draft.network, site.id)
             ),
             policy::managed_label(&draft.network, site)
         );
         lines.push(Line::styled(text, theme::dim()));
         // The peer row has the name the site runs under.
         if let Some(why) = app
-            .peer(&app.running_name(&site.name))
+            .peer(&app.running_name(site.id))
             .and_then(|p| p.down_reason.clone())
         {
             lines.push(Line::styled(format!(" Tunnel down: {why}"), theme::warn()));
@@ -235,14 +234,11 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
         if let Some(trunk) = draft
             .local
             .tunnel_trunks
-            .get(&site.name)
+            .get(&site.id)
             .map(|p| p.join(", "))
         {
             lines.push(Line::styled(
-                format!(
-                    " The tunnel to {} has its own trunk {trunk} here (Settings, 8).",
-                    site.name
-                ),
+                format!(" The tunnel to {name} has its own trunk {trunk} here (Settings, 8)."),
                 theme::dim(),
             ));
         }

@@ -12,12 +12,12 @@ wait_for 90 "site1 measured a path MTU of 1400 to site5 (direct tunnel)" \
   x site1 "grep -q 'Path MTU to \"site5\" is 1400 bytes' /var/log/wanderland.log"
 wait_for 90 "site1 measured the full 1500-byte underlay MTU to site2" \
   x site1 "grep -q 'Path MTU to \"site2\" is 1500 bytes (TCP MSS 1406)' /var/log/wanderland.log"
-wait_for 30 "site5 clamps the MSS to 1306 on vx-site2" \
-  x site5 "nft list table bridge wanderlan | grep -q 'oifname \"vx-site2\" .*maxseg size set 1306'"
+wait_for 30 "site5 clamps the MSS to 1306 on the tunnel to site2" \
+  x site5 "nft list table bridge wanderlan | grep -q \"oifname \\\"\$(tun site2)\\\" .*maxseg size set 1306\""
 check "site5 clamps IPv6 TCP to 1286" \
-  x site5 "nft list table bridge wanderlan | grep -q 'meta protocol ip6 oifname \"vx-site2\" .*maxseg size set 1286'"
+  x site5 "nft list table bridge wanderlan | grep -q \"meta protocol ip6 oifname \\\"\$(tun site2)\\\" .*maxseg size set 1286\""
 check "site2 clamps SYNs from site5 to 1306 as well" \
-  x site2 "nft list table bridge wanderlan | grep -q 'iifname \"vx-site5\" .*maxseg size set 1306'"
+  x site2 "nft list table bridge wanderlan | grep -q \"iifname \\\"\$(tun site5)\\\" .*maxseg size set 1306\""
 check "every bridged frame passes one rule: only TCP SYNs go on to the MSS rules" \
   x site5 "nft list chain bridge wanderlan forward | grep -q 'tcp flags.*jump wl-mss' && ! nft list chain bridge wanderlan forward | grep -q maxseg && nft list chain bridge wanderlan wl-mss | grep -q 'maxseg size set 1306'"
 

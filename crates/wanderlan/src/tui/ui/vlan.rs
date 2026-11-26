@@ -7,6 +7,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Clear, Paragraph, Row, Table};
 use wanderlan_core::config::{LocalVid, NATIVE_VID, Network};
+use wanderlan_core::identity::SiteId;
 use wanderlan_core::{forwarding, topology};
 
 use super::{list, titled};
@@ -19,7 +20,7 @@ fn label(text: &str) -> Span<'static> {
 
 /// What the configuration says about `vid` at site `me`: on the trunk (and
 /// how), the tunnels that carry it, where it is passed on.
-fn facts(network: &Network, me: &str, vid: u16) -> Vec<Line<'static>> {
+fn facts(network: &Network, me: SiteId, vid: u16) -> Vec<Line<'static>> {
     let Some(site) = network.site(me) else {
         return Vec::new();
     };
@@ -42,10 +43,8 @@ fn facts(network: &Network, me: &str, vid: u16) -> Vec<Line<'static>> {
     };
     let carried: Vec<String> = topology::tunnels_for(network, me)
         .iter()
-        .filter(|t| {
-            topology::tunnel_vlans(network, me, &t.peer.name).is_some_and(|v| v.contains(vid))
-        })
-        .map(|t| t.peer.name.clone())
+        .filter(|t| topology::tunnel_vlans(network, me, t.peer.id).is_some_and(|v| v.contains(vid)))
+        .map(|t| network.label(t.peer.id))
         .collect();
     let mut lines = vec![
         Line::from(vec![label("Here"), Span::raw(here)]),
@@ -63,7 +62,12 @@ fn facts(network: &Network, me: &str, vid: u16) -> Vec<Line<'static>> {
         .iter()
         .filter(|(vlans, _)| vlans.contains(vid))
         .flat_map(|(_, groups)| groups.iter())
-        .map(|g| g.iter().cloned().collect::<Vec<_>>().join(", "))
+        .map(|g| {
+            g.iter()
+                .map(|id| network.label(*id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
         .collect();
     if !groups.is_empty() {
         lines.push(Line::from(vec![
@@ -87,7 +91,7 @@ pub fn draw(frame: &mut Frame, app: &App, vid: u16, back: Option<&str>, area: Re
     let mut lines = app
         .running
         .as_ref()
-        .and_then(|r| r.network.as_ref().zip(r.local.self_name.as_deref()))
+        .and_then(|r| r.network.as_ref().zip(r.local.self_id))
         .map(|(network, me)| facts(network, me, vid))
         .unwrap_or_default();
     let ports = app

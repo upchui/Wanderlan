@@ -13,7 +13,7 @@ use wanderlan_core::config::{VlanSet, parse_network, render_network};
 use super::draw;
 use crate::client::ClientError;
 use crate::tui::app::{App, MessageKind, Modal, Msg, Reply};
-use crate::tui::fixtures;
+use crate::tui::fixtures::{self, id};
 
 fn render(app: &App) -> String {
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
@@ -178,7 +178,7 @@ fn settings_trunk_per_tunnel() {
     if let Some(d) = &mut app.draft {
         d.local
             .tunnel_trunks
-            .insert("haus2".into(), vec!["ens20".into()]);
+            .insert(id("haus2"), vec!["ens20".into()]);
     }
     key(&mut app, KeyCode::Char('8'));
     // Down to "to haus2": the fixed rows, then buero, then haus2.
@@ -280,7 +280,7 @@ fn sites_as_tree() {
     let mut app = connected();
     if let Some(d) = &mut app.draft {
         // haus2 becomes a client of heim: it moves up below heim, next to haus6.
-        d.network.sites[2].uplink = Some("heim".into());
+        d.network.sites[2].uplink = Some(id("heim"));
         d.revalidate();
     }
     key(&mut app, KeyCode::Char('2'));
@@ -302,7 +302,7 @@ fn vlans_tunnels() {
     let mut app = connected();
     if let Some(d) = &mut app.draft {
         d.network
-            .set_tunnel_limit("heim", "buero", Some(VlanSet::from_range(20, 30)));
+            .set_tunnel_limit(id("heim"), id("buero"), Some(VlanSet::from_range(20, 30)));
         d.revalidate();
     }
     key(&mut app, KeyCode::Char('3'));
@@ -334,7 +334,7 @@ fn tunnel_vlans_form() {
 fn a_renamed_site_is_changed_not_new() {
     let mut app = connected();
     if let Some(d) = &mut app.draft {
-        d.rename_references("haus3", "hausx");
+        d.rename_site(id("haus3"), "hausx");
         d.revalidate();
     }
     key(&mut app, KeyCode::Char('2'));
@@ -374,7 +374,7 @@ fn peer_details_limited() {
     let mut app = connected();
     let mut texts = fixtures::config_texts();
     let mut network = parse_network(&texts.network).unwrap().network.unwrap();
-    network.set_tunnel_limit("heim", "buero", Some(VlanSet::from_range(20, 30)));
+    network.set_tunnel_limit(id("heim"), id("buero"), Some(VlanSet::from_range(20, 30)));
     texts.network = render_network(&network);
     reply(&mut app, Request::GetConfig, Reply::Config(texts));
     key(&mut app, KeyCode::Enter);
@@ -392,7 +392,7 @@ fn the_help_bar_always_offers_help_and_quit() {
     let mut app = connected();
     if let Some(d) = &mut app.draft {
         // A modified draft adds a and x to every bar.
-        d.network.sites[2].uplink = Some("heim".into());
+        d.network.sites[2].uplink = Some(id("heim"));
         d.revalidate();
     }
     for view in ['1', '2', '3', '4', '5', '6', '7', '8'] {
@@ -714,7 +714,7 @@ fn with_breakouts() -> App {
     for site in &mut network.sites {
         match site.name.as_str() {
             "heim" => {
-                site.uplink = Some("buero".into());
+                site.uplink = Some(id("buero"));
                 site.breakout.insert(10, breakout(None, &[]));
                 site.breakout
                     .insert(20, breakout(Some("ens20"), &["203.0.113.0/24"]));

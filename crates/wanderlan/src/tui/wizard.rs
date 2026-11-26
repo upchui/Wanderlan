@@ -459,21 +459,13 @@ impl Wizard {
         let vlans = self.parse_vlans()?;
         self.check_trunk(interfaces)?;
         let mut network = Network::new(vlans);
-        network.sites.push(Site {
-            name: name.clone(),
-            address: parse_address(self.address.value())?,
-            id: None,
-            vlans: None,
-            own_vlans: None,
-            online: true,
-            managed_by: None,
-            self_managed: false,
-            uplink: None,
-            breakout: Default::default(),
-            ports: Default::default(),
-        });
+        // Known by its name until the daemon gives it the identity of
+        // this box.
+        let site = Site::new(&name, parse_address(self.address.value())?);
+        let id = site.id;
+        network.sites.push(site);
         let local = Local {
-            self_name: Some(name),
+            self_id: Some(id),
             trunk: vec![self.trunk(interfaces)],
             ..Default::default()
         };
@@ -598,8 +590,11 @@ mod tests {
         let (network, local) = w.build(&fixtures::interfaces()).unwrap();
         insta::assert_snapshot!("wizard_new_network_config", render_network(&network));
         assert_eq!(
-            render_local(&local),
-            "# wanderlan site-local configuration (never synchronised).\n\nself = \"heim\"\ntrunk = \"ens19\"\n"
+            render_local(&local, Some(&network)),
+            format!(
+                "# wanderlan site-local configuration (never synchronised).\n\nself = \"{}\"  # heim\ntrunk = \"ens19\"\n",
+                wanderlan_core::identity::SiteId::provisional("heim")
+            )
         );
     }
 

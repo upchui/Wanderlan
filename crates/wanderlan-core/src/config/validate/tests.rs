@@ -68,9 +68,18 @@ fn render_roundtrip_is_identical() {
     assert_eq!(network, again);
     assert_eq!(text, render_network(&again));
 
-    let local = crate::config::parse_local(EXAMPLE_LOCAL).unwrap().local;
-    let text = render_local(&local);
-    assert_eq!(crate::config::parse_local(&text).unwrap().local, local);
+    let local = crate::config::parse_local(EXAMPLE_LOCAL, Some(&network))
+        .unwrap()
+        .local;
+    let text = render_local(&local, Some(&network));
+    assert_eq!(
+        crate::config::parse_local(&text, Some(&network))
+            .unwrap()
+            .local,
+        local
+    );
+    // The sites are identities now, with their names as comments.
+    assert!(text.contains("  # haus2\n"), "{text}");
 }
 
 #[test]
@@ -227,9 +236,9 @@ fn site_vlans_are_parsed_and_rendered() {
     let Loaded::Configured(cfg) = outcome.loaded else {
         panic!("configured");
     };
-    let haus2 = cfg.network.site("haus2").expect("haus2");
+    let haus2 = cfg.network.by_name("haus2").expect("haus2");
     assert_eq!(cfg.network.vlans_of(haus2).to_string(), "20,30");
-    let heim = cfg.network.site("heim").expect("heim");
+    let heim = cfg.network.by_name("heim").expect("heim");
     assert_eq!(cfg.network.vlans_of(heim).to_string(), "10-50");
     assert!(render_network(&cfg.network).contains("vlans = \"20,30\""));
 }
@@ -368,7 +377,7 @@ fn without_vlans_everything_passes() {
     let Loaded::Configured(cfg) = load(&network, LOCAL).unwrap().loaded else {
         panic!("configured");
     };
-    assert_eq!(cfg.network.site("haus2").unwrap().vlans, None);
+    assert_eq!(cfg.network.by_name("haus2").unwrap().vlans, None);
 }
 
 #[test]
@@ -480,14 +489,14 @@ fn uplinks_make_clients_and_old_configurations_are_migrated() {
     let network = parse_network(CLIENTS).unwrap().network.unwrap();
     // No `uplink`, but invited by alex: a client of alex.
     assert_eq!(
-        network.site("marcel").unwrap().uplink.as_deref(),
-        Some("alex")
+        network.by_name("marcel").unwrap().uplink,
+        Some("alex".into())
     );
     assert_eq!(
-        network.site("site2").unwrap().uplink.as_deref(),
-        Some("alex")
+        network.by_name("site2").unwrap().uplink,
+        Some("alex".into())
     );
-    assert_eq!(network.site("alex").unwrap().uplink, None);
+    assert_eq!(network.by_name("alex").unwrap().uplink, None);
     // Written explicitly from now on; the canonical form reads back the same.
     let text = render_network(&network);
     assert_eq!(text.matches("server = \"alex\"").count(), 2, "{text}");
@@ -548,12 +557,15 @@ fn a_tunnel_can_have_its_own_trunk() {
     let Loaded::Configured(cfg) = outcome.loaded else {
         panic!("configured")
     };
-    assert_eq!(cfg.trunk_for("heim"), "ens20");
-    assert_eq!(cfg.trunk_for("buero"), "ens19");
+    assert_eq!(cfg.trunk_for("heim".into()), "ens20");
+    assert_eq!(cfg.trunk_for("buero".into()), "ens19");
     // The canonical form keeps it and reads back the same.
-    let rendered = render_local(&cfg.local);
+    let rendered = render_local(&cfg.local, Some(&cfg.network));
+    let heim = crate::identity::SiteId::provisional("heim");
     assert!(
-        rendered.contains("[tunnels.heim]\ntrunk = \"ens20\""),
+        rendered.contains(&format!(
+            "# The tunnel to \"heim\" has its own trunk (a segment of its own).\n[tunnels.\"{heim}\"]\ntrunk = \"ens20\""
+        )),
         "{rendered}"
     );
     let again = load(EXAMPLE_NETWORK, &rendered).expect("valid");
@@ -621,11 +633,14 @@ fn tunnel_limits_are_read_written_and_checked() {
     let Loaded::Configured(cfg) = outcome.loaded else {
         panic!("configured");
     };
-    let limit = cfg.network.tunnel_limit("buero", "heim").expect("limit");
+    let limit = cfg
+        .network
+        .tunnel_limit("buero".into(), "heim".into())
+        .expect("limit");
     assert_eq!(limit.to_string(), "20-30");
     assert!(
         cfg.network
-            .tunnel_limit("heim", "haus2")
+            .tunnel_limit("heim".into(), "haus2".into())
             .expect("none")
             .is_empty()
     );
@@ -696,20 +711,22 @@ fn several_trunk_ports_are_read_written_and_checked() {
     };
     assert_eq!(cfg.local.trunk, ["ens19", "ens20"]);
     assert_eq!(cfg.trunk(), "ens19");
-    assert_eq!(cfg.trunk_ports_for("heim"), ["ens21", "ens22"]);
+    assert_eq!(cfg.trunk_ports_for("heim".into()), ["ens21", "ens22"]);
     assert_eq!(
-        cfg.trunk_ports_for("haus3"),
+        cfg.trunk_ports_for("haus3".into()),
         ["ens19", "ens20"],
         "the default ports"
     );
-    let text = render_local(&cfg.local);
+    let text = render_local(&cfg.local, Some(&cfg.network));
     assert!(text.contains("trunk = [\"ens19\", \"ens20\"]\n"), "{text}");
     assert!(
         text.contains("trunk = \"ens23\"\n"),
         "one port stays a string: {text}"
     );
     assert_eq!(
-        crate::config::parse_local(&text).unwrap().local,
+        crate::config::parse_local(&text, Some(&cfg.network))
+            .unwrap()
+            .local,
         cfg.local,
         "round trip"
     );
@@ -775,8 +792,8 @@ fn edit(text: &str, from: &str, to: &str) -> String {
 fn both_formats_describe_the_same_network() {
     let old = parse_network(EXAMPLE_NETWORK).unwrap();
     let new = parse_network(EXAMPLE_NETWORK_2).unwrap();
-    assert!(old.old_format);
-    assert!(!new.old_format);
+    assert!(old.old_format());
+    assert!(!new.old_format());
     assert_eq!(old.network, new.network);
     let outcome = load(EXAMPLE_NETWORK_2, EXAMPLE_LOCAL).expect("example loads");
     assert!(outcome.warnings.is_empty(), "{:?}", outcome.warnings);
@@ -797,7 +814,7 @@ fn format_2_is_written_and_read_back() {
         "{text}"
     );
     let again = parse_network(&text).unwrap();
-    assert!(!again.old_format);
+    assert!(!again.old_format());
     assert_eq!(again.network.as_ref(), Some(&network));
     assert_eq!(render_network(&network), text, "canonical");
 }
@@ -828,7 +845,7 @@ fn the_wire_form_never_changes() {
         "8bafc5da21a7724f3687059252586b7ce8751c9a463d6831eefdeaaa260b76cf"
     );
     // And older sites read it: format 1.
-    assert!(parse_network(&wire).unwrap().old_format);
+    assert!(parse_network(&wire).unwrap().old_format());
 }
 
 #[test]
@@ -855,17 +872,22 @@ fn server_and_tunnel_limits_in_format_2() {
     );
     let network = parse_network(&text).unwrap().network.unwrap();
     assert_eq!(
-        network.site("haus2").unwrap().uplink.as_deref(),
-        Some("heim")
+        network.by_name("haus2").unwrap().uplink,
+        Some("heim".into())
     );
     assert_eq!(network.tunnels.len(), 2);
     assert_eq!(
         network
-            .tunnel_limit("heim", "haus2")
+            .tunnel_limit("heim".into(), "haus2".into())
             .map(ToString::to_string),
         Some("20".to_string())
     );
-    assert!(network.tunnel_limit("buero", "heim").unwrap().is_empty());
+    assert!(
+        network
+            .tunnel_limit("buero".into(), "heim".into())
+            .unwrap()
+            .is_empty()
+    );
     // Written back at the client, between two servers at the first one.
     let rendered = render_network(&network);
     assert!(
@@ -885,7 +907,7 @@ fn server_and_tunnel_limits_in_format_2() {
         "[site.buero]\naddress = \"10.8.0.2\"\nmanaged_by = \"heim\"\n",
     );
     let network = parse_network(&managed).unwrap().network.unwrap();
-    assert_eq!(network.site("buero").unwrap().uplink, None);
+    assert_eq!(network.by_name("buero").unwrap().uplink, None);
 }
 
 #[test]
@@ -897,8 +919,8 @@ fn format_1_files_with_a_manager_become_explicit_clients() {
     );
     let network = parse_network(&old).unwrap().network.unwrap();
     assert_eq!(
-        network.site("haus2").unwrap().uplink.as_deref(),
-        Some("heim")
+        network.by_name("haus2").unwrap().uplink,
+        Some("heim".into())
     );
     let new = render_network(&network);
     assert!(
@@ -1055,9 +1077,9 @@ fn site_ids_are_read_and_written_in_both_formats() {
         1,
     );
     let parsed = parse_network(&network).unwrap().network.unwrap();
-    let site = parsed.site("haus2").unwrap();
-    assert_eq!(site.id.unwrap().to_string(), ID_A);
-    assert!(parsed.sites.iter().filter(|s| s.id.is_some()).count() == 1);
+    let site = parsed.by_name("haus2").unwrap();
+    assert_eq!(site.id.to_string(), ID_A);
+    assert!(parsed.sites.iter().filter(|s| s.has_identity()).count() == 1);
     for text in [
         render_network(&parsed),
         crate::config::render_network_wire(&parsed),
@@ -1075,7 +1097,8 @@ fn without_ids_the_wire_form_and_fingerprint_stay_as_before() {
     assert!(!wire.contains("id ="), "{wire}");
     assert!(!render_network(&network).contains("id ="));
     let mut with_id = network.clone();
-    with_id.sites[0].id = Some(ID_A.parse().unwrap());
+    let first = with_id.sites[0].id;
+    with_id.rekey(first, ID_A.parse().unwrap());
     assert_ne!(fingerprint(&network), fingerprint(&with_id));
 }
 
@@ -1113,14 +1136,15 @@ fn two_sites_with_the_same_id() {
 fn clients_with_identities_may_share_an_address() {
     // Two clients of haus2 behind the same NAT.
     let mut network = parse_network(EXAMPLE_NETWORK).unwrap().network.unwrap();
-    let id = |n: u8| Some(crate::identity::SiteId::from_bytes([n; 32]));
+    let id = |n: u8| crate::identity::SiteId::from_bytes([n; 32]);
     let address = network.sites[1].address;
-    let server = network.sites[1].name.clone();
+    let server = network.sites[1].id;
     for (i, n) in [(2usize, 3u8), (3, 4)] {
+        let old = network.sites[i].id;
+        network.rekey(old, id(n));
         let site = &mut network.sites[i];
         site.address = address;
-        site.uplink = Some(server.clone());
-        site.id = id(n);
+        site.uplink = Some(server);
     }
     let text = render_network(&network);
     let errs = errors(&text, LOCAL);
@@ -1128,10 +1152,11 @@ fn clients_with_identities_may_share_an_address() {
         errs.iter().any(|e| e.message.contains("already used")),
         "the server has no identity: {errs:?}"
     );
-    network.sites[1].id = id(2);
+    network.rekey(server, id(2));
     assert!(load(&render_network(&network), LOCAL).is_ok());
     // Without identities they must not.
-    network.sites[2].id = None;
+    let name = network.sites[2].name.clone();
+    network.rekey(id(3), crate::identity::SiteId::provisional(&name));
     let errs = errors(&render_network(&network), LOCAL);
     assert!(
         errs.iter().any(|e| e.message.contains("already used")),
@@ -1185,10 +1210,10 @@ server = "alex"
 breakout = { 10 = {}, 20 = { uplink = "ens20", except = ["203.0.113.9/24", "2001:db8::1"] } }
 "#;
     let network = parse_network(text).unwrap().network.unwrap();
-    let site2 = network.site("site2").unwrap();
+    let site2 = network.by_name("site2").unwrap();
     assert_eq!(site2.breakout.len(), 2);
     let twenty = &site2.breakout[&20];
-    assert_eq!(twenty.uplink.as_deref(), Some("ens20"));
+    assert_eq!(twenty.uplink, Some("ens20".into()));
     let except: Vec<String> = twenty.except.iter().map(ToString::to_string).collect();
     assert_eq!(except, ["203.0.113.0/24", "2001:db8::1/128"]);
     // Both forms carry it, and read back the same.
@@ -1248,10 +1273,11 @@ breakout = { 10 = {}, 20 = { uplink = "ens20", except = ["203.0.113.9/24", "2001
     below.name = "site3".into();
     below.address = "10.13.0.105".parse().unwrap();
     below.uplink = Some("site2".into());
+    below.id = "site3".into();
     below.breakout.clear();
     network.sites.push(below);
-    let view = crate::view::view_for(&network, "site3");
-    assert!(view.site("site2").unwrap().breakout.is_empty());
+    let view = crate::view::view_for(&network, "site3".into());
+    assert!(view.by_name("site2").unwrap().breakout.is_empty());
 }
 
 #[test]
@@ -1270,7 +1296,7 @@ fn a_site_has_its_own_ports_and_settings() {
     assert_eq!(cfg.control_port(), 52821);
     assert_eq!(cfg.tunnel_port(), 52822, "the one after its control port");
     assert_eq!(
-        cfg.network.control_port_of("heim"),
+        cfg.network.control_port_of("heim".into()),
         51821,
         "the others keep theirs"
     );
@@ -1278,7 +1304,7 @@ fn a_site_has_its_own_ports_and_settings() {
     assert_eq!(cfg.mtu_probe_interval(), std::time::Duration::from_secs(60));
     assert_eq!(cfg.mss(), Some(1300));
     assert!(render_network(&cfg.network).contains("control_port = 52821"));
-    let rendered = render_local(&cfg.local);
+    let rendered = render_local(&cfg.local, None);
     assert!(rendered.contains("commit_timeout = \"2m\"") && rendered.contains("mss = 1300"));
     // Without own ports the network keeps its form and fingerprint.
     assert!(!render_network(&base).contains("\ntunnel_port ="));
@@ -1299,16 +1325,18 @@ fn a_site_has_its_own_ports_and_settings() {
 #[test]
 fn two_servers_at_one_address_also_with_a_client_between() {
     let mut network = parse_network(EXAMPLE_NETWORK).unwrap().network.unwrap();
-    let id = |b: u8| Some(crate::identity::SiteId::from_bytes([b; 32]));
+    let id = |b: u8| crate::identity::SiteId::from_bytes([b; 32]);
     let addr = network.sites[0].address;
     // s0 (server), s1 (client of s0), s2 (server): all at one address.
-    for (i, site) in network.sites.iter_mut().take(3).enumerate() {
+    for i in 0..3 {
+        let old = network.sites[i].id;
+        network.rekey(old, id(u8::try_from(i).unwrap() + 1));
+        let site = &mut network.sites[i];
         site.address = addr;
-        site.id = id(u8::try_from(i).unwrap() + 1);
         site.uplink = None;
     }
     let first = network.sites[0].name.clone();
-    network.sites[1].uplink = Some(first.clone());
+    network.sites[1].uplink = Some(network.sites[0].id);
     let errs: Vec<String> = crate::config::validate(&network, None)
         .into_iter()
         .filter(Diagnostic::is_error)
@@ -1324,8 +1352,8 @@ fn two_servers_at_one_address_also_with_a_client_between() {
 #[test]
 fn an_own_vlan_may_be_mapped() {
     let mut network = parse_network(EXAMPLE_NETWORK).unwrap().network.unwrap();
-    let site = network.maps[0].site.clone();
-    let entry = network.sites.iter_mut().find(|s| s.name == site).unwrap();
+    let site = network.maps[0].site;
+    let entry = network.site_mut(site).unwrap();
     entry.own_vlans = Some("60".parse().unwrap());
     network.maps[0].shared = 60;
     let errs: Vec<Diagnostic> = crate::config::validate(&network, None)

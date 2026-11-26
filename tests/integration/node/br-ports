@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# br-ports <bridge> [tunnels]: the ports of a bridge, sorted, a tunnel by the
+# site it leads to (its alias "wanderlan <site>"); with "tunnels" only those.
+ip -j link show master "$1" | jq -r --arg only "${2:-}" '
+  [.[] | (.ifalias // "") as $a
+       | if ($a | startswith("wanderlan ")) then ($a | ltrimstr("wanderlan "))
+         elif $only == "tunnels" then empty else .ifname end]
+  | sort | join(" ")'

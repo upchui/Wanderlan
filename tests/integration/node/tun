@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# tun <site>: the tunnel interface of this box to <site>. wanderlan names
+# it by the identity of the site; its alias ("wanderlan <site>") tells the
+# site. Prints nothing if there is none.
+ip -j link show | jq -r --arg a "wanderlan $1" '.[] | select(.ifalias == $a) | .ifname' | head -n 1

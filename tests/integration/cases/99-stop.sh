@@ -6,8 +6,8 @@ begin "Stopping the daemon removes all interfaces it created"
 for s in site1 site2 site3 site4 site5 natc1 natc2; do
   x "$s" "wl-daemon status" >/dev/null 2>&1 || continue
   x "$s" "wl-daemon stop"
-  check "$s: no br0 and no vx-* interfaces left" \
-    x "$s" "! ip link show br0 2>/dev/null && [ -z \"\$(ip -o link show | grep ' vx-')\" ]"
+  check "$s: no br0 and no tunnels left" \
+    x "$s" "! ip link show br0 2>/dev/null && [ -z \"\$(ip -o link show | grep ' vx')\" ]"
   check "$s: trunk0 still exists and is detached" \
     x "$s" "ip -j link show trunk0 | jq -e '.[0].master == null'"
   check "$s: no nftables table bridge wanderlan" \

@@ -370,7 +370,7 @@ where
         keyed.view.to_string()
     } else {
         let text = String::from_utf8(body).context("the pushed network is not text")?;
-        push_to_controller(&keyed.name, text, inputs).await.text()
+        push_to_controller(client, text, inputs).await.text()
     };
     let tag = keyed
         .keys
@@ -384,13 +384,13 @@ where
 }
 
 /// Hands a pushed network to the controller and waits for its decision.
-async fn push_to_controller(peer: &str, text: String, inputs: &mpsc::Sender<Input>) -> PushAnswer {
+async fn push_to_controller(
+    peer: SiteId,
+    text: String,
+    inputs: &mpsc::Sender<Input>,
+) -> PushAnswer {
     let (reply, answer) = oneshot::channel();
-    let input = Input::SyncPush {
-        peer: peer.to_string(),
-        text,
-        reply,
-    };
+    let input = Input::SyncPush { peer, text, reply };
     if inputs.send(input).await.is_err() {
         return PushAnswer::Busy;
     }

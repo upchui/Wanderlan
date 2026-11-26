@@ -1,105 +1,81 @@
-//! Renaming sites.
+//! Renaming sites, and sites that get another identity.
 //!
-//! A site is known by its name everywhere: the other sites' `uplink` and
-//! `managed_by`, the mappings, the tunnel limits, `self` and the trunks per
-//! tunnel in `local.toml`, the interfaces `vx-<name>`. Its identity (`id`)
-//! stays when it is renamed, so a rename is recognised as the same identity
-//! under a new name; sites without an identity (older versions) by their
-//! address, which is unique among them. Who may rename whom is in
-//! [`crate::policy`].
+//! Every reference to a site is its identity (`id`), so a rename changes
+//! only its `name`. A site's identity changes in two cases: a site of an
+//! older version claims its own instead of its provisional one, and a box
+//! that was reset (a new identity) joins again and takes over the entry of
+//! the old one. Such a site is recognised by its name and address; one
+//! without an identity of its own (known by its name) also by its address
+//! alone, when it is renamed. Who may rename whom is in [`crate::policy`].
 
-use crate::config::{Local, Network, Site, site_pair};
+use crate::config::{Local, Network};
+use crate::identity::SiteId;
 
-/// The renames from `old` to `new`, as (old name, new name): a site of `new`
-/// that is the same box as a site of `old` which `new` no longer has, while
-/// its own name is new. The same box: the same identity, or the same address
-/// where one of the two has no identity. A site without an identity that
-/// changes its name and its address at once is a removed and an added site.
-pub fn renames(old: &Network, new: &Network) -> Vec<(String, String)> {
+/// The renames from `old` to `new`, as (identity, old name, new name): a
+/// site of both with another name in `new`.
+pub fn renames(old: &Network, new: &Network) -> Vec<(SiteId, String, String)> {
     new.sites
         .iter()
-        .filter(|s| old.site(&s.name).is_none())
         .filter_map(|s| {
-            // Its old name may already belong to another box (a new one
-            // joined under it): the identity tells.
-            old.sites
-                .iter()
-                .find(|o| {
-                    same_box(o, s)
-                        && new
-                            .site(&o.name)
-                            .is_none_or(|n| matches!((n.id, o.id), (Some(a), Some(b)) if a != b))
-                })
-                .map(|o| (o.name.clone(), s.name.clone()))
+            let before = old.site(s.id)?;
+            (before.name != s.name).then(|| (s.id, before.name.clone(), s.name.clone()))
         })
         .collect()
 }
 
-/// True if the two entries describe the same box.
-fn same_box(a: &Site, b: &Site) -> bool {
-    match (a.id, b.id) {
-        (Some(x), Some(y)) => x == y,
-        _ => a.address == b.address,
-    }
-}
-
-impl Network {
-    /// Renames the site `old` to `new`, with every reference to it: the
-    /// `uplink` of its clients, `managed_by`, the mappings and the tunnel
-    /// limits.
-    pub fn rename_site(&mut self, old: &str, new: &str) {
-        let rename = |name: &mut String| {
-            if name == old {
-                *name = new.to_string();
-            }
-        };
-        for site in &mut self.sites {
-            rename(&mut site.name);
-            if let Some(up) = &mut site.uplink {
-                rename(up);
-            }
-            if let Some(by) = &mut site.managed_by {
-                rename(by);
-            }
-        }
-        for map in &mut self.maps {
-            rename(&mut map.site);
-        }
-        for tunnel in &mut self.tunnels {
-            if tunnel.touches(old) {
-                let [a, b] = tunnel.sites.clone();
-                let name = |n: String| if n == old { new.to_string() } else { n };
-                tunnel.sites = site_pair(&name(a), &name(b));
-            }
+/// The sites of `old` that have another identity in `new`, as (old
+/// identity, new identity): a site `new` no longer has, and one `old` did
+/// not have at the same address, with the same name (a claim, a box that
+/// joined again), or both without an identity of their own (a site of an
+/// older version renamed).
+pub fn rekeys(old: &Network, new: &Network) -> Vec<(SiteId, SiteId)> {
+    let mut gone: Vec<&crate::config::Site> = old
+        .sites
+        .iter()
+        .filter(|s| new.site(s.id).is_none())
+        .collect();
+    let mut out = Vec::new();
+    for site in new.sites.iter().filter(|s| old.site(s.id).is_none()) {
+        let found = gone.iter().position(|o| {
+            o.address == site.address
+                && (o.name == site.name || (!o.has_identity() && !site.has_identity()))
+        });
+        if let Some(i) = found {
+            out.push((gone.remove(i).id, site.id));
         }
     }
+    out
 }
 
-impl Local {
-    /// Follows the rename of the site `old` to `new`: `self` if it is this
-    /// site, the trunk of the tunnel to it if it is a peer.
-    pub fn rename_site(&mut self, old: &str, new: &str) {
-        if self.self_name.as_deref() == Some(old) {
-            self.self_name = Some(new.to_string());
-        }
-        if let Some(trunk) = self.tunnel_trunks.remove(old) {
-            self.tunnel_trunks.insert(new.to_string(), trunk);
+/// `old` with the identities of `new` ([`rekeys`]): the rest compares like
+/// two networks of the same sites. Returns it with the rekeys.
+pub fn rekeyed(old: &Network, new: &Network) -> (Network, Vec<(SiteId, SiteId)>) {
+    let rekeys = rekeys(old, new);
+    let mut base = old.clone();
+    for (from, to) in &rekeys {
+        base.rekey(*from, *to);
+        // A site of an older version renamed: its name comes with it.
+        if let (Some(now), Some(entry)) = (new.site(*to), base.site_mut(*to))
+            && !now.has_identity()
+        {
+            entry.name.clone_from(&now.name);
         }
     }
+    (base, rekeys)
 }
 
-/// Applies the renames from `previous` to `network` to `local`; returns
-/// them.
-pub fn follow_renames(
+/// Follows in `local` the sites that have another identity from `previous`
+/// to `network` (this site itself, the trunks of tunnels); returns them.
+pub fn follow_rekeys(
     previous: &Network,
     network: &Network,
     local: &mut Local,
-) -> Vec<(String, String)> {
-    let renamed = renames(previous, network);
-    for (old, new) in &renamed {
-        local.rename_site(old, new);
+) -> Vec<(SiteId, SiteId)> {
+    let rekeys = rekeys(previous, network);
+    for (old, new) in &rekeys {
+        local.rekey(*old, *new);
     }
-    renamed
+    rekeys
 }
 
 #[cfg(test)]
@@ -107,21 +83,21 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
-    use crate::config::{LocalVid, Site, TunnelVlans, VlanMap, VlanSet};
+    use crate::config::{LocalVid, Site, TunnelVlans, VlanMap, VlanSet, site_pair};
+
+    fn id(name: &str) -> SiteId {
+        SiteId::provisional(name)
+    }
+
+    fn real(n: u8) -> SiteId {
+        SiteId::from_bytes([n; 32])
+    }
 
     fn site(name: &str, last: u8, uplink: Option<&str>) -> Site {
         Site {
-            name: name.into(),
-            address: Ipv4Addr::new(10, 0, 0, last),
-            id: None,
-            vlans: None,
-            own_vlans: None,
-            online: true,
-            managed_by: uplink.map(Into::into),
-            self_managed: false,
-            uplink: uplink.map(Into::into),
-            breakout: Default::default(),
-            ports: Default::default(),
+            managed_by: uplink.map(id),
+            uplink: uplink.map(id),
+            ..Site::new(name, Ipv4Addr::new(10, 0, 0, last))
         }
     }
 
@@ -134,111 +110,80 @@ mod tests {
             site("x", 3, Some("c")),
         ];
         network.maps = vec![VlanMap {
-            site: "c".into(),
+            site: id("c"),
             local: LocalVid::Vid(130),
             shared: 30,
         }];
         network.tunnels = vec![TunnelVlans {
-            sites: site_pair("c", "hq"),
+            sites: site_pair(id("c"), id("hq")),
             vlans: VlanSet::from_range(30, 40),
         }];
         network
     }
 
     #[test]
-    fn a_rename_takes_its_references_along() {
-        let old = network();
+    fn a_rename_keeps_the_identity_and_every_reference() {
+        let mut old = network();
+        for (n, name) in [(1, "hq"), (2, "c"), (3, "x")] {
+            old.rekey(id(name), real(n));
+        }
         let mut new = old.clone();
-        new.rename_site("c", "c2");
-        let names: Vec<&str> = new.sites.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["hq", "c2", "x"]);
-        let x = new.site("x").unwrap();
-        assert_eq!(x.uplink.as_deref(), Some("c2"));
-        assert_eq!(x.managed_by.as_deref(), Some("c2"));
-        assert_eq!(new.maps[0].site, "c2");
-        assert_eq!(new.tunnels[0].sites, site_pair("c2", "hq"));
-        assert_eq!(renames(&old, &new), [("c".to_string(), "c2".to_string())]);
+        new.rename_site(real(2), "c2");
+        assert_eq!(
+            renames(&old, &new),
+            [(real(2), "c".to_string(), "c2".to_string())]
+        );
+        assert!(rekeys(&old, &new).is_empty());
+        assert_eq!(new.sites[2].uplink, Some(real(2)), "references stay");
         assert!(renames(&old, &old).is_empty());
     }
 
     #[test]
-    fn several_renames_and_what_is_no_rename() {
+    fn a_site_without_an_identity_is_known_by_its_name() {
         let old = network();
+        // Renamed: its provisional identity follows, recognised by its
+        // address.
         let mut new = old.clone();
-        new.rename_site("hq", "main");
-        new.rename_site("x", "x2");
-        assert_eq!(
-            renames(&old, &new),
-            [
-                ("hq".to_string(), "main".to_string()),
-                ("x".to_string(), "x2".to_string())
-            ]
-        );
+        new.rename_site(id("c"), "c2");
+        assert_eq!(new.site(id("x")).unwrap().uplink, Some(id("c2")));
+        assert_eq!(new.maps[0].site, id("c2"));
+        assert_eq!(new.tunnels[0].sites, site_pair(id("c2"), id("hq")));
+        assert_eq!(rekeys(&old, &new), [(id("c"), id("c2"))]);
+        let (base, _) = rekeyed(&old, &new);
+        assert_eq!(base, new);
         // A new name with a new address: removed and added.
         let mut moved = old.clone();
-        moved.rename_site("x", "y");
-        moved.sites[2].address = Ipv4Addr::new(10, 0, 0, 9);
-        assert!(renames(&old, &moved).is_empty());
-        // The old site is still there: the new one is a new site.
-        let mut added = old.clone();
-        added.sites.push(Site {
-            address: Ipv4Addr::new(10, 0, 0, 3),
-            id: None,
-            ..site("y", 0, None)
-        });
-        assert!(renames(&old, &added).is_empty());
-    }
-
-    #[test]
-    fn with_identities_a_rename_is_the_same_identity() {
-        let id = |n: u8| Some(crate::identity::SiteId::from_bytes([n; 32]));
-        let mut old = network();
-        for (i, site) in old.sites.iter_mut().enumerate() {
-            site.id = id(i as u8 + 1);
-        }
-        // Renamed and moved at once: still the same box.
-        let mut moved = old.clone();
-        moved.rename_site("x", "y");
-        moved.sites[2].address = Ipv4Addr::new(10, 0, 0, 9);
-        assert_eq!(renames(&old, &moved), [("x".to_string(), "y".to_string())]);
-        // Another box at the address of a site that left (behind the same
-        // NAT): no rename.
-        let mut other = old.clone();
-        other.sites[2].name = "z".into();
-        other.sites[2].id = id(9);
-        assert!(renames(&old, &other).is_empty());
-        // Renamed while its old name went to a new box: still a rename.
-        let mut reused = old.clone();
-        reused.rename_site("x", "x-old");
-        reused.sites.push(Site {
-            id: id(9),
-            ..site("x", 8, Some("c"))
-        });
-        assert_eq!(
-            renames(&old, &reused),
-            [("x".to_string(), "x-old".to_string())]
-        );
-    }
-
-    #[test]
-    fn local_toml_follows() {
-        let old = network();
-        let mut new = old.clone();
-        new.rename_site("c", "c2");
-        new.rename_site("hq", "main");
+        moved.rename_site(id("x"), "y");
+        moved.site_mut(id("y")).unwrap().address = Ipv4Addr::new(10, 0, 0, 9);
+        assert!(rekeys(&old, &moved).is_empty());
+        // It claims its identity: the same name and address.
+        let mut claimed = old.clone();
+        claimed.rekey(id("c"), real(7));
+        assert_eq!(rekeys(&old, &claimed), [(id("c"), real(7))]);
         let mut local = Local {
-            self_name: Some("c".into()),
-            trunk: vec!["ens19".into()],
-            tunnel_trunks: [("hq".to_string(), vec!["ens20".to_string()])].into(),
+            self_id: Some(id("c")),
+            tunnel_trunks: [(id("hq"), vec!["ens20".to_string()])].into(),
             ..Local::default()
         };
-        let renamed = follow_renames(&old, &new, &mut local);
-        assert_eq!(renamed.len(), 2);
-        assert_eq!(local.self_name.as_deref(), Some("c2"));
-        assert_eq!(
-            local.tunnel_trunks.get("main").map(Vec::as_slice),
-            Some(["ens20".to_string()].as_slice())
-        );
-        assert!(!local.tunnel_trunks.contains_key("hq"));
+        let mut hq = old.clone();
+        hq.rekey(id("hq"), real(1));
+        hq.rekey(id("c"), real(7));
+        assert_eq!(follow_rekeys(&old, &hq, &mut local).len(), 2);
+        assert_eq!(local.self_id, Some(real(7)));
+        assert!(local.tunnel_trunks.contains_key(&real(1)));
+    }
+
+    #[test]
+    fn a_box_that_joined_again_takes_over_the_entry() {
+        let mut old = network();
+        old.rekey(id("x"), real(3));
+        let mut new = old.clone();
+        new.rekey(real(3), real(9));
+        assert_eq!(rekeys(&old, &new), [(real(3), real(9))]);
+        // Another box at that address with another name is another site.
+        let mut other = old.clone();
+        other.sites[2].id = real(9);
+        other.sites[2].name = "z".into();
+        assert!(rekeys(&old, &other).is_empty());
     }
 }

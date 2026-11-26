@@ -6,7 +6,7 @@ use wanderlan_core::config::VlanSet;
 
 use super::*;
 use crate::client::ClientError;
-use crate::tui::fixtures;
+use crate::tui::fixtures::{self, id};
 
 fn key(code: KeyCode) -> Msg {
     Msg::Key(KeyEvent::new(code, KeyModifiers::NONE))
@@ -222,7 +222,12 @@ fn review_shows_the_diff_and_applies_with_the_base_revision() {
         .expect("apply request");
     assert_eq!(apply.base_revision, Some(7));
     assert!(apply.config.network.contains("vlans = \"10-60\""));
-    assert!(apply.config.local.contains("self = \"heim\""));
+    assert!(
+        apply
+            .config
+            .local
+            .contains(&format!("self = \"{}\"  # heim", id("heim")))
+    );
     assert_eq!(app.busy, Some(Busy::Applying));
 }
 
@@ -328,7 +333,7 @@ fn edits_made_during_the_countdown_survive_a_rollback() {
     let d = app.draft.as_ref().unwrap();
     assert_eq!(d.network.vlans.to_string(), "10-60");
     assert_eq!(
-        d.network.site("buero").unwrap().vlans,
+        d.network.by_name("buero").unwrap().vlans,
         Some(VlanSet::from_range(20, 20))
     );
     assert_eq!(d.base_revision, 7, "it builds on what runs");
@@ -543,7 +548,13 @@ fn a_site_goes_online_through_the_draft() {
     app.sites_selected = haus3;
     app.update(ch('o'));
     assert!(app.draft_dirty());
-    let site = app.draft.as_ref().unwrap().network.site("haus3").unwrap();
+    let site = app
+        .draft
+        .as_ref()
+        .unwrap()
+        .network
+        .by_name("haus3")
+        .unwrap();
     assert!(!site.online);
 }
 
@@ -686,7 +697,7 @@ fn settings_open_the_form_at_the_chosen_setting() {
     app.settings_selected = 5;
     app.update(key(KeyCode::Enter));
     assert!(
-        matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::OwnPorts("heim".into())),
+        matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::OwnPorts(id("heim"))),
         "{:?}",
         app.modal
     );
@@ -710,7 +721,7 @@ fn a_tunnel_gets_its_own_trunk_in_the_settings() {
         requests(&fx).contains(&&Request::Interfaces),
         "the list is read"
     );
-    assert_eq!(picker(&app).target, PortTarget::Tunnel("haus2".into()));
+    assert_eq!(picker(&app).target, PortTarget::Tunnel(id("haus2")));
     app.update(reply(
         Request::Interfaces,
         Reply::Interfaces(fixtures::interfaces()),
@@ -741,7 +752,11 @@ fn a_tunnel_gets_its_own_trunk_in_the_settings() {
     assert!(app.modal.is_none(), "saved");
     let draft = app.draft.as_ref().unwrap();
     assert_eq!(
-        draft.local.tunnel_trunks.get("haus2").map(Vec::as_slice),
+        draft
+            .local
+            .tunnel_trunks
+            .get(&id("haus2"))
+            .map(Vec::as_slice),
         Some(&["ens20".to_string()][..])
     );
     assert!(app.draft_dirty());
@@ -816,9 +831,7 @@ fn a_restricted_site_sets_its_own_vlans() {
     let mut app = restricted();
     app.update(ch('3'));
     app.update(ch('o'));
-    assert!(
-        matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::OwnVlans("heim".into()))
-    );
+    assert!(matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::OwnVlans(id("heim"))));
     for c in "50".chars() {
         app.update(ch(c));
     }
@@ -829,7 +842,7 @@ fn a_restricted_site_sets_its_own_vlans() {
         .as_ref()
         .unwrap()
         .network
-        .site("heim")
+        .by_name("heim")
         .unwrap()
         .clone();
     assert_eq!(heim.own_vlans.map(|v| v.to_string()).as_deref(), Some("50"));
@@ -1028,7 +1041,7 @@ fn deleting_a_site_removes_that_site_even_if_the_draft_changed_meanwhile() {
     app.update(ch('d'));
     assert!(matches!(
         &app.modal,
-        Some(Modal::Ask(a)) if a.action == AskAction::DeleteSite("haus3".into())
+        Some(Modal::Ask(a)) if a.action == AskAction::DeleteSite(id("haus3"))
     ));
     // Meanwhile another site goes (e.g. a sync): the indices move.
     let buero = at(&app, "buero").unwrap();
@@ -1191,7 +1204,7 @@ fn a_restricted_site_renames_itself_but_not_its_manager() {
     app.sites_selected = heim;
     app.update(ch('N'));
     assert!(
-        matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::Rename("heim".into())),
+        matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::Rename(id("heim"))),
         "{:?}",
         app.message
     );

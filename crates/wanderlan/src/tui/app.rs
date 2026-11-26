@@ -19,6 +19,7 @@ use wanderlan_core::api::{
     UnblockParams, VlanTraffic,
 };
 use wanderlan_core::config::{Diagnostic, VlanMap, has_errors, render_local, render_network};
+use wanderlan_core::identity::SiteId;
 use wanderlan_core::policy;
 use wanderlan_core::topology::{self, tunnel_name};
 
@@ -205,13 +206,13 @@ pub enum AskAction {
     Quit,
     /// Throw the draft away.
     Discard,
-    /// Remove a site from the draft (by name: the draft may change while
-    /// the question is open).
-    DeleteSite(String),
+    /// Remove a site from the draft (by identity: the draft may change
+    /// while the question is open).
+    DeleteSite(SiteId),
     /// Remove a VLAN mapping from the draft (by its content).
     DeleteMap(wanderlan_core::config::VlanMap),
     /// Remove the breakout of a VLAN of a site from the draft.
-    DeleteBreakout(String, u16),
+    DeleteBreakout(SiteId, u16),
     /// Re-enable a port blocked by the loop guard.
     Unblock(String),
     /// Remove everything wanderlan set up on this site.
@@ -1371,7 +1372,7 @@ impl App {
                 .running
                 .as_ref()
                 .and_then(|r| r.network.as_ref())
-                .and_then(|n| n.site(&site))
+                .and_then(|n| n.find(&site).ok())
                 .map(|s| s.online);
             match joined {
                 Some(false) => self.say(
@@ -1393,16 +1394,13 @@ impl App {
         }
     }
 
-    /// The selected site, mapping and breakout, by name and content.
-    fn selection(&self) -> (Option<String>, Option<VlanMap>, Option<(String, u16)>) {
+    /// The selected site, mapping and breakout, by identity and content.
+    fn selection(&self) -> (Option<SiteId>, Option<VlanMap>, Option<(SiteId, u16)>) {
         let Some(d) = &self.draft else {
             return (None, None, None);
         };
         (
-            d.network
-                .sites
-                .get(self.sites_selected)
-                .map(|s| s.name.clone()),
+            d.network.sites.get(self.sites_selected).map(|s| s.id),
             d.network.maps.get(self.maps_selected).cloned(),
             self.breakout_rows().get(self.breakouts_selected).cloned(),
         )
@@ -1412,13 +1410,10 @@ impl App {
     /// may have removed or added rows above them).
     fn restore_selection(
         &mut self,
-        (site, map, breakout): &(Option<String>, Option<VlanMap>, Option<(String, u16)>),
+        (site, map, breakout): &(Option<SiteId>, Option<VlanMap>, Option<(SiteId, u16)>),
     ) {
         let Some(d) = &self.draft else { return };
-        if let Some(i) = site
-            .as_ref()
-            .and_then(|n| d.network.sites.iter().position(|s| s.name == *n))
-        {
+        if let Some(i) = site.and_then(|id| d.network.sites.iter().position(|s| s.id == id)) {
             self.sites_selected = i;
         }
         if let Some(i) = map
@@ -1634,42 +1629,34 @@ impl App {
     /// may not change VLAN rules (see [`policy`]).
     pub fn restricted_by(&self) -> Option<String> {
         let running = self.running.as_ref()?;
-        let me = running.local.self_name.as_deref()?;
-        policy::restricted_by(running.network.as_ref()?, me).map(str::to_string)
+        let me = running.local.self_id?;
+        let network = running.network.as_ref()?;
+        policy::restricted_by(network, me).map(|m| network.label(m))
     }
 
-    /// True if this site may change the rules of `site` (VLANs, mappings,
-    /// online); otherwise says who may.
-    /// True if this site may change `site` (as it runs: a site renamed in
-    /// the draft by its old name).
-    pub fn may_change_quietly(&self, site: &str) -> bool {
+    /// This site, as it runs.
+    fn me(&self) -> Option<SiteId> {
+        self.running.as_ref()?.local.self_id
+    }
+
+    /// True if this site may change `site` (as it runs).
+    pub fn may_change_quietly(&self, site: SiteId) -> bool {
         let Some(running) = self.running.as_ref().and_then(|r| r.network.as_ref()) else {
             return true;
         };
-        let me = self
-            .running
-            .as_ref()
-            .and_then(|r| r.local.self_name.clone())
-            .unwrap_or_default();
+        let Some(me) = self.me() else {
+            return true;
+        };
         match self.running_entry(site) {
-            Some(entry) => policy::may_change(running, entry, &me),
+            Some(entry) => policy::may_change(running, entry, me),
             // New in the draft.
             None => true,
         }
     }
 
-    /// The entry of `site` as it runs, also when the draft renamed it.
-    fn running_entry(&self, site: &str) -> Option<&wanderlan_core::config::Site> {
-        let running = self.running.as_ref()?.network.as_ref()?;
-        if let Some(entry) = running.site(site) {
-            return Some(entry);
-        }
-        let draft = self.draft.as_ref()?;
-        let old = wanderlan_core::rename::renames(running, &draft.network)
-            .into_iter()
-            .find(|(_, new)| new == site)?
-            .0;
-        running.site(&old)
+    /// The entry of `site` as it runs.
+    fn running_entry(&self, site: SiteId) -> Option<&wanderlan_core::config::Site> {
+        self.running.as_ref()?.network.as_ref()?.site(site)
     }
 
     /// The graphs show the next time range.
@@ -1681,58 +1668,59 @@ impl App {
         );
     }
 
-    /// The name a site of the draft runs under (another one while the
-    /// draft renames it): its tunnel and its peer row have that one.
-    pub fn running_name(&self, site: &str) -> String {
-        self.running_entry(site)
-            .map_or_else(|| site.to_string(), |e| e.name.clone())
+    /// How a site of the draft is called where it runs: its peer row and
+    /// the status have that name (another one while the draft renames it).
+    pub fn running_name(&self, site: SiteId) -> String {
+        match (
+            self.running.as_ref().and_then(|r| r.network.as_ref()),
+            self.draft.as_ref(),
+        ) {
+            (Some(running), _) if running.site(site).is_some() => running.label(site),
+            (_, Some(d)) => d.network.label(site),
+            _ => site.fingerprint(),
+        }
     }
 
-    /// The name in the draft of a site that runs as `running`.
-    fn draft_name(&self, running: &str) -> String {
-        let renamed = self
-            .running
+    /// The site of the draft that runs as `running` (a name of the status).
+    fn draft_site(&self, running: &str) -> Option<SiteId> {
+        self.running
             .as_ref()
             .and_then(|r| r.network.as_ref())
-            .zip(self.draft.as_ref())
-            .and_then(|(net, d)| {
-                wanderlan_core::rename::renames(net, &d.network)
-                    .into_iter()
-                    .find(|(old, _)| old == running)
-                    .map(|(_, new)| new)
-            });
-        renamed.unwrap_or_else(|| running.to_string())
+            .and_then(|n| n.find(running).ok())
+            .map(|s| s.id)
+            .or_else(|| {
+                self.draft
+                    .as_ref()
+                    .and_then(|d| d.network.find(running).ok())
+                    .map(|s| s.id)
+            })
     }
 
-    fn may_change(&mut self, site: &str) -> bool {
+    fn may_change(&mut self, site: SiteId) -> bool {
         let Some(running) = self.running.as_ref().and_then(|r| r.network.as_ref()) else {
             return true;
         };
         let Some(entry) = self.running_entry(site) else {
             return true;
         };
-        let me = self
-            .running
-            .as_ref()
-            .and_then(|r| r.local.self_name.clone())
-            .unwrap_or_default();
-        if policy::may_change(running, entry, &me) {
+        let Some(me) = self.me() else {
+            return true;
+        };
+        if policy::may_change(running, entry, me) {
             return true;
         }
-        let text = policy::why_not(running, entry, &me, "change");
+        let text = policy::why_not(running, entry, me, "change");
         self.say(MessageKind::Error, text);
         false
     }
 
     /// True if this site may change the VLANs of the tunnel between `a` and
     /// `b`; otherwise says why not.
-    fn may_change_tunnel(&mut self, a: &str, b: &str) -> bool {
+    fn may_change_tunnel(&mut self, a: SiteId, b: SiteId) -> bool {
         let Some(running) = self.running.as_ref() else {
             return true;
         };
-        let (Some(network), Some(me)) =
-            (running.network.as_ref(), running.local.self_name.as_deref())
-        else {
+        let (Some(network), Some(me)) = (running.network.as_ref(), running.local.self_id) else {
             return true;
         };
         if policy::may_change_tunnel(network, a, b, me) {
@@ -1749,9 +1737,7 @@ impl App {
         let Some(running) = self.running.as_ref() else {
             return true;
         };
-        let (Some(network), Some(me)) =
-            (running.network.as_ref(), running.local.self_name.as_deref())
-        else {
+        let (Some(network), Some(me)) = (running.network.as_ref(), running.local.self_id) else {
             return true;
         };
         if policy::may_change_network_vlans(network, me) {
@@ -1764,19 +1750,20 @@ impl App {
 
     /// Toggles online/offline of the selected site in the draft.
     fn toggle_online(&mut self) {
-        let Some(name) = self
+        let Some(id) = self
             .draft
             .as_ref()
             .and_then(|d| d.network.sites.get(self.sites_selected))
-            .map(|s| s.name.clone())
+            .map(|s| s.id)
         else {
             return;
         };
-        if !self.may_change(&name) {
+        if !self.may_change(id) {
             return;
         }
         let Some(draft) = &mut self.draft else { return };
-        let Some(site) = draft.network.sites.iter_mut().find(|s| s.name == name) else {
+        let name = draft.network.label(id);
+        let Some(site) = draft.network.site_mut(id) else {
             return;
         };
         site.online = !site.online;
@@ -1789,22 +1776,20 @@ impl App {
     }
 
     /// True if this site may rename `site`; otherwise says why not.
-    fn may_rename(&mut self, site: &str) -> bool {
+    fn may_rename(&mut self, site: SiteId) -> bool {
         let Some(running) = self.running.as_ref().and_then(|r| r.network.as_ref()) else {
             return true;
         };
         if running.site(site).is_none() {
             return true;
         }
-        let me = self
-            .running
-            .as_ref()
-            .and_then(|r| r.local.self_name.clone())
-            .unwrap_or_default();
-        if policy::may_rename(running, site, &me) {
+        let Some(me) = self.me() else {
+            return true;
+        };
+        if policy::may_rename(running, site, me) {
             return true;
         }
-        let text = policy::why_not_rename(running, site, &me);
+        let text = policy::why_not_rename(running, site, me);
         self.say(MessageKind::Error, text);
         false
     }
@@ -2425,7 +2410,7 @@ impl App {
         }
         if let Some(running) = &self.running
             && let Some(old) = &running.network
-            && let Some(me) = &running.local.self_name
+            && let Some(me) = running.local.self_id
             && let Err(e) = policy::check_edit(old, &draft.network, me)
         {
             self.say(MessageKind::Error, e);
@@ -2957,11 +2942,11 @@ impl App {
                 self.clamp_selection();
                 self.say(MessageKind::Info, "Draft discarded.");
             }
-            AskAction::DeleteSite(name) => {
+            AskAction::DeleteSite(id) => {
                 let index = self
                     .draft
                     .as_ref()
-                    .and_then(|d| d.network.sites.iter().position(|s| s.name == name));
+                    .and_then(|d| d.network.sites.iter().position(|s| s.id == id));
                 if let Some(site) = index.and_then(|i| self.draft.as_mut()?.remove_site(i)) {
                     self.say(
                         MessageKind::Info,
@@ -2990,7 +2975,7 @@ impl App {
             }
             AskAction::DeleteBreakout(site, vid) => {
                 if let Some(draft) = &mut self.draft
-                    && let Some(entry) = draft.network.sites.iter_mut().find(|s| s.name == site)
+                    && let Some(entry) = draft.network.site_mut(site)
                     && entry.breakout.remove(&vid).is_some()
                 {
                     draft.revalidate();
@@ -3054,7 +3039,10 @@ impl App {
                 return;
             }
         };
-        let (network_text, local_text) = (render_network(&network), render_local(&local));
+        let (network_text, local_text) = (
+            render_network(&network),
+            render_local(&local, Some(&network)),
+        );
         let (old_network, old_local) = self
             .running
             .as_ref()
@@ -3096,13 +3084,13 @@ impl App {
                 d.network.sites.get(*i).is_some_and(|s| {
                     let vlans = d.network.vlans_of(s).to_string();
                     let address = s.address.to_string();
-                    let role = format::role(
-                        s.uplink.as_deref(),
-                        topology::has_clients(&d.network, &s.name),
-                    );
+                    let uplink = s.uplink.map(|up| d.network.label(up));
+                    let role =
+                        format::role(uplink.as_deref(), topology::has_clients(&d.network, s.id));
                     let managed = policy::managed_label(&d.network, s);
+                    let name = d.network.label(s.id);
                     self.sites_filter
-                        .matches(&[&s.name, &address, &vlans, &role, &managed])
+                        .matches(&[&name, &address, &vlans, &role, &managed])
                 })
             })
             .collect()
@@ -3118,8 +3106,9 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, m)| {
+                let site = d.network.label(m.site);
                 self.maps_filter
-                    .matches(&[&m.site, &m.local.to_string(), &m.shared.to_string()])
+                    .matches(&[&site, &m.local.to_string(), &m.shared.to_string()])
             })
             .map(|(i, _)| i)
             .collect()
@@ -3141,13 +3130,9 @@ impl App {
                     Some(false) => "client",
                     None => "no tunnel",
                 };
-                self.tunnels_filter.matches(&[
-                    &r.sites[0],
-                    &r.sites[1],
-                    kind,
-                    &text(&r.carries),
-                    &text(&r.limit),
-                ])
+                let (a, b) = (d.network.label(r.sites[0]), d.network.label(r.sites[1]));
+                self.tunnels_filter
+                    .matches(&[&a, &b, kind, &text(&r.carries), &text(&r.limit)])
             })
             .collect()
     }
@@ -3214,18 +3199,18 @@ impl App {
             }
             // A site of the list online or offline: straight to the review.
             KeyCode::Char('o') => {
-                let name = self
+                let id = self
                     .overview_sites()
                     .get(self.overview_selected.saturating_sub(peers))
                     .filter(|_| self.overview_selected >= peers)
-                    .map(|s| self.draft_name(&s.name));
-                let index = name.as_ref().and_then(|n| {
+                    .and_then(|s| self.draft_site(&s.name));
+                let index = id.and_then(|id| {
                     self.draft
                         .as_ref()?
                         .network
                         .sites
                         .iter()
-                        .position(|s| s.name == *n)
+                        .position(|s| s.id == id)
                 });
                 match index {
                     Some(i) => {
@@ -3268,9 +3253,26 @@ impl App {
         let names: Vec<String> = self
             .visible_sites()
             .into_iter()
-            .filter_map(|(i, _)| self.draft.as_ref()?.network.sites.get(i))
-            .map(|s| s.name.clone())
+            .filter_map(|(i, _)| {
+                let d = self.draft.as_ref()?;
+                d.network.sites.get(i).map(|s| d.network.label(s.id))
+            })
             .collect();
+        // The site of the window, by its label.
+        let site = self
+            .draft
+            .as_ref()
+            .and_then(|d| d.network.find(&name).ok())
+            .map(|s| s.id);
+        let index_of = |app: &Self, id: Option<SiteId>| {
+            let id = id?;
+            app.draft
+                .as_ref()?
+                .network
+                .sites
+                .iter()
+                .position(|s| s.id == id)
+        };
         match key.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
             // A long site scrolls; Up/Down stay the next site.
@@ -3283,12 +3285,9 @@ impl App {
                 scroll: scroll.saturating_sub(5),
             }),
             KeyCode::Char('e') => {
-                let index = self
-                    .draft
-                    .as_ref()
-                    .and_then(|d| d.network.sites.iter().position(|s| s.name == name));
-                match index {
-                    Some(i) if self.may_change(&name) => {
+                let index = index_of(self, site);
+                match (index, site) {
+                    (Some(i), Some(id)) if self.may_change(id) => {
                         self.sites_selected = i;
                         let draft = self.draft.as_ref()?;
                         Some(Modal::Form(Form::site(draft, Some(i))))
@@ -3297,12 +3296,9 @@ impl App {
                 }
             }
             KeyCode::Char('N') => {
-                let index = self
-                    .draft
-                    .as_ref()
-                    .and_then(|d| d.network.sites.iter().position(|s| s.name == name));
-                match index {
-                    Some(i) if self.may_rename(&name) => {
+                let index = index_of(self, site);
+                match (index, site) {
+                    (Some(i), Some(id)) if self.may_rename(id) => {
                         self.sites_selected = i;
                         let draft = self.draft.as_ref()?;
                         Some(Modal::Form(Form::rename(draft, i)))
@@ -3315,11 +3311,12 @@ impl App {
                 let next = nav(code, at, names.len(), 1)
                     .and_then(|i| names.get(i).cloned())
                     .unwrap_or_else(|| name.clone());
-                if let Some(i) = self
-                    .draft
-                    .as_ref()
-                    .and_then(|d| d.network.sites.iter().position(|s| s.name == next))
-                {
+                if let Some(i) = self.draft.as_ref().and_then(|d| {
+                    d.network
+                        .sites
+                        .iter()
+                        .position(|s| d.network.label(s.id) == next)
+                }) {
                     self.sites_selected = i;
                 }
                 // Another site starts at the top; any other key keeps it.
@@ -3364,15 +3361,15 @@ impl App {
                         self.modal = Some(Modal::Form(form));
                     }
                     Some(Setting::TunnelTrunk(site)) => {
-                        let Some(name) = self
+                        let Some(id) = self
                             .draft
                             .as_ref()
                             .and_then(|d| d.network.sites.get(site))
-                            .map(|s| s.name.clone())
+                            .map(|s| s.id)
                         else {
                             return;
                         };
-                        self.open_ports(PortTarget::Tunnel(name), fx);
+                        self.open_ports(PortTarget::Tunnel(id), fx);
                     }
                     None => {}
                 }
@@ -3430,17 +3427,17 @@ impl App {
             .draft
             .as_ref()
             .and_then(|d| d.network.sites.get(self.sites_selected))
-            .map(|s| s.name.clone());
+            .map(|s| s.id);
         let edits = matches!(key.code, KeyCode::Char('e' | 'd') | KeyCode::Delete);
         if edits
-            && let Some(name) = &selected_site
-            && !self.may_change(name)
+            && let Some(id) = selected_site
+            && !self.may_change(id)
         {
             return;
         }
         if key.code == KeyCode::Char('N')
-            && let Some(name) = &selected_site
-            && !self.may_rename(name)
+            && let Some(id) = selected_site
+            && !self.may_rename(id)
         {
             return;
         }
@@ -3464,7 +3461,8 @@ impl App {
             KeyCode::Char('/') => self.sites_filter.start(),
             KeyCode::Char('n') => self.modal = Some(Modal::Form(Form::site(draft, None))),
             KeyCode::Enter => {
-                if let Some(name) = selected_site {
+                if let Some(id) = selected_site {
+                    let name = draft.network.label(id);
                     self.modal = Some(Modal::Site { name, scroll: 0 });
                 }
             }
@@ -3490,32 +3488,31 @@ impl App {
                 let Some(site) = draft.network.sites.get(selected) else {
                     return;
                 };
-                if draft.local.self_name.as_deref() == Some(site.name.as_str()) {
+                let name = draft.network.label(site.id);
+                if draft.local.self_id == Some(site.id) {
                     let text = format!(
-                        "{} is this site and cannot be removed (change \"This site\" in the settings, 8, first).",
-                        site.name
+                        "{name} is this site and cannot be removed (change \"This site\" in the settings, 8, first)."
                     );
                     self.say(MessageKind::Error, text);
                     return;
                 }
                 // Its clients would hang in the air.
-                let clients: Vec<&str> = draft
+                let clients: Vec<String> = draft
                     .network
                     .sites
                     .iter()
-                    .filter(|c| c.uplink.as_deref() == Some(site.name.as_str()))
-                    .map(|c| c.name.as_str())
+                    .filter(|c| c.uplink == Some(site.id))
+                    .map(|c| draft.network.label(c.id))
                     .collect();
                 if !clients.is_empty() {
                     let text = format!(
-                        "{} still has clients ({}): delete them first.",
-                        site.name,
+                        "{name} still has clients ({}): delete them first.",
                         clients.join(", ")
                     );
                     self.say(MessageKind::Error, text);
                     return;
                 }
-                let maps = draft.network.maps_of(&site.name).count();
+                let maps = draft.network.maps_of(site.id).count();
                 let extra = if maps > 0 {
                     format!(" Its {maps} VLAN mapping(s) are removed too.")
                 } else {
@@ -3523,15 +3520,16 @@ impl App {
                 };
                 self.modal = Some(Modal::Ask(Ask {
                     title: "Delete site".into(),
-                    text: format!("Remove site {} from the draft?{extra}", site.name),
-                    action: AskAction::DeleteSite(site.name.clone()),
+                    text: format!("Remove site {name} from the draft?{extra}"),
+                    action: AskAction::DeleteSite(site.id),
                 }));
             }
             KeyCode::Char('u') if selected < count => {
-                // The tunnel has the name the site runs under.
-                let name = draft.network.sites.get(selected).map(|s| s.name.clone());
-                let port = name
-                    .map(|n| tunnel_name(&self.running_name(&n)))
+                // The tunnel as it runs (its name comes from the identity).
+                let id = draft.network.sites.get(selected).map(|s| s.id);
+                let port = id
+                    .and_then(|id| self.running_entry(id).or_else(|| draft.network.site(id)))
+                    .map(tunnel_name)
                     .unwrap_or_default();
                 let state = self
                     .status
@@ -3561,7 +3559,7 @@ impl App {
             .draft
             .as_ref()
             .and_then(|d| d.network.maps.get(self.maps_selected))
-            .map(|m| m.site.clone());
+            .map(|m| m.site);
         let edits = matches!(
             key.code,
             KeyCode::Enter | KeyCode::Char('e' | 'd') | KeyCode::Delete
@@ -3578,7 +3576,7 @@ impl App {
             return;
         }
         if edits
-            && let Some(site) = &selected_map_site
+            && let Some(site) = selected_map_site
             && !self.may_change(site)
         {
             return;
@@ -3612,13 +3610,8 @@ impl App {
             }
             KeyCode::Char('o') => {
                 // Its own VLANs: always this site's own business.
-                let me = draft.local.self_name.as_deref();
-                match draft
-                    .network
-                    .sites
-                    .iter()
-                    .position(|s| Some(s.name.as_str()) == me)
-                {
+                let me = draft.local.self_id;
+                match draft.network.sites.iter().position(|s| Some(s.id) == me) {
                     Some(i) => self.modal = Some(Modal::Form(Form::own_vlans(draft, i))),
                     None => self.not_configured(),
                 }
@@ -3645,7 +3638,9 @@ impl App {
                         title: "Delete VLAN mapping".into(),
                         text: format!(
                             "Remove the mapping of {}: source VLAN {} = mapped VLAN {} on its trunk?",
-                            map.site, map.shared, map.local
+                            draft.network.label(map.site),
+                            map.shared,
+                            map.local
                         ),
                         action: AskAction::DeleteMap(map.clone()),
                     }));
@@ -3657,14 +3652,14 @@ impl App {
 
     /// The rows of the breakout view: every VLAN of every site with a
     /// breakout, in the order of the sites.
-    pub fn breakout_rows(&self) -> Vec<(String, u16)> {
+    pub fn breakout_rows(&self) -> Vec<(SiteId, u16)> {
         let Some(d) = &self.draft else {
             return Vec::new();
         };
         d.network
             .sites
             .iter()
-            .flat_map(|s| s.breakout.keys().map(|vid| (s.name.clone(), *vid)))
+            .flat_map(|s| s.breakout.keys().map(|vid| (s.id, *vid)))
             .collect()
     }
 
@@ -3690,7 +3685,7 @@ impl App {
             return;
         }
         if edits
-            && let Some((site, _)) = &selected
+            && let Some((site, _)) = selected
             && !self.may_change(site)
         {
             return;
@@ -3699,24 +3694,21 @@ impl App {
             self.not_configured();
             return;
         };
-        let is_server = |name: &str| {
+        let is_server = |id: SiteId| {
             draft
                 .network
-                .site(name)
+                .site(id)
                 .is_some_and(wanderlan_core::topology::is_server)
         };
         match key.code {
             KeyCode::Char('n') => {
-                let site = selected
-                    .as_ref()
-                    .map(|(s, _)| s.clone())
-                    .or_else(|| draft.local.self_name.clone());
+                let site = selected.map(|(s, _)| s).or(draft.local.self_id);
                 let uplinks = self.uplink_hint();
                 if let Some(draft) = self.draft.clone() {
-                    let mut form = Form::breakout(&draft, None, site.as_deref(), &uplinks);
+                    let mut form = Form::breakout(&draft, None, site, &uplinks);
                     // Only clients (a server is where the gateways are),
                     // and only those this site may change.
-                    let client = |s: &str| {
+                    let client = |s: SiteId| {
                         draft
                             .network
                             .site(s)
@@ -3733,12 +3725,11 @@ impl App {
                     }
                 }
             }
-            KeyCode::Enter | KeyCode::Char('e')
-                if selected.as_ref().is_some_and(|(s, _)| is_server(s)) =>
-            {
+            KeyCode::Enter | KeyCode::Char('e') if selected.is_some_and(|(s, _)| is_server(s)) => {
                 if let Some((site, _)) = &selected {
                     let text = format!(
-                        "{site} is a server: its breakout is ignored (its devices use their gateway); d removes it."
+                        "{} is a server: its breakout is ignored (its devices use their gateway); d removes it.",
+                        draft.network.label(*site)
                     );
                     self.say(MessageKind::Info, text);
                 }
@@ -3756,10 +3747,11 @@ impl App {
             }
             KeyCode::Char('d') | KeyCode::Delete => {
                 if let Some((site, vid)) = selected {
+                    let name = draft.network.label(site);
                     self.modal = Some(Modal::Ask(Ask {
                         title: "Remove breakout".into(),
                         text: format!(
-                            "VLAN {vid} of {site} goes through the tunnel again, also to the internet?"
+                            "VLAN {vid} of {name} goes through the tunnel again, also to the internet?"
                         ),
                         action: AskAction::DeleteBreakout(site, vid),
                     }));
@@ -3774,8 +3766,7 @@ impl App {
     fn uplink_hint(&self) -> String {
         let client = self.draft.as_ref().is_some_and(|d| {
             d.local
-                .self_name
-                .as_deref()
+                .self_id
                 .and_then(|me| d.network.site(me))
                 .is_some_and(|s| !wanderlan_core::topology::is_server(s))
         });
@@ -3811,7 +3802,6 @@ impl App {
             self.not_configured();
             return;
         };
-        let _ = draft;
         // Also when the search matches nothing.
         if key.code == KeyCode::Char('/') {
             self.tunnels_filter.start();
@@ -3823,7 +3813,8 @@ impl App {
         let Some(row) = rows.into_iter().nth(selected) else {
             return;
         };
-        let [a, b] = row.sites.clone();
+        let [a_id, b_id] = row.sites;
+        let (a, b) = (draft.network.label(a_id), draft.network.label(b_id));
         if let Some(n) = nav(key.code, selected, count, self.scrolls.tunnels.page()) {
             self.tunnels_selected = n;
             return;
@@ -3835,10 +3826,10 @@ impl App {
                         MessageKind::Info,
                         format!("{a} and {b} have no tunnel with each other; d removes the entry."),
                     );
-                } else if self.may_change_tunnel(&a, &b)
+                } else if self.may_change_tunnel(a_id, b_id)
                     && let Some(draft) = &self.draft
                 {
-                    self.modal = Some(Modal::Form(Form::tunnel_vlans(draft, &a, &b)));
+                    self.modal = Some(Modal::Form(Form::tunnel_vlans(draft, a_id, b_id)));
                 }
             }
             KeyCode::Char('d') | KeyCode::Delete => {
@@ -3847,10 +3838,10 @@ impl App {
                         MessageKind::Info,
                         format!("The tunnel {a} – {b} has no limit of its own."),
                     );
-                } else if self.may_change_tunnel(&a, &b)
+                } else if self.may_change_tunnel(a_id, b_id)
                     && let Some(draft) = &mut self.draft
                 {
-                    draft.network.set_tunnel_limit(&a, &b, None);
+                    draft.network.set_tunnel_limit(a_id, b_id, None);
                     draft.revalidate();
                     self.clamp_selection();
                     self.say(

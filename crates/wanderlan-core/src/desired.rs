@@ -6,7 +6,7 @@ use std::net::{Ipv4Addr, SocketAddrV4};
 use crate::BRIDGE_NAME;
 use crate::config::{Config, LocalVid, NATIVE_VID, TunnelMode};
 use crate::forwarding;
-use crate::identity::PeerIdentity;
+use crate::identity::{PeerIdentity, SiteId};
 use crate::mtu;
 use crate::sys::breakout::{BreakoutSpec, Egress, Uplinks, conf};
 use crate::sys::nft::{MssRule, PortDir, SplitRule};
@@ -17,6 +17,26 @@ use crate::topology::{self, TunnelKind};
 
 /// Alias that marks interfaces created by wanderlan.
 pub const OWNER_ALIAS: &str = "wanderlan";
+
+/// The alias of a tunnel interface: the owner mark and the name of its peer,
+/// so that `ip link` tells which site it leads to.
+pub fn tunnel_alias(peer: &str) -> String {
+    let peer: String = peer
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect();
+    format!("{OWNER_ALIAS} {peer}")
+}
+
+/// True for the alias of an interface wanderlan made: [`OWNER_ALIAS`], or
+/// that and a name ([`tunnel_alias`]).
+pub fn is_owner_alias(alias: Option<&str>) -> bool {
+    alias.is_some_and(|a| {
+        a == OWNER_ALIAS
+            || a.strip_prefix(OWNER_ALIAS)
+                .is_some_and(|rest| rest.starts_with(' '))
+    })
+}
 /// MTU of the tunnel interfaces: full Ethernet frames. On a smaller path
 /// the outer packets of frames without DF are fragmented; for those with DF
 /// the kernel answers "fragmentation needed" (VXLAN path MTU discovery).
@@ -58,10 +78,14 @@ pub struct TrunkSpec {
 /// One tunnel port (VXLAN).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelSpec {
-    /// Interface name (`vx-<peer>`).
+    /// Interface name (`vx` and the start of the peer's identity).
     pub name: String,
-    /// Remote site name.
-    pub peer: String,
+    /// Remote site.
+    pub peer: SiteId,
+    /// How the remote site is called (for messages).
+    pub peer_name: String,
+    /// The alias of the interface ([`tunnel_alias`]).
+    pub alias: String,
     /// The bridge (segment) the tunnel belongs to: that of its trunk.
     pub bridge: String,
     /// VXLAN parameters.
@@ -100,7 +124,7 @@ pub struct Desired {
     /// The UDP port of the tunnels.
     pub tunnel_port: u16,
     /// Tunnels that cannot be built, by peer, with the reason.
-    pub unbuilt: BTreeMap<String, String>,
+    pub unbuilt: BTreeMap<SiteId, String>,
     /// The clients whose endpoints are learned (table `ip wanderlan`).
     pub learn: BTreeSet<LearnRule>,
     /// The tunnel packets of the clients skip connection tracking (only
@@ -164,25 +188,25 @@ pub struct Runtime {
     /// Tunnel interfaces shut down by the loop guard.
     pub blocked: BTreeSet<String>,
     /// Measured path MTU per peer site.
-    pub pmtu: BTreeMap<String, u16>,
+    pub pmtu: BTreeMap<SiteId, u16>,
     /// MTU of the interface the tunnel to a peer site leaves by: the path
     /// MTU is at most that, so it gives an MSS until the path is measured.
-    pub underlay_mtu: BTreeMap<String, u16>,
+    pub underlay_mtu: BTreeMap<SiteId, u16>,
     /// VNIs of the tunnels to peers whose identity is known (both sites
     /// have one, the keys derive from them); the others use a VNI from the
     /// two names and come up without proof of identity.
-    pub vnis: BTreeMap<String, u32>,
+    pub vnis: BTreeMap<SiteId, u32>,
     /// What the probes found about the identity of the peers with a key. A
     /// tunnel with a key comes up only once its peer is confirmed.
-    pub identity: BTreeMap<String, PeerIdentity>,
+    pub identity: BTreeMap<SiteId, PeerIdentity>,
     /// Where the tunnel packets of the clients of this site come from (the
     /// NAT in front of them chooses the port), learned from their
     /// keepalives.
-    pub endpoints: BTreeMap<String, SocketAddrV4>,
+    pub endpoints: BTreeMap<SiteId, SocketAddrV4>,
     /// The clients of this site that it reaches directly, at this address
     /// (they passed the test of `wanderlan_core::nat`): their tunnels run
     /// direct.
-    pub direct: BTreeMap<String, Ipv4Addr>,
+    pub direct: BTreeMap<SiteId, Ipv4Addr>,
     /// The uplink of this site (a client) reaches it directly and runs the
     /// tunnel direct.
     pub uplink_direct: bool,
@@ -206,7 +230,7 @@ impl Runtime {
         let direct = match t.kind {
             TunnelKind::Server => true,
             TunnelKind::Uplink => self.uplink_direct,
-            TunnelKind::Client => self.direct.contains_key(&t.peer.name),
+            TunnelKind::Client => self.direct.contains_key(&t.peer.id),
         };
         if direct {
             TunnelMode::Direct
@@ -220,7 +244,8 @@ impl Runtime {
 pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
     let blocked = &runtime.blocked;
     let network = &cfg.network;
-    let me = cfg.self_name();
+    let me = cfg.self_id();
+    let my_name = cfg.self_name();
     let local_address = cfg.self_site().map_or(Ipv4Addr::UNSPECIFIED, |s| s.address);
 
     let own = cfg
@@ -261,35 +286,36 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
     let mut tunnels: Vec<TunnelSpec> = Vec::new();
     for t in topology::tunnels_for(network, me) {
         let name = t.ifname();
+        let peer = t.peer.id;
+        let label = network.label(peer);
         // What the tunnel carries: the VLANs both ends take part in (on
         // the way down also the own VLANs of the upper site), at most its
         // own limit.
-        let carried = topology::tunnel_vlans(network, me, &t.peer.name).unwrap_or_default();
-        let keyed = runtime.vnis.get(&t.peer.name).copied();
-        let vni = keyed.unwrap_or_else(|| fallback_vni(me, &t.peer.name));
+        let carried = topology::tunnel_vlans(network, me, peer).unwrap_or_default();
+        let keyed = runtime.vnis.get(&peer).copied();
+        let vni = keyed.unwrap_or_else(|| fallback_vni(my_name, &t.peer.name));
         // One VNI per UDP port on a box (the kernel refuses a second).
         if let Some(other) = vni_of.get(&vni) {
             unbuilt.insert(
-                t.peer.name.clone(),
+                peer,
                 format!(
-                    "its tunnel would get the same VNI {vni} as the one to \"{other}\" (by chance, one in 16 million); a `wanderlan reset` and a new join of \"{}\" gives it another",
-                    t.peer.name
+                    "its tunnel would get the same VNI {vni} as the one to \"{other}\" (by chance, one in 16 million); a `wanderlan reset` and a new join of \"{label}\" gives it another"
                 ),
             );
             continue;
         }
-        vni_of.insert(vni, t.peer.name.clone());
+        vni_of.insert(vni, label.clone());
         // Down while blocked by the loop guard, or while this site or the
         // peer is offline (set up but not taken online yet).
-        let identity = runtime.identity.get(&t.peer.name).copied();
+        let identity = runtime.identity.get(&peer).copied();
         let down_reason = if blocked.contains(&name) {
             Some("blocked by the loop guard".to_string())
         } else if !self_online {
             Some("this site is offline".to_string())
         } else if !t.peer.online {
-            Some(format!("site \"{}\" is offline", t.peer.name))
+            Some(format!("site \"{label}\" is offline"))
         } else if keyed.is_some() {
-            identity_reason(&t.peer.name, t.peer.address, identity.unwrap_or_default())
+            identity_reason(&label, t.peer.address, identity.unwrap_or_default())
         } else {
             None
         };
@@ -301,26 +327,27 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
         has_clients |= t.kind == TunnelKind::Client;
         let remote = match (t.kind, mode) {
             (TunnelKind::Client, TunnelMode::Nat) => {
+                // The set of a client is named by its tunnel: the name of
+                // the client may not be its own.
                 learn.insert(LearnRule {
-                    client: t.peer.name.clone(),
+                    client: name.clone(),
                     vni,
                 });
-                runtime.endpoints.get(&t.peer.name).copied()
+                runtime.endpoints.get(&peer).copied()
             }
             (TunnelKind::Client, TunnelMode::Direct) => runtime
                 .direct
-                .get(&t.peer.name)
-                .map(|ip| SocketAddrV4::new(*ip, network.tunnel_port_of(&t.peer.name))),
+                .get(&peer)
+                .map(|ip| SocketAddrV4::new(*ip, network.tunnel_port_of(peer))),
             _ => Some(SocketAddrV4::new(
                 t.peer.address,
-                network.tunnel_port_of(&t.peer.name),
+                network.tunnel_port_of(peer),
             )),
         };
         let down_reason = down_reason.or_else(|| {
             remote.is_none().then(|| {
                 format!(
-                    "waiting for client \"{}\" to connect (its tunnel packets, UDP {tunnel_port})",
-                    t.peer.name
+                    "waiting for client \"{label}\" to connect (its tunnel packets, UDP {tunnel_port})"
                 )
             })
         });
@@ -328,15 +355,17 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
             enabled: down_reason.is_none(),
             down_reason,
             name,
-            peer: t.peer.name.clone(),
-            bridge: bridge_for(cfg.trunk_for(&t.peer.name), default_trunk),
+            peer,
+            alias: tunnel_alias(&label),
+            peer_name: label,
+            bridge: bridge_for(cfg.trunk_for(peer), default_trunk),
             params: VxlanParams {
                 vni,
                 port: tunnel_port,
                 source_port: (mode == TunnelMode::Nat).then_some(tunnel_port),
             },
             remote,
-            isolated: passing.isolated.contains(&t.peer.name),
+            isolated: passing.isolated.contains(&peer),
             vlans: carried.iter().map(|v| (v, VlanFlags::TAGGED)).collect(),
         });
     }
@@ -347,7 +376,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
     let mut segments: Vec<&[String]> = vec![cfg.local.trunk.as_slice()];
     let mut extra: Vec<&[String]> = tunnels
         .iter()
-        .map(|t| cfg.trunk_ports_for(&t.peer))
+        .map(|t| cfg.trunk_ports_for(t.peer))
         .filter(|ports| *ports != cfg.local.trunk.as_slice())
         .collect();
     extra.sort_unstable();
@@ -395,7 +424,10 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
             .split
             .iter()
             .map(|(peers, vlans)| SplitRule {
-                ports: peers.iter().map(|p| topology::tunnel_name(p)).collect(),
+                ports: peers
+                    .iter()
+                    .filter_map(|p| network.site(*p).map(topology::tunnel_name))
+                    .collect(),
                 vlans: vlans.ranges(),
             })
             .collect(),
@@ -419,7 +451,7 @@ fn breakouts(
     let Some(site) = cfg.self_site() else {
         return Vec::new();
     };
-    let Some(server) = site.uplink.as_deref() else {
+    let Some(server) = site.uplink else {
         return Vec::new();
     };
     if site.breakout.is_empty() {
@@ -758,7 +790,7 @@ fn mss_rules(cfg: &Config, tunnels: &[TunnelSpec], runtime: &Runtime) -> BTreeSe
 ///   is itself a translated local VLAN; otherwise local VLAN S and the
 ///   translated VLAN would merge into one.
 fn trunk_mapping(cfg: &Config, shared: &PortVlans) -> (PortVlans, Vec<TcRule>) {
-    let me = cfg.self_name();
+    let me = cfg.self_id();
     let mut native = None;
     let mut translations: Vec<(u16, u16)> = Vec::new();
     for map in cfg.network.maps_of(me) {
@@ -865,7 +897,7 @@ mod tests {
         let vni = |d: &Desired, peer: &str| {
             d.tunnels
                 .iter()
-                .find(|t| t.peer == peer)
+                .find(|t| t.peer_name == peer)
                 .unwrap()
                 .params
                 .vni
@@ -890,10 +922,10 @@ mod tests {
         }
         let d = derive(&cfg, &Runtime::default());
         assert_eq!(d.tunnel_port, 52822, "the one after its own control port");
-        let t = d.tunnels.iter().find(|t| t.peer == "buero").unwrap();
+        let t = d.tunnels.iter().find(|t| t.peer_name == "buero").unwrap();
         assert_eq!(t.params.port, 52822);
         assert_eq!(t.remote.map(|r| r.port()), Some(52833));
-        let other = d.tunnels.iter().find(|t| t.peer == "haus3").unwrap();
+        let other = d.tunnels.iter().find(|t| t.peer_name == "haus3").unwrap();
         assert_eq!(other.remote.map(|r| r.port()), Some(51822));
     }
 
@@ -908,12 +940,17 @@ mod tests {
             Loaded::Configured(cfg) => cfg,
             Loaded::Unconfigured { .. } => panic!("configured"),
         };
-        let tunnel =
-            |d: &Desired, peer: &str| d.tunnels.iter().find(|t| t.peer == peer).unwrap().clone();
+        let tunnel = |d: &Desired, peer: &str| {
+            d.tunnels
+                .iter()
+                .find(|t| t.peer_name == peer)
+                .unwrap()
+                .clone()
+        };
         // "lan" passed the test: its server reached it at 10.8.0.32.
         let lan = Ipv4Addr::new(10, 8, 0, 32);
         let mut runtime = Runtime {
-            direct: [("lan".to_string(), lan)].into(),
+            direct: [("lan".into(), lan)].into(),
             ..Runtime::default()
         };
         let server = derive(&cfg("heim"), &runtime);
@@ -935,7 +972,7 @@ mod tests {
                 .iter()
                 .map(|r| (r.client.as_str(), r.vni))
                 .collect::<Vec<_>>(),
-            [("nat1", nat.params.vni)]
+            [("vx-nat1", nat.params.vni)]
         );
         // direct: straight to where it was reached, a port per flow,
         // nothing learned.
@@ -977,11 +1014,11 @@ mod tests {
         assert_eq!(
             d.tunnels
                 .iter()
-                .map(|t| t.peer.as_str())
+                .map(|t| t.peer_name.as_str())
                 .collect::<Vec<_>>(),
             ["buero", "haus3"]
         );
-        assert!(d.unbuilt["haus2"].contains("same VNI 77 as the one to \"buero\""));
+        assert!(d.unbuilt[&"haus2".into()].contains("same VNI 77 as the one to \"buero\""));
     }
 
     #[test]
@@ -1261,7 +1298,11 @@ mod tests {
         );
         assert_eq!(d.trunks[0].vlans, d.trunks[1].vlans);
         for t in &d.tunnels {
-            let expected = if t.peer == "haus2" { "wl-ens20" } else { "br0" };
+            let expected = if t.peer_name == "haus2" {
+                "wl-ens20"
+            } else {
+                "br0"
+            };
             assert_eq!(t.bridge, expected, "{}", t.peer);
         }
     }
@@ -1280,12 +1321,12 @@ mod tests {
             Loaded::Unconfigured { .. } => panic!("configured"),
         };
         let d = derive(&cfg, &Runtime::default());
-        let haus2 = d.tunnels.iter().find(|t| t.peer == "haus2").unwrap();
+        let haus2 = d.tunnels.iter().find(|t| t.peer_name == "haus2").unwrap();
         assert!(!haus2.isolated, "a client of heim");
         assert!(
             d.tunnels
                 .iter()
-                .filter(|t| t.peer != "haus2")
+                .filter(|t| t.peer_name != "haus2")
                 .all(|t| t.isolated)
         );
         // haus2 has only its tunnel to heim.
@@ -1300,7 +1341,7 @@ mod tests {
         assert_eq!(
             d2.tunnels
                 .iter()
-                .map(|t| t.peer.as_str())
+                .map(|t| t.peer_name.as_str())
                 .collect::<Vec<_>>(),
             ["heim"]
         );
@@ -1330,7 +1371,7 @@ mod tests {
         let vids = |d: &Desired, peer: &str| -> Vec<u16> {
             d.tunnels
                 .iter()
-                .find(|t| t.peer == peer)
+                .find(|t| t.peer_name == peer)
                 .unwrap()
                 .vlans
                 .keys()

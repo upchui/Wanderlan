@@ -68,13 +68,13 @@ impl Network {
     /// has no meaning, but the text has one: the fingerprint is taken over
     /// this form, so that two sites holding the same entries agree.
     pub fn canonicalize(&mut self) {
-        let names: Vec<String> = self.sites.iter().map(|s| s.name.clone()).collect();
-        let position = |name: &str| names.iter().position(|n| n == name).unwrap_or(usize::MAX);
+        let ids: Vec<SiteId> = self.sites.iter().map(|s| s.id).collect();
+        let position = |id: &SiteId| ids.iter().position(|n| n == id).unwrap_or(usize::MAX);
         self.maps
             .sort_by_cached_key(|m| (position(&m.site), m.shared, m.local));
         self.tunnels.sort_by_cached_key(|t| {
             let (a, b) = (position(&t.sites[0]), position(&t.sites[1]));
-            (a.min(b), a.max(b), t.sites.clone())
+            (a.min(b), a.max(b), t.sites)
         });
     }
 
@@ -95,13 +95,13 @@ impl Network {
     }
 
     /// The VLAN limit of the tunnel between `a` and `b`, if it has one.
-    pub fn tunnel_limit(&self, a: &str, b: &str) -> Option<&VlanSet> {
+    pub fn tunnel_limit(&self, a: SiteId, b: SiteId) -> Option<&VlanSet> {
         self.tunnels.iter().find(|t| t.is(a, b)).map(|t| &t.vlans)
     }
 
     /// Sets (`Some`) or removes (`None`) the VLAN limit of the tunnel
     /// between `a` and `b`; an existing entry keeps its place.
-    pub fn set_tunnel_limit(&mut self, a: &str, b: &str, vlans: Option<VlanSet>) {
+    pub fn set_tunnel_limit(&mut self, a: SiteId, b: SiteId, vlans: Option<VlanSet>) {
         match vlans {
             None => self.tunnels.retain(|t| !t.is(a, b)),
             Some(vlans) => match self.tunnels.iter_mut().find(|t| t.is(a, b)) {
@@ -120,7 +120,7 @@ impl Network {
     }
 
     /// The control port of `site`: its own, or the network's.
-    pub fn control_port_of(&self, site: &str) -> u16 {
+    pub fn control_port_of(&self, site: SiteId) -> u16 {
         self.site(site)
             .and_then(|s| s.ports.control)
             .unwrap_or(self.control_port)
@@ -128,7 +128,7 @@ impl Network {
 
     /// The tunnel port of `site`: its own; with an own control port the one
     /// that goes with it; else the network's.
-    pub fn tunnel_port_of(&self, site: &str) -> u16 {
+    pub fn tunnel_port_of(&self, site: SiteId) -> u16 {
         let ports = self.site(site).map(|s| s.ports).unwrap_or_default();
         match (ports.tunnel, ports.control) {
             (Some(tunnel), _) => tunnel,
@@ -137,9 +137,99 @@ impl Network {
         }
     }
 
-    /// Looks up a site by name.
-    pub fn site(&self, name: &str) -> Option<&Site> {
-        self.sites.iter().find(|s| s.name == name)
+    /// Looks up a site by its identity.
+    pub fn site(&self, id: SiteId) -> Option<&Site> {
+        self.sites.iter().find(|s| s.id == id)
+    }
+
+    /// Looks up a site by its identity, to change it.
+    pub fn site_mut(&mut self, id: SiteId) -> Option<&mut Site> {
+        self.sites.iter_mut().find(|s| s.id == id)
+    }
+
+    /// The sites called `name` (several sites may share a name).
+    pub fn named<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Site> + 'a {
+        self.sites.iter().filter(move |s| s.name == name)
+    }
+
+    /// The site called `name` if it is the only one with that name.
+    pub fn by_name(&self, name: &str) -> Option<&Site> {
+        let mut named = self.sites.iter().filter(|s| s.name == name);
+        let first = named.next()?;
+        named.next().is_none().then_some(first)
+    }
+
+    /// True if no two sites share a name: the network can be written with
+    /// names alone, the form older versions read.
+    pub fn names_unique(&self) -> bool {
+        let mut seen = BTreeSet::new();
+        self.sites.iter().all(|s| seen.insert(s.name.as_str()))
+    }
+
+    /// True if every site has an identity of its own (none is provisional).
+    pub fn all_identified(&self) -> bool {
+        self.sites.iter().all(Site::has_identity)
+    }
+
+    /// How a site is called in messages and displays: its name, with the
+    /// short form of its identity where another site has the same name
+    /// (`c1#Ab3dK9xQ`); for a site that is not in the network the name of a
+    /// provisional identity, else the short identity.
+    pub fn label(&self, id: SiteId) -> String {
+        match self.site(id) {
+            Some(site) if self.named(&site.name).nth(1).is_some() => {
+                format!("{}#{}", site.name, id.fingerprint())
+            }
+            Some(site) => site.name.clone(),
+            None => id
+                .provisional_name()
+                .map_or_else(|| id.fingerprint(), str::to_string),
+        }
+    }
+
+    /// Finds the site a user means: its identity, `name#<start of the
+    /// identity>`, a name only one site has, or the start of an identity
+    /// (at least 4 characters). Several sites with the name: an error that
+    /// lists them.
+    pub fn find(&self, text: &str) -> Result<&Site, String> {
+        let text = text.trim();
+        if let Ok(id) = text.parse::<SiteId>() {
+            return self
+                .site(id)
+                .ok_or_else(|| format!("no site has the identity {}", id.fingerprint()));
+        }
+        let (name, start) = match text.split_once('#') {
+            Some((name, start)) => (Some(name), Some(start)),
+            None => (Some(text), None),
+        };
+        let mut found: Vec<&Site> = self
+            .sites
+            .iter()
+            .filter(|s| {
+                name.is_none_or(|n| n == s.name)
+                    && start.is_none_or(|p| s.id.to_string().starts_with(p))
+            })
+            .collect();
+        if found.is_empty() && start.is_none() && text.len() >= 4 {
+            found = self
+                .sites
+                .iter()
+                .filter(|s| s.has_identity() && s.id.to_string().starts_with(text))
+                .collect();
+        }
+        match found.as_slice() {
+            [one] => Ok(one),
+            [] => Err(format!("there is no site \"{text}\"")),
+            several => Err(format!(
+                "\"{text}\" names {} sites: {}; say which with its identity",
+                several.len(),
+                several
+                    .iter()
+                    .map(|s| format!("{}#{}", s.name, s.id.fingerprint()))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
     }
 
     /// Shared VLANs a site takes part in: its own list, or the network default.
@@ -152,10 +242,7 @@ impl Network {
     /// another VLAN (a native mapping).
     pub fn effective_vlans(&self, site: &Site) -> VlanSet {
         let mut vlans = self.vlans_of(site).clone();
-        if self
-            .maps_of(&site.name)
-            .any(|m| m.local == LocalVid::Native)
-        {
+        if self.maps_of(site.id).any(|m| m.local == LocalVid::Native) {
             vlans.remove(super::vlan::NATIVE_VID);
         }
         vlans
@@ -166,33 +253,76 @@ impl Network {
     /// the site puts its untagged traffic into another VLAN.
     pub fn own_vlans(&self, site: &Site) -> VlanSet {
         let mut vlans = site.own_vlans.clone().unwrap_or_default();
-        if self
-            .maps_of(&site.name)
-            .any(|m| m.local == LocalVid::Native)
-        {
+        if self.maps_of(site.id).any(|m| m.local == LocalVid::Native) {
             vlans.remove(super::vlan::NATIVE_VID);
         }
         vlans
     }
 
     /// Returns the VLAN mappings of one site.
-    pub fn maps_of<'a>(&'a self, site: &'a str) -> impl Iterator<Item = &'a VlanMap> + 'a {
+    pub fn maps_of(&self, site: SiteId) -> impl Iterator<Item = &VlanMap> + '_ {
         self.maps.iter().filter(move |m| m.site == site)
+    }
+
+    /// Gives the site `old` the identity `new`, with every reference to it:
+    /// a site claims its own identity, or a box takes over the entry of one
+    /// that was reset.
+    pub fn rekey(&mut self, old: SiteId, new: SiteId) {
+        let follow = |id: &mut SiteId| {
+            if *id == old {
+                *id = new;
+            }
+        };
+        for site in &mut self.sites {
+            follow(&mut site.id);
+            if let Some(up) = &mut site.uplink {
+                follow(up);
+            }
+            if let Some(by) = &mut site.managed_by {
+                follow(by);
+            }
+        }
+        for map in &mut self.maps {
+            follow(&mut map.site);
+        }
+        for tunnel in &mut self.tunnels {
+            if tunnel.touches(old) {
+                let [a, b] = tunnel.sites;
+                let id = |n: SiteId| if n == old { new } else { n };
+                tunnel.sites = site_pair(id(a), id(b));
+            }
+        }
+    }
+
+    /// Renames the site `id` to `name`. A site without an identity of its
+    /// own is known by its name: its provisional identity follows.
+    pub fn rename_site(&mut self, id: SiteId, name: &str) {
+        let Some(site) = self.site_mut(id) else {
+            return;
+        };
+        let provisional = !site.has_identity();
+        site.name = name.to_string();
+        if provisional {
+            self.rekey(id, SiteId::provisional(name));
+        }
     }
 }
 
 /// One site of the network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Site {
-    /// Unique name, also used in interface names (`vx-<name>`).
+    /// Its name, shown everywhere. Several sites may have the same name;
+    /// they are told apart by their identity.
     pub name: String,
     /// Address of the site in the existing transport network (e.g. its VPN
     /// address). GRETAP tunnels run between these addresses.
     pub address: Ipv4Addr,
-    /// Identity of the box (its public key, see [`crate::identity`]); the
-    /// keys of its tunnels derive from it. `None` for a site of an older
-    /// version that has not claimed one yet: its tunnels have no keys.
-    pub id: Option<SiteId>,
+    /// Identity of the box (its public key, see [`crate::identity`]): every
+    /// other part of the configuration refers to the site by it, and the
+    /// keys of its tunnels derive from it. A site of an older version that
+    /// has not claimed one yet has a provisional one
+    /// ([`SiteId::provisional`]): its tunnels have no keys.
+    pub id: SiteId,
     /// Shared VLANs this site takes part in, like the allowed VLANs of a
     /// switch port; `None` means the network default (`network.vlans`).
     pub vlans: Option<VlanSet>,
@@ -205,12 +335,12 @@ pub struct Site {
     pub online: bool,
     /// The site that invited this one; only it may change the rules of this
     /// site (VLANs, mappings, online). `None`: every site may.
-    pub managed_by: Option<String>,
+    pub managed_by: Option<SiteId>,
     /// The site may also change its own rules.
     pub self_managed: bool,
     /// The site this one is plugged into (a client of it): its only tunnel
     /// leads there. `None`: a server, connected with all other servers.
-    pub uplink: Option<String>,
+    pub uplink: Option<SiteId>,
     /// Local internet breakout per VLAN (the VLAN ID in the network): the
     /// public destinations of these VLANs leave through this site's own
     /// uplink instead of the tunnel. Only its managers change it.
@@ -218,6 +348,36 @@ pub struct Site {
     /// Where its daemon and its tunnels listen. Only the site itself
     /// changes them; the other sites connect there.
     pub ports: SitePorts,
+}
+
+impl Site {
+    /// A server at `address` with the default rules, known by its name only
+    /// (provisional identity) until it gets one.
+    pub fn new(name: &str, address: Ipv4Addr) -> Self {
+        Self {
+            name: name.to_string(),
+            address,
+            id: SiteId::provisional(name),
+            vlans: None,
+            own_vlans: None,
+            online: true,
+            managed_by: None,
+            self_managed: false,
+            uplink: None,
+            breakout: Breakouts::new(),
+            ports: SitePorts::default(),
+        }
+    }
+
+    /// True if the site has an identity of its own, not a provisional one.
+    pub fn has_identity(&self) -> bool {
+        !self.id.is_provisional()
+    }
+
+    /// Its own identity; `None` while it has a provisional one.
+    pub fn own_id(&self) -> Option<SiteId> {
+        self.has_identity().then_some(self.id)
+    }
 }
 
 /// The ports of one site; `None`: the default of the network.
@@ -325,7 +485,7 @@ impl fmt::Display for LocalVid {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct VlanMap {
     /// Site the mapping applies to.
-    pub site: String,
+    pub site: SiteId,
     /// Local side: untagged or a local VLAN ID.
     pub local: LocalVid,
     /// VLAN ID in the shared network.
@@ -336,15 +496,15 @@ pub struct VlanMap {
 /// the VLANs of its two sites.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct TunnelVlans {
-    /// The two sites, the smaller name first.
-    pub sites: [String; 2],
+    /// The two sites, the smaller identity first.
+    pub sites: [SiteId; 2],
     /// The VLANs; empty: none at all.
     pub vlans: VlanSet,
 }
 
 impl TunnelVlans {
     /// The limit of the tunnel between `a` and `b`.
-    pub fn new(a: &str, b: &str, vlans: VlanSet) -> Self {
+    pub fn new(a: SiteId, b: SiteId, vlans: VlanSet) -> Self {
         Self {
             sites: site_pair(a, b),
             vlans,
@@ -352,30 +512,36 @@ impl TunnelVlans {
     }
 
     /// True for the tunnel between `a` and `b` (in any order).
-    pub fn is(&self, a: &str, b: &str) -> bool {
+    pub fn is(&self, a: SiteId, b: SiteId) -> bool {
         self.sites == site_pair(a, b)
     }
 
     /// True if `site` is one of its ends.
-    pub fn touches(&self, site: &str) -> bool {
-        self.sites.iter().any(|s| s == site)
+    pub fn touches(&self, site: SiteId) -> bool {
+        self.sites.contains(&site)
+    }
+
+    /// The other end of the tunnel, seen from `site`.
+    pub fn other(&self, site: SiteId) -> SiteId {
+        if self.sites[0] == site {
+            self.sites[1]
+        } else {
+            self.sites[0]
+        }
     }
 }
 
-/// Two site names, the smaller one first.
-pub fn site_pair(a: &str, b: &str) -> [String; 2] {
-    if a <= b {
-        [a.to_string(), b.to_string()]
-    } else {
-        [b.to_string(), a.to_string()]
-    }
+/// Two sites, the smaller identity first.
+pub fn site_pair(a: SiteId, b: SiteId) -> [SiteId; 2] {
+    if a <= b { [a, b] } else { [b, a] }
 }
 
 /// The site-local configuration (`local.toml`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Local {
-    /// Name of this site in `network.toml`. `None` means "not configured yet".
-    pub self_name: Option<String>,
+    /// Identity of this site in `network.toml`. `None` means "not
+    /// configured yet".
+    pub self_id: Option<SiteId>,
     /// Trunk ports of the default segment (`br0`), the main port first:
     /// local interfaces that carry the VLANs, bridged like the ports of a
     /// switch.
@@ -383,7 +549,7 @@ pub struct Local {
     /// Trunk ports of single tunnels (peer site → interfaces). Each such list
     /// is a segment of its own at this site (own bridge); all other tunnels
     /// use `trunk`.
-    pub tunnel_trunks: std::collections::BTreeMap<String, Vec<String>>,
+    pub tunnel_trunks: BTreeMap<SiteId, Vec<String>>,
     /// Time to confirm a change on this site; `None`: the network's.
     pub commit_timeout: Option<Duration>,
     /// How often this site measures the path MTU; `None`: the network's.
@@ -400,18 +566,29 @@ impl Local {
     }
 
     /// The trunk ports of the tunnel to `peer`: its own, or the default ones.
-    pub fn trunk_ports_for(&self, peer: &str) -> &[String] {
-        self.tunnel_trunks.get(peer).unwrap_or(&self.trunk)
+    pub fn trunk_ports_for(&self, peer: SiteId) -> &[String] {
+        self.tunnel_trunks.get(&peer).unwrap_or(&self.trunk)
     }
 
     /// The first trunk port of the tunnel to `peer` (it names the segment).
-    pub fn trunk_for(&self, peer: &str) -> Option<&str> {
+    pub fn trunk_for(&self, peer: SiteId) -> Option<&str> {
         self.trunk_ports_for(peer).first().map(String::as_str)
     }
 
     /// Returns true if this site has been configured (`self` is set).
     pub fn is_configured(&self) -> bool {
-        self.self_name.is_some()
+        self.self_id.is_some()
+    }
+
+    /// Follows a site that got another identity ([`Network::rekey`]): this
+    /// site itself, or the trunk of the tunnel to it.
+    pub fn rekey(&mut self, old: SiteId, new: SiteId) {
+        if self.self_id == Some(old) {
+            self.self_id = Some(new);
+        }
+        if let Some(trunk) = self.tunnel_trunks.remove(&old) {
+            self.tunnel_trunks.insert(new, trunk);
+        }
     }
 
     /// Sets the trunk ports of the default trunk (`tunnel` `None`) or of the
@@ -422,8 +599,9 @@ impl Local {
     /// elsewhere, or why it cannot be (the default trunk needs a port).
     pub fn assign_trunk(
         &mut self,
-        tunnel: Option<&str>,
+        tunnel: Option<SiteId>,
         ports: Vec<String>,
+        label: impl Fn(SiteId) -> String,
     ) -> Result<Vec<String>, String> {
         // The same ports in another order are the same segment.
         let same =
@@ -435,7 +613,8 @@ impl Local {
                 if ports.is_empty() {
                     return Err("the default trunk needs at least one port".into());
                 }
-                for (site, own) in &mut self.tunnel_trunks {
+                for (id, own) in &mut self.tunnel_trunks {
+                    let site = label(*id);
                     if same(own, &ports) {
                         notes.push(format!(
                             "the tunnel to {site} has the same ports and uses the default trunk then"
@@ -464,14 +643,14 @@ impl Local {
                 self.trunk = ports;
             }
             Some(site) if ports.is_empty() || same(&ports, &self.trunk) => {
-                self.tunnel_trunks.remove(site);
+                self.tunnel_trunks.remove(&site);
             }
             Some(site) => {
                 // Shared with another tunnel: its list, in its order.
                 let ports = self
                     .tunnel_trunks
                     .iter()
-                    .find(|(other, own)| *other != site && same(own, &ports))
+                    .find(|(other, own)| **other != site && same(own, &ports))
                     .map_or(ports, |(_, own)| own.clone());
                 let taken: Vec<String> = self
                     .trunk
@@ -505,9 +684,10 @@ impl Local {
                     self.trunk = left;
                 }
                 for (other, own) in &mut self.tunnel_trunks {
-                    if other == site || same(own, &ports) {
+                    if *other == site || same(own, &ports) {
                         continue;
                     }
+                    let other = label(*other);
                     let taken: Vec<String> =
                         own.iter().filter(|p| ports.contains(p)).cloned().collect();
                     if taken.is_empty() {
@@ -527,7 +707,7 @@ impl Local {
                         )
                     });
                 }
-                self.tunnel_trunks.insert(site.to_string(), ports);
+                self.tunnel_trunks.insert(site, ports);
             }
         }
         // Tunnels left without ports, or with the default ones, use the
@@ -547,6 +727,19 @@ mod tests {
         p.iter().map(|s| (*s).to_string()).collect()
     }
 
+    fn id(name: &str) -> SiteId {
+        SiteId::provisional(name)
+    }
+
+    /// The name of the test sites, by their provisional identity.
+    fn name(site: SiteId) -> String {
+        ["lab", "dc"]
+            .into_iter()
+            .find(|n| id(n) == site)
+            .unwrap_or("?")
+            .to_string()
+    }
+
     #[test]
     fn the_order_of_the_chosen_ports_does_not_split_a_segment() {
         let mut local = Local {
@@ -555,21 +748,21 @@ mod tests {
         };
         local
             .tunnel_trunks
-            .insert("lab".into(), ports(&["ens21", "ens22"]));
+            .insert(id("lab"), ports(&["ens21", "ens22"]));
         // The default ports in another order: the default trunk.
         local
-            .assign_trunk(Some("dc"), ports(&["ens20", "ens19"]))
+            .assign_trunk(Some(id("dc")), ports(&["ens20", "ens19"]), name)
             .unwrap();
-        assert!(!local.tunnel_trunks.contains_key("dc"));
+        assert!(!local.tunnel_trunks.contains_key(&id("dc")));
         // The ports of lab in another order: lab's segment, in lab's order.
         local
-            .assign_trunk(Some("dc"), ports(&["ens22", "ens21"]))
+            .assign_trunk(Some(id("dc")), ports(&["ens22", "ens21"]), name)
             .unwrap();
-        assert_eq!(local.tunnel_trunks["dc"], ports(&["ens21", "ens22"]));
-        assert_eq!(local.tunnel_trunks["lab"], ports(&["ens21", "ens22"]));
+        assert_eq!(local.tunnel_trunks[&id("dc")], ports(&["ens21", "ens22"]));
+        assert_eq!(local.tunnel_trunks[&id("lab")], ports(&["ens21", "ens22"]));
         // The default trunk with lab's ports: lab merges into it, said so.
         let notes = local
-            .assign_trunk(None, ports(&["ens22", "ens21"]))
+            .assign_trunk(None, ports(&["ens22", "ens21"]), name)
             .unwrap();
         assert!(local.tunnel_trunks.is_empty(), "{:?}", local.tunnel_trunks);
         assert!(
@@ -586,7 +779,9 @@ mod tests {
             trunk: ports(&["ens19", "ens20"]),
             ..Local::default()
         };
-        let notes = local.assign_trunk(Some("dc"), ports(&["ens19"])).unwrap();
+        let notes = local
+            .assign_trunk(Some(id("dc")), ports(&["ens19"]), name)
+            .unwrap();
         assert_eq!(local.trunk, ports(&["ens20"]));
         assert!(
             notes[0].contains("ens20 becomes its main port"),
@@ -597,36 +792,62 @@ mod tests {
     #[test]
     fn network_lookups_and_site_vlans() {
         let mut network = Network::new(VlanSet::from_range(10, 20));
+        network
+            .sites
+            .push(Site::new("a", Ipv4Addr::new(10, 0, 0, 1)));
         network.sites.push(Site {
-            name: "a".into(),
-            address: Ipv4Addr::new(10, 0, 0, 1),
-            id: None,
-            vlans: None,
-            own_vlans: None,
-            online: true,
-            managed_by: None,
-            self_managed: false,
-            uplink: None,
-            breakout: Breakouts::new(),
-            ports: SitePorts::default(),
-        });
-        network.sites.push(Site {
-            name: "b".into(),
-            address: Ipv4Addr::new(10, 0, 0, 2),
-            id: None,
             vlans: Some(VlanSet::from_range(14, 14)),
-            own_vlans: None,
-            online: true,
-            managed_by: None,
-            self_managed: false,
-            uplink: None,
-            breakout: Breakouts::new(),
-            ports: SitePorts::default(),
+            ..Site::new("b", Ipv4Addr::new(10, 0, 0, 2))
         });
-        assert!(network.site("c").is_none());
-        let a = network.site("a").unwrap();
-        let b = network.site("b").unwrap();
+        assert!(network.site(id("c")).is_none());
+        let a = network.site(id("a")).unwrap();
+        let b = network.site(id("b")).unwrap();
         assert_eq!(network.vlans_of(a).len(), 11);
         assert_eq!(network.vlans_of(b).iter().collect::<Vec<_>>(), [14]);
+        assert!(!a.has_identity(), "provisional");
+    }
+
+    #[test]
+    fn sites_with_the_same_name_are_told_apart_by_their_identity() {
+        let real = |n: u8| SiteId::from_bytes([n; 32]);
+        let mut network = Network::new(VlanSet::from_range(10, 20));
+        for (n, last) in [(1, 1), (2, 2)] {
+            network.sites.push(Site {
+                id: real(n),
+                ..Site::new("c1", Ipv4Addr::new(10, 0, 0, last))
+            });
+        }
+        network.sites.push(Site {
+            id: real(3),
+            ..Site::new("hq", Ipv4Addr::new(10, 0, 0, 3))
+        });
+        assert!(!network.names_unique());
+        assert!(network.all_identified());
+        assert_eq!(network.label(real(3)), "hq");
+        assert_eq!(
+            network.label(real(1)),
+            format!("c1#{}", real(1).fingerprint())
+        );
+        assert_eq!(network.find("hq").unwrap().id, real(3));
+        let err = network.find("c1").unwrap_err();
+        assert!(err.contains("names 2 sites"), "{err}");
+        let short = &real(2).to_string()[..6];
+        assert_eq!(network.find(&format!("c1#{short}")).unwrap().id, real(2));
+        assert_eq!(network.find(&real(1).to_string()).unwrap().id, real(1));
+        assert!(network.find("nobody").is_err());
+        assert!(network.by_name("c1").is_none());
+        // Renamed: the identity stays.
+        network.rename_site(real(1), "c2");
+        assert_eq!(network.find("c2").unwrap().id, real(1));
+        assert!(network.names_unique());
+        // A site of an older version is known by its name: its provisional
+        // identity follows a rename.
+        network
+            .sites
+            .push(Site::new("old", Ipv4Addr::new(10, 0, 0, 9)));
+        network.sites[0].uplink = Some(id("old"));
+        network.rename_site(id("old"), "older");
+        assert_eq!(network.sites[0].uplink, Some(id("older")));
+        assert!(network.site(id("older")).is_some());
     }
 }

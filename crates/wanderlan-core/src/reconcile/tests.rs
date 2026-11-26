@@ -152,7 +152,11 @@ async fn removed_peer_is_deleted_and_changed_address_changed_in_place() {
     let mut runtime = Runtime::default();
     runtime.vnis.insert("buero".into(), 0x12_3456);
     let keyed = derive(&config_from(&network, "heim"), &runtime);
-    let tunnel = keyed.tunnels.iter().find(|t| t.peer == "buero").unwrap();
+    let tunnel = keyed
+        .tunnels
+        .iter()
+        .find(|t| t.peer_name == "buero")
+        .unwrap();
     assert!(!tunnel.enabled);
     assert!(
         tunnel
@@ -182,7 +186,7 @@ async fn removed_peer_is_deleted_and_changed_address_changed_in_place() {
         confirmed
             .tunnels
             .iter()
-            .find(|t| t.peer == "buero")
+            .find(|t| t.peer_name == "buero")
             .unwrap()
             .enabled
     );
@@ -191,7 +195,11 @@ async fn removed_peer_is_deleted_and_changed_address_changed_in_place() {
         .identity
         .insert("buero".into(), crate::identity::PeerIdentity::WrongKey);
     let wrong = derive(&config_from(&network, "heim"), &wrong);
-    let tunnel = wrong.tunnels.iter().find(|t| t.peer == "buero").unwrap();
+    let tunnel = wrong
+        .tunnels
+        .iter()
+        .find(|t| t.peer_name == "buero")
+        .unwrap();
     assert!(!tunnel.enabled);
     assert!(
         tunnel
@@ -985,7 +993,7 @@ fn a_tunnel_with_several_ports_has_a_segment_of_its_own() {
             ("ens22", "wl-ens21")
         ]
     );
-    let buero = d.tunnels.iter().find(|t| t.peer == "buero").unwrap();
+    let buero = d.tunnels.iter().find(|t| t.peer_name == "buero").unwrap();
     assert_eq!(buero.bridge, "wl-ens21");
 }
 
@@ -1044,7 +1052,11 @@ async fn a_client_behind_nat_is_reached_where_its_packets_come_from() {
         .identity
         .insert("haus3".into(), PeerIdentity::Confirmed);
     let server = derive(&config_from(&network, "heim"), &runtime);
-    let tunnel = server.tunnels.iter().find(|t| t.peer == "haus3").unwrap();
+    let tunnel = server
+        .tunnels
+        .iter()
+        .find(|t| t.peer_name == "haus3")
+        .unwrap();
     assert!(!tunnel.enabled);
     assert!(
         tunnel

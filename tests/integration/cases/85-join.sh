@@ -16,7 +16,7 @@ check "site5 has an identity" grep -qE '^[A-Za-z0-9+/]{43}=$' <<<"$old_id"
 check "wanderlan reset --yes" x site5 "wanderlan reset --yes"
 check "site5 is unconfigured" x site5 "wanderlan status --json | jq -e '.state == \"unconfigured\"'"
 check "no bridge, no tunnels and no nftables table are left" \
-  x site5 "! ip link show br0 2>/dev/null && ! ip -o link show | grep -q ' vx-' && ! nft list table bridge wanderlan 2>/dev/null"
+  x site5 "! ip link show br0 2>/dev/null && ! ip -o link show | grep -q ' vx' && ! nft list table bridge wanderlan 2>/dev/null"
 check "no tc rules are left on the trunk" x site5 "[ -z \"\$(tc filter show dev trunk0 ingress 2>/dev/null)\" ]"
 check "the identity is gone (the box is a new box now)" x site5 "[ ! -e /var/lib/wanderlan/identity ]"
 
@@ -54,23 +54,23 @@ check "site5 has a new identity" test -n "$new_id" -a "$new_id" != "$old_id"
 check "site2 knows site5 by its new identity" \
   test "$(jqs site2 '.sites[] | select(.name == "site5") | .id')" = "${new_id:0:8}"
 wait_for 30 "site5 is a client of site2: its only tunnel leads there" \
-  x site5 "[ \"\$(ip -j link show master br0 | jq -r '[.[].ifname | select(startswith(\"vx-\"))] | join(\" \")')\" = vx-site2 ]"
+  x site5 "[ \"\$(br-ports br0 tunnels)\" = site2 ]"
 check "site1 and site3 have no tunnel to site5" \
-  x site1 "! ip link show vx-site5 2>/dev/null" && x site3 "! ip link show vx-site5 2>/dev/null"
+  x site1 "[ -z \"\$(tun site5)\" ]" && x site3 "[ -z \"\$(tun site5)\" ]"
 check "the client port at site2 is not isolated, the server ports are" \
-  x site2 "bridge -d link show dev vx-site5 | grep -q 'isolated off' && bridge -d link show dev vx-site1 | grep -q 'isolated on'"
+  x site2 "bridge -d link show dev \$(tun site5) | grep -q 'isolated off' && bridge -d link show dev \$(tun site1) | grep -q 'isolated on'"
 check "site5 got the rules of the invitation (untagged is VLAN 20)" \
   test "$(vlan_summary site5 trunk0)" = "10-19,20:pu,21-50"
 
 begin "Online/offline: a new site starts offline until it is taken online"
 
 check "site5 is offline, its tunnel at site2 is down" \
-  x site2 "wanderlan status --json | jq -e '.peers[] | select(.name == \"site5\") | .port_state == \"offline\"' && ip -j link show vx-site5 | jq -e '.[0].flags | index(\"UP\") | not'"
+  x site2 "wanderlan status --json | jq -e '.peers[] | select(.name == \"site5\") | .port_state == \"offline\"' && ip -j link show \$(tun site5) | jq -e '.[0].flags | index(\"UP\") | not'"
 client_native c-site5 10.20.0.13/24
 expect_no_ping c-site5 10.20.0.1 "no traffic while site5 is offline"
 check "site2 takes site5 online" x site2 "wanderlan online site5 --confirm"
 wait_for 30 "the tunnel to site5 is up at site2" \
-  x site2 "ip -j link show vx-site5 | jq -e '.[0].flags | index(\"UP\")'"
+  x site2 "ip -j link show \$(tun site5) | jq -e '.[0].flags | index(\"UP\")'"
 expect_ping c-site5 10.20.0.1 "VLAN 20: the new site reaches site1's client (through site2)"
 expect_ping c-site3 10.20.0.13 "VLAN 20: site3's client reaches the new site (through site2)"
 
@@ -84,9 +84,9 @@ wait_eq 60 "site2 runs the tunnel to site5 direct, reached at its address" \
 wait_eq 30 "site5 runs it direct too" "direct" \
   jqs site5 '.peers[] | select(.name == "site2") | .tunnel'
 wait_for 30 "site5 sends from a port per flow" \
-  x site5 "ip -d link show vx-site2 | grep -q 'vxlan id' && ! ip -d link show vx-site2 | grep -q 'srcport 51822 51823'"
+  x site5 "ip -d link show \$(tun site2) | grep -q 'vxlan id' && ! ip -d link show \$(tun site2) | grep -q 'srcport 51822 51823'"
 check "site2 sends to site5's address" \
-  x site2 "bridge fdb show dev vx-site5 | grep -q '^00:00:00:00:00:00 dst 10.100.13.10 '"
+  x site2 "bridge fdb show dev \$(tun site5) | grep -q '^00:00:00:00:00:00 dst 10.100.13.10 '"
 check "the status tells how the tunnel runs" \
   x site5 "wanderlan status | grep -q 'Tunnel to site2: VXLAN direct: \"site2\" reaches this site at UDP 51822'"
 expect_ping c-site5 10.20.0.1 "VLAN 20: site5 reaches site1's client, direct"
@@ -97,7 +97,8 @@ rev=$(jqs site2 .revision)
 wait_eq 60 "site5 has revision $rev, nothing pending" "$rev null" \
   jqs site5 '"\(.revision) \(.pending)"'
 # site5 (a client of site2) adds a client of its own named like a site it
-# does not see: valid on site5, but the name is taken in the network.
+# does not see: valid on site5, but in the network a site without an
+# identity of its own needs a name of its own.
 x site5 "printf '\n[site.site1]\naddress = \"10.100.99.10\"\nserver = \"site5\"\n' | cat /etc/wanderlan/network.toml - > /tmp/taken-name.toml"
 if out=$(x site5 "wanderlan apply --network /tmp/taken-name.toml && wanderlan confirm" 2>&1); then
   pass "site5 adds a client named \"site1\""
@@ -105,14 +106,14 @@ else
   fail "site5 cannot add a client named \"site1\": $out"
 fi
 wait_for 15 "site2 marks the change of site5 as refused" \
-  x site2 "wanderlan status --json | jq -e '.peers[] | select(.name == \"site5\") | .refused | test(\"already used\")'"
+  x site2 "wanderlan status --json | jq -e '.peers[] | select(.name == \"site5\") | .refused | test(\"defined twice\")'"
 wait_eq 45 "site5 takes site2's configuration back" "site2 site5" \
   jqs site5 '[.sites[].name] | sort | join(" ")'
 check "site5's status tells why" \
-  x site5 "wanderlan status | grep -q 'WARNING: Your change was not taken over by \"site2\": .*already used'"
+  x site5 "wanderlan status | grep -q 'WARNING: Your change was not taken over by \"site2\": .*defined twice'"
 wait_eq 30 "site2 no longer marks site5" null \
   jqs site2 '.peers[] | select(.name == "site5") | .refused'
-wait_for 30 "site5 has no tunnel to the made-up site" x site5 "! ip link show vx-site1 2>/dev/null"
+wait_for 30 "site5 has no tunnel to the made-up site" x site5 "[ -z \"\$(tun site1)\" ]"
 
 begin "Join: a reset site joins again via another site"
 
@@ -128,8 +129,8 @@ fi
 check "site5 is a client of site1 now (it joined through site1)" \
   test "$(jqs site1 '"\(.revision) \(.sites[] | select(.name == "site5") | .uplink)"')" = "$((rev + 1)) site1"
 wait_for 30 "site5's only tunnel leads to site1" \
-  x site5 "[ \"\$(ip -j link show master br0 | jq -r '[.[].ifname | select(startswith(\"vx-\"))] | join(\" \")')\" = vx-site1 ]"
-wait_for 30 "site2 has no tunnel to site5 any more" x site2 "! ip link show vx-site5 2>/dev/null"
+  x site5 "[ \"\$(br-ports br0 tunnels)\" = site1 ]"
+wait_for 30 "site2 has no tunnel to site5 any more" x site2 "[ -z \"\$(tun site5)\" ]"
 check "site5 is still online (the state is kept)" \
   test "$(jqs site1 '.sites[] | select(.name == "site5") | .online')" = true
 expect_ping c-site5 10.20.0.1 "VLAN 20: site5 reaches site1's client again"
@@ -164,10 +165,10 @@ expect_ping c-site5 10.20.0.1 "VLAN 20: site5 reaches site1's client again"
 
 begin "Client + server: site5 (a client of site1) has a client of its own"
 
-only_tunnel() { x "$1" "[ \"\$(ip -j link show master br0 | jq -r '[.[].ifname | select(startswith(\"vx-\"))] | join(\" \")')\" = vx-$2 ]"; }
+only_tunnel() { x "$1" "[ \"\$(br-ports br0 tunnels)\" = $2 ]"; }
 check "site1 makes site4 a client of site5" x site1 "wanderlan role site4 client site5 --confirm"
 wait_for 60 "site4's only tunnel leads to site5" only_tunnel site4 site5
-wait_for 30 "site5 has a tunnel to its client site4" x site5 "ip link show vx-site4"
+wait_for 30 "site5 has a tunnel to its client site4" x site5 "[ -n \"\$(tun site4)\" ]"
 keyed site4 site5
 check "site1 shows site5 as client + server" \
   x site1 "wanderlan status | grep -q 'site5 .*client of site1 + server'"
@@ -192,11 +193,11 @@ fi
 uplink_at() { jqs "$1" ".sites[] | select(.name == \"$2\") | .uplink"; }
 wait_eq 30 "site2 has the network of site1" "$(jqs site1 .revision)" jqs site2 .revision
 check "site2 makes site5 a server" x site2 "wanderlan role site5 server --confirm"
-wait_for 60 "site5 has its tunnels to the servers" x site5 "ip link show vx-site2 && ip link show vx-site3"
+wait_for 60 "site5 has its tunnels to the servers" x site5 "[ -n \"\$(tun site2)\" ] && [ -n \"\$(tun site3)\" ]"
 wait_eq 30 "site1 knows site5 as a server" null uplink_at site1 site5
 check "then site4 a server" x site1 "wanderlan role site4 server --confirm"
 wait_for 60 "site4 has its tunnels to the servers again" \
-  x site4 "ip link show vx-site1 && ip link show vx-site2 && ip link show vx-site3"
+  x site4 "[ -n \"\$(tun site1)\" ] && [ -n \"\$(tun site2)\" ] && [ -n \"\$(tun site3)\" ]"
 wait_eq 30 "site2 knows site4 as a server" null uplink_at site2 site4
 check "and site5 a client of site1 again" x site2 "wanderlan role site5 client site1 --confirm"
 wait_for 60 "site5's only tunnel leads to site1 again" only_tunnel site5 site1

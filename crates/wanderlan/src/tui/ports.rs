@@ -6,6 +6,7 @@ use crossterm::event::KeyEvent;
 use wanderlan_core::api::Interface;
 use wanderlan_core::config::{FieldPath, ifname_error};
 use wanderlan_core::desired::{SEGMENT_PREFIX, bridge_for};
+use wanderlan_core::identity::SiteId;
 
 use super::draft::Draft;
 use super::form::trunk_candidates;
@@ -17,7 +18,7 @@ pub enum PortTarget {
     /// The default trunk of this host (`br0`).
     Default,
     /// The trunk of the tunnel to a site (a segment of its own).
-    Tunnel(String),
+    Tunnel(SiteId),
 }
 
 /// One interface of the list.
@@ -56,6 +57,8 @@ pub struct PortPicker {
     /// Why the last action did not work.
     pub error: Option<String>,
     initial: Vec<String>,
+    /// How the site of the tunnel is called.
+    site_name: String,
 }
 
 /// Why `interface` cannot be a trunk port at all: it is in a bridge or bond
@@ -95,6 +98,10 @@ impl PortPicker {
                 .cloned()
                 .unwrap_or_default(),
         };
+        let site_name = match &target {
+            PortTarget::Default => String::new(),
+            PortTarget::Tunnel(site) => draft.network.label(*site),
+        };
         Self {
             target,
             initial: chosen.clone(),
@@ -102,6 +109,7 @@ impl PortPicker {
             cursor: 0,
             manual: TextInput::default(),
             error: None,
+            site_name,
         }
     }
 
@@ -109,7 +117,7 @@ impl PortPicker {
     pub fn title(&self) -> String {
         match &self.target {
             PortTarget::Default => "Trunk ports of this host".into(),
-            PortTarget::Tunnel(site) => format!("Trunk ports of the tunnel to {site}"),
+            PortTarget::Tunnel(_) => format!("Trunk ports of the tunnel to {}", self.site_name),
         }
     }
 
@@ -158,23 +166,27 @@ impl PortPicker {
                 wanderlan_core::BRIDGE_NAME,
                 list(&self.chosen)
             ),
-            PortTarget::Tunnel(site) if self.chosen.is_empty() => format!(
-                "Nothing chosen: the tunnel to {site} uses the default trunk ({}).",
+            PortTarget::Tunnel(_) if self.chosen.is_empty() => format!(
+                "Nothing chosen: the tunnel to {} uses the default trunk ({}).",
+                self.site_name,
                 default.join(", ")
             ),
-            PortTarget::Tunnel(site)
+            PortTarget::Tunnel(_)
                 if self.chosen.len() == default.len()
                     && self.chosen.iter().all(|p| default.contains(p)) =>
             {
                 format!(
-                    "The ports of the default trunk: the tunnel to {site} uses it ({}).",
+                    "The ports of the default trunk: the tunnel to {} uses it ({}).",
+                    self.site_name,
                     default.join(", ")
                 )
             }
-            PortTarget::Tunnel(site) => {
+            PortTarget::Tunnel(id) => {
+                let site = &self.site_name;
                 // The default trunk as it is after ports moved here.
                 let mut after = draft.local.clone();
-                let _ = after.assign_trunk(Some(site), self.chosen.clone());
+                let _ =
+                    after.assign_trunk(Some(*id), self.chosen.clone(), |i| draft.network.label(i));
                 format!(
                     "A segment of its own, bridge {}: {}. Only the network on these ports reaches {site} through this site.",
                     bridge_for(&self.chosen[0], after.main_trunk().unwrap_or_default()),
@@ -234,16 +246,16 @@ impl PortPicker {
         let local = &draft.local;
         let here = match &self.target {
             PortTarget::Default => None,
-            PortTarget::Tunnel(site) => Some(site.as_str()),
+            PortTarget::Tunnel(site) => Some(*site),
         };
         if here.is_some() && local.trunk.iter().any(|p| p == name) {
             return Some("in the default trunk".into());
         }
-        let others: Vec<&str> = local
+        let others: Vec<String> = local
             .tunnel_trunks
             .iter()
-            .filter(|(site, ports)| Some(site.as_str()) != here && ports.iter().any(|p| p == name))
-            .map(|(site, _)| site.as_str())
+            .filter(|(site, ports)| Some(**site) != here && ports.iter().any(|p| p == name))
+            .map(|(site, _)| draft.network.label(*site))
             .collect();
         (!others.is_empty()).then(|| format!("trunk of the tunnel to {}", others.join(", ")))
     }
@@ -312,13 +324,14 @@ impl PortPicker {
         let (tunnel, path) = match &self.target {
             PortTarget::Default => (None, FieldPath::local("trunk")),
             PortTarget::Tunnel(site) => (
-                Some(site.as_str()),
+                Some(*site),
                 FieldPath::local(&format!("tunnels.{site}.trunk")),
             ),
         };
+        let network = draft.network.clone();
         candidate
             .local
-            .assign_trunk(tunnel, self.chosen.clone())
+            .assign_trunk(tunnel, self.chosen.clone(), |id| network.label(id))
             .map_err(|e| format!("{e}."))?;
         candidate.revalidate();
         let problem = candidate
@@ -339,11 +352,11 @@ impl PortPicker {
         let tunnel = match &self.target {
             PortTarget::Default if self.chosen.is_empty() => return Vec::new(),
             PortTarget::Default => None,
-            PortTarget::Tunnel(site) => Some(site.as_str()),
+            PortTarget::Tunnel(site) => Some(*site),
         };
         let mut local = draft.local.clone();
         local
-            .assign_trunk(tunnel, self.chosen.clone())
+            .assign_trunk(tunnel, self.chosen.clone(), |id| draft.network.label(id))
             .unwrap_or_default()
             .into_iter()
             .map(|n| format!("{n}."))
@@ -356,6 +369,7 @@ mod tests {
     use super::*;
     use crate::tui::draft::Running;
     use crate::tui::fixtures;
+    use crate::tui::fixtures::id;
 
     fn draft() -> Draft {
         Draft::from_running(&Running::parse(&fixtures::config_texts()).unwrap()).unwrap()
@@ -416,7 +430,7 @@ mod tests {
     #[test]
     fn a_tunnel_without_ports_uses_the_default_trunk() {
         let d = draft();
-        let mut picker = PortPicker::new(PortTarget::Tunnel("haus2".into()), &d);
+        let mut picker = PortPicker::new(PortTarget::Tunnel(id("haus2")), &d);
         assert!(picker.chosen.is_empty());
         let rows = picker.rows(&d, &fixtures::interfaces());
         // The default trunk's port can be chosen (it would move here).
@@ -429,9 +443,12 @@ mod tests {
         picker.add_manual(&fixtures::interfaces());
         assert_eq!(picker.chosen, ["usb0"]);
         let saved = picker.apply(&d).expect("valid");
-        assert_eq!(saved.local.tunnel_trunks.get("haus2").unwrap(), &["usb0"]);
+        assert_eq!(
+            saved.local.tunnel_trunks.get(&id("haus2")).unwrap(),
+            &["usb0"]
+        );
         // usb0 is not on the host: listed as missing, can be taken out.
-        let mut again = PortPicker::new(PortTarget::Tunnel("haus2".into()), &saved);
+        let mut again = PortPicker::new(PortTarget::Tunnel(id("haus2")), &saved);
         let rows = again.rows(&saved, &fixtures::interfaces());
         assert!(row(&rows, "usb0").missing);
         again.toggle(row(&rows, "usb0"));
@@ -447,16 +464,19 @@ mod tests {
         let mut d = draft();
         d.local
             .tunnel_trunks
-            .insert("buero".into(), vec!["ens18".into()]);
+            .insert(id("buero"), vec!["ens18".into()]);
         d.revalidate();
-        let mut picker = PortPicker::new(PortTarget::Tunnel("haus2".into()), &d);
+        let mut picker = PortPicker::new(PortTarget::Tunnel(id("haus2")), &d);
         let rows = picker.rows(&d, &fixtures::interfaces());
         let ens18 = row(&rows, "ens18");
         assert_eq!(ens18.blocked, None);
         assert_eq!(ens18.note.as_deref(), Some("trunk of the tunnel to buero"));
         picker.toggle(ens18);
         let saved = picker.apply(&d).expect("the same list: one segment");
-        assert_eq!(saved.local.tunnel_trunks.get("haus2").unwrap(), &["ens18"]);
+        assert_eq!(
+            saved.local.tunnel_trunks.get(&id("haus2")).unwrap(),
+            &["ens18"]
+        );
         assert!(picker.summary(&saved).contains("bridge wl-ens18"));
         // A different list takes the port: buero keeps nothing and uses
         // the default trunk then.
@@ -464,7 +484,7 @@ mod tests {
         picker.add_manual(&fixtures::interfaces());
         assert!(picker.effects(&d)[0].contains("moves from the tunnel to buero"));
         let moved = picker.apply(&d).expect("moved");
-        assert!(!moved.local.tunnel_trunks.contains_key("buero"));
+        assert!(!moved.local.tunnel_trunks.contains_key(&id("buero")));
     }
 
     #[test]
@@ -485,7 +505,7 @@ mod tests {
         let saved = picker.apply(&d).expect("saved");
         assert_eq!(saved.local.trunk, ["ens19", "ens18"]);
         // The same for a tunnel of its own, and when typed.
-        let mut tunnel = PortPicker::new(PortTarget::Tunnel("haus2".into()), &d);
+        let mut tunnel = PortPicker::new(PortTarget::Tunnel(id("haus2")), &d);
         tunnel.manual.set("ens18");
         tunnel.add_manual(&fixtures::interfaces());
         assert_eq!(tunnel.chosen, ["ens18"]);

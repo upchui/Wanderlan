@@ -10,6 +10,7 @@ use wanderlan_core::config::{
     Diagnostic, FieldPath, Local, LocalVid, Network, Severity, Site, TunnelVlans, VlanSet,
     parse_local, parse_network, render_local, render_network, validate,
 };
+use wanderlan_core::identity::SiteId;
 use wanderlan_core::topology;
 
 use super::diff::{self, DiffLine};
@@ -45,7 +46,7 @@ impl Running {
                 .map_err(|d| first("network.toml", d))?
                 .network
         };
-        let local = parse_local(&texts.local)
+        let local = parse_local(&texts.local, network.as_ref())
             .map_err(|d| first("local.toml", d))?
             .local;
         Ok(Self {
@@ -67,7 +68,7 @@ impl Running {
 
     /// Canonical `local.toml`.
     pub fn local_text(&self) -> String {
-        render_local(&self.local)
+        render_local(&self.local, self.network.as_ref())
     }
 }
 
@@ -145,27 +146,26 @@ impl Draft {
         merged.sites = now
             .sites
             .iter()
-            .filter_map(|n| match (base.site(&n.name), mine.site(&n.name)) {
+            .filter_map(|n| match (base.site(n.id), mine.site(n.id)) {
                 (Some(b), Some(d)) if d != b => {
                     if n != b && n != d {
-                        both.push(format!("site {}", n.name));
+                        both.push(format!("site {}", now.label(n.id)));
                     }
-                    // Its identity and (for another site) its ports are its
-                    // own: always as they run now.
+                    // The ports of another site are its own: always as they
+                    // run now.
                     let mut site = d.clone();
-                    site.id = n.id.or(d.id);
-                    if Some(n.name.as_str()) != self.local.self_name.as_deref() {
+                    if Some(n.id) != self.local.self_id {
                         site.ports = n.ports;
                     }
                     Some(site)
                 }
-                // Removed (or renamed) in the draft.
+                // Removed in the draft.
                 (Some(_), None) => None,
                 _ => Some(n.clone()),
             })
             .collect();
         for site in &mine.sites {
-            if base.site(&site.name).is_none() && merged.site(&site.name).is_none() {
+            if base.site(site.id).is_none() && merged.site(site.id).is_none() {
                 merged.sites.push(site.clone());
             }
         }
@@ -178,13 +178,13 @@ impl Draft {
             }
         }
         for t in &base.tunnels {
-            let [a, b] = &t.sites;
+            let [a, b] = t.sites;
             if mine.tunnel_limit(a, b).is_none() {
                 merged.set_tunnel_limit(a, b, None);
             }
         }
         for t in &mine.tunnels {
-            let [a, b] = &t.sites;
+            let [a, b] = t.sites;
             if base.tunnel_limit(a, b) != Some(&t.vlans) {
                 merged.set_tunnel_limit(a, b, Some(t.vlans.clone()));
             }
@@ -202,7 +202,7 @@ impl Draft {
                     }
                 };
             }
-            local_setting!(self_name);
+            local_setting!(self_id);
             local_setting!(trunk);
             local_setting!(tunnel_trunks);
             local_setting!(commit_timeout);
@@ -244,7 +244,7 @@ impl Draft {
 
     /// Canonical `local.toml` of the draft.
     pub fn local_text(&self) -> String {
-        render_local(&self.local)
+        render_local(&self.local, Some(&self.network))
     }
 
     /// Number of errors.
@@ -280,8 +280,8 @@ impl Draft {
             return None;
         }
         let site = self.network.sites.remove(index);
-        self.network.maps.retain(|m| m.site != site.name);
-        self.network.tunnels.retain(|t| !t.touches(&site.name));
+        self.network.maps.retain(|m| m.site != site.id);
+        self.network.tunnels.retain(|t| !t.touches(site.id));
         self.revalidate();
         Some(site)
     }
@@ -296,12 +296,15 @@ impl Draft {
         true
     }
 
-    /// Renames the site `old` to `new` with everything that names it: the
-    /// site itself, mappings, `managed_by`, `uplink`, tunnel limits, `self`
-    /// and the trunk of the tunnel to it.
-    pub fn rename_references(&mut self, old: &str, new: &str) {
-        self.network.rename_site(old, new);
-        self.local.rename_site(old, new);
+    /// Renames the site `id` to `new`. Everything refers to it by its
+    /// identity; a site known by its name (no identity of its own yet) gets
+    /// the provisional identity of its new name, everywhere.
+    pub fn rename_site(&mut self, id: SiteId, new: &str) {
+        let provisional = self.network.site(id).is_some_and(|s| !s.has_identity());
+        self.network.rename_site(id, new);
+        if provisional {
+            self.local.rekey(id, SiteId::provisional(new));
+        }
     }
 
     /// How many things the draft changes against `running`: settings,
@@ -312,12 +315,9 @@ impl Draft {
             return 0;
         };
         let new = &self.network;
-        // A rename is one change of its site; what names the site follows.
-        let renamed = wanderlan_core::rename::renames(before, new);
-        let mut base = before.clone();
-        for (from, to) in &renamed {
-            base.rename_site(from, to);
-        }
+        // A site of an older version renamed is one change of its site,
+        // though its provisional identity changes.
+        let (base, _) = wanderlan_core::rename::rekeyed(before, new);
         let old = &base;
         let settings = [
             old.vlans != new.vlans,
@@ -330,17 +330,20 @@ impl Draft {
         .iter()
         .filter(|c| **c)
         .count();
+        // A site of an older version renamed got another (provisional)
+        // identity: still one change.
         let sites = new
             .sites
             .iter()
             .filter(|s| {
-                old.site(&s.name) != Some(*s) || renamed.iter().any(|(_, to)| *to == s.name)
+                old.site(s.id) != Some(*s)
+                    || (before.site(s.id).is_none() && old.site(s.id).is_some())
             })
             .count()
             + old
                 .sites
                 .iter()
-                .filter(|s| new.site(&s.name).is_none())
+                .filter(|s| new.site(s.id).is_none())
                 .count();
         let added = new.maps.iter().filter(|m| !old.maps.contains(m)).count();
         let removed = old.maps.iter().filter(|m| !new.maps.contains(m)).count();
@@ -349,14 +352,14 @@ impl Draft {
             .tunnels
             .iter()
             .chain(new.tunnels.iter())
-            .map(|t| &t.sites)
+            .map(|t| t.sites)
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
-            .filter(|[a, b]| old.tunnel_limit(a, b) != new.tunnel_limit(a, b))
+            .filter(|[a, b]| old.tunnel_limit(*a, *b) != new.tunnel_limit(*a, *b))
             .count();
         let old_local = running.map(|r| &r.local);
         let local = old_local.map_or(0, |l| {
-            usize::from(l.self_name != self.local.self_name)
+            usize::from(l.self_id != self.local.self_id)
                 + usize::from(l.trunk != self.local.trunk)
                 + usize::from(l.commit_timeout != self.local.commit_timeout)
                 + usize::from(l.mtu_probe_interval != self.local.mtu_probe_interval)
@@ -375,13 +378,33 @@ impl Draft {
     /// The rows of the tunnel table: every tunnel of the network, then the
     /// limits of site pairs without a tunnel (so they can be removed).
     pub fn tunnel_rows(&self) -> Vec<TunnelRow> {
+        let mut rows = self.tunnel_rows_by_id();
+        // Shown by name: each pair and the rows.
+        let network = &self.network;
+        for row in &mut rows {
+            let [a, b] = row.sites;
+            if network.label(b) < network.label(a) {
+                row.sites = [b, a];
+            }
+        }
+        rows.sort_by_cached_key(|r| {
+            (
+                r.servers.is_none(),
+                network.label(r.sites[0]),
+                network.label(r.sites[1]),
+            )
+        });
+        rows
+    }
+
+    fn tunnel_rows_by_id(&self) -> Vec<TunnelRow> {
         let network = &self.network;
         let mut rows: Vec<TunnelRow> = topology::edges(network)
             .into_iter()
             .map(|(a, b, servers)| TunnelRow {
-                carries: topology::tunnel_vlans(network, &a, &b),
-                limit: network.tunnel_limit(&a, &b).cloned(),
-                entry: network.tunnels.iter().position(|t| t.is(&a, &b)),
+                carries: topology::tunnel_vlans(network, a, b),
+                limit: network.tunnel_limit(a, b).cloned(),
+                entry: network.tunnels.iter().position(|t| t.is(a, b)),
                 servers: Some(servers),
                 sites: [a, b],
             })
@@ -389,7 +412,7 @@ impl Draft {
         for (i, tunnel) in network.tunnels.iter().enumerate() {
             if !rows.iter().any(|r| r.sites == tunnel.sites) {
                 rows.push(TunnelRow {
-                    sites: tunnel.sites.clone(),
+                    sites: tunnel.sites,
                     servers: None,
                     carries: None,
                     limit: Some(tunnel.vlans.clone()),
@@ -418,7 +441,7 @@ impl Draft {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelRow {
     /// The two sites, the smaller name first.
-    pub sites: [String; 2],
+    pub sites: [SiteId; 2],
     /// Between two servers; `None` if there is no tunnel (only a limit).
     pub servers: Option<bool>,
     /// What the tunnel carries; `None` if there is no tunnel.
@@ -449,18 +472,14 @@ fn worst<'a>(diags: impl Iterator<Item = &'a Diagnostic>) -> Option<Severity> {
 /// Compares two networks ignoring the revision counter and the order of
 /// the mappings and tunnel limits (the daemon may return them in another).
 pub fn same_network(a: &Network, b: &Network) -> bool {
-    fn maps(n: &Network) -> Vec<(&str, u16, LocalVid)> {
-        let mut list: Vec<_> = n
-            .maps
-            .iter()
-            .map(|m| (m.site.as_str(), m.shared, m.local))
-            .collect();
+    fn maps(n: &Network) -> Vec<(SiteId, u16, LocalVid)> {
+        let mut list: Vec<_> = n.maps.iter().map(|m| (m.site, m.shared, m.local)).collect();
         list.sort_unstable();
         list
     }
     fn tunnels(n: &Network) -> Vec<&TunnelVlans> {
         let mut list: Vec<_> = n.tunnels.iter().collect();
-        list.sort_unstable_by(|x, y| x.sites.cmp(&y.sites));
+        list.sort_unstable_by_key(|x| x.sites);
         list
     }
     a.control_port == b.control_port
@@ -478,13 +497,14 @@ pub fn same_network(a: &Network, b: &Network) -> bool {
 mod tests {
     use super::*;
     use crate::tui::fixtures;
+    use crate::tui::fixtures::id;
 
     #[test]
     fn running_parses_texts() {
         let running = Running::parse(&fixtures::config_texts()).unwrap();
         assert_eq!(running.revision, 7);
         assert_eq!(running.network.as_ref().unwrap().sites.len(), 6);
-        assert_eq!(running.local.self_name.as_deref(), Some("heim"));
+        assert_eq!(running.local.self_id, Some(id("heim")));
     }
 
     #[test]
@@ -512,9 +532,12 @@ mod tests {
         assert!(draft.rebase_onto(&newer).is_empty());
         assert_eq!(draft.base_revision, 8);
         let n = &draft.network;
-        assert!(!n.site("buero").unwrap().online, "the other change stays");
+        assert!(
+            !n.by_name("buero").unwrap().online,
+            "the other change stays"
+        );
         assert_eq!(
-            n.site("haus3").unwrap().vlans,
+            n.by_name("haus3").unwrap().vlans,
             Some(VlanSet::from_range(20, 20))
         );
         // The diff shows only the own edit now.
@@ -538,7 +561,7 @@ mod tests {
             }
         }
         draft.rebase_onto(&newer);
-        let buero = draft.network.site("buero").unwrap();
+        let buero = draft.network.by_name("buero").unwrap();
         assert_eq!(buero.ports.control, Some(52821));
         assert_eq!(buero.vlans, Some(VlanSet::from_range(30, 30)));
         assert_eq!(draft.local.mss, Some(1300));
@@ -595,7 +618,7 @@ mod tests {
         draft
             .local
             .tunnel_trunks
-            .insert("haus3".into(), vec!["ens20".into()]);
+            .insert(id("haus3"), vec!["ens20".into()]);
         let haus3 = draft
             .network
             .sites
@@ -603,27 +626,27 @@ mod tests {
             .position(|s| s.name == "haus3")
             .unwrap();
         draft.network.sites[haus3].name = "haus33".into();
-        draft.rename_references("haus3", "haus33");
+        draft.rename_site(id("haus3"), "haus33");
         draft.network.sites[0].name = "home".into();
-        draft.rename_references("heim", "home");
+        draft.rename_site(id("heim"), "home");
         // buero manages haus6.
         draft.network.sites[1].name = "office".into();
-        draft.rename_references("buero", "office");
+        draft.rename_site(id("buero"), "office");
         draft.revalidate();
         assert_eq!(draft.errors(), 0, "{:?}", draft.diagnostics);
-        assert_eq!(draft.local.self_name.as_deref(), Some("home"));
-        assert!(draft.network.maps.iter().all(|m| m.site == "haus33"));
+        assert_eq!(draft.local.self_id, Some(id("home")));
+        assert!(draft.network.maps.iter().all(|m| m.site == id("haus33")));
         assert_eq!(
             draft
                 .local
                 .tunnel_trunks
-                .get("haus33")
+                .get(&id("haus33"))
                 .and_then(|p| p.first())
                 .map(String::as_str),
             Some("ens20")
         );
-        let haus6 = draft.network.site("haus6").unwrap();
-        assert_eq!(haus6.managed_by.as_deref(), Some("office"));
+        let haus6 = draft.network.by_name("haus6").unwrap();
+        assert_eq!(haus6.managed_by, Some(id("office")));
     }
 
     #[test]
@@ -645,16 +668,21 @@ mod tests {
         let mut draft = Draft::from_running(&running).unwrap();
         draft
             .network
-            .set_tunnel_limit("heim", "buero", Some(VlanSet::from_range(20, 20)));
+            .set_tunnel_limit(id("heim"), id("buero"), Some(VlanSet::from_range(20, 20)));
         draft
             .network
-            .set_tunnel_limit("haus2", "haus3", Some(VlanSet::new()));
-        draft.rename_references("buero", "zentrale");
-        assert!(draft.network.tunnel_limit("heim", "zentrale").is_some());
+            .set_tunnel_limit(id("haus2"), id("haus3"), Some(VlanSet::new()));
+        draft.rename_site(id("buero"), "zentrale");
+        assert!(
+            draft
+                .network
+                .tunnel_limit(id("heim"), id("zentrale"))
+                .is_some()
+        );
         assert_eq!(
             draft.network.tunnels[0].sites,
-            ["heim".to_string(), "zentrale".to_string()],
-            "the smaller name first"
+            wanderlan_core::config::site_pair(id("heim"), id("zentrale")),
+            "the smaller identity first"
         );
         let haus2 = draft
             .network

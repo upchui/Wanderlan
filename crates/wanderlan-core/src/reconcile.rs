@@ -138,7 +138,7 @@ impl Actual {
 
 /// Returns true if wanderlan created this link.
 pub fn is_owned(link: &LinkState) -> bool {
-    link.alias.as_deref() == Some(OWNER_ALIAS)
+    crate::desired::is_owner_alias(link.alias.as_deref())
 }
 
 /// One change to the system.
@@ -160,7 +160,11 @@ pub enum Change {
         name: String,
         peer: String,
         params: VxlanParams,
+        /// Its alias ([`crate::desired::tunnel_alias`]).
+        alias: String,
     },
+    /// Set the alias of a tunnel: its peer has another name.
+    SetAlias { name: String, alias: String },
     /// Set where a tunnel sends to, in place (the port, its VLANs and
     /// counters stay); `None`: nowhere.
     SetRemote {
@@ -256,7 +260,10 @@ impl fmt::Display for Change {
                 on_off(options.stp),
                 options.default_pvid
             ),
-            Self::CreateTunnel { name, peer, params } => write!(
+            Self::SetAlias { name, alias } => write!(f, "Labelling {name} \"{alias}\""),
+            Self::CreateTunnel {
+                name, peer, params, ..
+            } => write!(
                 f,
                 "Creating VXLAN tunnel {name} to site \"{peer}\" (VNI {}, UDP {}, {})",
                 params.vni,
@@ -663,28 +670,38 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
     for spec in &desired.tunnels {
         match actual.links.get(&spec.name) {
             Some(link) if !is_owned(link) => return Err(PlanError::Foreign(link.name.clone())),
-            Some(link) if !deleted.contains(&link.name) => port_changes(
-                PortWanted {
-                    name: &spec.name,
-                    mtu: Some(TUNNEL_MTU),
-                    isolated: spec.isolated,
-                    up: spec.enabled,
-                    up_reason: spec.down_reason.clone(),
-                    vlans: &spec.vlans,
-                },
-                link,
-                bridge_index.get(spec.bridge.as_str()).copied(),
-                &spec.bridge,
-                actual,
-                &mut settings,
-                &mut vlan_dels,
-                &mut vlan_adds,
-                &mut ups,
-            ),
+            Some(link) if !deleted.contains(&link.name) => {
+                // Its peer was renamed: the tunnel stays, its label follows.
+                if link.alias.as_deref() != Some(spec.alias.as_str()) {
+                    settings.push(Change::SetAlias {
+                        name: spec.name.clone(),
+                        alias: spec.alias.clone(),
+                    });
+                }
+                port_changes(
+                    PortWanted {
+                        name: &spec.name,
+                        mtu: Some(TUNNEL_MTU),
+                        isolated: spec.isolated,
+                        up: spec.enabled,
+                        up_reason: spec.down_reason.clone(),
+                        vlans: &spec.vlans,
+                    },
+                    link,
+                    bridge_index.get(spec.bridge.as_str()).copied(),
+                    &spec.bridge,
+                    actual,
+                    &mut settings,
+                    &mut vlan_dels,
+                    &mut vlan_adds,
+                    &mut ups,
+                );
+            }
             _ => creates.push(Change::CreateTunnel {
                 name: spec.name.clone(),
-                peer: spec.peer.clone(),
+                peer: spec.peer_name.clone(),
                 params: spec.params,
+                alias: spec.alias.clone(),
             }),
         }
     }
@@ -1128,6 +1145,13 @@ pub async fn apply<N: System>(net: &N, actual: &Actual, change: &Change) -> Resu
             };
             net.update_link(index_of(name)?, &update).await?;
         }
+        Change::SetAlias { name, alias } => {
+            let update = LinkUpdate {
+                alias: Some(alias.clone()),
+                ..LinkUpdate::default()
+            };
+            net.update_link(index_of(name)?, &update).await?;
+        }
         Change::Attach { name, bridge } => {
             let update = LinkUpdate {
                 master: Some(Some(index_of(bridge)?)),
@@ -1301,12 +1325,15 @@ pub async fn reconcile<N: System>(
             }
             if changes_links(&change) {
                 match &change {
-                    Change::CreateBridge { name, .. } | Change::CreateTunnel { name, .. } => {
-                        mark_owned(net, name).await?;
+                    Change::CreateBridge { name, .. } => {
+                        mark_owned(net, name, OWNER_ALIAS).await?;
+                    }
+                    Change::CreateTunnel { name, alias, .. } => {
+                        mark_owned(net, name, alias).await?;
                     }
                     Change::CreateVeth { router, port, .. } => {
-                        mark_owned(net, router).await?;
-                        mark_owned(net, port).await?;
+                        mark_owned(net, router, OWNER_ALIAS).await?;
+                        mark_owned(net, port, OWNER_ALIAS).await?;
                     }
                     _ => {}
                 }
@@ -1326,7 +1353,7 @@ pub async fn reconcile<N: System>(
 
 /// Sets the owner alias on a freshly created link. If that fails the link is
 /// removed again so that no unmarked interface is left behind.
-async fn mark_owned<N: System>(net: &N, name: &str) -> Result<(), SysError> {
+async fn mark_owned<N: System>(net: &N, name: &str, alias: &str) -> Result<(), SysError> {
     let link = net
         .links()
         .await?
@@ -1339,7 +1366,7 @@ async fn mark_owned<N: System>(net: &N, name: &str) -> Result<(), SysError> {
             )
         })?;
     let update = LinkUpdate {
-        alias: Some(OWNER_ALIAS.to_string()),
+        alias: Some(alias.to_string()),
         ..LinkUpdate::default()
     };
     if let Err(e) = net.update_link(link.index, &update).await {

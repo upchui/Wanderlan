@@ -127,9 +127,11 @@ fn peer_vlans(frame: &mut Frame, app: &App, peer: &str, vlan: Option<u16>, area:
 /// check.
 fn probes_line(app: &App, peer: &PeerStatus) -> Line<'static> {
     let network = app.running.as_ref().and_then(|r| r.network.as_ref());
-    let (control, tunnel) = network.map_or((0, 0), |n| {
-        (n.control_port_of(&peer.name), n.tunnel_port_of(&peer.name))
-    });
+    let (control, tunnel) = network
+        .and_then(|n| Some((n, n.find(&peer.name).ok()?.id)))
+        .map_or((0, 0), |(n, id)| {
+            (n.control_port_of(id), n.tunnel_port_of(id))
+        });
     let mut spans = vec![
         label("Probes"),
         Span::raw(format!(
@@ -231,8 +233,12 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, vlan: Option<u16>, area: R
     let limited = app.running.as_ref().is_some_and(|r| {
         r.network
             .as_ref()
-            .zip(r.local.self_name.as_deref())
-            .is_some_and(|(network, me)| network.tunnel_limit(me, &peer.name).is_some())
+            .zip(r.local.self_id)
+            .is_some_and(|(network, me)| {
+                network
+                    .find(&peer.name)
+                    .is_ok_and(|p| network.tunnel_limit(me, p.id).is_some())
+            })
     });
     let mut lines = vec![
         Line::from(vec![
@@ -345,7 +351,7 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, scroll: u16, area: Rect) {
     let Some((network, site)) = app
         .draft
         .as_ref()
-        .and_then(|d| d.network.site(name).map(|s| (&d.network, s)))
+        .and_then(|d| d.network.find(name).ok().map(|s| (&d.network, s)))
     else {
         frame.render_widget(
             Paragraph::new(format!(" {name} is not in the draft. Esc closes."))
@@ -354,11 +360,8 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, scroll: u16, area: Rect) {
         );
         return;
     };
-    let me = app
-        .draft
-        .as_ref()
-        .and_then(|d| d.local.self_name.clone())
-        .unwrap_or_default();
+    let me = app.draft.as_ref().and_then(|d| d.local.self_id);
+    let id = site.id;
     let dim = |t: &str| Span::styled(t.to_string(), theme::dim());
     let vlans_text = |v: &wanderlan_core::config::VlanSet| {
         if v.is_empty() {
@@ -371,10 +374,10 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, scroll: u16, area: Rect) {
         Line::from(vec![
             label("Role"),
             Span::raw(format::role(
-                site.uplink.as_deref(),
-                topology::has_clients(network, &site.name),
+                site.uplink.map(|up| network.label(up)).as_deref(),
+                topology::has_clients(network, id),
             )),
-            if site.name == me {
+            if Some(id) == me {
                 dim("   this site")
             } else {
                 Span::raw("")
@@ -397,14 +400,14 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, scroll: u16, area: Rect) {
             label("Ports"),
             Span::raw(format!(
                 "control {} (UDP/TCP), tunnel {} (UDP)",
-                network.control_port_of(&site.name),
-                network.tunnel_port_of(&site.name)
+                network.control_port_of(id),
+                network.tunnel_port_of(id)
             )),
         ]),
         Line::from(vec![
             label("Identity"),
             Span::raw(
-                site.id
+                site.own_id()
                     .map_or_else(|| "none yet (older version)".into(), |id| id.to_string()),
             ),
         ]),
@@ -427,11 +430,11 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, scroll: u16, area: Rect) {
             Span::raw(policy::renamers(network, site)),
         ]),
     ];
-    let clients: Vec<&str> = network
+    let clients: Vec<String> = network
         .sites
         .iter()
-        .filter(|s| s.uplink.as_deref() == Some(name))
-        .map(|s| s.name.as_str())
+        .filter(|s| s.uplink == Some(id))
+        .map(|s| network.label(s.id))
         .collect();
     if !clients.is_empty() {
         lines.push(Line::from(vec![
@@ -441,7 +444,7 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, scroll: u16, area: Rect) {
     }
     lines.push(Line::raw(""));
     lines.push(Line::styled(" Tunnels", theme::header()));
-    let tunnels = topology::tunnels_for(network, name);
+    let tunnels = topology::tunnels_for(network, id);
     if tunnels.is_empty() {
         lines.push(Line::styled("   none", theme::dim()));
     }
@@ -451,19 +454,19 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, scroll: u16, area: Rect) {
             topology::TunnelKind::Uplink => "its server",
             topology::TunnelKind::Client => "its client",
         };
-        let carries = topology::tunnel_vlans(network, name, &t.peer.name).unwrap_or_default();
+        let carries = topology::tunnel_vlans(network, id, t.peer.id).unwrap_or_default();
         let mut spans = vec![
-            Span::raw(format!("   to {:<13}", t.peer.name)),
+            Span::raw(format!("   to {:<13}", network.label(t.peer.id))),
             Span::styled(format!("{kind:<12}"), theme::dim()),
             Span::raw(format!("carries {}", vlans_text(&carries))),
         ];
-        if let Some(limit) = network.tunnel_limit(name, &t.peer.name) {
+        if let Some(limit) = network.tunnel_limit(id, t.peer.id) {
             spans.push(dim(&format!("  (limited to {})", vlans_text(limit))));
         }
         lines.push(Line::from(spans));
     }
     let maps: Vec<String> = network
-        .maps_of(name)
+        .maps_of(id)
         .map(|m| match m.local {
             LocalVid::Native => format!("source VLAN {} = untagged", m.shared),
             LocalVid::Vid(v) => format!("source VLAN {} = VLAN {v}", m.shared),
@@ -480,7 +483,7 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, scroll: u16, area: Rect) {
     if let Some(ports) = app
         .draft
         .as_ref()
-        .and_then(|d| d.local.tunnel_trunks.get(name))
+        .and_then(|d| d.local.tunnel_trunks.get(&id))
     {
         lines.push(Line::raw(""));
         lines.push(Line::from(vec![

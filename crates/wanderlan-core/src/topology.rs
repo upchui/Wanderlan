@@ -20,16 +20,26 @@
 use std::collections::BTreeSet;
 
 use crate::config::{Network, Site, VlanSet};
+use crate::identity::{IFNAME_PART_LEN, SiteId};
 
 /// Prefix of the tunnel (VXLAN) interfaces created by wanderlan.
 pub const TUNNEL_PREFIX: &str = "vx-";
+/// Prefix of the tunnel interfaces named by the identity of the peer.
+pub const TUNNEL_ID_PREFIX: &str = "vx";
 /// Prefix of the GRETAP interfaces of older versions (removed on upgrade).
 pub const LEGACY_TUNNEL_PREFIX: &str = "gt-";
 
 /// True for the name of a tunnel interface of wanderlan (also of an older
 /// version).
 pub fn is_tunnel_name(name: &str) -> bool {
-    name.starts_with(TUNNEL_PREFIX) || name.starts_with(LEGACY_TUNNEL_PREFIX)
+    name.starts_with(TUNNEL_PREFIX)
+        || name.starts_with(LEGACY_TUNNEL_PREFIX)
+        || name.strip_prefix(TUNNEL_ID_PREFIX).is_some_and(|rest| {
+            rest.len() == IFNAME_PART_LEN
+                && rest
+                    .bytes()
+                    .all(|c| c.is_ascii_lowercase() || (b'2'..=b'7').contains(&c))
+        })
 }
 
 /// What a tunnel connects, seen from the local site.
@@ -55,7 +65,7 @@ pub struct Tunnel<'a> {
 impl Tunnel<'_> {
     /// Name of the tunnel interface.
     pub fn ifname(&self) -> String {
-        tunnel_name(&self.peer.name)
+        tunnel_name(self.peer)
     }
 
     /// Server-to-server ports are isolated (split horizon); the ports of a
@@ -65,9 +75,21 @@ impl Tunnel<'_> {
     }
 }
 
-/// Name of the tunnel interface towards a peer.
-pub fn tunnel_name(peer: &str) -> String {
-    format!("{TUNNEL_PREFIX}{peer}")
+/// Name of the tunnel interface towards a peer: `vx` and the start of its
+/// identity, so that it stays when the peer is renamed and two peers with
+/// the same name get their own; `vx-<name>` for a peer of an older version
+/// without an identity.
+pub fn tunnel_name(peer: &Site) -> String {
+    if peer.has_identity() {
+        format!("{TUNNEL_ID_PREFIX}{}", peer.id.ifname_part())
+    } else {
+        format!("{TUNNEL_PREFIX}{}", peer.name)
+    }
+}
+
+/// The peer the tunnel interface `ifname` leads to.
+pub fn peer_of<'a>(network: &'a Network, ifname: &str) -> Option<&'a Site> {
+    network.sites.iter().find(|s| tunnel_name(s) == ifname)
 }
 
 /// True for a server (a site without uplink).
@@ -75,21 +97,21 @@ pub fn is_server(site: &Site) -> bool {
     site.uplink.is_none()
 }
 
-/// The tunnels the given site has to build, sorted by peer name: to its
-/// uplink, to its clients and, as a server, to every other server. A site
-/// that is not part of the network has none.
-pub fn tunnels_for<'a>(network: &'a Network, local: &str) -> Vec<Tunnel<'a>> {
+/// The tunnels the given site has to build, sorted by peer name (then by
+/// identity): to its uplink, to its clients and, as a server, to every other
+/// server. A site that is not part of the network has none.
+pub fn tunnels_for(network: &Network, local: SiteId) -> Vec<Tunnel<'_>> {
     let Some(me) = network.site(local) else {
         return Vec::new();
     };
-    let mut out: Vec<Tunnel<'a>> = network
+    let mut out: Vec<Tunnel<'_>> = network
         .sites
         .iter()
-        .filter(|peer| peer.name != local)
+        .filter(|peer| peer.id != local)
         .filter_map(|peer| {
-            let kind = if me.uplink.as_deref() == Some(peer.name.as_str()) {
+            let kind = if me.uplink == Some(peer.id) {
                 TunnelKind::Uplink
-            } else if peer.uplink.as_deref() == Some(local) {
+            } else if peer.uplink == Some(local) {
                 TunnelKind::Client
             } else if is_server(me) && is_server(peer) {
                 TunnelKind::Server
@@ -99,7 +121,7 @@ pub fn tunnels_for<'a>(network: &'a Network, local: &str) -> Vec<Tunnel<'a>> {
             Some(Tunnel { peer, kind })
         })
         .collect();
-    out.sort_by(|a, b| a.peer.name.cmp(&b.peer.name));
+    out.sort_by(|a, b| (&a.peer.name, a.peer.id).cmp(&(&b.peer.name, b.peer.id)));
     out
 }
 
@@ -108,11 +130,11 @@ pub fn tunnels_for<'a>(network: &'a Network, local: &str) -> Vec<Tunnel<'a>> {
 /// Between a site and its client: also the own VLANs of the upper site,
 /// never those of the client. Never more than the tunnel's own limit
 /// (`[[tunnel]]`).
-pub fn tunnel_vlans(network: &Network, a: &str, b: &str) -> Option<VlanSet> {
+pub fn tunnel_vlans(network: &Network, a: SiteId, b: SiteId) -> Option<VlanSet> {
     let me = network.site(a)?;
     let tunnel = tunnels_for(network, a)
         .into_iter()
-        .find(|t| t.peer.name == b)?;
+        .find(|t| t.peer.id == b)?;
     let peer = tunnel.peer;
     let with_own = |s: &Site| -> VlanSet {
         network
@@ -133,16 +155,16 @@ pub fn tunnel_vlans(network: &Network, a: &str, b: &str) -> Option<VlanSet> {
     })
 }
 
-/// All tunnels of the network as unordered site pairs (smaller name first),
-/// with `true` for tunnels between servers.
-pub fn edges(network: &Network) -> BTreeSet<(String, String, bool)> {
+/// All tunnels of the network as unordered site pairs (smaller identity
+/// first), with `true` for tunnels between servers.
+pub fn edges(network: &Network) -> BTreeSet<(SiteId, SiteId, bool)> {
     let mut out = BTreeSet::new();
     for site in &network.sites {
-        for t in tunnels_for(network, &site.name) {
-            let (a, b) = if site.name <= t.peer.name {
-                (site.name.clone(), t.peer.name.clone())
+        for t in tunnels_for(network, site.id) {
+            let (a, b) = if site.id <= t.peer.id {
+                (site.id, t.peer.id)
             } else {
-                (t.peer.name.clone(), site.name.clone())
+                (t.peer.id, site.id)
             };
             out.insert((a, b, t.kind == TunnelKind::Server));
         }
@@ -152,10 +174,10 @@ pub fn edges(network: &Network) -> BTreeSet<(String, String, bool)> {
 
 /// The chain from `site` up to its server: the site, its uplink, the uplink
 /// of that, ... Stops at a loop or an unknown site (invalid configurations).
-fn ancestors<'a>(network: &'a Network, site: &'a str) -> Vec<&'a str> {
+fn ancestors(network: &Network, site: SiteId) -> Vec<SiteId> {
     let mut chain = vec![site];
     let mut current = site;
-    while let Some(up) = network.site(current).and_then(|s| s.uplink.as_deref()) {
+    while let Some(up) = network.site(current).and_then(|s| s.uplink) {
         if chain.contains(&up) || network.site(up).is_none() {
             break;
         }
@@ -167,18 +189,18 @@ fn ancestors<'a>(network: &'a Network, site: &'a str) -> Vec<&'a str> {
 
 /// True if `site` hangs (directly or indirectly) off `root`: its chain of
 /// servers leads there. A site is not below itself.
-pub fn is_below(network: &Network, site: &str, root: &str) -> bool {
+pub fn is_below(network: &Network, site: SiteId, root: SiteId) -> bool {
     site != root && ancestors(network, site).contains(&root)
 }
 
 /// The sites below `root`: its clients, their clients, ... in the order of
 /// the network.
-pub fn below<'a>(network: &'a Network, root: &str) -> Vec<&'a str> {
+pub fn below(network: &Network, root: SiteId) -> Vec<SiteId> {
     network
         .sites
         .iter()
-        .map(|s| s.name.as_str())
-        .filter(|s| is_below(network, s, root))
+        .map(|s| s.id)
+        .filter(|s| is_below(network, *s, root))
         .collect()
 }
 
@@ -187,24 +209,21 @@ pub fn below<'a>(network: &'a Network, root: &str) -> Vec<&'a str> {
 /// server tells a site where it went, and that client would no longer know
 /// it (a server knows the whole network, so moving a site away from a server
 /// is fine).
-pub fn stranded<'a>(old: &'a Network, new: &Network) -> Option<(&'a str, &'a str)> {
+pub fn stranded(old: &Network, new: &Network) -> Option<(SiteId, SiteId)> {
     old.sites.iter().find_map(|site| {
-        let up = site.uplink.as_deref()?;
+        let up = site.uplink?;
         let up_was_client = old.site(up)?.uplink.is_some();
-        new.site(&site.name)?;
+        new.site(site.id)?;
         let known = new
             .site(up)
-            .is_some_and(|u| u.uplink.is_none() || is_below(new, &site.name, up));
-        (up_was_client && !known).then_some((site.name.as_str(), up))
+            .is_some_and(|u| u.uplink.is_none() || is_below(new, site.id, up));
+        (up_was_client && !known).then_some((site.id, up))
     })
 }
 
 /// True if a site has clients of its own.
-pub fn has_clients(network: &Network, site: &str) -> bool {
-    network
-        .sites
-        .iter()
-        .any(|s| s.uplink.as_deref() == Some(site))
+pub fn has_clients(network: &Network, site: SiteId) -> bool {
+    network.sites.iter().any(|s| s.uplink == Some(site))
 }
 
 /// The role of a site for displays: `server`, `client of hq`, or
@@ -220,9 +239,9 @@ pub fn role(uplink: Option<&str>, has_clients: bool) -> String {
 
 /// The neighbour through which `from` reaches `to`, if `to` is neither
 /// `from` itself nor a direct neighbour: shown as "via …".
-pub fn via<'a>(network: &'a Network, from: &str, to: &str) -> Option<&'a str> {
-    let from = network.site(from)?.name.as_str();
-    let to = network.site(to)?.name.as_str();
+pub fn via(network: &Network, from: SiteId, to: SiteId) -> Option<SiteId> {
+    network.site(from)?;
+    network.site(to)?;
     if from == to {
         return None;
     }
@@ -230,7 +249,7 @@ pub fn via<'a>(network: &'a Network, from: &str, to: &str) -> Option<&'a str> {
     let next = match up_from_target.iter().position(|s| *s == from) {
         // `to` hangs (indirectly) off `from`: towards that client.
         Some(pos) => *up_from_target.get(pos.checked_sub(1)?)?,
-        None => match network.site(from).and_then(|s| s.uplink.as_deref()) {
+        None => match network.site(from).and_then(|s| s.uplink) {
             // Up towards the own server.
             Some(up) => up,
             // A server: to the server `to` hangs off.
@@ -240,12 +259,12 @@ pub fn via<'a>(network: &'a Network, from: &str, to: &str) -> Option<&'a str> {
     (next != to).then_some(next)
 }
 
-/// Display order of sites given as `(name, uplink)`: every server (or site
+/// Display order of sites given as `(key, uplink)`: every server (or site
 /// whose uplink is unknown here), each followed by its clients, recursively.
 /// Returns `(index, depth)`; sites in an uplink loop come last at depth 0.
-pub fn tree_order_by<'a>(sites: &[(&'a str, Option<&'a str>)]) -> Vec<(usize, usize)> {
-    fn add<'a>(
-        sites: &[(&'a str, Option<&'a str>)],
+pub fn tree_order_by<K: PartialEq + Copy>(sites: &[(K, Option<K>)]) -> Vec<(usize, usize)> {
+    fn add<K: PartialEq + Copy>(
+        sites: &[(K, Option<K>)],
         index: usize,
         depth: usize,
         seen: &mut Vec<bool>,
@@ -258,9 +277,9 @@ pub fn tree_order_by<'a>(sites: &[(&'a str, Option<&'a str>)]) -> Vec<(usize, us
             *s = true;
         }
         out.push((index, depth));
-        let name = sites.get(index).map(|s| s.0);
+        let key = sites.get(index).map(|s| s.0);
         for (child, (_, uplink)) in sites.iter().enumerate() {
-            if uplink.is_some() && *uplink == name {
+            if uplink.is_some() && *uplink == key {
                 add(sites, child, depth + 1, seen, out);
             }
         }
@@ -291,11 +310,8 @@ pub fn tree_name(name: &str, depth: usize) -> String {
 
 /// [`tree_order_by`] for the sites of a network.
 pub fn tree_order(network: &Network) -> Vec<(usize, usize)> {
-    let sites: Vec<(&str, Option<&str>)> = network
-        .sites
-        .iter()
-        .map(|s| (s.name.as_str(), s.uplink.as_deref()))
-        .collect();
+    let sites: Vec<(SiteId, Option<SiteId>)> =
+        network.sites.iter().map(|s| (s.id, s.uplink)).collect();
     tree_order_by(&sites)
 }
 
@@ -305,17 +321,17 @@ pub fn tree_order(network: &Network) -> Vec<(usize, usize)> {
 /// valid; VLAN changes do not move addresses between ports.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardingKey {
-    edges: BTreeSet<(String, String, bool)>,
+    edges: BTreeSet<(SiteId, SiteId, bool)>,
     /// The tunnel limits: they decide where VLANs are passed on.
-    limits: Vec<([String; 2], String)>,
+    limits: Vec<([SiteId; 2], String)>,
 }
 
 /// Computes the [`ForwardingKey`] of a network.
 pub fn forwarding_key(network: &Network) -> ForwardingKey {
-    let mut limits: Vec<([String; 2], String)> = network
+    let mut limits: Vec<([SiteId; 2], String)> = network
         .tunnels
         .iter()
-        .map(|t| (t.sites.clone(), t.vlans.to_string()))
+        .map(|t| (t.sites, t.vlans.to_string()))
         .collect();
     limits.sort();
     ForwardingKey {
@@ -329,29 +345,26 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
-    use crate::config::VlanSet;
+    use crate::config::{VlanSet, site_pair};
+
+    fn id(name: &str) -> SiteId {
+        SiteId::provisional(name)
+    }
 
     fn site(name: &str, last: u8) -> Site {
-        Site {
-            name: name.into(),
-            address: Ipv4Addr::new(10, 0, 0, last),
-            id: None,
-            vlans: None,
-            own_vlans: None,
-            online: true,
-            managed_by: None,
-            self_managed: false,
-            uplink: None,
-            breakout: Default::default(),
-            ports: Default::default(),
-        }
+        Site::new(name, Ipv4Addr::new(10, 0, 0, last))
     }
 
     fn client(name: &str, last: u8, uplink: &str) -> Site {
         Site {
-            uplink: Some(uplink.into()),
+            uplink: Some(id(uplink)),
             ..site(name, last)
         }
+    }
+
+    fn edge(a: &str, b: &str, server: bool) -> (SiteId, SiteId, bool) {
+        let [a, b] = site_pair(id(a), id(b));
+        (a, b, server)
     }
 
     fn example() -> Network {
@@ -374,7 +387,7 @@ mod tests {
     }
 
     fn peers(network: &Network, site: &str) -> Vec<(String, TunnelKind)> {
-        tunnels_for(network, site)
+        tunnels_for(network, id(site))
             .iter()
             .map(|t| (t.peer.name.clone(), t.kind))
             .collect()
@@ -383,14 +396,29 @@ mod tests {
     #[test]
     fn servers_have_a_tunnel_to_every_other_server() {
         let network = example();
-        let names: Vec<String> = tunnels_for(&network, "heim")
+        let names: Vec<String> = tunnels_for(&network, id("heim"))
             .iter()
             .map(Tunnel::ifname)
             .collect();
-        assert_eq!(names, vec!["vx-buero", "vx-haus2"]);
-        assert!(tunnels_for(&network, "heim").iter().all(Tunnel::isolated));
-        assert_eq!(tunnels_for(&network, "haus2").len(), 2);
-        assert!(tunnels_for(&network, "unknown").is_empty());
+        assert_eq!(names, vec!["vx-buero", "vx-haus2"], "known by their names");
+        assert!(
+            tunnels_for(&network, id("heim"))
+                .iter()
+                .all(Tunnel::isolated)
+        );
+        assert_eq!(tunnels_for(&network, id("haus2")).len(), 2);
+        assert!(tunnels_for(&network, id("unknown")).is_empty());
+        // With an identity: named by it, whatever the site is called.
+        let mut with_id = example();
+        with_id.sites[1].id = SiteId::from_bytes([0; 32]);
+        let tunnels = tunnels_for(&with_id, id("heim"));
+        assert_eq!(tunnels[0].ifname(), "vxaaaaaaaaaaaaa");
+        assert!(is_tunnel_name("vxaaaaaaaaaaaaa"));
+        assert!(!is_tunnel_name("vxaaaaaaaaaaaa"));
+        assert_eq!(
+            peer_of(&with_id, "vxaaaaaaaaaaaaa").map(|s| s.name.as_str()),
+            Some("buero")
+        );
     }
 
     #[test]
@@ -413,7 +441,9 @@ mod tests {
         assert_eq!(peers(&network, "x"), [("marcel".to_string(), Uplink)]);
         assert_eq!(peers(&network, "dc"), [("alex".to_string(), Server)]);
         assert!(
-            !tunnels_for(&network, "marcel").iter().any(Tunnel::isolated),
+            !tunnels_for(&network, id("marcel"))
+                .iter()
+                .any(Tunnel::isolated),
             "client ports are ordinary ports"
         );
     }
@@ -421,15 +451,16 @@ mod tests {
     #[test]
     fn via_names_the_next_hop() {
         let network = with_clients();
-        assert_eq!(via(&network, "marcel", "site2"), Some("alex"));
-        assert_eq!(via(&network, "marcel", "dc"), Some("alex"));
-        assert_eq!(via(&network, "marcel", "alex"), None, "direct");
-        assert_eq!(via(&network, "alex", "x"), Some("marcel"));
-        assert_eq!(via(&network, "dc", "x"), Some("alex"));
-        assert_eq!(via(&network, "dc", "site2"), Some("alex"));
-        assert_eq!(via(&network, "x", "site2"), Some("marcel"));
-        assert_eq!(via(&network, "x", "x"), None);
-        assert_eq!(via(&network, "x", "nowhere"), None);
+        let via = |a: &str, b: &str| via(&network, id(a), id(b));
+        assert_eq!(via("marcel", "site2"), Some(id("alex")));
+        assert_eq!(via("marcel", "dc"), Some(id("alex")));
+        assert_eq!(via("marcel", "alex"), None, "direct");
+        assert_eq!(via("alex", "x"), Some(id("marcel")));
+        assert_eq!(via("dc", "x"), Some(id("alex")));
+        assert_eq!(via("dc", "site2"), Some(id("alex")));
+        assert_eq!(via("x", "site2"), Some(id("marcel")));
+        assert_eq!(via("x", "x"), None);
+        assert_eq!(via("x", "nowhere"), None);
     }
 
     #[test]
@@ -464,20 +495,20 @@ mod tests {
     fn edges_are_symmetric_and_complete() {
         let e = edges(&example());
         assert_eq!(e.len(), 3);
-        assert!(e.contains(&("buero".to_string(), "heim".to_string(), true)));
-        assert!(e.contains(&("buero".to_string(), "haus2".to_string(), true)));
-        assert!(e.contains(&("haus2".to_string(), "heim".to_string(), true)));
+        assert!(e.contains(&edge("buero", "heim", true)));
+        assert!(e.contains(&edge("buero", "haus2", true)));
+        assert!(e.contains(&edge("haus2", "heim", true)));
         let e = edges(&with_clients());
         assert_eq!(e.len(), 4);
-        assert!(e.contains(&("alex".to_string(), "marcel".to_string(), false)));
-        assert!(!e.iter().any(|(a, b, _)| a == "marcel" && b == "site2"));
+        assert!(e.contains(&edge("alex", "marcel", false)));
+        assert!(!e.contains(&edge("marcel", "site2", false)));
     }
 
     #[test]
     fn a_single_site_has_no_tunnels() {
         let mut network = Network::new(VlanSet::from_range(10, 50));
         network.sites = vec![site("first", 1)];
-        assert!(tunnels_for(&network, "first").is_empty());
+        assert!(tunnels_for(&network, id("first")).is_empty());
         assert!(edges(&network).is_empty());
     }
 
@@ -492,7 +523,7 @@ mod tests {
         assert_ne!(forwarding_key(&a), forwarding_key(&b));
         // A server that becomes a client changes the paths.
         let mut c = example();
-        c.sites[2].uplink = Some("heim".into());
+        c.sites[2].uplink = Some(id("heim"));
         assert_ne!(forwarding_key(&a), forwarding_key(&c));
     }
 
@@ -502,7 +533,7 @@ mod tests {
         // dc takes part in 30-60.
         network.sites[1].vlans = Some(VlanSet::from_range(30, 60));
         assert_eq!(
-            tunnel_vlans(&network, "alex", "dc"),
+            tunnel_vlans(&network, id("alex"), id("dc")),
             Some(VlanSet::from_range(30, 50)),
             "servers: what both have"
         );
@@ -510,31 +541,31 @@ mod tests {
         network.sites[0].own_vlans = Some(VlanSet::from_range(60, 60));
         network.sites[2].vlans = Some(VlanSet::from_range(10, 60));
         assert!(
-            tunnel_vlans(&network, "alex", "marcel")
+            tunnel_vlans(&network, id("alex"), id("marcel"))
                 .unwrap()
                 .contains(60)
         );
         assert_eq!(
-            tunnel_vlans(&network, "marcel", "alex"),
-            tunnel_vlans(&network, "alex", "marcel"),
+            tunnel_vlans(&network, id("marcel"), id("alex")),
+            tunnel_vlans(&network, id("alex"), id("marcel")),
             "the same from both ends"
         );
         // The limit narrows it, entered in either order.
-        network.set_tunnel_limit("dc", "alex", Some(VlanSet::from_range(40, 45)));
+        network.set_tunnel_limit(id("dc"), id("alex"), Some(VlanSet::from_range(40, 45)));
         assert_eq!(
-            tunnel_vlans(&network, "alex", "dc"),
+            tunnel_vlans(&network, id("alex"), id("dc")),
             Some(VlanSet::from_range(40, 45))
         );
-        network.set_tunnel_limit("alex", "dc", Some(VlanSet::new()));
-        assert_eq!(tunnel_vlans(&network, "dc", "alex"), Some(VlanSet::new()));
-        assert_eq!(network.tunnels.len(), 1);
+        network.set_tunnel_limit(id("alex"), id("dc"), Some(VlanSet::new()));
         assert_eq!(
-            network.tunnels[0].sites,
-            ["alex".to_string(), "dc".to_string()]
+            tunnel_vlans(&network, id("dc"), id("alex")),
+            Some(VlanSet::new())
         );
+        assert_eq!(network.tunnels.len(), 1);
+        assert_eq!(network.tunnels[0].sites, site_pair(id("alex"), id("dc")));
         // Two clients of one site have no tunnel.
-        assert_eq!(tunnel_vlans(&network, "marcel", "site2"), None);
-        network.set_tunnel_limit("alex", "dc", None);
+        assert_eq!(tunnel_vlans(&network, id("marcel"), id("site2")), None);
+        network.set_tunnel_limit(id("alex"), id("dc"), None);
         assert!(network.tunnels.is_empty());
     }
 }

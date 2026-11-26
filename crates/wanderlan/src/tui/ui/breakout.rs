@@ -26,7 +26,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     .areas(area);
     draw_uplinks(frame, app, uplinks);
 
-    let me = draft.local.self_name.clone().unwrap_or_default();
+    let me = draft.local.self_id;
     let live: &[BreakoutStatus] = app.status.as_ref().map_or(&[], |s| &s.breakout);
     let running = app.running.as_ref().and_then(|r| r.network.as_ref());
     let rows = app.breakout_rows();
@@ -46,11 +46,11 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 .network
                 .sites
                 .iter()
-                .position(|s| s.name == *site)
+                .position(|s| s.id == *site)
                 .unwrap_or_default();
-            let entry = draft.network.site(site).and_then(|s| s.breakout.get(vid));
+            let entry = draft.network.site(*site).and_then(|s| s.breakout.get(vid));
             let marker = match running
-                .and_then(|n| n.site(site))
+                .and_then(|n| n.site(*site))
                 .map(|s| s.breakout.get(vid))
             {
                 Some(Some(old)) if Some(old) == entry => Span::raw("  "),
@@ -58,16 +58,16 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 Some(None) | None if running.is_some() => Span::styled("+ ", theme::ok()),
                 _ => Span::raw("  "),
             };
-            let shown = draft
-                .network
-                .site(site)
-                .map_or_else(|| site.clone(), format::site_with_kind);
+            let shown = draft.network.site(*site).map_or_else(
+                || draft.network.label(*site),
+                |s| format::site_with_kind(&draft.network, s),
+            );
             let uplink = entry
                 .and_then(|b| b.uplink.clone())
                 .unwrap_or_else(|| "auto".into());
             let except = entry.map_or(0, |b| b.except.len());
             // One per segment (bridge) of this site with the VLAN.
-            let states: Vec<&BreakoutStatus> = if *site == me {
+            let states: Vec<&BreakoutStatus> = if Some(*site) == me {
                 live.iter().filter(|b| b.vid == *vid).collect()
             } else {
                 Vec::new()
@@ -165,11 +165,11 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     // tunnel, or what the view is about.
     let mut lines: Vec<Line> = Vec::new();
     if let Some((site, vid)) = rows.get(selected) {
-        if let Some(i) = draft.network.sites.iter().position(|s| s.name == *site) {
+        if let Some(i) = draft.network.sites.iter().position(|s| s.id == *site) {
             let path = FieldPath::site_field(i, &format!("breakout.{vid}"));
             lines.extend(draft.within(&path).map(diagnostic_line));
         }
-        let states: Vec<&BreakoutStatus> = if *site == me {
+        let states: Vec<&BreakoutStatus> = if Some(*site) == me {
             live.iter().filter(|b| b.vid == *vid).collect()
         } else {
             Vec::new()
@@ -231,8 +231,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_uplinks(frame: &mut Frame, app: &App, area: Rect) {
     let server = app.draft.as_ref().is_some_and(|d| {
         d.local
-            .self_name
-            .as_deref()
+            .self_id
             .and_then(|me| d.network.site(me))
             .is_some_and(wanderlan_core::topology::is_server)
     });

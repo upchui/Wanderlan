@@ -4,13 +4,23 @@
 //! messages with line numbers instead of generic serde errors. Unknown keys are
 //! rejected to catch typos.
 //!
-//! `network.toml` comes in two formats with the same model:
+//! `network.toml` comes in three formats with the same model:
+//! * format 3: `[site."<identity>"]` tables with the site's `name` inside;
+//!   every reference to a site (`server`, `managed_by`, `tunnel_vlans`) is
+//!   its identity, so several sites may have the same name. Written once
+//!   every site has an identity of its own.
 //! * format 2 (written since 1.0.21): `[site.<name>]` tables with the
 //!   mappings (`map = { <source VLAN> = <VLAN on the trunk> }`) and tunnel
 //!   limits (`tunnel_vlans = { <site> = "<VLANs>" }`) inside the site;
-//! * format 1: `[[site]]`, `[[map]]` and `[[tunnel]]` arrays. The sites
-//!   exchange the network in this format (see `render_network_wire`), so it
-//!   is read forever.
+//!   references are names.
+//! * format 1: `[[site]]`, `[[map]]` and `[[tunnel]]` arrays, references
+//!   are names. The sites exchange the network in this format as long as no
+//!   two sites share a name (see `render_network_wire`), so it is read
+//!   forever.
+//!
+//! A reference may always be an identity or a name; a name no site of the
+//! file has stands for its provisional identity
+//! ([`SiteId::provisional`]), which keeps the name.
 
 use std::net::Ipv4Addr;
 use std::ops::Range;
@@ -162,10 +172,12 @@ struct RawNetworkFile2 {
     tunnel: Option<Spanned<toml::Value>>,
 }
 
-/// `[site.<name>]` in format 2.
+/// `[site.<name>]` in format 2, `[site."<identity>"]` in format 3.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSite2 {
+    /// Format 3: the name of the site (the key is its identity).
+    name: Option<Spanned<String>>,
     address: Option<Spanned<String>>,
     id: Option<Spanned<String>>,
     server: Option<Spanned<String>>,
@@ -232,8 +244,55 @@ pub struct ParsedNetwork {
     pub spans: SpanMap,
     /// Warnings found while reading (e.g. keys that are no longer used).
     pub warnings: Vec<Diagnostic>,
+    /// The format of the file: 1 (`[[site]]`, `[[map]]`, `[[tunnel]]`), 2
+    /// (`[site.<name>]`), 3 (`[site."<identity>"]`), 0 for tables of both
+    /// format 2 and 3.
+    pub format: u8,
+}
+
+impl ParsedNetwork {
     /// The file is in format 1 (`[[site]]`, `[[map]]`, `[[tunnel]]`).
-    pub old_format: bool,
+    pub fn old_format(&self) -> bool {
+        self.format == 1
+    }
+}
+
+/// A reference to a site as written: its identity or its name.
+struct Ref {
+    text: String,
+    path: FieldPath,
+    /// Who refers, for messages: `site "x": server`.
+    what: String,
+}
+
+/// The references of one site, resolved once all sites are read.
+struct SiteRefs {
+    uplink: Option<Ref>,
+    managed_by: Option<Ref>,
+    /// `uplink` was given at all (format 1: `uplink = ""` marks a server).
+    uplink_given: bool,
+}
+
+/// The site of a mapping or a tunnel limit.
+enum Target {
+    /// The site whose table it is in.
+    Known(SiteId),
+    /// Written in it.
+    Named(Ref),
+}
+
+/// A mapping before its site is known.
+struct PendingMap {
+    site: Target,
+    local: LocalVid,
+    shared: u16,
+}
+
+/// A tunnel limit before its sites are known.
+struct PendingTunnel {
+    index: usize,
+    sites: [Target; 2],
+    vlans: VlanSet,
 }
 
 /// Result of parsing `local.toml`.
@@ -325,13 +384,155 @@ fn toml_error(file: ConfigFile, spans: &SpanMap, err: &toml::de::Error) -> Diagn
     diag
 }
 
-/// Parses `network.toml` in either format. Returns all syntax and type
-/// errors at once.
+/// Parses `network.toml` in any format. Returns all syntax and type errors
+/// at once.
 pub fn parse_network(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
+    parse_network_in(text, None)
+}
+
+/// [`parse_network`] for a part of `context`: a name the text has no site
+/// for is the site of that name in `context` (the view a client sends back
+/// lacks the sites it does not see, but names them).
+pub fn parse_network_in(
+    text: &str,
+    context: Option<&Network>,
+) -> Result<ParsedNetwork, Vec<Diagnostic>> {
     if is_format_1(text) {
-        parse_network_1(text)
+        parse_network_1(text, context)
     } else {
-        parse_network_2(text)
+        parse_network_2(text, context)
+    }
+}
+
+/// Resolves a reference: an identity as it is; a name to the site of that
+/// name in `sites`, else to the one in `context`, else to its provisional
+/// identity (which keeps the name: the validation tells if it is missing).
+/// A name several sites have is an error.
+fn resolve(
+    lw: &mut Lowering,
+    sites: &[Site],
+    context: Option<&Network>,
+    r: &Ref,
+) -> Option<SiteId> {
+    let text = r.text.trim();
+    if let Ok(id) = text.parse::<SiteId>() {
+        return Some(id);
+    }
+    let mut named = sites.iter().filter(|s| s.name == text);
+    match (named.next(), named.next()) {
+        (Some(one), None) => Some(one.id),
+        (Some(_), Some(_)) => {
+            lw.error(
+                r.path.clone(),
+                format!(
+                    "{}: \"{text}\" names several sites; write the identity of the one it means",
+                    r.what
+                ),
+            );
+            None
+        }
+        (None, _) => Some(
+            context
+                .and_then(|c| c.by_name(text))
+                .map_or_else(|| SiteId::provisional(text), |s| s.id),
+        ),
+    }
+}
+
+/// Fills in the references once all sites are read.
+fn link(
+    lw: &mut Lowering,
+    network: &mut Network,
+    refs: Vec<SiteRefs>,
+    maps: Vec<PendingMap>,
+    tunnels: Vec<PendingTunnel>,
+    context: Option<&Network>,
+    format_1: bool,
+) {
+    // Sites without an identity are known by their name alone.
+    for (i, site) in network.sites.iter().enumerate() {
+        if site.has_identity() {
+            continue;
+        }
+        if let Some(first) = network.sites[..i]
+            .iter()
+            .position(|s| s.name == site.name && !s.has_identity())
+        {
+            lw.error(
+                FieldPath::site_field(i, "name"),
+                format!(
+                    "site \"{}\" is defined twice (also site #{}); two sites may only share a name once both have an identity (a wanderlan version that has one)",
+                    site.name,
+                    first + 1
+                ),
+            );
+        }
+    }
+    for (i, r) in refs.into_iter().enumerate() {
+        let uplink = r
+            .uplink
+            .and_then(|u| resolve(lw, &network.sites, context, &u));
+        let managed_by = r
+            .managed_by
+            .and_then(|m| resolve(lw, &network.sites, context, &m));
+        let me = network.sites[i].id;
+        // Configurations from before uplinks: a site that joined with an
+        // invitation (it has a manager) hangs off that site.
+        let uplink = match (uplink, managed_by) {
+            (None, Some(m))
+                if format_1 && !r.uplink_given && m != me && network.site(m).is_some() =>
+            {
+                Some(m)
+            }
+            (uplink, _) => uplink,
+        };
+        let site = &mut network.sites[i];
+        site.uplink = uplink;
+        site.managed_by = managed_by;
+    }
+    let target = |lw: &mut Lowering, network: &Network, t: &Target| match t {
+        Target::Known(id) => Some(*id),
+        Target::Named(r) => resolve(lw, &network.sites, context, r),
+    };
+    for m in maps {
+        if let Some(site) = target(lw, network, &m.site) {
+            network.maps.push(VlanMap {
+                site,
+                local: m.local,
+                shared: m.shared,
+            });
+        }
+    }
+    for t in tunnels {
+        let [a, b] = &t.sites;
+        let (Some(a), Some(b)) = (target(lw, network, a), target(lw, network, b)) else {
+            continue;
+        };
+        let path = FieldPath::tunnel_field(t.index, "between");
+        if a == b {
+            let name = network.label(a);
+            lw.error(
+                path,
+                format!("tunnel limit: a tunnel connects two sites, not \"{name}\" with itself"),
+            );
+            continue;
+        }
+        let sites = site_pair(a, b);
+        // Format 2: written at both of its sites.
+        if !format_1 && network.tunnels.iter().any(|t| t.sites == sites) {
+            let (a, b) = (network.label(a), network.label(b));
+            lw.error(
+                path,
+                format!(
+                    "the tunnel between \"{a}\" and \"{b}\" is limited at both sites; keep one `tunnel_vlans` entry"
+                ),
+            );
+            continue;
+        }
+        network.tunnels.push(TunnelVlans {
+            sites,
+            vlans: t.vlans,
+        });
     }
 }
 
@@ -345,7 +546,10 @@ fn is_format_1(text: &str) -> bool {
     })
 }
 
-fn parse_network_1(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
+fn parse_network_1(
+    text: &str,
+    context: Option<&Network>,
+) -> Result<ParsedNetwork, Vec<Diagnostic>> {
     let mut lw = Lowering::new(ConfigFile::Network, text);
     let raw: RawNetworkFile = match toml::from_str(text) {
         Ok(raw) => raw,
@@ -357,7 +561,7 @@ fn parse_network_1(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
             network: None,
             spans: lw.spans,
             warnings: Vec::new(),
-            old_format: false,
+            format: 1,
         });
     }
 
@@ -372,49 +576,38 @@ fn parse_network_1(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
         Some(section) => lower_section(&mut lw, section, &mut network),
     }
 
-    let mut uplink_missing = Vec::new();
+    let mut refs = Vec::new();
     for (i, raw_site) in raw.site.into_iter().enumerate() {
         let path = FieldPath::site(i);
-        if let Some((site, given)) = lw
+        if let Some((site, r)) = lw
             .take(&path, Some(raw_site))
             .and_then(|s| lower_site(&mut lw, i, s))
         {
-            if !given {
-                uplink_missing.push(network.sites.len());
-            }
             network.sites.push(site);
+            refs.push(r);
         }
     }
-    // Configurations from before uplinks: a site that joined with an
-    // invitation (it has a manager) hangs off that site.
-    for i in uplink_missing {
-        let manager = network.sites.get(i).and_then(|s| s.managed_by.clone());
-        if let Some(m) = manager
-            && network.site(&m).is_some()
-            && network.sites.get(i).is_some_and(|s| s.name != m)
-            && let Some(site) = network.sites.get_mut(i)
-        {
-            site.uplink = Some(m);
-        }
-    }
+    let mut maps = Vec::new();
     for (i, raw_map) in raw.map.into_iter().enumerate() {
         let path = FieldPath::map(i);
         if let Some(map) = lw
             .take(&path, Some(raw_map))
             .and_then(|m| lower_map(&mut lw, i, m))
         {
-            network.maps.push(map);
+            maps.push(map);
         }
     }
+    let mut tunnels = Vec::new();
     for (i, raw_tunnel) in raw.tunnel.into_iter().enumerate() {
         let path = FieldPath::tunnel(i);
         if let Some(tunnel) = lw
             .take(&path, Some(raw_tunnel))
             .and_then(|t| lower_tunnel(&mut lw, i, t))
         {
-            network.tunnels.push(tunnel);
+            tunnels.push(tunnel);
         }
     }
+    link(&mut lw, &mut network, refs, maps, tunnels, context, true);
 
     if lw.diags.iter().any(Diagnostic::is_error) {
         Err(lw.diags)
@@ -423,12 +616,15 @@ fn parse_network_1(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
             network: Some(network),
             spans: lw.spans,
             warnings: lw.diags,
-            old_format: true,
+            format: 1,
         })
     }
 }
 
-fn parse_network_2(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
+fn parse_network_2(
+    text: &str,
+    context: Option<&Network>,
+) -> Result<ParsedNetwork, Vec<Diagnostic>> {
     let mut lw = Lowering::new(ConfigFile::Network, text);
     let raw: RawNetworkFile2 = match toml::from_str(text) {
         Ok(raw) => raw,
@@ -440,7 +636,7 @@ fn parse_network_2(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
             network: None,
             spans: lw.spans,
             warnings: Vec::new(),
-            old_format: false,
+            format: 2,
         });
     }
     for (key, value, example) in [
@@ -470,11 +666,46 @@ fn parse_network_2(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
         Some(section) => lower_section(&mut lw, section, &mut network),
     }
 
+    let (mut by_id, mut by_name) = (0usize, 0usize);
+    let mut refs = Vec::new();
+    let mut maps = Vec::new();
+    let mut tunnels = Vec::new();
     let (mut map_index, mut tunnel_index) = (0, 0);
-    for (i, (name, raw_site)) in sites.into_iter().enumerate() {
+    for (i, (key, raw_site)) in sites.into_iter().enumerate() {
         lw.span(&FieldPath::site(i), raw_site.span());
         let raw_site = raw_site.into_inner();
-        let site_name = name.get_ref().clone();
+        // Format 3: the key is the identity, the name is inside.
+        let keyed_by_id = key.get_ref().trim().parse::<SiteId>().is_ok();
+        let (name, id) = if keyed_by_id {
+            by_id += 1;
+            if let Some(id) = &raw_site.id {
+                let path = FieldPath::site_field(i, "id");
+                lw.span(&path, id.span());
+                lw.error(
+                    path,
+                    "`id` is not needed: the identity of the site is the name of its table, [site.\"<identity>\"]",
+                );
+            }
+            (raw_site.name, Some(key))
+        } else {
+            by_name += 1;
+            if let Some(name) = &raw_site.name {
+                let path = FieldPath::site_field(i, "name");
+                lw.span(&path, name.span());
+                lw.error(
+                    path,
+                    format!(
+                        "site \"{}\": `name` belongs to a table named by the identity of the site, [site.\"<identity>\"]; here the name of the table is the name",
+                        key.get_ref()
+                    ),
+                );
+            }
+            (Some(key), raw_site.id)
+        };
+        let site_name = name
+            .as_ref()
+            .map(|n| n.get_ref().clone())
+            .unwrap_or_default();
         let label = format!("site \"{site_name}\"");
         if let Some(server) = &raw_site.server
             && server.get_ref().trim().is_empty()
@@ -489,9 +720,9 @@ fn parse_network_2(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
             );
         }
         let site = RawSite {
-            name: Some(name),
+            name,
             address: raw_site.address,
-            id: raw_site.id,
+            id,
             vlans: raw_site.vlans,
             own_vlans: raw_site.own_vlans,
             online: raw_site.online,
@@ -506,21 +737,32 @@ fn parse_network_2(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
             role: None,
             hub: None,
         };
-        if let Some((site, _)) = lower_site(&mut lw, i, site) {
-            network.sites.push(site);
-        }
+        let owner = match lower_site(&mut lw, i, site) {
+            Some((site, r)) => {
+                let id = site.id;
+                network.sites.push(site);
+                refs.push(r);
+                Some(id)
+            }
+            None => None,
+        };
         if let Some(map) = raw_site.map {
             let table = map.span();
             for (source, mapped) in map.into_inner().0 {
-                if let Some(map) = lower_map_2(
+                if let Some((local, shared)) = lower_map_2(
                     &mut lw,
                     map_index,
                     &site_name,
                     table.clone(),
                     source,
                     mapped,
-                ) {
-                    network.maps.push(map);
+                ) && let Some(owner) = owner
+                {
+                    maps.push(PendingMap {
+                        site: Target::Known(owner),
+                        local,
+                        shared,
+                    });
                 }
                 map_index += 1;
             }
@@ -528,31 +770,32 @@ fn parse_network_2(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
         if let Some(limits) = raw_site.tunnel_vlans {
             let table = limits.span();
             for (other, vlans) in limits.into_inner().0 {
-                if let Some(tunnel) = lower_tunnel_2(
+                if let Some((other, vlans)) = lower_tunnel_2(
                     &mut lw,
                     tunnel_index,
                     &site_name,
                     table.clone(),
                     other,
                     vlans,
-                ) {
-                    if network.tunnels.iter().any(|t| t.sites == tunnel.sites) {
-                        let [a, b] = &tunnel.sites;
-                        lw.error(
-                            FieldPath::tunnel_field(tunnel_index, "between"),
-                            format!(
-                                "the tunnel between \"{a}\" and \"{b}\" is limited at both sites; keep one `tunnel_vlans` entry"
-                            ),
-                        );
-                    } else {
-                        network.tunnels.push(tunnel);
-                    }
+                ) && let Some(owner) = owner
+                {
+                    tunnels.push(PendingTunnel {
+                        index: tunnel_index,
+                        sites: [Target::Known(owner), Target::Named(other)],
+                        vlans,
+                    });
                 }
                 tunnel_index += 1;
             }
         }
     }
+    link(&mut lw, &mut network, refs, maps, tunnels, context, false);
 
+    let format = match (by_id, by_name) {
+        (_, 0) if by_id > 0 => 3,
+        (0, _) => 2,
+        _ => 0,
+    };
     if lw.diags.iter().any(Diagnostic::is_error) {
         Err(lw.diags)
     } else {
@@ -560,7 +803,7 @@ fn parse_network_2(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
             network: Some(network),
             spans: lw.spans,
             warnings: lw.diags,
-            old_format: false,
+            format,
         })
     }
 }
@@ -573,7 +816,7 @@ fn lower_map_2(
     table: Range<usize>,
     source: Spanned<String>,
     mapped: Spanned<RawLocalVid>,
-) -> Option<VlanMap> {
+) -> Option<(LocalVid, u16)> {
     lw.span(&FieldPath::map(i), table.clone());
     lw.span(&FieldPath::map_field(i, "site"), table);
     let shared_path = FieldPath::map_field(i, "shared");
@@ -610,11 +853,7 @@ fn lower_map_2(
             .and_then(|v| u16::try_from(v).ok())
             .map(LocalVid::Vid),
     };
-    Some(VlanMap {
-        site: site.to_string(),
-        local: local?,
-        shared: shared?,
-    })
+    Some((local?, shared?))
 }
 
 /// One entry of `tunnel_vlans = { <other site> = "<VLANs>" | "none" }`.
@@ -625,7 +864,7 @@ fn lower_tunnel_2(
     table: Range<usize>,
     other: Spanned<String>,
     vlans: Spanned<RawVlans>,
-) -> Option<TunnelVlans> {
+) -> Option<(Ref, VlanSet)> {
     lw.span(&FieldPath::tunnel(i), table);
     let between_path = FieldPath::tunnel_field(i, "between");
     lw.span(&between_path, other.span());
@@ -633,14 +872,10 @@ fn lower_tunnel_2(
     lw.span(&vlans_path, vlans.span());
     let other = other.into_inner();
     let label = format!("site \"{site}\": tunnel_vlans");
-    let sites = if other == site {
-        lw.error(
-            between_path,
-            format!("{label}: a tunnel connects two sites, not \"{site}\" with itself"),
-        );
-        None
-    } else {
-        Some(site_pair(site, &other))
+    let other_ref = Ref {
+        text: other.clone(),
+        path: between_path,
+        what: label.clone(),
     };
     let vlans = match vlans.into_inner() {
         RawVlans::Text(t) if t.trim() == "none" => Some(VlanSet::new()),
@@ -653,10 +888,7 @@ fn lower_tunnel_2(
             }
         },
     };
-    Some(TunnelVlans {
-        sites: sites?,
-        vlans: vlans?,
-    })
+    Some((other_ref, vlans?))
 }
 
 fn lower_section(lw: &mut Lowering, s: RawNetworkSection, network: &mut Network) {
@@ -737,8 +969,8 @@ fn parse_vlans(vlans: RawVlans) -> Result<VlanSet, super::vlan::VlanSetError> {
     }
 }
 
-/// Lowers one site; the flag tells whether `uplink` was given at all.
-fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
+/// Lowers one site; its references are resolved once all sites are read.
+fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, SiteRefs)> {
     let name_path = FieldPath::site_field(i, "name");
     let name = lw.take(&name_path, s.name);
     let addr_path = FieldPath::site_field(i, "address");
@@ -763,7 +995,8 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
     let online = lw
         .take(&FieldPath::site_field(i, "online"), s.online)
         .unwrap_or(true);
-    let managed_by = lw.take(&FieldPath::site_field(i, "managed_by"), s.managed_by);
+    let managed_path = FieldPath::site_field(i, "managed_by");
+    let managed_by = lw.take(&managed_path, s.managed_by);
     let self_managed = lw
         .take(&FieldPath::site_field(i, "self_managed"), s.self_managed)
         .unwrap_or(false);
@@ -775,8 +1008,9 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
     let rename_by_manager = lw.take(&rename_path, s.rename_by_manager).is_some();
     // `uplink = ""` marks a server explicitly.
     let uplink_given = s.uplink.is_some();
+    let uplink_path = FieldPath::site_field(i, "uplink");
     let uplink = lw
-        .take(&FieldPath::site_field(i, "uplink"), s.uplink)
+        .take(&uplink_path, s.uplink)
         .map(|u| u.trim().to_string())
         .filter(|u| !u.is_empty());
 
@@ -844,29 +1078,54 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
                 None
             }
         });
-    let id = id_text.and_then(|text| match text.parse::<SiteId>() {
-        Ok(id) => Some(id),
-        Err(e) => {
+    // A provisional identity only as the one of its name (format 3 names a
+    // site of an older version so).
+    let provisional = name.as_deref().map(SiteId::provisional);
+    let id = match id_text.map(|text| (text.parse::<SiteId>(), text)) {
+        None => Some(None),
+        Some((Ok(id), _)) if !id.is_provisional() || Some(id) == provisional => Some(Some(id)),
+        Some((Ok(_), text)) => {
+            lw.error(
+                id_path,
+                format!("{label}: id \"{text}\" is not the key of a box"),
+            );
+            None
+        }
+        Some((Err(e), text)) => {
             lw.error(id_path, format!("{label}: id \"{text}\" is {e}"));
             None
         }
-    });
+    };
     let breakout = breakout.map_or_else(Breakouts::new, |b| lower_breakout(lw, i, &label, b));
+    let name = name?;
+    let refs = SiteRefs {
+        uplink: uplink.map(|text| Ref {
+            text,
+            path: uplink_path,
+            what: format!("site \"{name}\": server"),
+        }),
+        managed_by: managed_by.map(|text| Ref {
+            text,
+            path: managed_path,
+            what: format!("site \"{name}\": managed_by"),
+        }),
+        uplink_given,
+    };
     Some((
         Site {
-            name: name?,
+            id: id?.unwrap_or_else(|| SiteId::provisional(&name)),
+            name,
             address: address?,
-            id,
             vlans,
             own_vlans,
             online,
-            managed_by,
+            managed_by: None,
             self_managed,
-            uplink,
+            uplink: None,
             breakout,
             ports,
         },
-        uplink_given,
+        refs,
     ))
 }
 
@@ -935,7 +1194,7 @@ fn lower_breakout(
     breakouts
 }
 
-fn lower_map(lw: &mut Lowering, i: usize, m: RawMap) -> Option<VlanMap> {
+fn lower_map(lw: &mut Lowering, i: usize, m: RawMap) -> Option<PendingMap> {
     let site_path = FieldPath::map_field(i, "site");
     let site = lw.take(&site_path, m.site);
     let local_path = FieldPath::map_field(i, "local");
@@ -944,7 +1203,13 @@ fn lower_map(lw: &mut Lowering, i: usize, m: RawMap) -> Option<VlanMap> {
     let shared = lw.take(&shared_path, m.shared);
 
     let label = format!("map #{}", i + 1);
-    let site = lw.required(site_path, site, &format!("{label}: site"));
+    let site = lw
+        .required(site_path.clone(), site, &format!("{label}: site"))
+        .map(|text| Ref {
+            text,
+            path: site_path,
+            what: label.clone(),
+        });
     let local = lw
         .required(
             local_path.clone(),
@@ -972,14 +1237,14 @@ fn lower_map(lw: &mut Lowering, i: usize, m: RawMap) -> Option<VlanMap> {
                 .and_then(|v| u16::try_from(v).ok())
         });
 
-    Some(VlanMap {
-        site: site?,
+    Some(PendingMap {
+        site: Target::Named(site?),
         local: local?,
         shared: shared?,
     })
 }
 
-fn lower_tunnel(lw: &mut Lowering, i: usize, t: RawTunnel) -> Option<TunnelVlans> {
+fn lower_tunnel(lw: &mut Lowering, i: usize, t: RawTunnel) -> Option<PendingTunnel> {
     let label = format!("tunnel #{}", i + 1);
     let between_path = FieldPath::tunnel_field(i, "between");
     let between = lw.take(&between_path, t.between);
@@ -992,7 +1257,13 @@ fn lower_tunnel(lw: &mut Lowering, i: usize, t: RawTunnel) -> Option<TunnelVlans
             &format!("{label}: between (the two sites, e.g. [\"hq\", \"lab\"])"),
         )
         .and_then(|names| match names.as_slice() {
-            [a, b] if a != b => Some(site_pair(a, b)),
+            [a, b] if a != b => Some([a, b].map(|text| {
+                Target::Named(Ref {
+                    text: text.clone(),
+                    path: between_path.clone(),
+                    what: label.clone(),
+                })
+            })),
             [a, _] => {
                 lw.error(
                     between_path.clone(),
@@ -1027,21 +1298,48 @@ fn lower_tunnel(lw: &mut Lowering, i: usize, t: RawTunnel) -> Option<TunnelVlans
                 }
             },
         });
-    Some(TunnelVlans {
+    Some(PendingTunnel {
+        index: i,
         sites: sites?,
         vlans: vlans?,
     })
 }
 
-/// Parses `local.toml`.
-pub fn parse_local(text: &str) -> Result<ParsedLocal, Vec<Diagnostic>> {
+/// True if `local.toml` names a site by its name, not by its identity (a
+/// file of an older version).
+pub fn local_uses_names(text: &str) -> bool {
+    let Ok(table) = toml::from_str::<toml::Table>(text) else {
+        return false;
+    };
+    let is_name = |s: &str| s.trim().parse::<SiteId>().is_err();
+    table
+        .get("self")
+        .and_then(toml::Value::as_str)
+        .is_some_and(is_name)
+        || table
+            .get("tunnels")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|t| t.keys().any(|k| is_name(k)))
+}
+
+/// Parses `local.toml`. Its sites (`self`, `[tunnels.<site>]`) are
+/// identities, or names (files of older versions) of sites of `network`.
+pub fn parse_local(text: &str, network: Option<&Network>) -> Result<ParsedLocal, Vec<Diagnostic>> {
     let mut lw = Lowering::new(ConfigFile::Local, text);
     let raw: RawLocal = match toml::from_str(text) {
         Ok(raw) => raw,
         Err(e) => return Err(vec![toml_error(ConfigFile::Local, &lw.spans, &e)]),
     };
+    let sites = network.map_or(&[][..], |n| n.sites.as_slice());
     let self_path = FieldPath::local("self");
-    let self_name = lw.take(&self_path, raw.self_name);
+    let self_id = lw.take(&self_path, raw.self_name).and_then(|text| {
+        let r = Ref {
+            text,
+            path: self_path,
+            what: "self".into(),
+        };
+        resolve(&mut lw, sites, None, &r)
+    });
     let trunk_path = FieldPath::local("trunk");
     let trunk = lw
         .take(&trunk_path, raw.trunk)
@@ -1049,9 +1347,18 @@ pub fn parse_local(text: &str) -> Result<ParsedLocal, Vec<Diagnostic>> {
         .unwrap_or_default();
     let mut tunnel_trunks = std::collections::BTreeMap::new();
     for (site, tunnel) in raw.tunnels.unwrap_or_default() {
-        let path = FieldPath::local(&format!("tunnels.{site}.trunk"));
+        let r = Ref {
+            path: FieldPath::local(&format!("tunnels.{site}.trunk")),
+            text: site,
+            what: "tunnels".into(),
+        };
+        let Some(id) = resolve(&mut lw, sites, None, &r) else {
+            continue;
+        };
+        // The validation names the entry by the identity.
+        let path = FieldPath::local(&format!("tunnels.{id}.trunk"));
         if let Some(t) = lw.take(&path, tunnel.trunk) {
-            tunnel_trunks.insert(site, t.into_vec());
+            tunnel_trunks.insert(id, t.into_vec());
         }
     }
     let path = FieldPath::local("commit_timeout");
@@ -1068,7 +1375,7 @@ pub fn parse_local(text: &str) -> Result<ParsedLocal, Vec<Diagnostic>> {
             .and_then(|v| u16::try_from(v).ok())
     });
     let local = Local {
-        self_name,
+        self_id,
         trunk,
         tunnel_trunks,
         commit_timeout,

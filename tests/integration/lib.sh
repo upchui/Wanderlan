@@ -41,7 +41,11 @@ x() {
 xq() { x "$@" >/dev/null 2>&1; }
 
 # entry_of <site> <name>: the entry of site <name> in the network.toml of <site>.
-entry_of() { x "$1" "sed -n '/^\[site.$2\]/,/^\[/p' /etc/wanderlan/network.toml"; }
+entry_of() { x "$1" "site-entry $2"; }
+
+# tunnel_of <box> <site>: the tunnel interface of <box> to <site> (named
+# by the identity of the site, see the node helper `tun`).
+tunnel_of() { x "$1" "tun $2"; }
 
 # Writes stdin to a file in a container.
 put() {
@@ -223,14 +227,19 @@ vlan_summary() {
     | join(",")'
 }
 
-# expect_vlans <svc> <dev> <summary>
+# expect_vlans <svc> <dev|to:site> <summary>; `to:site2` is the tunnel to
+# site2.
 expect_vlans() {
-  local got
-  got=$(vlan_summary "$1" "$2")
+  local got dev="$2" shown="$2"
+  if [[ "$dev" == to:* ]]; then
+    dev=$(tunnel_of "$1" "${dev#to:}")
+    shown="the tunnel to ${2#to:}"
+  fi
+  got=$(vlan_summary "$1" "$dev")
   if [ "$got" = "$3" ]; then
-    pass "$1: $2 carries VLANs $3"
+    pass "$1: $shown carries VLANs $3"
   else
-    fail "$1: $2 carries VLANs '$got', expected '$3'"
+    fail "$1: $shown carries VLANs '$got', expected '$3'"
   fi
 }
 

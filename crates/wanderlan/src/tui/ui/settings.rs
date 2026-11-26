@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use wanderlan_core::config::FieldPath;
 use wanderlan_core::desired::bridge_for;
+use wanderlan_core::identity::SiteId;
 use wanderlan_core::policy;
 
 use super::{list, not_configured, severity_style, titled};
@@ -87,7 +88,7 @@ pub const ROWS: [SettingRow; 7] = [
 fn value(draft: &Draft, key: &str) -> String {
     let m = &draft.network;
     let l = &draft.local;
-    let me = l.self_name.as_deref().unwrap_or_default();
+    let me = l.self_id.unwrap_or_else(|| SiteId::provisional(""));
     let ports = m.site(me).map(|s| s.ports).unwrap_or_default();
     // Its own value, or the default of the network.
     let from = |own: bool| if own { "" } else { "  (network default)" };
@@ -123,7 +124,10 @@ fn value(draft: &Draft, key: &str) -> String {
                 (None, None, Some(_)) => "  (network default)",
             }
         ),
-        "self" => draft.local.self_name.clone().unwrap_or_else(|| "-".into()),
+        "self" => draft
+            .local
+            .self_id
+            .map_or_else(|| "-".into(), |id| draft.network.label(id)),
         "trunk" if draft.local.trunk.is_empty() => "-".into(),
         "trunk" => draft.local.trunk.join(", "),
         _ => String::new(),
@@ -134,18 +138,21 @@ fn value(draft: &Draft, key: &str) -> String {
 /// sites are its clients.
 fn permissions(draft: &Draft) -> [(&'static str, String); 4] {
     let network = &draft.network;
-    let me = draft.local.self_name.as_deref().unwrap_or_default();
+    let me = draft
+        .local
+        .self_id
+        .unwrap_or_else(|| SiteId::provisional(""));
     let site = network.site(me);
     let role = site.map_or_else(
         || "-".to_string(),
         |s| {
-            let clients: Vec<&str> = network
+            let clients: Vec<String> = network
                 .sites
                 .iter()
-                .filter(|c| c.uplink.as_deref() == Some(me))
-                .map(|c| c.name.as_str())
+                .filter(|c| c.uplink == Some(me))
+                .map(|c| network.label(c.id))
                 .collect();
-            match s.uplink.as_deref() {
+            match s.uplink.map(|up| network.label(up)) {
                 // A client in the tunnel up, the server in those down.
                 Some(up) if !clients.is_empty() => format!(
                     "client of {up} (tunnel up) + server of its clients ({})",
@@ -157,14 +164,14 @@ fn permissions(draft: &Draft) -> [(&'static str, String); 4] {
         },
     );
     let managed = match (site, policy::restricted_by(network, me)) {
-        (_, Some(m)) => format!("{m}: no VLAN changes here"),
+        (_, Some(m)) => format!("{}: no VLAN changes here", network.label(m)),
         (Some(site), None) => match policy::manager(network, site) {
-            Some(m) => format!("{m}, may change its own VLANs"),
+            Some(m) => format!("{}, may change its own VLANs", network.label(m)),
             None => "- (not managed by another site)".to_string(),
         },
         (None, None) => "-".to_string(),
     };
-    let list = |names: Vec<&str>| {
+    let list = |names: Vec<String>| {
         if names.is_empty() {
             "-".to_string()
         } else {
@@ -175,16 +182,16 @@ fn permissions(draft: &Draft) -> [(&'static str, String); 4] {
         network
             .sites
             .iter()
-            .filter(|s| s.name != me && policy::manager(network, s) == Some(me))
-            .map(|s| s.name.as_str())
+            .filter(|s| s.id != me && policy::manager(network, s) == Some(me))
+            .map(|s| network.label(s.id))
             .collect(),
     );
     let clients = list(
         network
             .sites
             .iter()
-            .filter(|s| s.uplink.as_deref() == Some(me))
-            .map(|s| s.name.as_str())
+            .filter(|s| s.uplink == Some(me))
+            .map(|s| network.label(s.id))
             .collect(),
     );
     [
@@ -209,17 +216,17 @@ pub fn settings(draft: Option<&Draft>) -> Vec<Setting> {
     let mut out: Vec<Setting> = (0..ROWS.len()).map(Setting::Fixed).collect();
     if let Some(d) = draft {
         // Only the sites this site has a tunnel to.
-        let me = d.local.self_name.as_deref().unwrap_or_default();
-        let peers: Vec<String> = wanderlan_core::topology::tunnels_for(&d.network, me)
+        let me = d.local.self_id.unwrap_or_else(|| SiteId::provisional(""));
+        let peers: Vec<SiteId> = wanderlan_core::topology::tunnels_for(&d.network, me)
             .iter()
-            .map(|t| t.peer.name.clone())
+            .map(|t| t.peer.id)
             .collect();
         out.extend(
             d.network
                 .sites
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| peers.contains(&s.name))
+                .filter(|(_, s)| peers.contains(&s.id))
                 .map(|(i, _)| Setting::TunnelTrunk(i)),
         );
     }
@@ -227,9 +234,9 @@ pub fn settings(draft: Option<&Draft>) -> Vec<Setting> {
 }
 
 /// The trunk of the tunnel to `site`, for display.
-fn tunnel_trunk(draft: &Draft, site: &str) -> String {
+fn tunnel_trunk(draft: &Draft, site: SiteId) -> String {
     let default = draft.local.main_trunk().unwrap_or("-");
-    match draft.local.tunnel_trunks.get(site) {
+    match draft.local.tunnel_trunks.get(&site) {
         Some(ports) if *ports != draft.local.trunk => format!(
             "{} (own segment {})",
             ports.join(", "),
@@ -269,8 +276,8 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         )),
     ])];
     let mut selected_row = 0;
-    let me = draft.local.self_name.as_deref().unwrap_or_default();
-    let own = draft.network.sites.iter().position(|s| s.name == me);
+    let me = draft.local.self_id;
+    let own = draft.network.sites.iter().position(|s| Some(s.id) == me);
     for (i, row) in ROWS.iter().enumerate() {
         if selected == Some(Setting::Fixed(i)) {
             selected_row = rows.len();
@@ -318,11 +325,11 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         if selected == Some(*setting) {
             selected_row = rows.len();
         }
-        let path = FieldPath::local(&format!("tunnels.{}.trunk", site.name));
+        let path = FieldPath::local(&format!("tunnels.{}.trunk", site.id));
         rows.push(
             Row::new(vec![
-                Cell::from(format!("  to {}", site.name)),
-                Cell::from(tunnel_trunk(draft, &site.name)),
+                Cell::from(format!("  to {}", draft.network.label(site.id))),
+                Cell::from(tunnel_trunk(draft, site.id)),
             ])
             .style(severity_style(draft.worst_at(&path))),
         );

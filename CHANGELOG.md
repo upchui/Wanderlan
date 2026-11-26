@@ -7,6 +7,29 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
+### Identities instead of names
+
+- Every reference to a site is its identity: `network.toml` has a table
+  `[site."<identity>"]` per site with its `name` inside, `server`,
+  `managed_by` and `tunnel_vlans` name sites by their identities (the
+  names as comments), `local.toml` too (`self`, `[tunnels."<identity>"]`).
+  Names are labels: a rename changes only the name, and two sites may have
+  the same one once both have an identity (a server with two clients
+  `c1`); where a name is not unique the UI shows `c1#Ab3dK9xQ`, and the
+  command line takes that form, an identity, or a name only one site has.
+- The files are converted when the daemon starts (the old one is kept as
+  `network.toml.v1`/`.v2`); the new form is written once every site has an
+  identity, until then the one with names. Older forms are read forever,
+  and references by name still work in files edited by hand.
+- Tunnels are named by the identity of the peer (`vx` and 13 characters,
+  alias `wanderlan <site>` in `ip link`): after the update every tunnel is
+  built anew once (a few seconds), afterwards a rename keeps it up. The
+  sets of the clients behind NAT are named by their tunnels.
+- The sites exchange the network in the old form as long as every name in
+  it is unique: older sites keep working with newer ones until two sites
+  share a name; after that they get no changes until they are updated.
+- `wanderlan vlan` shows a tunnel by the site it leads to.
+
 ### Fixes, third review
 
 - Breakout only at clients: a server is where the gateways of its devices

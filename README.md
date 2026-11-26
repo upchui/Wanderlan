@@ -422,11 +422,23 @@ them); which box is behind a site, however, is protected by its key (see
 rename <site> <new-name>`. A site may always rename itself, also a
 restricted one; its manager (`managed_by`, "Changes") may rename it too; a
 client never renames its server. Its identity stays, so every site
-recognises the renamed one: the network, `self` in its own
-`local.toml` and the trunks per tunnel of the others follow, and the
-tunnels to it are built anew (about a second without traffic on them).
-Older sites do not understand a rename made by their client; update them
-first.
+recognises the renamed one: everything refers to it by its identity, so
+only its name changes; its tunnels stay up (they are named by the
+identity too). Older sites do not understand a rename made by their
+client; update them first.
+
+**Two sites with the same name.** Names are labels: two sites may have the
+same one (a server with two clients called `c1`, say), once both have an
+identity of their own (a box of this version joined as each). They are
+told apart by their identities: where a name is not unique, the terminal
+UI and the status show it with the start of its identity (`c1#Ab3dK9xQ`),
+and the command line takes that form (or the identity, or a name only one
+site has); for a name two sites have it lists them. A site added by hand
+(no box joined as it yet) is known by its name alone and needs one of its
+own. Older sites read the network only while every name in what they get
+is unique: after the first name that two sites share they keep running
+with what they have and get no changes until they are updated; update all
+sites first.
 
 ### Identities and keys
 
@@ -566,9 +578,9 @@ or `wanderlan trunk <site> ens20` / `ens20,ens21` (`default` to undo).
 ```
 hq
   ens19 ─┐
-  ens22 ─┴ br0 ───────┬── vx-office ══ office
-                      └── vx-lab    ══ lab
-  ens20 ── wl-ens20 ───── vx-dc     ══ dc
+  ens22 ─┴ br0 ───────┬── tunnel ══ office
+                      └── tunnel ══ lab
+  ens20 ── wl-ens20 ───── tunnel ══ dc
 ```
 
 **Traffic graphs.** The daemon records the traffic of its tunnels and trunk
@@ -611,20 +623,25 @@ Two files in `/etc/wanderlan/`, both maintained by the daemon:
   files in sync.
 * `local.toml`: this host only, never synchronised.
 
+Every reference to a site is its **identity** (the public key of its box,
+see [Identities and keys](#identities-and-keys)): the name of a site is
+only what it is called, it may change, and two sites may have the same one.
+The daemon writes the names as comments next to the identities.
+
 `local.toml`:
 
 ```toml
-self = "hq"         # which site of network.toml this host is
+self = "Ab3dK9xQ…="  # hq: which site of network.toml this host is
 trunk = "ens19"     # the interface carrying the VLANs (several: ["ens19", "ens22"])
 
 # Optional: the tunnel to dc uses a trunk of its own (a segment of its own).
-[tunnels.dc]
+[tunnels."Hq7pR2mT…="]  # dc
 trunk = "ens20"
 ```
 
-`network.toml` on `hq` (a server). Every site is a table `[site.<name>]`
-with everything about it: its server, its VLANs, its mappings and the limits
-of its tunnels.
+`network.toml` on `hq` (a server). Every site is a table
+`[site."<identity>"]` with everything about it: its name, its server, its
+VLANs, its mappings and the limits of its tunnels.
 
 ```toml
 [network]
@@ -635,39 +652,51 @@ commit_timeout = "60s"        # changes are rolled back unless confirmed in time
 # control_port = 51821        # UDP/TCP port for probes, sync and joining
 revision = 12                 # maintained by wanderlan
 
-[site.hq]
+[site."Ab3dK9xQ…="]
+name = "hq"
 address = "10.8.0.1"          # address in the transport network
 
-[site.dc]                     # a second server (no `server`)
+[site."Hq7pR2mT…="]           # a second server (no `server`)
+name = "dc"
 address = "10.8.0.2"
 
-[site.office]
+[site."Zp7mW2rT…="]
+name = "office"
 address = "10.8.0.11"
-server = "hq"                 # a client of hq
-managed_by = "hq"             # invited by hq
+server = "Ab3dK9xQ…="  # hq     a client of hq
+managed_by = "Ab3dK9xQ…="  # hq invited by hq
 vlans = "10,20"               # office only takes part in VLANs 10 and 20
 map = { 20 = 120 }            # source VLAN 20 = VLAN 120 at office
 
-[site.lab]
+[site."Lx4nB8qS…="]
+name = "lab"
 address = "10.8.0.12"
-server = "hq"
-managed_by = "hq"
+server = "Ab3dK9xQ…="  # hq
+managed_by = "Ab3dK9xQ…="  # hq
 online = false                # joined, not taken online yet
 map = { 30 = "native" }       # source VLAN 30 = untagged at lab
-tunnel_vlans = { hq = "30-40" }  # the tunnel to hq carries at most 30-40
+tunnel_vlans = { "Ab3dK9xQ…=" = "30-40" }  # hq: that tunnel carries at most 30-40
 # VLAN 30 reaches the internet through lab's own uplink, except 203.0.113.0/24
 breakout = { 30 = { except = ["203.0.113.0/24"] } }
 ```
 
-`map` reads like the VLAN mapping view: `source VLAN = VLAN on the trunk of
-this site` (or `"native"` for the untagged traffic). The `network.toml` of
-`lab` contains only `hq` (as its server) and `lab`.
+(The identities are 44 characters each; shortened here.) `map` reads like
+the VLAN mapping view: `source VLAN = VLAN on the trunk of this site` (or
+`"native"` for the untagged traffic). The `network.toml` of `lab` contains
+only `hq` (as its server) and `lab`.
 
-Files of wanderlan 1.0.20 and older (`[[site]]` with `name`, `[[map]]`,
-`[[tunnel]]`) are still read. The daemon writes such a file in the new form
-when it starts and keeps the old one as `network.toml.v1` (an older version
-can only read that one). The sites exchange the network in the old form, so
-sites with older and newer versions keep working together.
+A reference may also be a name only one site has: in a file edited by hand,
+`server = "hq"` works too. Older forms are still read: `[site.<name>]`
+tables with references by name (written by 1.0.21 and later until every
+site has an identity: a site of an older version that never claimed one is
+known by its name alone, and the file keeps that form until it has one), and
+`[[site]]` with `name`, `[[map]]`, `[[tunnel]]` (1.0.20 and older). The
+daemon writes a file of an older form in the current one when it starts
+and keeps the old one as `network.toml.v1` or `network.toml.v2` (an older
+version can only read that one); `local.toml` gets the identities too. The
+sites exchange the network in the oldest form (`[[site]]`) as long as every
+name in it is unique, so sites with older and newer versions keep working
+together until two sites share a name.
 
 ### Settings
 
@@ -688,22 +717,23 @@ other sites).
 | `network.control_port` | `51821` | Default UDP and TCP port of the daemons. |
 | `network.tunnel_port` | control port + 1 (`51822`) | Default UDP port of the tunnels (VXLAN). |
 | `network.revision` | `0` | Revision counter of the sync; raised by the daemon. |
-| `[site.<name>]` | | One table per site. The name is unique; `a-z`, `0-9` and `-`, at most 12 characters (it is part of the interface name `vx-<name>`). |
-| `site.<name>.address` | | Unique IPv4 address of the site in the transport network. |
-| `site.<name>.server` | none | The site this one is a client of; none: a server. |
-| `site.<name>.managed_by` | none | The site that manages this one (the inviting site). |
-| `site.<name>.self_managed` | `false` | The site may also change its own VLANs, mappings and online state. |
-| `site.<name>.online` | `true` | `false`: the tunnels of the site stay down. Sites that join start with `false`. |
-| `site.<name>.vlans` | `network.vlans` | VLANs this site takes part in. |
-| `site.<name>.own_vlans` | none | The site's own VLANs: on its trunk and towards its own clients, never towards its server. The site itself may always change them. |
-| `site.<name>.map` | none | VLAN mappings: `{ <source VLAN> = <mapped VLAN> }`. The source VLAN is the VLAN in the network (one of the VLANs of the site, not 1), the mapped VLAN its ID on the site's trunk or `"native"` (untagged), e.g. `{ 30 = "native", 40 = 140 }`. |
-| `site.<name>.tunnel_vlans` | none | The most the tunnel to another site carries (on top of the VLANs of both sites), e.g. `{ dc = "30-40" }`; `"none"`: no VLAN at all. At one of the two sites. |
-| `site.<name>.control_port` | `network.control_port` | UDP and TCP port of this site's daemon. Only the site itself changes it (`wanderlan settings control-port`). |
-| `site.<name>.tunnel_port` | its control port + 1 | UDP port of this site's tunnels; a tunnel through NAT also sends from the one above. Only the site itself changes it. |
-| `site.<name>.breakout` | none | [Local breakout](#local-breakout) per VLAN of a client (not of a server; its ID in the network; untagged: 1): `{ <VLAN> = { uplink = "<interface>", except = [<networks>] } }`, both optional, e.g. `{ 10 = {}, 20 = { uplink = "ens20", except = ["203.0.113.0/24"] } }`. Older sites do not read a network with it: update all sites first. |
-| `self` (local) | | Which site of `network.toml` this host is. |
+| `[site."<identity>"]` | | One table per site, by the identity of its box. |
+| `site.<id>.name` | | What it is called: `a-z`, `0-9` and `-`, at most 12 characters. Two sites with identities may have the same one. |
+| `site.<id>.address` | | Unique IPv4 address of the site in the transport network (clients behind one NAT share it). |
+| `site.<id>.server` | none | The site this one is a client of (its identity); none: a server. |
+| `site.<id>.managed_by` | none | The site that manages this one (the inviting site). |
+| `site.<id>.self_managed` | `false` | The site may also change its own VLANs, mappings and online state. |
+| `site.<id>.online` | `true` | `false`: the tunnels of the site stay down. Sites that join start with `false`. |
+| `site.<id>.vlans` | `network.vlans` | VLANs this site takes part in. |
+| `site.<id>.own_vlans` | none | The site's own VLANs: on its trunk and towards its own clients, never towards its server. The site itself may always change them. |
+| `site.<id>.map` | none | VLAN mappings: `{ <source VLAN> = <mapped VLAN> }`. The source VLAN is the VLAN in the network (one of the VLANs of the site, not 1), the mapped VLAN its ID on the site's trunk or `"native"` (untagged), e.g. `{ 30 = "native", 40 = 140 }`. |
+| `site.<id>.tunnel_vlans` | none | The most the tunnel to another site (its identity) carries (on top of the VLANs of both sites), e.g. `{ "Hq7pR2mT…=" = "30-40" }`; `"none"`: no VLAN at all. At one of the two sites. |
+| `site.<id>.control_port` | `network.control_port` | UDP and TCP port of this site's daemon. Only the site itself changes it (`wanderlan settings control-port`). |
+| `site.<id>.tunnel_port` | its control port + 1 | UDP port of this site's tunnels; a tunnel through NAT also sends from the one above. Only the site itself changes it. |
+| `site.<id>.breakout` | none | [Local breakout](#local-breakout) per VLAN of a client (not of a server; its ID in the network; untagged: 1): `{ <VLAN> = { uplink = "<interface>", except = [<networks>] } }`, both optional, e.g. `{ 10 = {}, 20 = { uplink = "ens20", except = ["203.0.113.0/24"] } }`. Older sites do not read a network with it: update all sites first. |
+| `self` (local) | | Which site of `network.toml` this host is (its identity). |
 | `trunk` (local) | | The interface carrying the VLANs, or several (`["ens19", "ens22"]`, bridged like switch ports, the first is the main port). |
-| `tunnels.<site>.trunk` (local) | `trunk` | A trunk of its own for the tunnel to `<site>`: one interface or several. A port belongs to one segment. |
+| `tunnels."<identity>".trunk` (local) | `trunk` | A trunk of its own for the tunnel to that site: one interface or several. A port belongs to one segment. |
 | `commit_timeout` (local) | `network.commit_timeout` | Time to confirm a change on this site (10 s to 1 h). |
 | `mtu_probe_interval` (local) | `network.mtu_probe_interval` | How often this site measures the path MTU (at least 10 s). |
 | `mss` (local) | `network.mss` | Fixed TCP MSS (536 to 1460) on this site's tunnels instead of the measured value. |
@@ -716,7 +746,8 @@ network.toml:24: error: site "office": vlans: VLAN ID 5000 is outside 1-4094
 network.toml:26: error: map #2: source VLAN 60 is not one of the VLANs of site "office" (10,20)
 ```
 
-Names and addresses are unique, servers are existing sites and never form
+Identities and addresses are unique (names too for sites without an
+identity of their own), servers are existing sites and never form
 a circle, mappings use VLANs of their site (at most one native mapping
 per site, no mapped VLAN used twice, no source VLAN mapped twice per site),
 `self` exists, and unknown keys are errors (typos). Older files load
@@ -741,11 +772,15 @@ once more before every start in case that could not run):
   anew once (a short interruption); on a kernel without them the bridge
   stays as it is and the traffic per VLAN is not shown;
 * `wl-<interface>`: the same for every further trunk ("trunk per tunnel");
-* `vx-<peer>`: a VXLAN tunnel (UDP 51822, the VNI of the two identities,
+* `vx<identity>`: a VXLAN tunnel, named by the start of the identity of
+  the peer (13 characters of base32, `vxk3fa…`; `ip link` shows its
+  alias `wanderlan <peer>`; a peer of an older version without an identity:
+  `vx-<peer>`), so a rename keeps it and two peers with the same name have
+  their own (UDP 51822, the VNI of the two identities,
   no learning, no UDP checksum and no DF outside, MTU 1500) to its server,
   to each of its clients and, on a server, to every other server. It sends
   from any address of the box; where to is its default FDB entry
-  (`bridge fdb show dev vx-<peer>`: `00:00:00:00:00:00 dst …`), for a client
+  (`bridge fdb show dev <tunnel>`: `00:00:00:00:00:00 dst …`), for a client
   behind NAT the address and port its packets come from. In `nat` mode
   both ends send from the tunnel port, otherwise from a port per
   connection. The ports between servers are `isolated` (split horizon: a
@@ -789,11 +824,12 @@ once more before every start in case that could not run):
   of these tunnels (by their VNI). On the server a tunnel packet to the
   tunnel port costs one compare of its inner ethertype (data frames always
   carry a VLAN tag); only the keepalives of the clients go on and put their
-  source address and port into the set of their client (`ep-<client>`,
+  source address and port into the set of their client (`ep-<tunnel>`,
   recognised by the VNI).
 
-Everything it creates carries the interface alias `wanderlan`; foreign
-interfaces are never touched (a foreign `br0` or `vx-*` stops the
+Everything it creates carries the interface alias `wanderlan` (a tunnel
+`wanderlan <peer>`); foreign interfaces are never touched (a foreign `br0`
+or `vx*` stops the
 configuration with an error). After a restart it adopts what is there
 without changes. After a topology change it flushes the learned MAC
 addresses, again after 10 s and 30 s while the other sites follow.
@@ -857,7 +893,7 @@ passes VLANs on between servers uses nftables rules (`wl split` in table
 The loop guard watches the forwarding database of every bridge: if a MAC
 address keeps moving between the trunk and a tunnel, or between two tunnels
 (5 times within 10 s), it shuts the tunnel port down (never the trunk),
-logs it and shows it in the TUI until `wanderlan unblock vx-<site>` (`u` on
+logs it and shows it in the TUI until `wanderlan unblock <tunnel>` (`u` on
 the peer in the TUI; a blocked trunk port: `U`) or the configuration changes.
 
 ### Operation
@@ -1004,7 +1040,8 @@ or `WANDERLAN_SOCKET`.
 * **Large transfers stall**: compare the path MTU in `wanderlan status` with
   the MTU of the VPN; set `mss` if probes are filtered.
 * **A port is BLOCKED**: the loop guard found a loop through another layer-2
-  path between sites; remove it, then `wanderlan unblock vx-<site>`.
+  path between sites; remove it, then `wanderlan unblock <tunnel>` (`u` on
+  the peer in the terminal UI).
 * **A change was rolled back**: confirm within the commit timeout (`c`,
   `wanderlan confirm`).
 * **A change did not arrive at a site**: `wanderlan log` there and on its
@@ -1075,9 +1112,15 @@ or `WANDERLAN_SOCKET`.
 * **The history for the graphs lives in the daemon**: an hour of samples
   per tunnel and trunk port in memory (a few tens of KB each), fetched by
   the terminal UI once and then only what is new (`history` request).
-* **Fixed interface names** `br0`, `wl-<interface>`, `vx-<site>` and
-  `wlbo<vid>`/`wlbp<vid>`; site names have at most 12 characters so that
-  `vx-<site>` fits.
+* **Fixed interface names** `br0`, `wl-<interface>`, `vx<identity>` and
+  `wlbo<vid>`/`wlbp<vid>`. A tunnel is named by the identity of its peer,
+  not by its name: names may repeat and change, the tunnel stays; its
+  alias tells the site. Site names keep at most 12 characters (older
+  sites check that).
+* **Identities, not names, in the files.** Every reference to a site is
+  its identity; the name is a label. The sites still exchange the network
+  in the oldest form while the names in it are unique, so a network keeps
+  working across versions until two sites share a name.
 * **Local breakout by destination, not by gateway.** The devices keep their
   gateway; the box takes the frames to public destinations out of the
   bridge before they reach the tunnel, and masquerades them (IPv6 too, so

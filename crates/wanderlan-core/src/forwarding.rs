@@ -22,36 +22,37 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::{Network, VID_MAX, VID_MIN, VlanSet};
+use crate::identity::SiteId;
 use crate::topology;
 
 /// How a site keeps the split horizon.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Forwarding {
     /// Peers whose tunnel port is `isolated` in the kernel.
-    pub isolated: BTreeSet<String>,
+    pub isolated: BTreeSet<SiteId>,
     /// Instead of `isolated`: the tunnels (by peer) that must not pass the
     /// VLANs on to each other.
-    pub split: Vec<(BTreeSet<String>, VlanSet)>,
+    pub split: Vec<(BTreeSet<SiteId>, VlanSet)>,
     /// Where VLANs are passed on between server tunnels here: the VLANs and
     /// the groups of peers between which they pass.
-    pub passes: Vec<(VlanSet, Vec<BTreeSet<String>>)>,
+    pub passes: Vec<(VlanSet, Vec<BTreeSet<SiteId>>)>,
 }
 
 /// A tunnel of the network that carries VLANs.
 struct Edge {
-    a: String,
-    b: String,
+    a: SiteId,
+    b: SiteId,
     servers: bool,
     vlans: VlanSet,
 }
 
 fn edges(network: &Network) -> Vec<Edge> {
-    let online = |name: &str| network.site(name).is_some_and(|s| s.online);
+    let online = |id: SiteId| network.site(id).is_some_and(|s| s.online);
     topology::edges(network)
         .into_iter()
-        .filter(|(a, b, _)| online(a) && online(b))
+        .filter(|(a, b, _)| online(*a) && online(*b))
         .filter_map(|(a, b, servers)| {
-            let vlans = topology::tunnel_vlans(network, &a, &b)?;
+            let vlans = topology::tunnel_vlans(network, a, b)?;
             (!vlans.is_empty()).then_some(Edge {
                 a,
                 b,
@@ -84,16 +85,16 @@ fn classes(edges: &[Edge]) -> Vec<(Vec<usize>, VlanSet)> {
 
 /// The block of every edge of the graph (Hopcroft–Tarjan).
 fn blocks(edges: &[Edge], members: &[usize]) -> BTreeMap<usize, usize> {
-    let mut nodes: BTreeMap<&str, usize> = BTreeMap::new();
+    let mut nodes: BTreeMap<SiteId, usize> = BTreeMap::new();
     for &i in members {
-        for name in [edges[i].a.as_str(), edges[i].b.as_str()] {
+        for id in [edges[i].a, edges[i].b] {
             let next = nodes.len();
-            nodes.entry(name).or_insert(next);
+            nodes.entry(id).or_insert(next);
         }
     }
     let mut adjacent: Vec<Vec<(usize, usize)>> = vec![Vec::new(); nodes.len()];
     for &i in members {
-        let (a, b) = (nodes[edges[i].a.as_str()], nodes[edges[i].b.as_str()]);
+        let (a, b) = (nodes[&edges[i].a], nodes[&edges[i].b]);
         adjacent[a].push((b, i));
         adjacent[b].push((a, i));
     }
@@ -160,33 +161,33 @@ fn groups_at(
     edges: &[Edge],
     members: &[usize],
     block_of: &BTreeMap<usize, usize>,
-    me: &str,
-) -> Vec<Vec<(String, bool)>> {
-    let mut groups: BTreeMap<usize, Vec<(String, bool)>> = BTreeMap::new();
+    me: SiteId,
+) -> Vec<Vec<(SiteId, bool)>> {
+    let mut groups: BTreeMap<usize, Vec<(SiteId, bool)>> = BTreeMap::new();
     for &i in members {
         let e = &edges[i];
         let peer = if e.a == me {
-            &e.b
+            e.b
         } else if e.b == me {
-            &e.a
+            e.a
         } else {
             continue;
         };
         groups
             .entry(block_of[&i])
             .or_default()
-            .push((peer.clone(), e.servers));
+            .push((peer, e.servers));
     }
     groups.into_values().collect()
 }
 
 /// How the site `me` keeps the split horizon in `network`.
-pub fn forwarding(network: &Network, me: &str) -> Forwarding {
+pub fn forwarding(network: &Network, me: SiteId) -> Forwarding {
     let kernel_only = || Forwarding {
         isolated: topology::tunnels_for(network, me)
             .iter()
             .filter(|t| t.isolated())
-            .map(|t| t.peer.name.clone())
+            .map(|t| t.peer.id)
             .collect(),
         split: Vec::new(),
         passes: Vec::new(),
@@ -198,18 +199,18 @@ pub fn forwarding(network: &Network, me: &str) -> Forwarding {
     }
     let edges = edges(network);
     let mut kernel = true;
-    let mut split: BTreeMap<BTreeSet<String>, VlanSet> = BTreeMap::new();
-    let mut passes: Vec<(VlanSet, Vec<BTreeSet<String>>)> = Vec::new();
+    let mut split: BTreeMap<BTreeSet<SiteId>, VlanSet> = BTreeMap::new();
+    let mut passes: Vec<(VlanSet, Vec<BTreeSet<SiteId>>)> = Vec::new();
     for (members, vlans) in classes(&edges) {
         let block_of = blocks(&edges, &members);
         let groups = groups_at(&edges, &members, &block_of, me);
-        let server_groups: Vec<BTreeSet<String>> = groups
+        let server_groups: Vec<BTreeSet<SiteId>> = groups
             .iter()
             .map(|g| {
                 g.iter()
                     .filter(|(_, servers)| *servers)
-                    .map(|(p, _)| p.clone())
-                    .collect::<BTreeSet<String>>()
+                    .map(|(p, _)| *p)
+                    .collect::<BTreeSet<SiteId>>()
             })
             .filter(|g| !g.is_empty())
             .collect();
@@ -219,7 +220,7 @@ pub fn forwarding(network: &Network, me: &str) -> Forwarding {
             passes.push((vlans.clone(), server_groups));
         }
         for group in groups.iter().filter(|g| g.len() > 1) {
-            let ports: BTreeSet<String> = group.iter().map(|(p, _)| p.clone()).collect();
+            let ports: BTreeSet<SiteId> = group.iter().map(|(p, _)| *p).collect();
             let entry = split.entry(ports).or_default();
             *entry = entry.iter().chain(vlans.iter()).collect();
         }
@@ -240,30 +241,30 @@ pub fn forwarding(network: &Network, me: &str) -> Forwarding {
 /// Sites that take part in the same VLANs but do not reach each other,
 /// because the tunnels carrying them form a ring without every direct
 /// tunnel: (VLANs, the two sites, how many such pairs there are).
-pub fn unreachable(network: &Network) -> Vec<(VlanSet, String, String, usize)> {
+pub fn unreachable(network: &Network) -> Vec<(VlanSet, SiteId, SiteId, usize)> {
     let edges = edges(network);
     let mut out = Vec::new();
     for (members, vlans) in classes(&edges) {
         let block_of = blocks(&edges, &members);
         // A frame at `node` that came in through block `from` goes on
         // through every tunnel of another block.
-        let mut sites: BTreeSet<&str> = BTreeSet::new();
+        let mut sites: BTreeSet<SiteId> = BTreeSet::new();
         for &i in &members {
-            sites.insert(&edges[i].a);
-            sites.insert(&edges[i].b);
+            sites.insert(edges[i].a);
+            sites.insert(edges[i].b);
         }
-        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut pairs: Vec<(SiteId, SiteId)> = Vec::new();
         for &start in &sites {
-            let mut reached: BTreeSet<&str> = BTreeSet::from([start]);
-            let mut seen: BTreeSet<(&str, usize)> = BTreeSet::new();
-            let mut queue: Vec<(&str, Option<usize>)> = vec![(start, None)];
+            let mut reached: BTreeSet<SiteId> = BTreeSet::from([start]);
+            let mut seen: BTreeSet<(SiteId, usize)> = BTreeSet::new();
+            let mut queue: Vec<(SiteId, Option<usize>)> = vec![(start, None)];
             while let Some((node, from)) = queue.pop() {
                 for &i in &members {
                     let e = &edges[i];
                     let next = if e.a == node {
-                        e.b.as_str()
+                        e.b
                     } else if e.b == node {
-                        e.a.as_str()
+                        e.a
                     } else {
                         continue;
                     };
@@ -276,12 +277,12 @@ pub fn unreachable(network: &Network) -> Vec<(VlanSet, String, String, usize)> {
                 }
             }
             for &other in &sites {
-                if start < other && !reached.contains(other) {
-                    pairs.push((start.to_string(), other.to_string()));
+                if start < other && !reached.contains(&other) {
+                    pairs.push((start, other));
                 }
             }
         }
-        if let Some((a, b)) = pairs.first().cloned() {
+        if let Some(&(a, b)) = pairs.first() {
             out.push((vlans, a, b, pairs.len()));
         }
     }
@@ -295,19 +296,14 @@ mod tests {
     use super::*;
     use crate::config::Site;
 
+    fn id(name: &str) -> SiteId {
+        SiteId::provisional(name)
+    }
+
     fn site(name: &str, last: u8, uplink: Option<&str>) -> Site {
         Site {
-            name: name.into(),
-            address: Ipv4Addr::new(10, 0, 0, last),
-            id: None,
-            vlans: None,
-            own_vlans: None,
-            online: true,
-            managed_by: None,
-            self_managed: false,
-            uplink: uplink.map(Into::into),
-            breakout: Default::default(),
-            ports: Default::default(),
+            uplink: uplink.map(id),
+            ..Site::new(name, Ipv4Addr::new(10, 0, 0, last))
         }
     }
 
@@ -327,23 +323,29 @@ mod tests {
     fn without(network: &mut Network, a: &str, b: &str, vid: u16) {
         let mut vlans = VlanSet::from_range(10, 20);
         vlans.remove(vid);
-        network.set_tunnel_limit(a, b, Some(vlans));
+        network.set_tunnel_limit(id(a), id(b), Some(vlans));
     }
 
-    fn set(names: &[&str]) -> BTreeSet<String> {
-        names.iter().map(|n| (*n).to_string()).collect()
+    fn set(names: &[&str]) -> BTreeSet<SiteId> {
+        names.iter().map(|n| id(n)).collect()
     }
 
     #[test]
     fn without_limits_the_kernel_isolates_the_server_tunnels() {
         let network = network();
         for me in ["a", "b", "c", "d"] {
-            let f = forwarding(&network, me);
+            let f = forwarding(&network, id(me));
             assert!(f.split.is_empty(), "{me}: {f:?}");
             assert!(f.passes.is_empty(), "{me}");
         }
-        assert_eq!(forwarding(&network, "a").isolated, set(&["b", "c", "d"]));
-        assert!(forwarding(&network, "e").isolated.is_empty(), "a client");
+        assert_eq!(
+            forwarding(&network, id("a")).isolated,
+            set(&["b", "c", "d"])
+        );
+        assert!(
+            forwarding(&network, id("e")).isolated.is_empty(),
+            "a client"
+        );
         assert!(unreachable(&network).is_empty());
     }
 
@@ -354,7 +356,7 @@ mod tests {
         for (x, y) in [("a", "b"), ("a", "d"), ("b", "d")] {
             without(&mut network, x, y, 15);
         }
-        let c = forwarding(&network, "c");
+        let c = forwarding(&network, id("c"));
         assert!(c.isolated.is_empty(), "nftables instead of isolated");
         assert_eq!(c.passes.len(), 1);
         assert_eq!(c.passes[0].0, VlanSet::from_range(15, 15));
@@ -372,7 +374,7 @@ mod tests {
             "VLAN 15 passes between all of them"
         );
         // a has only one server tunnel with VLAN 15: the kernel suffices.
-        let a = forwarding(&network, "a");
+        let a = forwarding(&network, id("a"));
         assert_eq!(a.isolated, set(&["b", "c", "d"]));
         assert!(
             unreachable(&network).is_empty(),
@@ -388,7 +390,7 @@ mod tests {
             without(&mut network, x, y, 15);
         }
         for me in ["a", "b", "c", "d"] {
-            assert!(forwarding(&network, me).passes.is_empty(), "{me}");
+            assert!(forwarding(&network, id(me)).passes.is_empty(), "{me}");
         }
         assert!(unreachable(&network).is_empty());
     }
@@ -400,7 +402,7 @@ mod tests {
         for (x, y) in [("a", "d"), ("b", "d")] {
             without(&mut network, x, y, 15);
         }
-        let c = forwarding(&network, "c");
+        let c = forwarding(&network, id("c"));
         assert_eq!(c.passes.len(), 1);
         let groups = &c.passes[0].1;
         assert!(groups.contains(&set(&["a", "b"])) && groups.contains(&set(&["d"])));
@@ -421,13 +423,13 @@ mod tests {
             without(&mut network, x, y, 15);
         }
         for me in ["a", "b", "c", "d"] {
-            assert!(forwarding(&network, me).passes.is_empty(), "{me}");
+            assert!(forwarding(&network, id(me)).passes.is_empty(), "{me}");
         }
         let gaps = unreachable(&network);
         assert_eq!(gaps.len(), 1, "{gaps:?}");
         let (vlans, a, b, count) = &gaps[0];
         assert_eq!(*vlans, VlanSet::from_range(15, 15));
-        assert_eq!((a.as_str(), b.as_str()), ("a", "c"));
+        assert_eq!((*a, *b), (id("a"), id("c")));
         // a – c and b – d, and the client e (behind a) does not reach c.
         assert_eq!(*count, 3);
     }
@@ -442,7 +444,7 @@ mod tests {
         // Nobody passes on; a, b and d no longer reach each other in VLAN 15
         // (only through c), but that is what offline means.
         for me in ["a", "b", "d"] {
-            assert!(forwarding(&network, me).passes.is_empty(), "{me}");
+            assert!(forwarding(&network, id(me)).passes.is_empty(), "{me}");
         }
     }
 }

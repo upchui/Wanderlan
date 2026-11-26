@@ -125,14 +125,6 @@ pub enum JoinError {
     /// The name is not a valid site name.
     #[error("{0}")]
     InvalidName(String),
-    /// Another site has this name.
-    #[error("the name \"{name}\" is already used by the site at {address}; choose another name")]
-    NameTaken {
-        /// The requested name.
-        name: String,
-        /// Address of the site that has it.
-        address: Ipv4Addr,
-    },
     /// Another site has this address.
     #[error(
         "the address {address} already belongs to site \"{site}\"; join as \"{site}\" or remove that site first"
@@ -184,6 +176,8 @@ pub enum JoinError {
 pub struct Admission {
     /// The network to send (and, if `added`, to apply on the inviting site).
     pub network: Network,
+    /// The identity of the joining site in it.
+    pub site: SiteId,
     /// Final name of the joining site.
     pub name: String,
     /// False if the site was already a member (same name and address): it
@@ -200,54 +194,42 @@ pub struct Admission {
 /// A client that joins again through another site now hangs off that site
 /// (it reached it, maybe not its old uplink). Servers stay servers, and a
 /// site never hangs off one of its own clients.
-fn rejoin(network: &Network, inviter: &str, name: &str) -> Option<Admission> {
-    let site = network.site(name)?;
-    let current = site.uplink.as_deref()?;
-    if current == inviter || name == inviter {
+fn rejoin(network: &Network, inviter: SiteId, site: SiteId) -> Option<Network> {
+    let current = network.site(site)?.uplink?;
+    if current == inviter || site == inviter {
         return None;
     }
     // The inviter must not hang (indirectly) off the joining site.
-    let mut up = network.site(inviter)?.uplink.as_deref();
-    let mut steps = 0;
-    while let Some(u) = up {
-        if u == name || steps > network.sites.len() {
-            return None;
-        }
-        up = network.site(u).and_then(|s| s.uplink.as_deref());
-        steps += 1;
+    if crate::topology::is_below(network, inviter, site) {
+        return None;
     }
     let mut new = network.clone();
     new.revision = next_revision(network.revision);
-    let entry = new.sites.iter_mut().find(|s| s.name == name)?;
-    entry.uplink = Some(inviter.to_string());
-    Some(Admission {
-        network: new,
-        name: name.to_string(),
-        added: false,
-        changed: true,
-        took_over: None,
-    })
+    new.site_mut(site)?.uplink = Some(inviter);
+    Some(new)
 }
 
-/// The existing site `name` joins again, with the joiner's identity and
+/// The existing site `site` joins again, with the joiner's identity and
 /// address: the same box (maybe moved), or a new box taking over the entry
 /// of one that was reset. A client joining through another site now hangs
 /// off that site.
 fn join_again(
     network: &Network,
-    inviter: &str,
-    name: &str,
+    inviter: SiteId,
+    site: SiteId,
     id: SiteId,
     address: Ipv4Addr,
 ) -> Admission {
-    let mut new = rejoin(network, inviter, name).map_or_else(|| network.clone(), |a| a.network);
+    let mut new = rejoin(network, inviter, site).unwrap_or_else(|| network.clone());
     let mut took_over = None;
-    if let Some(entry) = new.sites.iter_mut().find(|s| s.name == name) {
-        if entry.id != Some(id) {
-            took_over = entry.id;
-            entry.id = Some(id);
-        }
+    if site != id {
+        took_over = new.site(site).and_then(crate::config::Site::own_id);
+        new.rekey(site, id);
+    }
+    let mut name = String::new();
+    if let Some(entry) = new.site_mut(id) {
         entry.address = address;
+        name.clone_from(&entry.name);
     }
     let changed = new != *network;
     new.revision = if changed {
@@ -257,7 +239,8 @@ fn join_again(
     };
     Admission {
         network: new,
-        name: name.to_string(),
+        site: id,
+        name,
         added: false,
         changed,
         took_over,
@@ -300,16 +283,19 @@ pub struct Joiner<'a> {
 ///   its default name) is taken over if it does not answer any more: the box
 ///   was reset (new identity) and joins again. If it still answers, another
 ///   box at the same address is refused (every box needs its own address).
-///   A site of an older version without identity is taken over as before.
+///   A client behind a NAT, which shares the address with other boxes, is
+///   taken over only by a box of its name. A site of an older version
+///   without identity is taken over as before.
 /// * A client joining through another site now hangs off that site.
 /// * The new site is a client of the inviting site (`uplink`).
 /// * A default name (the host name) that is taken gets a suffix `-2`, `-3`,
-///   ...; a chosen name that is taken is refused.
+///   ...; a chosen name may be one another site has (they are told apart by
+///   their identities).
 pub fn add_site(
     network: &Network,
-    inviter: &str,
+    inviter: SiteId,
     joiner: Joiner<'_>,
-    alive: &BTreeSet<String>,
+    alive: &BTreeSet<SiteId>,
     rules: &SiteRules,
 ) -> Result<Admission, JoinError> {
     let Joiner { address, id, .. } = joiner;
@@ -322,8 +308,8 @@ pub fn add_site(
     }
     // The same box (its identity). The inviting site itself never joins
     // (it never counts as alive here): a copy of it is refused.
-    if let Some(existing) = network.sites.iter().find(|s| s.id == Some(id)) {
-        if existing.name == inviter {
+    if let Some(existing) = network.site(id) {
+        if existing.id == inviter {
             return Err(JoinError::IdentityInUse {
                 site: existing.name.clone(),
                 address: existing.address,
@@ -337,13 +323,13 @@ pub fn add_site(
         // A box that joins does not run yet: one with this identity that
         // answers is another box with the same key (a cloned machine), also
         // behind the same address.
-        if alive.contains(&existing.name) {
+        if alive.contains(&existing.id) {
             return Err(JoinError::IdentityInUse {
                 site: existing.name.clone(),
                 address: existing.address,
             });
         }
-        return checked(join_again(network, inviter, &existing.name, id, address));
+        return checked(join_again(network, inviter, existing.id, id, address));
     }
     // Another box at the address of a site: the site of that name first
     // (several clients may sit behind one NAT).
@@ -353,7 +339,7 @@ pub fn add_site(
         .find(|s| s.address == address && s.name == name)
         .or_else(|| network.sites.iter().find(|s| s.address == address));
     if let Some(existing) = at_address {
-        if existing.name == inviter {
+        if existing.id == inviter {
             return Err(JoinError::AddressTaken {
                 address,
                 site: existing.name.clone(),
@@ -361,16 +347,16 @@ pub fn add_site(
         }
         // A client with an identity shares its address with other boxes
         // behind the same NAT: only its name claims its entry.
-        let shared = existing.id.is_some() && existing.uplink.is_some();
+        let shared = existing.has_identity() && existing.uplink.is_some();
         let wants_it = existing.name == name || (name_is_default && !shared);
         if wants_it {
-            if existing.id.is_some() && alive.contains(&existing.name) {
+            if existing.has_identity() && alive.contains(&existing.id) {
                 return Err(JoinError::StillRunning {
                     address,
                     site: existing.name.clone(),
                 });
             }
-            return checked(join_again(network, inviter, &existing.name, id, address));
+            return checked(join_again(network, inviter, existing.id, id, address));
         }
         if !shared {
             return Err(JoinError::AddressTaken {
@@ -379,15 +365,10 @@ pub fn add_site(
             });
         }
     }
-    let name = match network.site(name) {
-        None => name.to_string(),
-        Some(taken) if !name_is_default => {
-            return Err(JoinError::NameTaken {
-                name: name.to_string(),
-                address: taken.address,
-            });
-        }
-        Some(_) => free_name(network, name),
+    let name = if name_is_default && network.named(name).next().is_some() {
+        free_name(network, name)
+    } else {
+        name.to_string()
     };
     let vlans = match rules.vlans.as_deref().map(str::trim) {
         None | Some("") => None,
@@ -399,29 +380,25 @@ pub fn add_site(
     let mut new = network.clone();
     new.revision = next_revision(network.revision);
     new.sites.push(Site {
-        name: name.clone(),
-        address,
-        id: Some(id),
+        id,
         vlans,
-        own_vlans: None,
         online: false,
-        managed_by: Some(inviter.to_string()),
+        managed_by: Some(inviter),
         self_managed: rules.allow_self,
         // Plugged into the inviting site: its only tunnel leads there.
-        uplink: Some(inviter.to_string()),
-        breakout: Default::default(),
-        ports: Default::default(),
+        uplink: Some(inviter),
+        ..Site::new(&name, address)
     });
     if let Some(shared) = rules.native {
         new.maps.push(VlanMap {
-            site: name.clone(),
+            site: id,
             local: LocalVid::Native,
             shared,
         });
     }
     for t in &rules.translations {
         new.maps.push(VlanMap {
-            site: name.clone(),
+            site: id,
             local: LocalVid::Vid(t.local),
             shared: t.shared,
         });
@@ -437,6 +414,7 @@ pub fn add_site(
     }
     Ok(Admission {
         network: new,
+        site: id,
         name,
         added: true,
         changed: true,
@@ -446,7 +424,7 @@ pub fn add_site(
 
 /// Checks the rules of a new invitation against the network as it is now,
 /// with an address no site has.
-pub fn check_rules(network: &Network, inviter: &str, rules: &SiteRules) -> Result<(), JoinError> {
+pub fn check_rules(network: &Network, inviter: SiteId, rules: &SiteRules) -> Result<(), JoinError> {
     let address = (1..=254u8)
         .map(|last| Ipv4Addr::new(192, 0, 2, last))
         .find(|a| network.sites.iter().all(|s| s.address != *a))
@@ -454,7 +432,7 @@ pub fn check_rules(network: &Network, inviter: &str, rules: &SiteRules) -> Resul
     // An identity no site has.
     let id = (0..=u8::MAX)
         .map(|n| SiteId::from_bytes([n; 32]))
-        .find(|id| network.sites.iter().all(|s| s.id != Some(*id)))
+        .find(|id| network.site(*id).is_none())
         .unwrap_or(SiteId::from_bytes([0xa5; 32]));
     let joiner = Joiner {
         name: "new-site",
@@ -474,7 +452,7 @@ fn free_name(network: &Network, base: &str) -> String {
             let stem: String = base.chars().take(keep).collect();
             format!("{}{suffix}", stem.trim_end_matches('-'))
         })
-        .find(|candidate| network.site(candidate).is_none())
+        .find(|candidate| network.named(candidate).next().is_none())
         .unwrap_or_else(|| base.to_string())
 }
 
@@ -545,9 +523,16 @@ mod tests {
         SiteId::from_bytes([address.octets()[3]; 32])
     }
 
+    const SITE1: Ipv4Addr = Ipv4Addr::new(10, 13, 0, 103);
+    const NEW: Ipv4Addr = Ipv4Addr::new(10, 13, 0, 104);
+
+    fn site1() -> SiteId {
+        id_of(SITE1)
+    }
+
     fn join(
         network: &Network,
-        inviter: &str,
+        inviter: SiteId,
         name: &str,
         name_is_default: bool,
         address: Ipv4Addr,
@@ -562,22 +547,17 @@ mod tests {
         add_site(network, inviter, joiner, &BTreeSet::new(), rules)
     }
 
+    fn server(name: &str, address: Ipv4Addr) -> Site {
+        Site {
+            id: id_of(address),
+            ..Site::new(name, address)
+        }
+    }
+
     fn network() -> Network {
         let mut network = Network::new(VlanSet::from_range(10, 50));
         network.revision = 4;
-        network.sites.push(Site {
-            name: "site1".into(),
-            address: Ipv4Addr::new(10, 13, 0, 103),
-            id: Some(id_of(Ipv4Addr::new(10, 13, 0, 103))),
-            vlans: None,
-            own_vlans: None,
-            online: true,
-            managed_by: None,
-            self_managed: false,
-            uplink: None,
-            breakout: Default::default(),
-            ports: Default::default(),
-        });
+        network.sites.push(server("site1", SITE1));
         network
     }
 
@@ -585,25 +565,18 @@ mod tests {
         SiteRules::default()
     }
 
-    const NEW: Ipv4Addr = Ipv4Addr::new(10, 13, 0, 104);
-
     #[test]
     fn a_new_site_is_added_with_the_next_revision() {
-        let a = join(&network(), "site1", "site2", false, NEW, &none()).unwrap();
+        let a = join(&network(), site1(), "site2", false, NEW, &none()).unwrap();
         assert!(a.added);
         assert_eq!(a.name, "site2");
+        assert_eq!(a.site, id_of(NEW));
         assert_eq!(a.network.revision, 5);
         assert_eq!(a.network.sites.len(), 2);
-        assert_eq!(a.network.site("site2").unwrap().address, NEW);
-        assert!(
-            !a.network.site("site2").unwrap().online,
-            "new sites start offline"
-        );
-        assert_eq!(
-            a.network.site("site2").unwrap().uplink.as_deref(),
-            Some("site1"),
-            "a client of the inviting site"
-        );
+        let site2 = a.network.site(a.site).unwrap();
+        assert_eq!(site2.address, NEW);
+        assert!(!site2.online, "new sites start offline");
+        assert_eq!(site2.uplink, Some(site1()), "a client of the inviting site");
         assert!(a.changed);
     }
 
@@ -619,61 +592,59 @@ mod tests {
             }],
             allow_self: true,
         };
-        let a = join(&network(), "site1", "wanderlan", true, NEW, &rules).unwrap();
+        let a = join(&network(), site1(), "wanderlan", true, NEW, &rules).unwrap();
         assert_eq!(a.name, "branch", "the name of the invitation wins");
-        let site = a.network.site("branch").unwrap();
+        let site = a.network.site(a.site).unwrap();
         assert_eq!(site.vlans.as_ref().unwrap().to_string(), "native,10-20");
-        assert_eq!(a.network.maps_of("branch").count(), 1);
-        assert_eq!(site.managed_by.as_deref(), Some("site1"));
+        assert_eq!(a.network.maps_of(a.site).count(), 1);
+        assert_eq!(site.managed_by, Some(site1()));
         assert!(site.self_managed);
 
         let native = SiteRules {
             native: Some(14),
             ..SiteRules::default()
         };
-        let b = join(&network(), "site1", "client", false, NEW, &native).unwrap();
+        let b = join(&network(), site1(), "client", false, NEW, &native).unwrap();
         assert!(
             b.network
-                .maps_of("client")
+                .maps_of(b.site)
                 .any(|m| m.local == LocalVid::Native && m.shared == 14)
         );
 
         // Rules are checked when the invitation is created.
-        assert!(check_rules(&network(), "site1", &rules).is_ok());
+        assert!(check_rules(&network(), site1(), &rules).is_ok());
         let bad = SiteRules {
             native: Some(99),
             ..SiteRules::default()
         };
         assert!(matches!(
-            check_rules(&network(), "site1", &bad),
+            check_rules(&network(), site1(), &bad),
             Err(JoinError::Invalid(_))
         ));
+        // A name another site has: they are told apart by their identities.
         let taken = SiteRules {
             name: Some("site1".into()),
             ..SiteRules::default()
         };
-        assert!(matches!(
-            check_rules(&network(), "site1", &taken),
-            Err(JoinError::NameTaken { .. })
-        ));
+        assert!(check_rules(&network(), site1(), &taken).is_ok());
         let unreadable = SiteRules {
             vlans: Some("ten".into()),
             ..SiteRules::default()
         };
         assert!(matches!(
-            check_rules(&network(), "site1", &unreadable),
+            check_rules(&network(), site1(), &unreadable),
             Err(JoinError::InvalidRules(_))
         ));
     }
 
     #[test]
     fn a_member_joining_again_gets_the_network_unchanged() {
-        let first = join(&network(), "site1", "site2", false, NEW, &none()).unwrap();
-        let again = join(&first.network, "site1", "site2", false, NEW, &none()).unwrap();
+        let first = join(&network(), site1(), "site2", false, NEW, &none()).unwrap();
+        let again = join(&first.network, site1(), "site2", false, NEW, &none()).unwrap();
         assert!(!again.added);
         assert_eq!(again.network, first.network);
         // With its host name it joins as the site that has its address.
-        let by_host = join(&first.network, "site1", "wanderlan", true, NEW, &none()).unwrap();
+        let by_host = join(&first.network, site1(), "wanderlan", true, NEW, &none()).unwrap();
         assert!(!by_host.added);
         assert!(!by_host.changed);
         assert_eq!(by_host.name, "site2");
@@ -682,76 +653,45 @@ mod tests {
     #[test]
     fn a_client_joining_again_through_another_site_hangs_off_that_site() {
         // site1 and site3 are servers, site2 a client of site1.
-        let mut base = join(&network(), "site1", "site2", false, NEW, &none())
+        let mut base = join(&network(), site1(), "site2", false, NEW, &none())
             .unwrap()
             .network;
-        base.sites.push(Site {
-            name: "site3".into(),
-            address: Ipv4Addr::new(10, 13, 0, 105),
-            id: Some(id_of(Ipv4Addr::new(10, 13, 0, 105))),
-            vlans: None,
-            own_vlans: None,
-            online: true,
-            managed_by: None,
-            self_managed: false,
-            uplink: None,
-            breakout: Default::default(),
-            ports: Default::default(),
-        });
-        let moved = join(&base, "site3", "site2", false, NEW, &none()).unwrap();
+        let site3 = Ipv4Addr::new(10, 13, 0, 105);
+        base.sites.push(server("site3", site3));
+        let moved = join(&base, id_of(site3), "site2", false, NEW, &none()).unwrap();
         assert!(!moved.added && moved.changed);
         assert_eq!(moved.network.revision, base.revision + 1);
-        let site2 = moved.network.site("site2").unwrap();
-        assert_eq!(site2.uplink.as_deref(), Some("site3"));
-        assert_eq!(
-            site2.managed_by.as_deref(),
-            Some("site1"),
-            "the manager stays"
-        );
+        let site2 = moved.network.site(id_of(NEW)).unwrap();
+        assert_eq!(site2.uplink, Some(id_of(site3)));
+        assert_eq!(site2.managed_by, Some(site1()), "the manager stays");
 
         // A server joining again stays a server.
-        let server = join(
-            &base,
-            "site3",
-            "site1",
-            false,
-            Ipv4Addr::new(10, 13, 0, 103),
-            &none(),
-        )
-        .unwrap();
-        assert!(!server.changed);
-        assert_eq!(server.network.site("site1").unwrap().uplink, None);
+        let server_again = join(&base, id_of(site3), "site1", false, SITE1, &none()).unwrap();
+        assert!(!server_again.changed);
+        assert_eq!(server_again.network.site(site1()).unwrap().uplink, None);
 
         // Never off one of its own clients.
         let mut chain = base.clone();
+        let site4 = Ipv4Addr::new(10, 13, 0, 106);
         chain.sites.push(Site {
-            name: "site4".into(),
-            address: Ipv4Addr::new(10, 13, 0, 106),
-            id: Some(id_of(Ipv4Addr::new(10, 13, 0, 106))),
-            vlans: None,
-            own_vlans: None,
-            online: true,
-            managed_by: None,
-            self_managed: false,
-            uplink: Some("site2".into()),
-            breakout: Default::default(),
-            ports: Default::default(),
+            uplink: Some(id_of(NEW)),
+            ..server("site4", site4)
         });
-        let no_loop = join(&chain, "site4", "site2", false, NEW, &none()).unwrap();
+        let no_loop = join(&chain, id_of(site4), "site2", false, NEW, &none()).unwrap();
         assert!(!no_loop.changed);
         assert_eq!(
-            no_loop.network.site("site2").unwrap().uplink.as_deref(),
-            Some("site1")
+            no_loop.network.site(id_of(NEW)).unwrap().uplink,
+            Some(site1())
         );
     }
 
     #[test]
     fn a_taken_default_name_gets_a_suffix() {
-        let a = join(&network(), "site1", "site1", true, NEW, &none()).unwrap();
+        let a = join(&network(), site1(), "site1", true, NEW, &none()).unwrap();
         assert_eq!(a.name, "site1-2");
         let b = join(
             &a.network,
-            "site1",
+            site1(),
             "site1",
             true,
             Ipv4Addr::new(10, 13, 0, 105),
@@ -759,11 +699,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(b.name, "site1-3");
-        let long = join(&network(), "site1", "abcdefghijkl", true, NEW, &none()).unwrap();
+        let long = join(&network(), site1(), "abcdefghijkl", true, NEW, &none()).unwrap();
         assert_eq!(long.name, "abcdefghijkl");
         let longer = join(
             &long.network,
-            "site1",
+            site1(),
             "abcdefghijkl",
             true,
             Ipv4Addr::new(10, 1, 1, 1),
@@ -774,36 +714,35 @@ mod tests {
     }
 
     #[test]
-    fn a_chosen_name_or_a_foreign_address_is_refused() {
-        assert!(matches!(
-            join(&network(), "site1", "site1", false, NEW, &none()),
-            Err(JoinError::NameTaken { .. })
-        ));
+    fn a_chosen_name_may_repeat_a_foreign_address_is_refused() {
+        let twin = join(&network(), site1(), "site1", false, NEW, &none()).unwrap();
+        assert!(twin.added);
+        assert_eq!(twin.network.named("site1").count(), 2);
         // Another box at the address of site1, with another name.
         let other = Joiner {
             name: "other",
             name_is_default: false,
-            address: Ipv4Addr::new(10, 13, 0, 103),
+            address: SITE1,
             id: SiteId::from_bytes([77; 32]),
         };
         assert!(matches!(
-            add_site(&network(), "site1", other, &BTreeSet::new(), &none()),
+            add_site(&network(), site1(), other, &BTreeSet::new(), &none()),
             Err(JoinError::AddressTaken { .. })
         ));
         assert!(matches!(
-            join(&network(), "site1", "Bad_Name", false, NEW, &none()),
+            join(&network(), site1(), "Bad_Name", false, NEW, &none()),
             Err(JoinError::InvalidName(_))
         ));
     }
 
     #[test]
     fn the_identity_tells_the_same_box_from_another_one() {
-        let base = join(&network(), "site1", "site2", false, NEW, &none())
+        let base = join(&network(), site1(), "site2", false, NEW, &none())
             .unwrap()
             .network;
         let site2 = id_of(NEW);
         let nobody = BTreeSet::new();
-        let alive: BTreeSet<String> = ["site2".to_string()].into();
+        let alive: BTreeSet<SiteId> = [site2].into();
         let elsewhere = Ipv4Addr::new(10, 99, 0, 1);
         let at = |address, id, name| Joiner {
             name,
@@ -814,18 +753,18 @@ mod tests {
 
         // The same box at another address: it moved, unless it still runs
         // at the old one (a copy of the machine).
-        let moved = add_site(&base, "site1", at(elsewhere, site2, "x"), &nobody, &none()).unwrap();
+        let moved = add_site(&base, site1(), at(elsewhere, site2, "x"), &nobody, &none()).unwrap();
         assert!(moved.changed && !moved.added);
         assert_eq!(moved.name, "site2");
-        assert_eq!(moved.network.site("site2").unwrap().address, elsewhere);
+        assert_eq!(moved.network.site(site2).unwrap().address, elsewhere);
         assert_eq!(moved.network.revision, base.revision + 1);
         assert!(matches!(
-            add_site(&base, "site1", at(elsewhere, site2, "x"), &alive, &none()),
+            add_site(&base, site1(), at(elsewhere, site2, "x"), &alive, &none()),
             Err(JoinError::IdentityInUse { .. })
         ));
         // Also at the same address (a copy behind the same NAT).
         assert!(matches!(
-            add_site(&base, "site1", at(NEW, site2, "x"), &alive, &none()),
+            add_site(&base, site1(), at(NEW, site2, "x"), &alive, &none()),
             Err(JoinError::IdentityInUse { .. })
         ));
         // A chosen other name for a member.
@@ -834,43 +773,50 @@ mod tests {
             ..at(NEW, site2, "branch")
         };
         assert!(matches!(
-            add_site(&base, "site1", renamed, &nobody, &none()),
+            add_site(&base, site1(), renamed, &nobody, &none()),
             Err(JoinError::AlreadyMember { .. })
         ));
 
         // Another box at the address of site2 (it was reset, or sits behind
         // the same NAT): taken over only if site2 does not answer.
         let reset = SiteId::from_bytes([200; 32]);
-        let took = add_site(&base, "site1", at(NEW, reset, "site2"), &nobody, &none()).unwrap();
+        let took = add_site(&base, site1(), at(NEW, reset, "site2"), &nobody, &none()).unwrap();
         assert!(took.changed && !took.added);
         assert_eq!(took.took_over, Some(site2));
-        let entry = took.network.site("site2").unwrap();
-        assert_eq!(entry.id, Some(reset));
-        assert_eq!(entry.managed_by.as_deref(), Some("site1"), "the rules stay");
+        assert_eq!(took.site, reset);
+        let entry = took.network.site(reset).unwrap();
+        assert_eq!(entry.name, "site2");
+        assert_eq!(entry.managed_by, Some(site1()), "the rules stay");
+        assert!(took.network.site(site2).is_none());
         assert!(matches!(
-            add_site(&base, "site1", at(NEW, reset, "site2"), &alive, &none()),
+            add_site(&base, site1(), at(NEW, reset, "site2"), &alive, &none()),
             Err(JoinError::StillRunning { .. })
         ));
 
         // The inviting site is never taken over: a copy of it, or another
         // box at its address.
-        let site1 = id_of(Ipv4Addr::new(10, 13, 0, 103));
         assert!(matches!(
-            add_site(&base, "site1", at(elsewhere, site1, "x"), &nobody, &none()),
+            add_site(
+                &base,
+                site1(),
+                at(elsewhere, site1(), "x"),
+                &nobody,
+                &none()
+            ),
             Err(JoinError::IdentityInUse { .. })
         ));
-        let at_inviter = at(Ipv4Addr::new(10, 13, 0, 103), reset, "site1");
+        let at_inviter = at(SITE1, reset, "site1");
         assert!(matches!(
-            add_site(&base, "site1", at_inviter, &nobody, &none()),
+            add_site(&base, site1(), at_inviter, &nobody, &none()),
             Err(JoinError::AddressTaken { .. })
         ));
 
         // A site of an older version without identity is taken over as
         // before, and gets the identity.
         let mut legacy = base.clone();
-        legacy.sites[1].id = None;
-        let claimed = add_site(&legacy, "site1", at(NEW, reset, "x"), &alive, &none()).unwrap();
-        assert_eq!(claimed.network.site("site2").unwrap().id, Some(reset));
+        legacy.rekey(site2, SiteId::provisional("site2"));
+        let claimed = add_site(&legacy, site1(), at(NEW, reset, "x"), &alive, &none()).unwrap();
+        assert_eq!(claimed.network.site(reset).unwrap().name, "site2");
         assert_eq!(claimed.took_over, None);
         assert!(claimed.changed);
     }
@@ -885,29 +831,25 @@ mod tests {
             id: SiteId::from_bytes([31; 32]),
         };
         let nobody = BTreeSet::new();
-        let one = add_site(&network(), "site1", first, &nobody, &none()).unwrap();
+        let one = add_site(&network(), site1(), first, &nobody, &none()).unwrap();
         // A second box behind the same NAT with another host name.
         let second = Joiner {
             name: "other",
             id: SiteId::from_bytes([32; 32]),
             ..first
         };
-        let two = add_site(&one.network, "site1", second, &nobody, &none()).unwrap();
+        let two = add_site(&one.network, site1(), second, &nobody, &none()).unwrap();
         assert!(two.added);
         assert_eq!(two.name, "other");
-        assert_eq!(two.network.site("other").unwrap().address, nat);
-        assert_eq!(
-            two.network.site("box").unwrap().id,
-            Some(first.id),
-            "untouched"
-        );
+        assert_eq!(two.network.site(second.id).unwrap().address, nat);
+        assert!(two.network.site(first.id).is_some(), "untouched");
         // With the same host name: the name says it.
-        let alive: BTreeSet<String> = ["box".to_string()].into();
+        let alive: BTreeSet<SiteId> = [first.id].into();
         let twin = Joiner {
             id: SiteId::from_bytes([33; 32]),
             ..first
         };
-        let err = add_site(&two.network, "site1", twin, &alive, &none()).unwrap_err();
+        let err = add_site(&two.network, site1(), twin, &alive, &none()).unwrap_err();
         assert!(matches!(err, JoinError::StillRunning { .. }), "{err}");
         assert!(err.to_string().contains("choose another name"), "{err}");
         let named = Joiner {
@@ -915,17 +857,28 @@ mod tests {
             name_is_default: false,
             ..twin
         };
-        let three = add_site(&two.network, "site1", named, &alive, &none()).unwrap();
+        let three = add_site(&two.network, site1(), named, &alive, &none()).unwrap();
         assert!(three.added);
         // The second box joins again after a reset: its own entry.
         let reset = Joiner {
             id: SiteId::from_bytes([34; 32]),
             ..second
         };
-        let again = add_site(&three.network, "site1", reset, &nobody, &none()).unwrap();
+        let again = add_site(&three.network, site1(), reset, &nobody, &none()).unwrap();
         assert_eq!(again.name, "other");
         assert_eq!(again.took_over, Some(second.id));
         assert_eq!(again.network.sites.len(), three.network.sites.len());
+        // Through another server too: it hangs off that one now.
+        let mut servers = three.network.clone();
+        let site3 = Ipv4Addr::new(10, 13, 0, 105);
+        servers.sites.push(server("site3", site3));
+        let elsewhere = add_site(&servers, id_of(site3), reset, &nobody, &none()).unwrap();
+        assert!(!elsewhere.added);
+        assert_eq!(elsewhere.name, "other");
+        assert_eq!(
+            elsewhere.network.site(reset.id).unwrap().uplink,
+            Some(id_of(site3))
+        );
     }
 
     #[test]

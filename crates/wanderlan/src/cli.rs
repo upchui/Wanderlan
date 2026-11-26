@@ -15,6 +15,7 @@ use wanderlan_core::api::{
     VlanPortTraffic, VlanTraffic,
 };
 use wanderlan_core::config::{self, ConfigFile, Severity};
+use wanderlan_core::identity::SiteId;
 use wanderlan_core::join;
 
 use crate::client::Client;
@@ -537,15 +538,16 @@ pub async fn run(args: Args) -> Result<ExitCode> {
                     bail!("name the site it is a client of: wanderlan role {site} client <site>")
                 }
             };
-            edit_site(&socket, &site, confirm, |entry, _| {
+            edit_site(&socket, &site, confirm, |entry, known| {
+                let uplink = uplink.as_deref().map(|up| known.find(up)).transpose()?;
+                let role = role_text(uplink.map(|up| known.label(up)).as_deref(), false);
                 if entry.uplink == uplink {
-                    return Err(format!(
-                        "{} is already a {}.",
-                        entry.name,
-                        role_text(uplink.as_deref(), false)
-                    ));
+                    return Ok(Edit::Nothing(format!(
+                        "{} is already a {role}.",
+                        entry.name
+                    )));
                 }
-                entry.uplink.clone_from(&uplink);
+                entry.uplink = uplink;
                 // A server breaks out nothing: the gateways are there.
                 let gone = if uplink.is_none() && !entry.breakout.is_empty() {
                     entry.breakout.clear();
@@ -553,11 +555,7 @@ pub async fn run(args: Args) -> Result<ExitCode> {
                 } else {
                     ""
                 };
-                Ok(format!(
-                    "{} is a {}{gone}",
-                    entry.name,
-                    role_text(uplink.as_deref(), false)
-                ))
+                Ok(Edit::Done(format!("{} is a {role}{gone}", entry.name)))
             })
             .await
         }
@@ -585,13 +583,16 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             };
             edit_site(&socket, &site, confirm, |entry, _| {
                 if entry.own_vlans == own {
-                    return Err(format!("{} already has these own VLANs.", entry.name));
+                    return Ok(Edit::Nothing(format!(
+                        "{} already has these own VLANs.",
+                        entry.name
+                    )));
                 }
                 entry.own_vlans.clone_from(&own);
-                Ok(match &own {
+                Ok(Edit::Done(match &own {
                     Some(v) => format!("{} has the own VLANs {v}", entry.name),
                     None => format!("{} has no own VLANs", entry.name),
-                })
+                }))
             })
             .await
         }
@@ -636,8 +637,9 @@ pub async fn run(args: Args) -> Result<ExitCode> {
                 let u = u.trim().to_string();
                 (!u.is_empty() && u != "auto").then_some(u)
             });
-            edit_network(&socket, confirm, |network, _| {
-                let Some(entry) = network.sites.iter_mut().find(|s| s.name == site) else {
+            edit_network(&socket, confirm, |network, known| {
+                let id = known.find(&site)?;
+                let Some(entry) = network.site_mut(id) else {
                     bail!("there is no site \"{site}\"");
                 };
                 // A server is where the gateways are: it breaks out nothing.
@@ -690,16 +692,15 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             self_managed,
             confirm,
         }) => {
-            edit_site(&socket, &site, confirm, |entry, me| {
-                let before = (entry.managed_by.clone(), entry.self_managed);
-                let manager = by
-                    .or_else(|| entry.managed_by.clone())
-                    .unwrap_or_else(|| me.to_string());
+            edit_site(&socket, &site, confirm, |entry, known| {
+                let before = (entry.managed_by, entry.self_managed);
+                let by = by.as_deref().map(|m| known.find(m)).transpose()?;
+                let manager = by.or(entry.managed_by).unwrap_or(known.me);
                 entry.managed_by = Some(manager);
                 if let Some(v) = self_managed {
                     entry.self_managed = v;
                 }
-                let who = match (&entry.managed_by, entry.self_managed) {
+                let who = match (entry.managed_by.map(|m| known.label(m)), entry.self_managed) {
                     (None, _) => "every site may change it".to_string(),
                     (Some(m), false) => format!("only \"{m}\" may change and rename it"),
                     (Some(m), true) => format!(
@@ -707,10 +708,10 @@ pub async fn run(args: Args) -> Result<ExitCode> {
                         entry.name
                     ),
                 };
-                if before == (entry.managed_by.clone(), entry.self_managed) {
-                    Err(format!("Nothing to change: {who}."))
+                if before == (entry.managed_by, entry.self_managed) {
+                    Ok(Edit::Nothing(format!("Nothing to change: {who}.")))
                 } else {
-                    Ok(format!("{}: {who}", entry.name))
+                    Ok(Edit::Done(format!("{}: {who}", entry.name)))
                 }
             })
             .await
@@ -836,10 +837,13 @@ async fn join_network(
             let mut in_sync = false;
             for _ in 0..30 {
                 let st: Status = client.call(Request::Status).await?;
-                in_sync = st
-                    .peers
-                    .iter()
-                    .any(|p| p.name == joined.via && p.in_sync == Some(true));
+                in_sync = st.peers.iter().any(|p| {
+                    // Its name, with the start of its identity where
+                    // another site has the same name.
+                    let named =
+                        p.name == joined.via || p.name.starts_with(&format!("{}#", joined.via));
+                    named && p.in_sync == Some(true)
+                });
                 if in_sync {
                     break;
                 }
@@ -895,10 +899,10 @@ async fn set_online(socket: &Path, site: &str, online: bool, confirm: bool) -> R
     let word = if online { "online" } else { "offline" };
     edit_site(socket, site, confirm, |entry, _| {
         if entry.online == online {
-            return Err(format!("{site} is already {word}."));
+            return Ok(Edit::Nothing(format!("{site} is already {word}.")));
         }
         entry.online = online;
-        Ok(format!("{site} is {word}"))
+        Ok(Edit::Done(format!("{site} is {word}")))
     })
     .await
 }
@@ -932,17 +936,13 @@ async fn settings(
     if !running.configured {
         bail!("this site is not part of a network");
     }
-    let mut network = config::parse_network(&running.network)
-        .ok()
-        .and_then(|p| p.network)
-        .context("cannot read the running configuration")?;
-    let mut local = config::parse_local(&running.local)
-        .map_err(|_| anyhow!("cannot read the running local.toml"))?
-        .local;
-    let me = local.self_name.clone().context("this site has no name")?;
+    let (mut network, mut local) = running_config(&running)?;
+    let me = local
+        .self_id
+        .context("this site has no identity in its network")?;
     let Some(setting) = setting else {
         let own = |own: bool| if own { "" } else { "  (network default)" };
-        let ports = network.site(&me).map(|s| s.ports).unwrap_or_default();
+        let ports = network.site(me).map(|s| s.ports).unwrap_or_default();
         println!(
             "commit-timeout  {}{}",
             humantime::format_duration(local.commit_timeout.unwrap_or(network.commit_timeout)),
@@ -963,12 +963,12 @@ async fn settings(
         }
         println!(
             "control-port    {} (UDP, TCP){}",
-            network.control_port_of(&me),
+            network.control_port_of(me),
             own(ports.control.is_some())
         );
         println!(
             "tunnel-port     {} (UDP){}",
-            network.tunnel_port_of(&me),
+            network.tunnel_port_of(me),
             if ports.tunnel.is_some() {
                 ""
             } else {
@@ -1021,9 +1021,7 @@ async fn settings(
                 u16::MAX
             })?;
             let site = network
-                .sites
-                .iter_mut()
-                .find(|s| s.name == me)
+                .site_mut(me)
                 .context("this site is not in its network")?;
             if setting == SettingName::ControlPort {
                 site.ports.control = port;
@@ -1034,15 +1032,8 @@ async fn settings(
             }
         }
     };
-    send_edit(
-        &client,
-        &network,
-        config::render_local(&local),
-        running.revision,
-        confirm,
-        &done,
-    )
-    .await
+    let local = config::render_local(&local, Some(&network));
+    send_edit(&client, &network, local, running.revision, confirm, &done).await
 }
 
 /// Sets the trunk of the tunnel to `site` (local.toml) and applies it.
@@ -1053,17 +1044,10 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
     if !running.configured {
         bail!("this site is not part of a network");
     }
-    let network = config::parse_network(&running.network)
-        .ok()
-        .and_then(|p| p.network)
-        .context("cannot read the running configuration")?;
-    let mut local = config::parse_local(&running.local)
-        .map_err(|_| anyhow!("cannot read the running local.toml"))?
-        .local;
-    let own = local.self_name.as_deref() == Some(site);
-    if network.site(site).is_none() {
-        bail!("there is no site \"{site}\"");
-    }
+    let (network, mut local) = running_config(&running)?;
+    let site_id = network.find(site).map_err(|e| anyhow!(e))?.id;
+    let site = &network.label(site_id);
+    let own = local.self_id == Some(site_id);
     let mut ports: Vec<String> = Vec::new();
     for port in interface.split([',', ' ']).map(str::trim) {
         // Once each, in the order given.
@@ -1078,13 +1062,10 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
     // A trunk of its own is only for a tunnel ("default" still removes a
     // stale entry).
     if !own && !back {
-        let me = local
-            .self_name
-            .as_deref()
-            .context("this site has no name")?;
+        let me = local.self_id.context("this site has no identity")?;
         if !wanderlan_core::topology::tunnels_for(&network, me)
             .iter()
-            .any(|t| t.peer.name == site)
+            .any(|t| t.peer.id == site_id)
         {
             bail!(
                 "this site has no tunnel to \"{site}\"; a trunk of its own is only for the tunnel to a peer"
@@ -1120,11 +1101,12 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
     // Ports of another segment move here; that segment keeps the rest.
     let moved = local
         .assign_trunk(
-            (!own).then_some(site),
+            (!own).then_some(site_id),
             if back { Vec::new() } else { ports },
+            |id| network.label(id),
         )
         .map_err(|e| anyhow!(e))?;
-    let now = local.trunk_ports_for(site).join(", ");
+    let now = local.trunk_ports_for(site_id).join(", ");
     if local == before {
         if own {
             println!("The default trunk already is {}.", local.trunk.join(", "));
@@ -1138,7 +1120,7 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
         ApplyParams {
             config: ConfigInput {
                 network: running.network,
-                local: config::render_local(&local),
+                local: config::render_local(&local, Some(&network)),
             },
             base_revision: Some(running.revision),
             timeout_secs: None,
@@ -1147,7 +1129,7 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
     .await?;
     let done = if own {
         format!("The default trunk is {}", local.trunk.join(", "))
-    } else if !local.tunnel_trunks.contains_key(site) {
+    } else if !local.tunnel_trunks.contains_key(&site_id) {
         format!(
             "The tunnel to {site} uses the default trunk {}",
             local.trunk.join(", ")
@@ -1199,14 +1181,11 @@ async fn set_tunnel_vlans(
     if !running.configured {
         bail!("this site is not part of a network");
     }
-    let mut network = config::parse_network(&running.network)
-        .ok()
-        .and_then(|p| p.network)
-        .context("cannot read the running configuration")?;
-    if let Some(unknown) = [a, b].into_iter().find(|n| network.site(n).is_none()) {
-        bail!("there is no site \"{unknown}\" in the network of this site");
-    }
-    if wanderlan_core::topology::tunnel_vlans(&network, a, b).is_none() {
+    let (mut network, _) = running_config(&running)?;
+    let find = |text: &str| network.find(text).map(|s| s.id).map_err(|e| anyhow!(e));
+    let (a_id, b_id) = (find(a)?, find(b)?);
+    let (a, b) = (&network.label(a_id), &network.label(b_id));
+    if wanderlan_core::topology::tunnel_vlans(&network, a_id, b_id).is_none() {
         bail!("\"{a}\" and \"{b}\" have no tunnel with each other");
     }
     let show = |v: &config::VlanSet| {
@@ -1216,12 +1195,13 @@ async fn set_tunnel_vlans(
             v.to_string()
         }
     };
-    if network.tunnel_limit(a, b) == limit.as_ref() {
+    if network.tunnel_limit(a_id, b_id) == limit.as_ref() {
         println!("The tunnel between {a} and {b} already has this limit.");
         return Ok(ExitCode::SUCCESS);
     }
-    network.set_tunnel_limit(a, b, limit.clone());
-    let carries = wanderlan_core::topology::tunnel_vlans(&network, a, b).unwrap_or_default();
+    let (a, b) = (a.clone(), b.clone());
+    network.set_tunnel_limit(a_id, b_id, limit.clone());
+    let carries = wanderlan_core::topology::tunnel_vlans(&network, a_id, b_id).unwrap_or_default();
     let applied = send_apply(
         &client,
         ApplyParams {
@@ -1258,24 +1238,58 @@ async fn set_tunnel_vlans(
 }
 
 /// Changes one site of the running configuration and applies the change.
-/// `edit` gets the site and the name of this site; it returns what changed,
+/// `edit` gets the site and the network as it was; it returns what changed,
 /// or why nothing needs to change.
 async fn edit_site(
     socket: &Path,
     site: &str,
     confirm: bool,
-    edit: impl FnOnce(&mut config::Site, &str) -> Result<String, String>,
+    edit: impl FnOnce(&mut config::Site, &Known) -> Result<Edit>,
 ) -> Result<ExitCode> {
-    edit_network(socket, confirm, |network, me| {
-        let Some(entry) = network.sites.iter_mut().find(|s| s.name == site) else {
+    edit_network(socket, confirm, |network, known| {
+        let id = known.find(site)?;
+        let Some(entry) = network.site_mut(id) else {
             bail!("there is no site \"{site}\"");
         };
-        Ok(match edit(entry, me) {
-            Ok(done) => Edit::Done(done),
-            Err(nothing) => Edit::Nothing(nothing),
-        })
+        edit(entry, known)
     })
     .await
+}
+
+/// The running network before an edit, to find the sites a user names and
+/// to tell their names.
+struct Known {
+    network: config::Network,
+    /// This site.
+    me: SiteId,
+}
+
+impl Known {
+    /// The site the user means (see [`config::Network::find`]).
+    fn find(&self, text: &str) -> Result<SiteId> {
+        self.network
+            .find(text)
+            .map(|s| s.id)
+            .map_err(|e| anyhow!(e))
+    }
+
+    /// How a site is called.
+    fn label(&self, id: SiteId) -> String {
+        self.network.label(id)
+    }
+}
+
+/// The running configuration: the network and `local.toml` (whose sites
+/// are those of the network).
+fn running_config(running: &ConfigTexts) -> Result<(config::Network, config::Local)> {
+    let network = config::parse_network(&running.network)
+        .ok()
+        .and_then(|p| p.network)
+        .context("cannot read the running configuration")?;
+    let local = config::parse_local(&running.local, Some(&network))
+        .map_err(|_| anyhow!("cannot read the running local.toml"))?
+        .local;
+    Ok((network, local))
 }
 
 /// What an edit of the running network came to.
@@ -1291,21 +1305,23 @@ enum Edit {
 async fn edit_network(
     socket: &Path,
     confirm: bool,
-    edit: impl FnOnce(&mut config::Network, &str) -> Result<Edit>,
+    edit: impl FnOnce(&mut config::Network, &Known) -> Result<Edit>,
 ) -> Result<ExitCode> {
     let client = connect(socket).await?;
     settle(&client).await?;
-    let status: Status = client.call(Request::Status).await?;
     let running: ConfigTexts = client.call(Request::GetConfig).await?;
     if !running.configured {
         bail!("this site is not part of a network");
     }
-    let mut network = config::parse_network(&running.network)
-        .ok()
-        .and_then(|p| p.network)
-        .context("cannot read the running configuration")?;
-    let me = status.site.unwrap_or_default();
-    match edit(&mut network, &me)? {
+    let (mut network, local) = running_config(&running)?;
+    let me = local
+        .self_id
+        .context("this site has no identity in its network")?;
+    let known = Known {
+        network: network.clone(),
+        me,
+    };
+    match edit(&mut network, &known)? {
         Edit::Nothing(text) => {
             println!("{text}");
             Ok(ExitCode::SUCCESS)
@@ -1336,32 +1352,25 @@ async fn site_command(socket: &Path, action: SiteAction) -> Result<ExitCode> {
                         .map_err(|e| anyhow!("{text}: {e}"))
                 })
                 .transpose()?;
-            edit_network(socket, confirm, |network, me| {
-                if network.site(&name).is_some() {
-                    bail!("\"{name}\" is already a site of the network");
+            edit_network(socket, confirm, |network, known| {
+                // Known by its name until its box joins: one site per name.
+                if network.named(&name).next().is_some() {
+                    bail!(
+                        "\"{name}\" is already a site of the network (a site added by hand is known by its name; a box that joins with an invitation may share it)"
+                    );
                 }
                 // Like a new site in the TUI: a client of this site.
                 let uplink = match server.as_deref() {
                     Some("none") => None,
-                    Some(s) => Some(s.to_string()),
-                    None => Some(me.to_string()),
+                    Some(s) => Some(known.find(s).map_err(|e| anyhow!("server: {e}"))?),
+                    None => Some(known.me),
                 };
-                if let Some(up) = uplink.as_deref().filter(|u| network.site(u).is_none()) {
-                    bail!("there is no site \"{up}\" to be a client of");
-                }
-                let role = role_text(uplink.as_deref(), false);
+                let role = role_text(uplink.map(|up| known.label(up)).as_deref(), false);
                 network.sites.push(config::Site {
-                    name: name.clone(),
-                    address,
-                    id: None,
                     vlans: vlans.clone(),
-                    own_vlans: None,
-                    online: true,
-                    managed_by: Some(me.to_string()),
-                    self_managed: false,
+                    managed_by: Some(known.me),
                     uplink,
-                    breakout: Default::default(),
-                    ports: Default::default(),
+                    ..config::Site::new(&name, address)
                 });
                 Ok(Edit::Done(format!(
                     "Site \"{name}\" ({address}, {role}) is added"
@@ -1369,20 +1378,18 @@ async fn site_command(socket: &Path, action: SiteAction) -> Result<ExitCode> {
             })
             .await
         }
-        SiteAction::Remove { name, confirm } => edit_network(socket, confirm, |network, me| {
-            if network.site(&name).is_none() {
-                bail!("there is no site \"{name}\"");
-            }
-            if name == me {
+        SiteAction::Remove { name, confirm } => edit_network(socket, confirm, |network, known| {
+            let id = known.find(&name)?;
+            if id == known.me {
                 bail!(
                     "\"{name}\" is this site: `wanderlan reset` removes wanderlan from this host"
                 );
             }
-            let clients: Vec<&str> = network
+            let clients: Vec<String> = network
                 .sites
                 .iter()
-                .filter(|s| s.uplink.as_deref() == Some(name.as_str()))
-                .map(|s| s.name.as_str())
+                .filter(|s| s.uplink == Some(id))
+                .map(|s| known.label(s.id))
                 .collect();
             if !clients.is_empty() {
                 bail!(
@@ -1390,11 +1397,11 @@ async fn site_command(socket: &Path, action: SiteAction) -> Result<ExitCode> {
                     clients.join(", ")
                 );
             }
-            network.sites.retain(|s| s.name != name);
+            network.sites.retain(|s| s.id != id);
             let maps = network.maps.len();
-            network.maps.retain(|m| m.site != name);
+            network.maps.retain(|m| m.site != id);
             let maps = maps - network.maps.len();
-            network.tunnels.retain(|t| !t.touches(&name));
+            network.tunnels.retain(|t| !t.touches(id));
             let extra = if maps > 0 {
                 format!(" with its {maps} VLAN mapping(s)")
             } else {
@@ -1417,13 +1424,16 @@ async fn site_command(socket: &Path, action: SiteAction) -> Result<ExitCode> {
             };
             edit_site(socket, &name, confirm, |entry, _| {
                 if entry.vlans == vlans {
-                    return Err(format!("{} has these VLANs already.", entry.name));
+                    return Ok(Edit::Nothing(format!(
+                        "{} has these VLANs already.",
+                        entry.name
+                    )));
                 }
                 entry.vlans.clone_from(&vlans);
-                Ok(match &vlans {
+                Ok(Edit::Done(match &vlans {
                     Some(v) => format!("{} has the VLANs {v}", entry.name),
                     None => format!("{} has the VLANs of the network", entry.name),
-                })
+                }))
             })
             .await
         }
@@ -1447,10 +1457,8 @@ async fn map_command(socket: &Path, action: MapAction) -> Result<ExitCode> {
                     _ => bail!("\"{mapped}\": the mapped VLAN is \"native\" or a VLAN ID (1-4094)"),
                 }
             };
-            edit_network(socket, confirm, |network, _| {
-                if network.site(&site).is_none() {
-                    bail!("there is no site \"{site}\"");
-                }
+            edit_network(socket, confirm, |network, known| {
+                let id = known.find(&site)?;
                 let there = match local {
                     config::LocalVid::Native => format!("untagged at {site}"),
                     config::LocalVid::Vid(v) => format!("VLAN {v} at {site}"),
@@ -1459,7 +1467,7 @@ async fn map_command(socket: &Path, action: MapAction) -> Result<ExitCode> {
                 match network
                     .maps
                     .iter_mut()
-                    .find(|m| m.site == site && m.shared == source)
+                    .find(|m| m.site == id && m.shared == source)
                 {
                     Some(m) if m.local == local => {
                         return Ok(Edit::Nothing(format!(
@@ -1468,7 +1476,7 @@ async fn map_command(socket: &Path, action: MapAction) -> Result<ExitCode> {
                     }
                     Some(m) => m.local = local,
                     None => network.maps.push(config::VlanMap {
-                        site: site.clone(),
+                        site: id,
                         local,
                         shared: source,
                     }),
@@ -1482,11 +1490,12 @@ async fn map_command(socket: &Path, action: MapAction) -> Result<ExitCode> {
             source,
             confirm,
         } => {
-            edit_network(socket, confirm, |network, _| {
+            edit_network(socket, confirm, |network, known| {
+                let id = known.find(&site)?;
                 let Some(i) = network
                     .maps
                     .iter()
-                    .position(|m| m.site == site && m.shared == source)
+                    .position(|m| m.site == id && m.shared == source)
                 else {
                     bail!("site \"{site}\" has no mapping of source VLAN {source}");
                 };
@@ -1569,28 +1578,37 @@ async fn rename(socket: &Path, site: &str, new: &str, confirm: bool) -> Result<E
     if !running.configured {
         bail!("this site is not part of a network");
     }
-    let mut network = config::parse_network(&running.network)
-        .ok()
-        .and_then(|p| p.network)
-        .context("cannot read the running configuration")?;
-    let mut local = config::parse_local(&running.local)
-        .ok()
-        .map(|p| p.local)
-        .context("cannot read the running local.toml")?;
-    if network.site(site).is_none() {
-        bail!("there is no site \"{site}\" in the network of this site");
-    }
-    if site == new {
+    let (mut network, local) = running_config(&running)?;
+    let entry = network.find(site).map_err(|e| anyhow!(e))?;
+    let (id, old, provisional) = (entry.id, entry.name.clone(), !entry.has_identity());
+    if old == new {
         println!("Nothing to change: the site is called \"{new}\" already.");
         return Ok(ExitCode::SUCCESS);
     }
-    if network.site(new).is_some() {
-        bail!("\"{new}\" is already a site of the network");
+    // A site known by its name (no box with an identity yet) needs a name
+    // of its own; two boxes with identities may share one.
+    if provisional && let Some(other) = network.named(new).next() {
+        bail!(
+            "\"{new}\" is already the name of a site ({}); \"{old}\" is known by its name until its box has an identity, so it needs a name of its own",
+            other.address
+        );
     }
-    network.rename_site(site, new);
-    local.rename_site(site, new);
-    let done = format!("Site \"{site}\" is called \"{new}\"");
-    let local = config::render_local(&local);
+    let shared = network.named(new).count();
+    network.rename_site(id, new);
+    let mut local = local;
+    // A site known by its name got another provisional identity.
+    if provisional {
+        local.rekey(id, SiteId::provisional(new));
+    }
+    let done = if shared > 0 {
+        format!(
+            "Site \"{old}\" is called \"{new}\" (as {shared} other site{}: they are told apart by their identities)",
+            if shared == 1 { "" } else { "s" }
+        )
+    } else {
+        format!("Site \"{old}\" is called \"{new}\"")
+    };
+    let local = config::render_local(&local, Some(&network));
     send_edit(&client, &network, local, running.revision, confirm, &done).await
 }
 
@@ -2094,9 +2112,18 @@ async fn vlan(socket: &Path, vid: &str, json: bool) -> Result<ExitCode> {
         "{:<16} {:>11} {:>11} {:>10} {:>10} {:>21}  MACS",
         "PORT", "IN", "OUT", "RECEIVED", "SENT", "PACKETS IN/OUT"
     );
+    // A tunnel by the site it leads to (its interface is named by the
+    // identity of that site).
+    let shown = |port: &str| {
+        ports
+            .iter()
+            .find(|p| p.port == port)
+            .and_then(|p| p.peer.clone())
+            .unwrap_or_else(|| port.to_string())
+    };
     for p in &ports {
         let name = match &p.peer {
-            Some(_) => p.port.clone(),
+            Some(peer) => peer.clone(),
             None => format!("{} (trunk)", p.port),
         };
         let count = macs.iter().filter(|m| m.port == p.port).count();
@@ -2112,7 +2139,7 @@ async fn vlan(socket: &Path, vid: &str, json: bool) -> Result<ExitCode> {
     if !macs.is_empty() {
         println!("MAC addresses in VLAN {vid}:");
         for m in &macs {
-            println!("  {} on {}", m.mac, m.port);
+            println!("  {} on {}", m.mac, shown(&m.port));
         }
     }
     Ok(ExitCode::SUCCESS)

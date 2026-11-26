@@ -6,6 +6,7 @@ use wanderlan_core::api::{
     RttPoint, SiteState, SiteSummary, Status, TrafficPoint, VlanPortTraffic, VlanTraffic,
 };
 use wanderlan_core::config::{Local, fingerprint, parse_network, render_local, render_network};
+use wanderlan_core::identity::SiteId;
 
 /// `network.toml` of the fixture network (revision 7).
 pub const NETWORK: &str = r#"
@@ -54,18 +55,24 @@ local = 130
 shared = 30
 "#;
 
+/// The identity of a site of the fixture network: they have none of their
+/// own (a network of an older version), so their provisional one.
+pub fn id(name: &str) -> SiteId {
+    SiteId::provisional(name)
+}
+
 /// The running configuration as the daemon sends it (canonical form).
 pub fn config_texts() -> ConfigTexts {
     let network = parse_network(NETWORK).unwrap().network.unwrap();
     let local = Local {
-        self_name: Some("heim".into()),
+        self_id: Some(id("heim")),
         trunk: vec!["ens19".into()],
         ..Default::default()
     };
     ConfigTexts {
         configured: true,
         network: render_network(&network),
-        local: render_local(&local),
+        local: render_local(&local, Some(&network)),
         revision: 7,
         fingerprint: fingerprint(&network),
     }

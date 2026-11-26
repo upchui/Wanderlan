@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# site-entry <name> [file]: the table of site <name> in network.toml:
+# [site.<name>] (format 2), or the [site."<identity>"] with name = "<name>"
+# (format 3).
+file=${2:-/etc/wanderlan/network.toml}
+awk -v n="$1" '
+  function flush() { if (named) printf "%s", buf; buf = ""; named = 0 }
+  /^\[/ { flush(); intable = ($0 ~ /^\[site\./); if ($0 == "[site." n "]") named = 1 }
+  intable { buf = buf $0 "\n" }
+  intable && $0 == "name = \"" n "\"" { named = 1 }
+  END { flush() }
+' "$file"

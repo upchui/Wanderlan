@@ -63,6 +63,100 @@ impl SiteId {
         text.truncate(FINGERPRINT_LEN);
         text
     }
+
+    /// The identity a site of an older version has until it claims its own
+    /// (it never had one), and that of a name in a file of an older format
+    /// that no site of the file has (a manager a client does not see): made
+    /// of its name, so that every site gives it the same and the name can
+    /// be told again ([`Self::provisional_name`]). Nobody holds its key; its
+    /// tunnels have no keys.
+    pub fn provisional(name: &str) -> Self {
+        let mut out = [0u8; KEY_LEN];
+        out[..PROVISIONAL.len()].copy_from_slice(PROVISIONAL);
+        let bytes = name.as_bytes();
+        let start = PROVISIONAL.len() + 1;
+        let room = KEY_LEN - start;
+        if bytes.len() <= room {
+            out[PROVISIONAL.len()] = bytes.len() as u8;
+            out[start..start + bytes.len()].copy_from_slice(bytes);
+        } else {
+            // Longer than any valid name: only to tell it apart.
+            out[PROVISIONAL.len()] = u8::MAX;
+            let digest: [u8; 32] = <Sha256 as sha2::Digest>::digest(bytes).into();
+            out[start..].copy_from_slice(&digest[..room]);
+        }
+        Self(out)
+    }
+
+    /// True for a provisional identity ([`Self::provisional`]).
+    pub fn is_provisional(&self) -> bool {
+        self.0.starts_with(PROVISIONAL)
+    }
+
+    /// The name a provisional identity was made of.
+    pub fn provisional_name(&self) -> Option<&str> {
+        if !self.is_provisional() {
+            return None;
+        }
+        let len = usize::from(self.0[PROVISIONAL.len()]);
+        let start = PROVISIONAL.len() + 1;
+        let name = self.0.get(start..start + len)?;
+        let padding = self.0.get(start + len..)?;
+        padding
+            .iter()
+            .all(|b| *b == 0)
+            .then(|| std::str::from_utf8(name).ok())
+            .flatten()
+    }
+
+    /// The part of interface names that stands for this identity:
+    /// [`IFNAME_PART_LEN`] characters of lowercase base32 (65 bits), which
+    /// never contain `-`.
+    pub fn ifname_part(&self) -> String {
+        const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+        let mut out = String::with_capacity(IFNAME_PART_LEN);
+        let (mut acc, mut bits) = (0u32, 0u32);
+        for &byte in &self.0 {
+            acc = (acc << 8) | u32::from(byte);
+            bits += 8;
+            while bits >= 5 && out.len() < IFNAME_PART_LEN {
+                bits -= 5;
+                out.push(char::from(BASE32[((acc >> bits) & 31) as usize]));
+            }
+            acc &= (1 << bits) - 1;
+            if out.len() == IFNAME_PART_LEN {
+                break;
+            }
+        }
+        out
+    }
+}
+
+/// Start of the provisional identities ([`SiteId::provisional`]); a real key
+/// begins so with a chance of 2^-64.
+const PROVISIONAL: &[u8] = b"wanderl\0";
+/// Characters of [`SiteId::ifname_part`].
+pub const IFNAME_PART_LEN: usize = 13;
+
+/// Tests name their sites: a name stands for its provisional identity.
+#[cfg(test)]
+impl From<&str> for SiteId {
+    fn from(name: &str) -> Self {
+        Self::provisional(name)
+    }
+}
+
+impl serde::Serialize for SiteId {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for SiteId {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(d)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 impl fmt::Display for SiteId {
@@ -396,6 +490,29 @@ mod tests {
         ] {
             assert!(bad.parse::<SiteId>().is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn provisional_identities_and_interface_names() {
+        assert_eq!(SiteId::provisional("hq"), SiteId::provisional("hq"));
+        assert_ne!(SiteId::provisional("hq"), SiteId::provisional("hq2"));
+        assert_eq!(SiteId::provisional("hq").provisional_name(), Some("hq"));
+        assert!(SiteId::provisional("hq").is_provisional());
+        assert!(!identity(1).id().is_provisional());
+        assert_eq!(identity(1).id().provisional_name(), None);
+        let long = "x".repeat(40);
+        assert!(SiteId::provisional(&long).is_provisional());
+        assert_eq!(SiteId::provisional(&long).provisional_name(), None);
+        assert_eq!(SiteId::from_bytes([0; 32]).ifname_part(), "aaaaaaaaaaaaa");
+        let part = identity(1).id().ifname_part();
+        assert_eq!(part.len(), IFNAME_PART_LEN);
+        assert!(
+            part.bytes()
+                .all(|c| c.is_ascii_lowercase() || (b'2'..=b'7').contains(&c))
+        );
+        let id = identity(1).id();
+        let json = serde_json::to_string(&id).unwrap();
+        assert_eq!(serde_json::from_str::<SiteId>(&json).unwrap(), id);
     }
 
     #[test]

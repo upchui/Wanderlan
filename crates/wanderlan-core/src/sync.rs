@@ -41,15 +41,15 @@ impl Version {
 
 /// Picks the peer to fetch from: the newest announced version that is newer
 /// than ours and was not rejected before.
-pub fn choose<'a>(
+pub fn choose<K: Ord + Copy>(
     ours: &Version,
-    announced: impl IntoIterator<Item = (&'a str, Version)>,
+    announced: impl IntoIterator<Item = (K, Version)>,
     rejected: &BTreeSet<String>,
-) -> Option<(&'a str, Version)> {
+) -> Option<(K, Version)> {
     announced
         .into_iter()
         .filter(|(_, v)| v.is_newer_than(ours) && !rejected.contains(&v.fingerprint))
-        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(a.0)))
+        .max_by(|a, b| a.1.cmp(&b.1).then_with(|| b.0.cmp(&a.0)))
 }
 
 /// Why a received network cannot be used here.
@@ -74,14 +74,21 @@ pub enum Rejection {
     IdentityTakenOver(String, String),
 }
 
-/// Writes this site's identity into its own entry if it has none yet (a
-/// network of an older version, or one the uplink has not received the
-/// claim for yet), with a new revision so that it spreads. Returns true if
-/// it changed the network.
-pub fn claim_own_id(network: &mut Network, me: &str, id: SiteId) -> bool {
-    match network.sites.iter_mut().find(|s| s.name == me) {
-        Some(site) if site.id.is_none() => {
-            site.id = Some(id);
+/// Gives this site's entry its own identity `id` if it has a provisional one
+/// (a network of an older version, or one the uplink has not received the
+/// claim for yet), with every reference to it and `self` in `local`, with a
+/// new revision so that it spreads. Returns true if it changed the network.
+pub fn claim_own_id(network: &mut Network, local: &mut Local, id: SiteId) -> bool {
+    let Some(me) = local.self_id else {
+        return false;
+    };
+    if me == id {
+        return false;
+    }
+    match network.site(me) {
+        Some(site) if !site.has_identity() && network.site(id).is_none() => {
+            network.rekey(me, id);
+            local.rekey(me, id);
             network.revision = crate::config::next_revision(network.revision);
             true
         }
@@ -92,16 +99,16 @@ pub fn claim_own_id(network: &mut Network, me: &str, id: SiteId) -> bool {
 /// Checks a received network against the local configuration and returns the
 /// complete configuration to apply.
 ///
-/// Renames since `previous` (the network in effect here; a site with the
-/// same address under a new name) are followed in `local.toml`: the own
-/// name and the trunks of tunnels. This site itself may be renamed by
-/// another only if it allows it, or if `taken_back`: its server refused a
-/// change of this site, its new name included, and its network applies
-/// again.
+/// Sites that got another identity since `previous` (the network in effect
+/// here: a claim, a box that joined again) are followed in `local.toml`: the
+/// trunks of tunnels. This site itself may be renamed by another only if it
+/// allows it, or if `taken_back`: its server refused a change of this site,
+/// its new name included, and its network applies again.
 ///
-/// With `own_id`, the entry of this site must carry that identity: one it
-/// lacks is claimed again ([`claim_own_id`]), another one means another box
-/// took this site over.
+/// With `own_id`, the entry of this site must carry that identity: one that
+/// still has its provisional identity claims it again ([`claim_own_id`]);
+/// an entry of this site under another identity means another box took this
+/// site over.
 pub fn accept(
     mut received: Network,
     local: &Local,
@@ -110,44 +117,74 @@ pub fn accept(
     own_id: Option<SiteId>,
 ) -> Result<Config, Rejection> {
     let mut local = local.clone();
-    if let Some(previous) = previous {
-        let me = local.self_name.clone().unwrap_or_default();
-        let renamed = crate::rename::renames(previous, &received);
+    let me = local.self_id.unwrap_or_else(|| SiteId::provisional(""));
+    let before = previous.and_then(|p| p.site(me));
+    let name = before.map_or_else(
+        || {
+            me.provisional_name()
+                .map_or_else(|| me.fingerprint(), str::to_string)
+        },
+        |s| s.name.clone(),
+    );
+    // A network of sites that did not see the claim yet names this site by
+    // its provisional identity: claimed again.
+    if let Some(own) = own_id
+        && received.site(own).is_none()
+    {
+        let provisional = SiteId::provisional(&name);
+        if received
+            .site(provisional)
+            .is_some_and(|s| !s.has_identity())
+        {
+            received.rekey(provisional, own);
+            received.revision = crate::config::next_revision(received.revision);
+            local.rekey(provisional, own);
+        }
+    }
+    if let Some(own) = own_id {
+        claim_own_id(&mut received, &mut local, own);
+    }
+    let me = local.self_id.unwrap_or(me);
+    let Some(entry) = received.site(me) else {
+        // Another box joined under this site's name and address.
+        let address = before.map(|s| s.address);
+        if let Some(other) = received
+            .sites
+            .iter()
+            .find(|s| s.name == name && Some(s.address) == address && s.has_identity())
+        {
+            return Err(Rejection::IdentityTakenOver(name, other.id.fingerprint()));
+        }
+        return Err(Rejection::SelfMissing(name));
+    };
+    if let Some(previous) = previous
+        && let Some(old) = previous.site(me)
+        && old.name != entry.name
+    {
         // Only its manager may rename it (see `policy::may_rename`).
-        let manager_may = previous
-            .site(&me)
-            .and_then(|s| crate::policy::manager(previous, s))
-            .is_some_and(|m| m != me && crate::policy::may_rename(previous, &me, m));
+        let manager_may = crate::policy::manager(previous, old)
+            .is_some_and(|m| m != me && crate::policy::may_rename(previous, me, m));
         // A client may not see its manager (it hangs off another site); its
         // server, which knows it, decided.
-        let manager_unseen = previous.site(&me).is_some_and(|s| {
-            s.uplink.is_some()
-                && s.managed_by
-                    .as_deref()
-                    .is_some_and(|m| m != me && previous.site(m).is_none())
-        });
-        if let Some((_, new)) = renamed.iter().find(|(old, _)| *old == me)
-            && !taken_back
-            && !manager_may
-            && !manager_unseen
-        {
-            return Err(Rejection::RenamedWithoutConsent(me, new.clone()));
-        }
-        for (old, new) in &renamed {
-            local.rename_site(old, new);
+        let manager_unseen = old.uplink.is_some()
+            && old
+                .managed_by
+                .is_some_and(|m| m != me && previous.site(m).is_none());
+        if !taken_back && !manager_may && !manager_unseen {
+            return Err(Rejection::RenamedWithoutConsent(
+                old.name.clone(),
+                entry.name.clone(),
+            ));
         }
     }
-    let me = local.self_name.clone().unwrap_or_default();
-    let Some(entry) = received.site(&me) else {
-        return Err(Rejection::SelfMissing(me));
-    };
-    if let (Some(theirs), Some(mine)) = (entry.id, own_id)
-        && theirs != mine
-    {
-        return Err(Rejection::IdentityTakenOver(me, theirs.fingerprint()));
-    }
-    if let Some(mine) = own_id {
-        claim_own_id(&mut received, &me, mine);
+    if let Some(previous) = previous {
+        // The other sites that got another identity: the trunks of the
+        // tunnels to them follow.
+        for (old, new) in crate::rename::rekeys(previous, &received) {
+            if old != me && new != me {
+                local.rekey(old, new);
+            }
+        }
     }
     let diags = validate(&received, Some(&local));
     if let Some(err) = diags.iter().find(|d| d.is_error()) {
@@ -204,20 +241,28 @@ mod tests {
         assert_eq!(choose(&ours, vec![("x", v(1, "aa"))], &rejected), None);
     }
 
-    #[test]
-    fn accept_requires_self() {
-        let network = parse_network(include_str!("config/testdata/network-v1.toml"))
+    fn example() -> Network {
+        parse_network(include_str!("config/testdata/network-v1.toml"))
             .unwrap()
             .network
-            .unwrap();
+            .unwrap()
+    }
+
+    fn id(name: &str) -> SiteId {
+        SiteId::provisional(name)
+    }
+
+    #[test]
+    fn accept_requires_self() {
+        let network = example();
         let local = Local {
-            self_name: Some("haus2".into()),
+            self_id: Some(id("haus2")),
             trunk: vec!["ens19".into()],
             ..Default::default()
         };
         assert!(accept(network.clone(), &local, None, false, None).is_ok());
         let stranger = Local {
-            self_name: Some("haus9".into()),
+            self_id: Some(id("haus9")),
             trunk: vec!["ens19".into()],
             ..Default::default()
         };
@@ -228,87 +273,77 @@ mod tests {
     }
 
     #[test]
-    fn renames_are_followed_and_this_site_needs_to_agree() {
-        let previous = parse_network(include_str!("config/testdata/network-v1.toml"))
-            .unwrap()
-            .network
-            .unwrap();
+    fn this_site_needs_to_agree_to_be_renamed() {
+        let previous = example();
         let local = Local {
-            self_name: Some("haus2".into()),
+            self_id: Some(SiteId::from_bytes([1; 32])),
             trunk: vec!["ens19".into()],
-            tunnel_trunks: [("heim".to_string(), vec!["ens20".to_string()])].into(),
             ..Local::default()
         };
-        // A peer renamed: the trunk of the tunnel to it follows.
+        let mut previous = previous;
+        previous.rekey(id("haus2"), SiteId::from_bytes([1; 32]));
+        let me = SiteId::from_bytes([1; 32]);
+        // A peer renamed: nothing to follow, the trunks name its identity.
         let mut received = previous.clone();
-        received.rename_site("heim", "home");
-        let cfg = accept(received, &local, Some(&previous), false, None).unwrap();
-        assert!(cfg.local.tunnel_trunks.contains_key("home"));
-        assert!(!cfg.local.tunnel_trunks.contains_key("heim"));
+        received.rename_site(id("heim"), "home");
+        assert!(accept(received, &local, Some(&previous), false, None).is_ok());
         // This site renamed by another: only if it has a manager (haus2 has
         // none in the example).
         let mut received = previous.clone();
-        received.rename_site("haus2", "h2");
+        received.rename_site(me, "h2");
         assert_eq!(
             accept(received.clone(), &local, Some(&previous), false, None).unwrap_err(),
             Rejection::RenamedWithoutConsent("haus2".into(), "h2".into())
         );
         let cfg = accept(received.clone(), &local, Some(&previous), true, None).unwrap();
-        assert_eq!(cfg.local.self_name.as_deref(), Some("h2"), "taken back");
+        assert_eq!(cfg.self_name(), "h2", "taken back");
         let mut managed = previous.clone();
-        managed
-            .sites
-            .iter_mut()
-            .find(|s| s.name == "haus2")
-            .unwrap()
-            .managed_by = Some("heim".into());
+        managed.site_mut(me).unwrap().managed_by = Some(id("heim"));
         let cfg = accept(received, &local, Some(&managed), false, None).unwrap();
-        assert_eq!(
-            cfg.local.self_name.as_deref(),
-            Some("h2"),
-            "managed by heim"
-        );
+        assert_eq!(cfg.self_name(), "h2", "managed by heim");
         // A client whose manager it does not see (it hangs off another
         // site): its server knows the manager and decided.
         let mut unseen = previous.clone();
-        let entry = unseen.sites.iter_mut().find(|s| s.name == "haus2").unwrap();
-        entry.managed_by = Some("elsewhere".into());
-        entry.uplink.get_or_insert_with(|| "heim".into());
+        let entry = unseen.site_mut(me).unwrap();
+        entry.managed_by = Some(id("elsewhere"));
+        entry.uplink.get_or_insert_with(|| id("heim"));
         let mut received = unseen.clone();
-        received.rename_site("haus2", "h2");
+        received.rename_site(me, "h2");
         let cfg = accept(received, &local, Some(&unseen), false, None).unwrap();
-        assert_eq!(cfg.local.self_name.as_deref(), Some("h2"));
+        assert_eq!(cfg.self_name(), "h2");
     }
 
     #[test]
     fn the_own_identity_is_claimed_again_and_another_is_refused() {
-        let me = crate::identity::SiteId::from_bytes([1; 32]);
-        let other = crate::identity::SiteId::from_bytes([2; 32]);
-        let mut network = parse_network(include_str!("config/testdata/network-v1.toml"))
-            .unwrap()
-            .network
-            .unwrap();
+        let me = SiteId::from_bytes([1; 32]);
+        let other = SiteId::from_bytes([2; 32]);
+        let network = example();
         let local = Local {
-            self_name: Some("haus2".into()),
+            self_id: Some(id("haus2")),
             trunk: vec!["ens19".into()],
             ..Local::default()
         };
         let revision = network.revision;
         let cfg = accept(network.clone(), &local, None, false, Some(me)).unwrap();
-        assert_eq!(
-            cfg.network.site("haus2").unwrap().id,
-            Some(me),
-            "claimed again"
-        );
+        assert!(cfg.network.site(me).is_some(), "claimed");
+        assert_eq!(cfg.local.self_id, Some(me));
         assert_eq!(cfg.network.revision, revision + 1, "so that it spreads");
         // Already there: unchanged.
-        let again = accept(cfg.network.clone(), &local, None, false, Some(me)).unwrap();
+        let again = accept(cfg.network.clone(), &cfg.local, None, false, Some(me)).unwrap();
         assert_eq!(again.network, cfg.network);
-        // Another box has this site now.
-        if let Some(site) = network.sites.iter_mut().find(|s| s.name == "haus2") {
-            site.id = Some(other);
-        }
-        let err = accept(network, &local, None, false, Some(me)).unwrap_err();
+        // From a site that did not see the claim yet: claimed again.
+        let old = accept(
+            network.clone(),
+            &cfg.local,
+            Some(&cfg.network),
+            false,
+            Some(me),
+        );
+        assert!(old.unwrap().network.site(me).is_some());
+        // Another box has this site now (same name and address).
+        let mut taken = cfg.network.clone();
+        taken.rekey(me, other);
+        let err = accept(taken, &cfg.local, Some(&cfg.network), false, Some(me)).unwrap_err();
         assert!(matches!(err, Rejection::IdentityTakenOver(..)), "{err}");
         assert!(err.to_string().contains(&other.fingerprint()), "{err}");
     }
