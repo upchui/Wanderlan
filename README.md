@@ -1046,7 +1046,10 @@ or `WANDERLAN_SOCKET`.
   the sync announcements (`CAP_NET_RAW` is only for the keepalive frames of
   the client tunnels).
 * **MSS clamping on entering and leaving SYNs** per tunnel port, so both
-  directions get the smaller value.
+  directions get the smaller value. Only what goes through a tunnel is
+  clamped: the local breakout keeps the MSS of the devices and lowers it only
+  where its uplink itself is smaller (to the MTU of the route, e.g. PPPoE);
+  no interface MTU is changed.
 * **netlink everywhere except nftables**: links, bridges, VLANs, VXLAN with its FDB entry and tc
   use rtnetlink; nftables is driven through its JSON interface (the
   `nftables` crate, hence the dependency on the `nftables` package; a test

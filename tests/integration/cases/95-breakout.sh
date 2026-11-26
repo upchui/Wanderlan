@@ -42,6 +42,15 @@ expect_ping c-site3 203.0.113.1 "VLAN 44: IPv4 to the internet through site3's u
 check "the internet sees site3's uplink address, nothing unmasked" \
   eval '[ "$(seen uplink)" -gt 0 ] && [ "$(seen unmasked)" = 0 ]'
 expect_ping c-site3 2001:db8:ffff::1 "VLAN 44: IPv6 to the internet through site3's uplink too"
+# Only what goes through a tunnel gets a smaller MSS: the breakout keeps the
+# one of the devices (1460 behind a trunk of 1500).
+x router "rm -f /tmp/syn44.txt; (timeout 60 nc -l 5002 >/dev/null) >/dev/null 2>&1 &
+          (timeout 30 tcpdump -nli any -c 1 'tcp[tcpflags] & tcp-syn != 0 and tcp[tcpflags] & tcp-ack == 0 and dst port 5002' > /tmp/syn44.txt 2>/dev/null) &
+          sleep 1"
+x c-site3 "echo hi | timeout 10 nc -N 203.0.113.1 5002" >/dev/null 2>&1 || true
+sleep 1
+check "a SYN through the breakout keeps its MSS (1460, not the tunnel's)" \
+  x router "grep -q 'mss 1460' /tmp/syn44.txt"
 expect_ping c-site3 10.44.0.1 "private destinations still go through the tunnel"
 
 begin "Local breakout: exceptions and a second uplink"
