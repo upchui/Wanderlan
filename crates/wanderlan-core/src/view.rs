@@ -45,8 +45,10 @@ pub fn view_for(network: &Network, site: &str) -> Network {
         .map(|s| {
             let mut s = s.clone();
             if s.name == uplink {
-                // Seen from here, the uplink is a server.
+                // Seen from here, the uplink is a server; its breakout (as a
+                // client + server, towards its own server) is its own matter.
                 s.uplink = None;
+                s.breakout.clear();
             }
             s
         })

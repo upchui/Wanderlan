@@ -142,7 +142,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                     theme::dim(),
                 ),
                 Line::styled(
-                    " n lets a VLAN of a site reach the internet through that site's own uplink.",
+                    " n lets a VLAN of a client reach the internet through the client's own uplink.",
                     theme::dim(),
                 ),
             ])
@@ -226,8 +226,30 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), detail);
 }
 
-/// The uplinks of this box: the interfaces with a gateway.
+/// The uplinks of this box: the interfaces with a gateway. A server breaks
+/// out nothing: it says so instead.
 fn draw_uplinks(frame: &mut Frame, app: &App, area: Rect) {
+    let server = app.draft.as_ref().is_some_and(|d| {
+        d.local
+            .self_name
+            .as_deref()
+            .and_then(|me| d.network.site(me))
+            .is_some_and(wanderlan_core::topology::is_server)
+    });
+    if server {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(
+                    " This site is a server: its devices reach the internet through their gateway.",
+                    theme::dim(),
+                ),
+                Line::styled(" Breakouts are for its clients.", theme::dim()),
+            ])
+            .block(titled(" Uplinks of this box ")),
+            area,
+        );
+        return;
+    }
     let uplinks = app.status.as_ref().map_or(&[][..], |s| &s.uplinks[..]);
     let with_gateway: Vec<_> = uplinks
         .iter()

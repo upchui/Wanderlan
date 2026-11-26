@@ -1144,6 +1144,15 @@ async fn the_gretap_tunnels_of_an_older_version_are_removed() {
     assert!(net.link("vx-buero").is_some());
 }
 
+/// The example network with haus2 a client of heim (only clients break
+/// out) and the given breakouts.
+fn with_breakout(breakout: &str) -> String {
+    NETWORK.replace(
+        "vlans = \"20,30\"               # haus2 only takes part in VLANs 20 and 30",
+        &format!("vlans = \"20,30\"\nuplink = \"heim\"\nbreakout = {breakout}"),
+    )
+}
+
 /// haus2 breaks out VLAN 20 by its default route and VLAN 30 out of eth1.
 fn breakout_runtime() -> Runtime {
     use crate::sys::breakout::{Uplink, Uplinks};
@@ -1166,10 +1175,7 @@ fn breakout_runtime() -> Runtime {
 
 #[tokio::test]
 async fn a_breakout_builds_its_pair_and_goes_again() {
-    let network = NETWORK.replace(
-        "vlans = \"20,30\"               # haus2 only takes part in VLANs 20 and 30",
-        "vlans = \"20,30\"\nbreakout = { 20 = {}, 30 = { uplink = \"eth1\" } }",
-    );
+    let network = with_breakout("{ 20 = {}, 30 = { uplink = \"eth1\" } }");
     let net = fresh();
     net.add_physical("eth1");
     net.set_sysctl("ipv4/conf/eth1/forwarding", "0");
@@ -1177,6 +1183,13 @@ async fn a_breakout_builds_its_pair_and_goes_again() {
     let d = derive(&config_from(&network, "haus2"), &runtime);
     assert_eq!(d.breakout.len(), 2);
     assert!(d.breakout[0].v6.is_err(), "no IPv6 uplink");
+    // A server breaks out nothing: its devices have their gateway there.
+    let server = network.replace("uplink = \"heim\"\n", "");
+    assert!(
+        derive(&config_from(&server, "haus2"), &runtime)
+            .breakout
+            .is_empty()
+    );
     run(&net, &d).await;
 
     let br = net.link("br0").unwrap();
@@ -1226,10 +1239,7 @@ async fn a_breakout_builds_its_pair_and_goes_again() {
 
 #[tokio::test]
 async fn without_writable_sysctls_a_family_breaks_out_only_if_forwarding_is_on() {
-    let network = NETWORK.replace(
-        "vlans = \"20,30\"               # haus2 only takes part in VLANs 20 and 30",
-        "vlans = \"20,30\"\nbreakout = { 20 = {} }",
-    );
+    let network = with_breakout("{ 20 = {} }");
     let mut runtime = breakout_runtime();
     runtime.sysctl_writable = false;
     let cfg = config_from(&network, "haus2");

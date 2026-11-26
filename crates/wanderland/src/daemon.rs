@@ -3399,7 +3399,11 @@ impl Controller {
             Ok(uplinks) => self.runtime.uplinks = uplinks,
             Err(e) => debug!("{e}"),
         }
-        if cfg.self_site().is_none_or(|s| s.breakout.is_empty()) {
+        // Only a client breaks out.
+        if cfg
+            .self_site()
+            .is_none_or(|s| s.breakout.is_empty() || wanderlan_core::topology::is_server(s))
+        {
             self.runtime.sysctls.clear();
             self.forward_drops.clear();
             return;

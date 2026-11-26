@@ -1,11 +1,18 @@
 # shellcheck shell=bash
 # Local breakout: VLAN 44 of site3 reaches "the internet" (203.0.113.1 and
 # 2001:db8:ffff::1 on the router) through site3's own uplink, masqueraded;
-# its gateway (c-site2, at site2) does not route at all. Exceptions go
-# through the tunnel, a second uplink is used when chosen, and nothing is
+# its gateway (c-site2, at site2) does not route at all. Only a client
+# breaks out: site3 becomes a client of site2 first (and stays one). Exceptions
+# go through the tunnel, a second uplink is used when chosen, and nothing is
 # left once the breakout is off.
 
 begin "Local breakout: VLAN 44 of site3 leaves through site3's uplink"
+
+check "a server does not break out" \
+  x site3 "! out=\$(wanderlan breakout site3 44 on --confirm 2>&1) && grep -q 'site3 is a server' <<<\"\$out\""
+check "site3 becomes a client of site2" x site2 "wanderlan role site3 client site2 --confirm"
+wait_eq 60 "site3 knows only its server site2" "site2" jqs site3 '[.peers[].name] | join(" ")'
+keyed site3
 
 # The gateway of VLAN 44 is at site2 and routes nowhere.
 client_vlan c-site2 44 10.44.0.1/24

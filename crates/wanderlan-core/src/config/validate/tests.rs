@@ -1226,6 +1226,32 @@ breakout = { 10 = {}, 20 = { uplink = "ens20", except = ["203.0.113.9/24", "2001
         err.message.contains("\"example.com\" is not an address"),
         "{err}"
     );
+    // A server breaks out nothing: an older network with one still loads,
+    // it is ignored with a warning.
+    let server = text.replace(
+        "address = \"10.13.0.103\"\n",
+        "address = \"10.13.0.103\"\nbreakout = { 10 = {} }\n",
+    );
+    let outcome = load(&server, "self = \"alex\"\ntrunk = \"ens19\"\n").unwrap();
+    let ignored: Vec<_> = outcome
+        .warnings
+        .iter()
+        .filter(|w| {
+            w.message
+                .contains("breakout 10 is ignored: \"alex\" is a server")
+        })
+        .collect();
+    assert_eq!(ignored.len(), 1, "{:#?}", outcome.warnings);
+    // A client of site2 sees site2 as a server, without its breakout.
+    let mut network = parse_network(text).unwrap().network.unwrap();
+    let mut below = network.sites[1].clone();
+    below.name = "site3".into();
+    below.address = "10.13.0.105".parse().unwrap();
+    below.uplink = Some("site2".into());
+    below.breakout.clear();
+    network.sites.push(below);
+    let view = crate::view::view_for(&network, "site3");
+    assert!(view.site("site2").unwrap().breakout.is_empty());
 }
 
 #[test]

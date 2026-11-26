@@ -195,11 +195,12 @@ pub enum Command {
         #[arg(long)]
         confirm: bool,
     },
-    /// The local internet breakout of VLANs of a site: their public IPv4
+    /// The local internet breakout of VLANs of a client: their public IPv4
     /// and IPv6 destinations leave through that site's own uplink
-    /// (masqueraded) instead of the tunnel; private destinations and the
-    /// exceptions still go through the tunnel. "off": all through the
-    /// tunnel again. Without arguments: the breakouts of this site.
+    /// (masqueraded) instead of the tunnel to its server; private
+    /// destinations and the exceptions still go through the tunnel. "off":
+    /// all through the tunnel again. A server breaks out nothing (the
+    /// gateways are there). Without arguments: the breakouts of this site.
     ///
     /// Examples: `wanderlan breakout office 10,20 on`,
     /// `wanderlan breakout office 20 on --uplink ens20 --except 203.0.113.0/24`,
@@ -545,8 +546,15 @@ pub async fn run(args: Args) -> Result<ExitCode> {
                     ));
                 }
                 entry.uplink.clone_from(&uplink);
+                // A server breaks out nothing: the gateways are there.
+                let gone = if uplink.is_none() && !entry.breakout.is_empty() {
+                    entry.breakout.clear();
+                    "; its local breakout goes (a server has none)"
+                } else {
+                    ""
+                };
                 Ok(format!(
-                    "{} is a {}",
+                    "{} is a {}{gone}",
                     entry.name,
                     role_text(uplink.as_deref(), false)
                 ))
@@ -628,7 +636,17 @@ pub async fn run(args: Args) -> Result<ExitCode> {
                 let u = u.trim().to_string();
                 (!u.is_empty() && u != "auto").then_some(u)
             });
-            edit_site(&socket, &site, confirm, |entry, _| {
+            edit_network(&socket, confirm, |network, _| {
+                let Some(entry) = network.sites.iter_mut().find(|s| s.name == site) else {
+                    bail!("there is no site \"{site}\"");
+                };
+                // A server is where the gateways are: it breaks out nothing.
+                if state != "off" && entry.uplink.is_none() {
+                    bail!(
+                        "{0} is a server: its devices reach the internet through their own gateway; only clients break out (wanderlan role {0} client <site> makes it one)",
+                        entry.name
+                    );
+                }
                 let before = entry.breakout.clone();
                 for vid in vlans.iter() {
                     if state == "off" {
@@ -644,9 +662,12 @@ pub async fn run(args: Args) -> Result<ExitCode> {
                     }
                 }
                 if entry.breakout == before {
-                    return Err(format!("Nothing to change for {}.", entry.name));
+                    return Ok(Edit::Nothing(format!(
+                        "Nothing to change for {}.",
+                        entry.name
+                    )));
                 }
-                Ok(if entry.breakout.is_empty() {
+                Ok(Edit::Done(if entry.breakout.is_empty() {
                     format!("{} has no local breakout", entry.name)
                 } else {
                     let list: config::VlanSet = entry.breakout.keys().copied().collect();
@@ -654,7 +675,7 @@ pub async fn run(args: Args) -> Result<ExitCode> {
                         "{} breaks out VLANs {list} to the internet through its own uplink",
                         entry.name
                     )
-                })
+                }))
             })
             .await
         }

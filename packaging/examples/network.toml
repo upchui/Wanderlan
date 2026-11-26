@@ -29,8 +29,9 @@ address = "10.8.0.2"
 [site.haus2]
 address = "10.8.0.11"
 vlans = "20,30"               # haus2 only takes part in VLANs 20 and 30
-# Public destinations of VLAN 20 leave through haus2's own uplink:
-# breakout = { 20 = {}, 30 = { uplink = "ens20", except = ["203.0.113.0/24"] } }
+# As a client (server = "heim"), public destinations of VLAN 20 could leave
+# through haus2's own uplink (only clients break out, servers have the gateways):
+# breakout ={ 20 = {}, 30 = { uplink = "ens20", except = ["203.0.113.0/24"] } }
 
 [site.haus3]
 address = "10.8.0.12"

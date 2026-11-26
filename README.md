@@ -348,8 +348,8 @@ its keys: `shared` is the source VLAN, `local` the mapped VLAN.
 
 Normally the devices of a site reach the internet like everything else:
 through the tunnel and the gateway (and firewall) of the network. A **local
-breakout** lets one VLAN of one site use that site's own internet instead,
-completely transparently: its devices keep their gateway, DHCP and DNS, but
+breakout** lets one VLAN of a client use that client's own internet instead
+of the tunnel to its server, completely transparently: its devices keep their gateway, DHCP and DNS, but
 every frame they send to a **public IPv4 or IPv6 address** leaves through
 the uplink of the box at their site, masqueraded to its address, and the
 answers come back to them. Everything else keeps going through the tunnel:
@@ -375,6 +375,15 @@ tunnel, and nothing of a breakout ever reaches a tunnel: the central site
 does not see it at all. If a family cannot break out (no IPv6 uplink, no
 default route on the chosen interface, forwarding cannot be switched on), it
 goes through the tunnel as before, and the status says why.
+
+**Only clients break out.** A server is where the gateways and firewalls of
+its VLANs are: its devices reach them locally, a breakout would only bypass
+them. So the Breakout view and `wanderlan breakout` offer only clients; a
+site that becomes a server loses its breakouts in the same change, and one
+from an earlier version is ignored with a warning (`wanderlan breakout <site>
+<vlan> off` removes it). A client + server breaks out only towards its own
+server: in a segment with just tunnels to its own clients it is their
+server.
 
 A breakout bypasses the firewall of the network, so **its manager decides**,
 like for the VLANs of a site (Breakout (`7`), or `wanderlan breakout`).
@@ -507,7 +516,8 @@ site, source VLAN (e.g. `30`), mapped VLAN `native` (or the VLAN ID on that
 site's trunk, e.g. `130`). CLI: `wanderlan map add lab 30 native`,
 `wanderlan map add lab 40 140`, `wanderlan map del lab 30`.
 
-**Let a VLAN use the internet of its own site.** Breakout (`7`), `n`: site,
+**Let a VLAN of a client use the internet of its own site.** Breakout (`7`),
+`n`: client,
 VLAN, uplink (empty: the default route; the window names the interfaces of
 this box) and exceptions; `Enter` changes one, `d` removes it. The view
 shows for this site where IPv4 and IPv6 leave now and the traffic. CLI:
@@ -690,7 +700,7 @@ other sites).
 | `site.<name>.tunnel_vlans` | none | The most the tunnel to another site carries (on top of the VLANs of both sites), e.g. `{ dc = "30-40" }`; `"none"`: no VLAN at all. At one of the two sites. |
 | `site.<name>.control_port` | `network.control_port` | UDP and TCP port of this site's daemon. Only the site itself changes it (`wanderlan settings control-port`). |
 | `site.<name>.tunnel_port` | its control port + 1 | UDP port of this site's tunnels; a tunnel through NAT also sends from the one above. Only the site itself changes it. |
-| `site.<name>.breakout` | none | [Local breakout](#local-breakout) per VLAN of the site (its ID in the network; untagged: 1): `{ <VLAN> = { uplink = "<interface>", except = [<networks>] } }`, both optional, e.g. `{ 10 = {}, 20 = { uplink = "ens20", except = ["203.0.113.0/24"] } }`. Older sites do not read a network with it: update all sites first. |
+| `site.<name>.breakout` | none | [Local breakout](#local-breakout) per VLAN of a client (not of a server; its ID in the network; untagged: 1): `{ <VLAN> = { uplink = "<interface>", except = [<networks>] } }`, both optional, e.g. `{ 10 = {}, 20 = { uplink = "ens20", except = ["203.0.113.0/24"] } }`. Older sites do not read a network with it: update all sites first. |
 | `self` (local) | | Which site of `network.toml` this host is. |
 | `trunk` (local) | | The interface carrying the VLANs, or several (`["ens19", "ens22"]`, bridged like switch ports, the first is the main port). |
 | `tunnels.<site>.trunk` (local) | `trunk` | A trunk of its own for the tunnel to `<site>`: one interface or several. A port belongs to one segment. |
@@ -1073,8 +1083,9 @@ or `WANDERLAN_SOCKET`.
   bridge before they reach the tunnel, and masquerades them (IPv6 too, so
   dual-stack devices do not keep using the tunnel). The answers return by a
   connection mark, so the box needs no address in the VLAN; a family that
-  cannot break out stays on the tunnel. The manager of a site decides about
-  it, like about its VLANs.
+  cannot break out stays on the tunnel. Only a client breaks out (towards
+  its server); a server has the gateways itself. The manager of a site
+  decides about it, like about its VLANs.
 
 Open questions are collected in [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md).
 

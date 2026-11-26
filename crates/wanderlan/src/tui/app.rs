@@ -3699,6 +3699,12 @@ impl App {
             self.not_configured();
             return;
         };
+        let is_server = |name: &str| {
+            draft
+                .network
+                .site(name)
+                .is_some_and(wanderlan_core::topology::is_server)
+        };
         match key.code {
             KeyCode::Char('n') => {
                 let site = selected
@@ -3708,15 +3714,33 @@ impl App {
                 let uplinks = self.uplink_hint();
                 if let Some(draft) = self.draft.clone() {
                     let mut form = Form::breakout(&draft, None, site.as_deref(), &uplinks);
-                    // Only sites this site may change.
-                    if form.limit_sites("site", |s| self.may_change_quietly(s), &draft) {
+                    // Only clients (a server is where the gateways are),
+                    // and only those this site may change.
+                    let client = |s: &str| {
+                        draft
+                            .network
+                            .site(s)
+                            .is_some_and(|s| !wanderlan_core::topology::is_server(s))
+                    };
+                    if form.limit_sites("site", |s| client(s) && self.may_change_quietly(s), &draft)
+                    {
                         self.modal = Some(Modal::Form(form));
                     } else {
                         self.say(
                             MessageKind::Error,
-                            "There is no site whose breakouts this site may change.",
+                            "Only clients break out, and there is no client whose breakouts this site may change.",
                         );
                     }
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('e')
+                if selected.as_ref().is_some_and(|(s, _)| is_server(s)) =>
+            {
+                if let Some((site, _)) = &selected {
+                    let text = format!(
+                        "{site} is a server: its breakout is ignored (its devices use their gateway); d removes it."
+                    );
+                    self.say(MessageKind::Info, text);
                 }
             }
             KeyCode::Enter | KeyCode::Char('e') => {
@@ -3745,9 +3769,17 @@ impl App {
         }
     }
 
-    /// The uplinks of this box, for the hint of the uplink field.
+    /// The uplinks of this box, for the hint of the uplink field; none at a
+    /// server (it breaks out nothing, its forms are for other boxes).
     fn uplink_hint(&self) -> String {
-        let Some(status) = &self.status else {
+        let client = self.draft.as_ref().is_some_and(|d| {
+            d.local
+                .self_name
+                .as_deref()
+                .and_then(|me| d.network.site(me))
+                .is_some_and(|s| !wanderlan_core::topology::is_server(s))
+        });
+        let Some(status) = self.status.as_ref().filter(|_| client) else {
             return String::new();
         };
         let mut names: Vec<String> = status

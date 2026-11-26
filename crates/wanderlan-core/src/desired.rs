@@ -405,8 +405,10 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
     }
 }
 
-/// The local breakouts of this site: for every segment with a tunnel and
-/// every VLAN of the site with a breakout.
+/// The local breakouts of this site: for every segment with its tunnel to
+/// its server and every VLAN of the site with a breakout. Only a client
+/// breaks out; a server (and a client + server in the segments with only
+/// its own clients) is where the gateways of its devices are.
 fn breakouts(
     cfg: &Config,
     runtime: &Runtime,
@@ -415,6 +417,9 @@ fn breakouts(
     trunk_vlans: &PortVlans,
 ) -> Vec<BreakoutSpec> {
     let Some(site) = cfg.self_site() else {
+        return Vec::new();
+    };
+    let Some(server) = site.uplink.as_deref() else {
         return Vec::new();
     };
     if site.breakout.is_empty() {
@@ -431,7 +436,10 @@ fn breakouts(
     let trunk_ports: BTreeSet<&str> = trunks.iter().map(|t| t.name.as_str()).collect();
     let mut out = Vec::new();
     for (segment, (bridge, ports)) in segments.iter().enumerate() {
-        if !tunnels.iter().any(|t| t.bridge == *bridge) {
+        if !tunnels
+            .iter()
+            .any(|t| t.bridge == *bridge && t.peer == server)
+        {
             continue;
         }
         for (vid, b) in &site.breakout {

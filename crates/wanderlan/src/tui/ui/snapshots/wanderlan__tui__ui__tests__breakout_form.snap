@@ -7,7 +7,7 @@ expression: render(&app)
 "│ ens18 (default route)  192.168.1.50, 2001:db8:51::2                          │"
 "│                                                                              │"
 "└ ┌ New local breakout ──────────────────────────────────────────────────────┐ ┘"
-"┌ │ Site             < heim (server) >  5 choices                            │ ┐"
+"┌ │ Site             < heim (client) >                                       │ ┐"
 "│ │                  the site whose devices go to the internet through its   │ │"
 "│ │                  own uplink                                              │ │"
 "│ │ VLAN                                                                     │ │"

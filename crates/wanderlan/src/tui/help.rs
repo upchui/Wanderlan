@@ -139,7 +139,7 @@ pub const SECTIONS: &[Section] = &[
         title: "7 Breakout",
         keys: &[
             ("Up/Down", "select a breakout"),
-            ("n", "a VLAN of a site uses its own uplink to the internet"),
+            ("n", "a VLAN of a client uses its own uplink"),
             (
                 "e, Enter",
                 "edit: uplink (empty: default route), exceptions",
@@ -147,9 +147,10 @@ pub const SECTIONS: &[Section] = &[
             ("d, Del", "the VLAN goes through the tunnel again"),
         ],
         text: "Public IPv4 and IPv6 destinations of the VLAN leave through the uplink of \
-               that site (masqueraded); its devices keep their gateway and DHCP. Private \
-               destinations and the exceptions still go through the tunnel. Its manager \
-               decides, like for its VLANs.",
+               that client (masqueraded) instead of the tunnel to its server; its devices \
+               keep their gateway and DHCP. Private destinations and the exceptions still \
+               go through the tunnel. Only clients break out: a server is where the \
+               gateways are. Its manager decides, like for its VLANs.",
     },
     Section {
         title: "8 Settings",

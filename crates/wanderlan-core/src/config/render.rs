@@ -31,7 +31,7 @@ const NETWORK_HEADER_2: &str = "\
 # map = { <source VLAN> = <VLAN on its trunk, or \"native\"> };
 # tunnel_vlans = { <other site> = <the most that tunnel carries> };
 # breakout = { <VLAN> = { uplink = <interface>, except = [<networks>] } }:
-# the public destinations of the VLAN leave through the site's own uplink.
+# at a client, the public destinations of the VLAN leave through its own uplink.
 ";
 
 const LOCAL_HEADER: &str = "\

@@ -709,14 +709,17 @@ fn with_breakouts() -> App {
             .filter_map(|e| wanderlan_core::breakout::parse_net(e))
             .collect(),
     };
+    // Only clients break out: heim is a client of buero here (and the
+    // server of haus6).
     for site in &mut network.sites {
         match site.name.as_str() {
             "heim" => {
+                site.uplink = Some("buero".into());
                 site.breakout.insert(10, breakout(None, &[]));
                 site.breakout
                     .insert(20, breakout(Some("ens20"), &["203.0.113.0/24"]));
             }
-            "buero" => {
+            "haus6" => {
                 site.breakout.insert(30, breakout(None, &[]));
             }
             _ => {}

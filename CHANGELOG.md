@@ -9,6 +9,11 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
 ### Fixes, third review
 
+- Breakout only at clients: a server is where the gateways of its devices
+  are, a breakout there would only bypass them. The Breakout view and
+  `wanderlan breakout` offer only clients, a site that becomes a server
+  loses its breakouts, one of a server from an earlier version is ignored
+  with a warning; a client + server breaks out only towards its own server.
 - Breakout: a frame for a router never floods the tunnels (also while its
   port is gone; the pair of a breakout goes only after its rules); IPv6
   breaks out only what goes to a router of the VLAN (learned from its

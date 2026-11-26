@@ -282,10 +282,25 @@ impl Validator {
         }
     }
 
-    /// The local breakout of a site: VLANs of the site, usable uplink
-    /// names, not too many exceptions.
+    /// The local breakout of a site: only at a client, VLANs of the site,
+    /// usable uplink names, not too many exceptions.
     fn breakout(&mut self, network: &Network, i: usize, site: &super::model::Site) {
         let name = &site.name;
+        // A server is where the gateways and firewalls of its VLANs are: its
+        // devices reach them locally, a breakout would only bypass them.
+        // Networks of earlier versions may have one: ignored, not an error,
+        // so the server keeps running after an update.
+        if crate::topology::is_server(site) {
+            for vid in site.breakout.keys() {
+                self.warning(
+                    FieldPath::site_field(i, &format!("breakout.{vid}")),
+                    format!(
+                        "site \"{name}\": breakout {vid} is ignored: \"{name}\" is a server, its devices reach the internet through their own gateway; only clients break out (wanderlan breakout {name} {vid} off removes it)"
+                    ),
+                );
+            }
+            return;
+        }
         let vlans: super::vlan::VlanSet = network
             .effective_vlans(site)
             .iter()
@@ -694,6 +709,7 @@ impl Validator {
             .iter()
             .enumerate()
             .find(|(_, s)| Some(s.name.as_str()) == me)
+            .filter(|(_, s)| !crate::topology::is_server(s))
         {
             let trunks: BTreeSet<&String> = local
                 .trunk

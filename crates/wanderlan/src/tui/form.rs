@@ -461,7 +461,9 @@ impl Form {
         let except: Vec<String> = entry
             .map(|b| b.except.iter().map(ToString::to_string).collect())
             .unwrap_or_default();
-        let uplink_hint = if uplinks.is_empty() {
+        // The uplinks of this box only for a breakout of this box.
+        let own = draft.local.self_name.as_deref() == Some(site.as_str());
+        let uplink_hint = if uplinks.is_empty() || !own {
             "empty: the interface of the site's default route; or e.g. ens20".to_string()
         } else {
             format!("empty: the default route; at this box: {uplinks}")
@@ -921,10 +923,16 @@ impl Form {
                             slot.uplink.clone()
                         };
                         // Its identity is the box's, its ports are its own,
-                        // its breakouts have a view of their own: kept.
+                        // its breakouts have a view of their own: kept;
+                        // only as a server it has none (the gateways are
+                        // there).
                         site.id = slot.id;
                         site.ports = slot.ports;
-                        site.breakout = slot.breakout.clone();
+                        site.breakout = if site.uplink.is_some() {
+                            slot.breakout.clone()
+                        } else {
+                            Default::default()
+                        };
                         site.own_vlans = own_vlans;
                         let old = std::mem::replace(slot, site.clone());
                         if old.name != site.name {
@@ -1577,7 +1585,8 @@ mod tests {
         let edited = form.submit(&d).unwrap();
         assert_eq!(edited.network.site(&name).unwrap().managed_by, None);
 
-        // Its own ports and its breakouts stay; the server can be chosen.
+        // Its own ports and its breakouts (as a client) stay; the server can
+        // be chosen.
         let mut with = d.clone();
         let i = with
             .network
@@ -1585,6 +1594,7 @@ mod tests {
             .iter()
             .position(|s| s.name == "haus3")
             .unwrap();
+        with.network.sites[i].uplink = Some("heim".into());
         with.network.sites[i].ports.control = Some(52821);
         with.network.sites[i]
             .breakout
