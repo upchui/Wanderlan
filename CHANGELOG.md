@@ -7,6 +7,45 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
+### Traffic graphs
+
+- The daemon records the traffic of its tunnels and trunk ports and every
+  round trip of the last hour (`history` request): the graphs are full as
+  soon as the terminal UI starts, with a real time axis.
+- Graphs mirrored: in above the line, out below it, each on a round scale
+  of its own, with now, mean and peak in the title; nothing hides the other
+  direction any more. `z` switches between 2 minutes, 10 minutes and an
+  hour.
+- The Overview shows all tunnels together (on a tall enough terminal) and a
+  LOAD sparkline per neighbour; the details of a neighbour show its round
+  trips over the same time with the lost probes.
+
+### Fixes found in a review
+
+- Sync: a change a client of a client made and the top server refused is
+  refused at every site on the way (it no longer goes round and round); a
+  rolled-back change of a client stays rolled back (the client learns it);
+  a client that is busy or failed is not sent the same change every second.
+- A removed peer behind the same NAT address as another client gets its
+  grace time too; the grace starts when the change is confirmed; a peer
+  that comes back is tested anew (direct or NAT); a client that became a
+  server is probed again; the probes restart without "Address in use".
+- Rights: the VLANs of the network are decided with the rights of the site
+  that passes a change on (a released site below a restricted one does not
+  open them); a site new below a client brings its own ports; a tunnel limit
+  towards a site a client does not see stays; a rename by a manager the
+  client does not see is taken over.
+- Validation: two servers at one address are found also with a client in
+  between; a VLAN mapping may use one of the site's own VLANs. A native
+  mapping drops tagged frames of its VLAN on the trunk.
+- `wanderlan vlan <vid>` shows the rates (it measured nothing before); a
+  peer that does not answer shows no round trip; rates round to the right
+  unit everywhere (`1.0M`, not `1000.0k`).
+- TUI: the cursor of the Overview and of the breakouts stays on its row;
+  the ports of the VLAN window scroll; the VLANs of a peer keep their order;
+  a site renamed in the draft finds its tunnel; an unconfigured site says
+  so.
+
 ### Client + server: clients with clients of their own
 
 - A client with clients of its own is their server in every respect: it

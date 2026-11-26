@@ -50,7 +50,14 @@ pub fn draw(frame: &mut Frame, app: &App, status: &Status, area: Rect) {
         .map(|l| l.width().div_ceil(width).max(1))
         .sum();
     let head_height = u16::try_from(head_height).unwrap_or_default();
-    let rest = area.height.saturating_sub(head_height);
+    // The traffic of all tunnels, where there is room for it besides the
+    // lists.
+    let graph_height = if area.height.saturating_sub(head_height) >= GRAPH_FROM {
+        GRAPH_HEIGHT
+    } else {
+        0
+    };
+    let rest = area.height.saturating_sub(head_height + graph_height);
     // Both lists get what they need if it fits, otherwise a share of it.
     let want_peers = u16::try_from(status.peers.len().max(1) + 3).unwrap_or(u16::MAX);
     let want_sites = u16::try_from(status.sites.len().max(1) + 3).unwrap_or(u16::MAX);
@@ -65,13 +72,24 @@ pub fn draw(frame: &mut Frame, app: &App, status: &Status, area: Rect) {
             .max(rest / 2)
             .clamp(4.min(rest), want_peers)
     };
-    let [head, peers, sites] = Layout::vertical([
+    let [head, graph, peers, sites] = Layout::vertical([
         Constraint::Length(head_height),
+        Constraint::Length(graph_height),
         Constraint::Length(peers_height),
         Constraint::Min(4),
     ])
     .areas(area);
     frame.render_widget(Paragraph::new(header).wrap(Wrap { trim: false }), head);
+    if graph_height > 0 {
+        super::graph::traffic(
+            frame,
+            graph,
+            "All tunnels",
+            &app.recorded.tunnels_total(),
+            app.recorded.now_ms,
+            app.graph_range,
+        );
+    }
     draw_peers(frame, app, status, peers);
     draw_sites(frame, app, status, sites);
 }
@@ -266,7 +284,7 @@ fn config_cell(peer: &PeerStatus) -> String {
     }
 }
 
-fn peer_row(peer: &PeerStatus, wide: bool) -> Row<'static> {
+fn peer_row(peer: &PeerStatus, wide: bool, load: Option<String>) -> Row<'static> {
     let opt = |v: Option<String>| v.unwrap_or_else(|| "-".into());
     let reply = if peer.reachable {
         opt(peer.last_reply_secs.map(format::age))
@@ -283,8 +301,11 @@ fn peer_row(peer: &PeerStatus, wide: bool) -> Row<'static> {
         Cell::from(Line::raw(peer.macs.to_string()).right_aligned()),
         Cell::from(Line::raw(format::rate(peer.rx_bps)).right_aligned()),
         Cell::from(Line::raw(format::rate(peer.tx_bps)).right_aligned()),
-        Cell::from(config_cell(peer)),
     ];
+    if let Some(load) = load {
+        cells.push(Cell::from(Span::styled(load, theme::title())));
+    }
+    cells.push(Cell::from(config_cell(peer)));
     if wide {
         cells.push(Cell::from(peer.vlans.clone()));
         cells.push(Cell::from(peer.trunk.clone()));
@@ -294,20 +315,81 @@ fn peer_row(peer: &PeerStatus, wide: bool) -> Row<'static> {
 
 /// From this width on, the peer table also shows VLANs and trunk.
 const WIDE: u16 = 110;
+/// From this width on, it shows the load of each tunnel over time.
+const LOAD_FROM: u16 = 88;
+/// Rows of the graph of all tunnels.
+const GRAPH_HEIGHT: u16 = 9;
+/// From this height (below the head) on, the overview shows it.
+const GRAPH_FROM: u16 = 26;
+
+/// The traffic (in + out) of each peer's tunnel over the time range, in
+/// `width` characters, all on one scale: who has load stands out.
+fn loads(app: &App, status: &Status, width: usize) -> Vec<String> {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let parts: Vec<Vec<Option<u64>>> = status
+        .peers
+        .iter()
+        .map(|p| {
+            let points: Vec<_> = app
+                .recorded
+                .peers
+                .get(&p.name)
+                .map(|r| r.traffic.iter().copied().collect())
+                .unwrap_or_default();
+            super::graph::buckets(
+                &points,
+                app.recorded.now_ms,
+                app.graph_range.ms(),
+                width,
+                |t: &wanderlan_core::api::TrafficPoint| t.0,
+                |t| Some(((t.1 + t.2) as f64, 0.0)),
+            )
+            .into_iter()
+            .map(|b| b.map(|(v, _)| v as u64))
+            .collect()
+        })
+        .collect();
+    let max = parts.iter().flatten().flatten().copied().max().unwrap_or(0);
+    parts
+        .iter()
+        .map(|values| super::graph::spark(values, max))
+        .collect()
+}
 
 fn draw_peers(frame: &mut Frame, app: &App, status: &Status, area: Rect) {
     let wide = area.width >= WIDE;
+    let load_width: u16 = if wide {
+        16
+    } else if area.width >= LOAD_FROM {
+        10
+    } else {
+        0
+    };
     let mut names = vec![
-        "PEER", "PORT", "REPLY", "RTT", "PMTU", "MSS", "MACS", "RX b/s", "TX b/s", "CONFIG",
+        "PEER", "PORT", "REPLY", "RTT", "PMTU", "MSS", "MACS", "RX b/s", "TX b/s",
     ];
+    if load_width > 0 {
+        names.push("LOAD");
+    }
+    names.push("CONFIG");
     if wide {
         names.extend(["VLANS", "TRUNK"]);
     }
     let header = Row::new(names).style(theme::header());
+    let mut loads = if load_width > 0 {
+        loads(app, status, usize::from(load_width))
+    } else {
+        Vec::new()
+    }
+    .into_iter();
     let rows: Vec<Row> = if status.peers.is_empty() {
         vec![Row::new(vec![Cell::from("no direct peers")]).style(theme::dim())]
     } else {
-        status.peers.iter().map(|p| peer_row(p, wide)).collect()
+        status
+            .peers
+            .iter()
+            .map(|p| peer_row(p, wide, loads.next()))
+            .collect()
     };
     let mut widths = vec![
         Constraint::Length(12),
@@ -319,12 +401,15 @@ fn draw_peers(frame: &mut Frame, app: &App, status: &Status, area: Rect) {
         Constraint::Length(4),
         Constraint::Length(6),
         Constraint::Length(6),
-        if wide {
-            Constraint::Length(12)
-        } else {
-            Constraint::Min(7)
-        },
     ];
+    if load_width > 0 {
+        widths.push(Constraint::Length(load_width));
+    }
+    widths.push(if wide {
+        Constraint::Length(12)
+    } else {
+        Constraint::Min(7)
+    });
     if wide {
         widths.extend([Constraint::Length(14), Constraint::Min(8)]);
     }

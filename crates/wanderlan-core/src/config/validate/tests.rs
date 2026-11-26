@@ -1269,3 +1269,42 @@ fn a_site_has_its_own_ports_and_settings() {
     );
     assert!(!errors(EXAMPLE_NETWORK, &format!("{LOCAL}mss = 100\n")).is_empty());
 }
+
+#[test]
+fn two_servers_at_one_address_also_with_a_client_between() {
+    let mut network = parse_network(EXAMPLE_NETWORK).unwrap().network.unwrap();
+    let id = |b: u8| Some(crate::identity::SiteId::from_bytes([b; 32]));
+    let addr = network.sites[0].address;
+    // s0 (server), s1 (client of s0), s2 (server): all at one address.
+    for (i, site) in network.sites.iter_mut().take(3).enumerate() {
+        site.address = addr;
+        site.id = id(u8::try_from(i).unwrap() + 1);
+        site.uplink = None;
+    }
+    let first = network.sites[0].name.clone();
+    network.sites[1].uplink = Some(first.clone());
+    let errs: Vec<String> = crate::config::validate(&network, None)
+        .into_iter()
+        .filter(Diagnostic::is_error)
+        .map(|d| d.message)
+        .collect();
+    assert!(
+        errs.iter()
+            .any(|e| e.contains(&format!("already used by site \"{first}\""))),
+        "{errs:?}"
+    );
+}
+
+#[test]
+fn an_own_vlan_may_be_mapped() {
+    let mut network = parse_network(EXAMPLE_NETWORK).unwrap().network.unwrap();
+    let site = network.maps[0].site.clone();
+    let entry = network.sites.iter_mut().find(|s| s.name == site).unwrap();
+    entry.own_vlans = Some("60".parse().unwrap());
+    network.maps[0].shared = 60;
+    let errs: Vec<Diagnostic> = crate::config::validate(&network, None)
+        .into_iter()
+        .filter(Diagnostic::is_error)
+        .collect();
+    assert!(errs.is_empty(), "{errs:?}");
+}

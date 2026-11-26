@@ -34,6 +34,17 @@ impl Scroll {
         inside.then(|| self.offset.get() + usize::from(row - rows.y))
     }
 
+    /// Scrolls by `rows` (negative: up); the next frame keeps it within the
+    /// list.
+    pub fn scroll_by(&self, rows: isize) {
+        let offset = self.offset.get();
+        self.offset.set(if rows < 0 {
+            offset.saturating_sub(rows.unsigned_abs())
+        } else {
+            offset.saturating_add(rows.unsigned_abs())
+        });
+    }
+
     /// True if the last frame drew the list under this position.
     pub fn contains(&self, column: u16, row: u16) -> bool {
         self.row_at(column, row).is_some()

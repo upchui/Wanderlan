@@ -19,6 +19,16 @@ pub fn bad() -> Style {
     Style::new().fg(Color::Red)
 }
 
+/// Received traffic (in) in graphs and rate columns.
+pub fn rx() -> Style {
+    Style::new().fg(Color::Green)
+}
+
+/// Sent traffic (out): its own colour, not a warning.
+pub fn tx() -> Style {
+    Style::new().fg(Color::Magenta)
+}
+
 /// Secondary text: a fainter form of the terminal's own colour (dark
 /// grey is invisible on many dark themes).
 pub fn dim() -> Style {

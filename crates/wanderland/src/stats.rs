@@ -12,7 +12,7 @@ use wanderlan_core::sys::linux::LinuxSystem;
 use wanderlan_core::sys::observe::{ObserveOps as _, VlanCounters};
 
 /// Sampling interval.
-const INTERVAL: Duration = Duration::from_secs(2);
+pub const INTERVAL: Duration = Duration::from_secs(2);
 
 /// Receive and transmit rate in bit/s per interface.
 pub type Rates = Arc<RwLock<BTreeMap<String, (u64, u64)>>>;
@@ -106,7 +106,12 @@ fn vlan_rates(
 }
 
 /// Starts the sampler.
-pub fn spawn(sys: LinuxSystem, rates: Rates, vlans: VlanRates) -> JoinHandle<()> {
+pub fn spawn(
+    sys: LinuxSystem,
+    rates: Rates,
+    vlans: VlanRates,
+    history: crate::history::SharedHistory,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut last: BTreeMap<String, (Instant, u64, u64)> = BTreeMap::new();
         let mut last_vlans: Option<(Instant, VlanSample)> = None;
@@ -133,6 +138,9 @@ pub fn spawn(sys: LinuxSystem, rates: Rates, vlans: VlanRates) -> JoinHandle<()>
                 next.insert(link.name.clone(), (now, rx_bytes, tx_bytes));
             }
             last = next;
+            if let Ok(mut h) = history.write() {
+                h.record(crate::history::now_ms(), &out);
+            }
             if let Ok(mut r) = rates.write() {
                 *r = out;
             }

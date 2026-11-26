@@ -248,18 +248,20 @@ pub fn why_not_rename(network: &Network, site: &str, editor: &str) -> String {
 /// same address under a new name), the network's VLANs, and every site of
 /// `old` whose rules differ in `new` (or that is gone).
 pub fn check_edit(old: &Network, new: &Network, editor: &str) -> Result<(), String> {
-    check_by(old, new, &[editor])
+    check_by(old, new, &[editor], None)
 }
 
 /// [`check_edit`] for the changes a client passes on to its uplink: they
 /// were made by the client `from` itself or by a site below it, so a change
 /// passes if one of them may make it. A client only changes itself and the
 /// sites below it, so this never reaches beyond them; each site on the way
-/// already checked the changes of the sites below it.
+/// already checked the changes of the sites below it. The VLANs of the
+/// network (the default of every site) only `from` decides with its own
+/// rights; sites new below it bring their own ports.
 pub fn check_relayed(old: &Network, new: &Network, from: &str) -> Result<(), String> {
     let mut editors = vec![from];
     editors.extend(topology::below(old, from));
-    check_by(old, new, &editors)
+    check_by(old, new, &editors, Some(from))
 }
 
 /// The editor an error about `site` is told for: the site itself if it is
@@ -274,8 +276,14 @@ fn speaker<'a>(editors: &[&'a str], site: &str) -> &'a str {
         .unwrap_or_default()
 }
 
-/// [`check_edit`] for changes made by one of `editors`.
-fn check_by(old: &Network, new: &Network, editors: &[&str]) -> Result<(), String> {
+/// [`check_edit`] for changes made by one of `editors` (the first made or
+/// passed them on); `relayed` names the client that passed them on.
+fn check_by(
+    old: &Network,
+    new: &Network,
+    editors: &[&str],
+    relayed: Option<&str>,
+) -> Result<(), String> {
     let renamed = crate::rename::renames(old, new);
     for (from, _) in &renamed {
         if !editors.iter().any(|e| may_rename(old, from, e)) {
@@ -288,16 +296,16 @@ fn check_by(old: &Network, new: &Network, editors: &[&str]) -> Result<(), String
     for (from, to) in &renamed {
         base.rename_site(from, to);
     }
-    let editors: Vec<&str> = editors
-        .iter()
-        .map(|e| {
-            renamed
-                .iter()
-                .find(|(from, _)| from == e)
-                .map_or(*e, |(_, to)| to.as_str())
-        })
-        .collect();
-    check_changes(&base, new, &editors)
+    let now_called = |e: &str| -> String {
+        renamed
+            .iter()
+            .find(|(from, _)| from == e)
+            .map_or_else(|| e.to_string(), |(_, to)| to.clone())
+    };
+    let names: Vec<String> = editors.iter().map(|e| now_called(e)).collect();
+    let editors: Vec<&str> = names.iter().map(String::as_str).collect();
+    let relayed = relayed.map(now_called);
+    check_changes(&base, new, &editors, relayed.as_deref())
 }
 
 /// What `editor` may not do to `site` (as it is in `old`) in `new`, if
@@ -336,9 +344,17 @@ fn check_site(old: &Network, new: &Network, site: &Site, editor: &str) -> Result
 }
 
 /// [`check_edit`] for two networks with the same names.
-fn check_changes(old: &Network, new: &Network, editors: &[&str]) -> Result<(), String> {
+fn check_changes(
+    old: &Network,
+    new: &Network,
+    editors: &[&str],
+    relayed: Option<&str>,
+) -> Result<(), String> {
     let first = editors.first().copied().unwrap_or_default();
-    if old.vlans != new.vlans && !editors.iter().any(|e| may_change_network_vlans(old, e)) {
+    // The default of every site: by the rights of the site that made or
+    // passed on the change (a released site below a restricted one does
+    // not open them).
+    if old.vlans != new.vlans && !may_change_network_vlans(old, first) {
         return Err(why_not_network(old, first));
     }
     // The settings of `[network]` would change those of every other site
@@ -358,10 +374,13 @@ fn check_changes(old: &Network, new: &Network, editors: &[&str]) -> Result<(), S
                 .to_string(),
         );
     }
-    // The ports of a site: only the site itself.
+    // The ports of a site: only the site itself; a site new below the
+    // client that passes the change on brings its own.
     for site in &new.sites {
         let before = old.site(&site.name).map(|s| s.ports).unwrap_or_default();
-        if site.ports != before && !editors.contains(&site.name.as_str()) {
+        let brought = old.site(&site.name).is_none()
+            && relayed.is_some_and(|r| topology::is_below(new, &site.name, r));
+        if site.ports != before && !editors.contains(&site.name.as_str()) && !brought {
             return Err(format!(
                 "only \"{}\" itself may change its ports (`wanderlan settings` there)",
                 site.name

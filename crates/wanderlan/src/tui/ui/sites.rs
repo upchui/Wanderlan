@@ -225,7 +225,11 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
             policy::managed_label(&draft.network, site)
         );
         lines.push(Line::styled(text, theme::dim()));
-        if let Some(why) = app.peer(&site.name).and_then(|p| p.down_reason.clone()) {
+        // The peer row has the name the site runs under.
+        if let Some(why) = app
+            .peer(&app.running_name(&site.name))
+            .and_then(|p| p.down_reason.clone())
+        {
             lines.push(Line::styled(format!(" Tunnel down: {why}"), theme::warn()));
         }
         if let Some(trunk) = draft

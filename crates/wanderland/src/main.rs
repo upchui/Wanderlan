@@ -11,6 +11,7 @@ mod daemon;
 mod events;
 mod fdb_guard;
 mod files;
+mod history;
 mod invites;
 mod keepalive;
 mod logging;

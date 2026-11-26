@@ -118,9 +118,18 @@ pub fn accept(
             .site(&me)
             .and_then(|s| crate::policy::manager(previous, s))
             .is_some_and(|m| m != me && crate::policy::may_rename(previous, &me, m));
+        // A client may not see its manager (it hangs off another site); its
+        // server, which knows it, decided.
+        let manager_unseen = previous.site(&me).is_some_and(|s| {
+            s.uplink.is_some()
+                && s.managed_by
+                    .as_deref()
+                    .is_some_and(|m| m != me && previous.site(m).is_none())
+        });
         if let Some((_, new)) = renamed.iter().find(|(old, _)| *old == me)
             && !taken_back
             && !manager_may
+            && !manager_unseen
         {
             return Err(Rejection::RenamedWithoutConsent(me, new.clone()));
         }
@@ -259,6 +268,16 @@ mod tests {
             Some("h2"),
             "managed by heim"
         );
+        // A client whose manager it does not see (it hangs off another
+        // site): its server knows the manager and decided.
+        let mut unseen = previous.clone();
+        let entry = unseen.sites.iter_mut().find(|s| s.name == "haus2").unwrap();
+        entry.managed_by = Some("elsewhere".into());
+        entry.uplink.get_or_insert_with(|| "heim".into());
+        let mut received = unseen.clone();
+        received.rename_site("haus2", "h2");
+        let cfg = accept(received, &local, Some(&unseen), false, None).unwrap();
+        assert_eq!(cfg.local.self_name.as_deref(), Some("h2"));
     }
 
     #[test]

@@ -33,6 +33,12 @@ check "br0 itself has no VLANs" \
 client_vlan c-site1 20 10.20.0.1/24
 client_vlan c-site2 20 10.20.0.2/24
 expect_ping c-site1 10.20.0.2 "ping in VLAN 20 from site1's client to site2's client"
+# The rates per VLAN from the command line (measured on request).
+x c-site1 "ping -c 40 -i 0.2 10.20.0.2" >/dev/null 2>&1 &
+pinging=$!
+check "wanderlan vlan 20 shows the traffic of the ping" \
+  x site1 "wanderlan vlan 20 --json | jq -e '[.ports[].rx_bps] | add > 0'"
+wait "$pinging" || true
 
 # Identities: every site claimed one at its first start; the tunnel has the
 # VNI of the two and came up once each side answered with its key.

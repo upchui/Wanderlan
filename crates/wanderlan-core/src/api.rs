@@ -57,6 +57,9 @@ pub enum Request {
     MacTable,
     /// Traffic per VLAN and bridge port → [`VlanTraffic`].
     VlanTraffic,
+    /// The traffic of the tunnels and trunk ports and the round trips of
+    /// the last hour, newer than `since_ms` → [`History`].
+    History(HistoryParams),
     /// Re-enables a port shut down by the loop guard → [`Done`].
     Unblock(UnblockParams),
     /// Measures the path MTU to all peers again → [`Done`].
@@ -786,6 +789,65 @@ impl Interface {
         self.is_listed() && kind_ok && master_ok
     }
 }
+
+/// Parameters of [`Request::History`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryParams {
+    /// Only what came after this time (ms since the Unix epoch); without
+    /// it, the whole hour.
+    #[serde(default)]
+    pub since_ms: Option<u64>,
+}
+
+/// What the daemon recorded for the graphs ([`Request::History`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct History {
+    /// The daemon's clock now (ms since the Unix epoch).
+    pub now_ms: u64,
+    /// When the daemon started (ms): another value means another history.
+    pub started_ms: u64,
+    /// How often the traffic is sampled (ms).
+    pub interval_ms: u64,
+    /// Per direct peer: the traffic of its tunnel and its round trips.
+    pub peers: Vec<PeerHistory>,
+    /// Per trunk port: its traffic.
+    pub trunks: Vec<PortHistory>,
+}
+
+/// The history of one peer.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PeerHistory {
+    /// The peer.
+    pub name: String,
+    /// The traffic of its tunnel: in = from the peer, out = to it.
+    pub traffic: Vec<TrafficPoint>,
+    /// Every control probe: its round trip, or lost.
+    pub rtt: Vec<RttPoint>,
+}
+
+/// The history of one trunk port.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PortHistory {
+    /// The port.
+    pub port: String,
+    /// Its traffic: in = into the bridge, out = out of it.
+    pub traffic: Vec<TrafficPoint>,
+}
+
+/// One sample: `[at_ms, rx_bps, tx_bps]` (an array on the wire).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrafficPoint(pub u64, pub u64, pub u64);
+
+impl TrafficPoint {
+    /// When (ms since the Unix epoch).
+    pub fn at(&self) -> u64 {
+        self.0
+    }
+}
+
+/// One probe: `[at_ms, round trip in ms]`, `null` for a lost one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct RttPoint(pub u64, pub Option<f32>);
 
 /// Traffic per VLAN on the ports of this site's bridges.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]

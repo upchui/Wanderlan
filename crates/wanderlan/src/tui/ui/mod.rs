@@ -6,6 +6,7 @@
 
 mod breakout;
 mod details;
+mod graph;
 pub mod list;
 mod log;
 mod macs;

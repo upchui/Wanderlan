@@ -3,19 +3,17 @@
 
 use wanderlan_core::api::{VlanPortTraffic, VlanTraffic};
 
-/// The VLANs on the tunnel to `peer`, the busiest first (then by VLAN).
+/// The VLANs on the tunnel to `peer`: those that carried traffic first,
+/// each part by VLAN. The order stays while the rates change (the cursor
+/// moves through it).
 pub fn peer_vlans<'a>(traffic: &'a VlanTraffic, peer: &str) -> Vec<&'a VlanPortTraffic> {
     let mut list: Vec<&VlanPortTraffic> = traffic
         .ports
         .iter()
         .filter(|p| p.peer.as_deref() == Some(peer))
         .collect();
-    list.sort_by(|a, b| {
-        (b.rx_bps + b.tx_bps)
-            .cmp(&(a.rx_bps + a.tx_bps))
-            .then((b.rx_bytes + b.tx_bytes).cmp(&(a.rx_bytes + a.tx_bytes)))
-            .then(a.vid.cmp(&b.vid))
-    });
+    let unused = |p: &VlanPortTraffic| p.rx_bytes == 0 && p.tx_bytes == 0;
+    list.sort_by_key(|p| (unused(p), p.vid));
     list
 }
 
@@ -78,6 +76,7 @@ mod tests {
             vid,
             rx_bps,
             tx_bps: rx_bps / 2,
+            rx_bytes: rx_bps,
             ..VlanPortTraffic::default()
         }
     }
@@ -97,10 +96,11 @@ mod tests {
     }
 
     #[test]
-    fn the_busiest_vlans_of_a_peer_first() {
-        let t = traffic();
+    fn the_vlans_of_a_peer_that_carried_traffic_first() {
+        let mut t = traffic();
+        t.ports.push(port("vx-buero", 5, 0));
         let vids: Vec<u16> = peer_vlans(&t, "buero").iter().map(|p| p.vid).collect();
-        assert_eq!(vids, [20, 10, 30]);
+        assert_eq!(vids, [10, 20, 5, 30], "by VLAN, the unused ones last");
         assert!(peer_vlans(&t, "haus9").is_empty());
     }
 

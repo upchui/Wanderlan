@@ -14,8 +14,9 @@ use std::collections::{BTreeMap, VecDeque};
 
 use wanderlan_core::api::{
     ApiError, Applied, ApplyParams, ChangeSource, ConfigInput, ConfigTexts, Confirmed, Event,
-    Interface, Invitation, InviteParams, Joined, MacEntry, PeerStatus, PendingChange, PortState,
-    Request, ResetReport, SiteState, SiteSummary, Status, UnblockParams, VlanTraffic,
+    HistoryParams, Interface, Invitation, InviteParams, Joined, MacEntry, PeerStatus,
+    PendingChange, PortState, Request, ResetReport, SiteState, SiteSummary, Status, TrafficPoint,
+    UnblockParams, VlanTraffic,
 };
 use wanderlan_core::config::{Diagnostic, VlanMap, has_errors, render_local, render_network};
 use wanderlan_core::policy;
@@ -26,6 +27,7 @@ use super::draft::{Draft, Running, TunnelRow, same_network};
 use super::filter::Filter;
 use super::form::{Form, FormEvent, FormKind};
 use super::format;
+use super::history::{HistoryStore, Range};
 use super::log::LogState;
 use super::macs::MacState;
 use super::ports::{PortPicker, PortTarget};
@@ -383,20 +385,6 @@ impl Modal {
     }
 }
 
-/// Samples kept per peer for the traffic graphs (one per status answer).
-pub const HISTORY_LEN: usize = 120;
-
-/// One sample of a peer's traffic.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct Sample {
-    /// Receive rate in bit/s.
-    pub rx_bps: u64,
-    /// Transmit rate in bit/s.
-    pub tx_bps: u64,
-    /// Round-trip time in milliseconds.
-    pub rtt_ms: Option<f64>,
-}
-
 /// A typed answer of the daemon.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reply {
@@ -416,6 +404,8 @@ pub enum Reply {
     Macs(Vec<MacEntry>),
     /// Answer to `vlan_traffic`.
     VlanTraffic(VlanTraffic),
+    /// Answer to `history`: what the daemon recorded for the graphs.
+    Traffic(Box<wanderlan_core::api::History>),
     /// Answer to `invite`.
     Invitation(Invitation),
     /// Answer to `invites`.
@@ -480,6 +470,7 @@ struct InFlight {
     macs: Option<u64>,
     interfaces: Option<u64>,
     vlans: Option<u64>,
+    history: Option<u64>,
 }
 
 /// Scroll positions of the lists (see [`list::Scroll`]).
@@ -534,6 +525,8 @@ enum ListId {
     Ports,
     PeerVlans,
     Breakouts,
+    /// The ports of the VLAN window (scrolled, nothing to choose).
+    VlanPorts,
 }
 
 /// The key a label of the help bar stands for; `None` for labels that
@@ -630,14 +623,19 @@ pub struct App {
     select_invite: Option<String>,
     /// The invitation form while its request runs (back if refused).
     invite_pending: Option<Form>,
-    /// Traffic history per peer, oldest first.
-    pub history: BTreeMap<String, VecDeque<Sample>>,
+    /// The traffic and round trips the daemon recorded (the graphs).
+    pub recorded: HistoryStore,
+    /// Why the daemon gave none (an older version).
+    pub recorded_error: Option<String>,
+    /// The time range of the graphs (z).
+    pub graph_range: Range,
     /// The traffic per VLAN and port, as read last.
     pub vlan_traffic: Option<VlanTraffic>,
     /// Why it could not be read.
     pub vlan_traffic_error: Option<String>,
-    /// Traffic history per VLAN (all ports), oldest first.
-    pub vlan_history: BTreeMap<u16, VecDeque<Sample>>,
+    /// Traffic history per VLAN (all ports), oldest first, by the time of
+    /// the answers (the daemon counts per VLAN only while asked).
+    pub vlan_history: BTreeMap<u16, VecDeque<TrafficPoint>>,
     /// Selected row in the settings view.
     pub settings_selected: usize,
     /// Popup, if any.
@@ -703,7 +701,9 @@ impl App {
             invitations: Vec::new(),
             select_invite: None,
             invite_pending: None,
-            history: BTreeMap::new(),
+            recorded: HistoryStore::default(),
+            recorded_error: None,
+            graph_range: Range::default(),
             vlan_traffic: None,
             vlan_traffic_error: None,
             vlan_history: BTreeMap::new(),
@@ -809,6 +809,8 @@ impl App {
         self.diagnosis = None;
         self.in_flight = InFlight::default();
         self.seen = None;
+        // Maybe another daemon now: asked for its history again.
+        self.recorded_error = None;
         self.log.resubscribe();
         self.request_status(fx);
         self.request_config(fx);
@@ -889,6 +891,13 @@ impl App {
                 if stale {
                     self.request_status(fx);
                 }
+                // What the daemon recorded since the last answer.
+                if self.recorded_error.is_none() && self.may_send(self.in_flight.history) {
+                    self.in_flight.history = Some(self.ticks);
+                    fx.push(Effect::Request(Request::History(HistoryParams {
+                        since_ms: self.recorded.since(),
+                    })));
+                }
                 let vlan_open = matches!(self.modal, Some(Modal::Vlan { .. }));
                 if (self.view == View::Macs || vlan_open)
                     && self.ticks.is_multiple_of(MAC_REFRESH_TICKS)
@@ -966,6 +975,10 @@ impl App {
                 self.macs.set_entries(entries);
             }
             (_, Ok(Reply::VlanTraffic(traffic))) => self.on_vlan_traffic(traffic),
+            (_, Ok(Reply::Traffic(history))) => {
+                self.in_flight.history = None;
+                self.recorded.merge(*history);
+            }
             (Request::Apply(_), Ok(Reply::Applied(applied))) => self.on_applied(applied, fx),
             (Request::Apply(_), Err(e)) => self.on_apply_failed(e, fx),
             (Request::Confirm, Ok(Reply::Confirmed(c))) => self.on_confirmed(&c, fx),
@@ -1056,6 +1069,15 @@ impl App {
             Request::VlanTraffic => {
                 self.in_flight.vlans = None;
                 self.vlan_traffic_error = Some(error.to_string());
+                return;
+            }
+            // An older daemon does not know the request: not asked again
+            // (until the next connection); anything else is tried again.
+            Request::History(_) => {
+                self.in_flight.history = None;
+                if matches!(error, ClientError::Api(_)) {
+                    self.recorded_error = Some(error.to_string());
+                }
                 return;
             }
             Request::Interfaces => {
@@ -1167,7 +1189,6 @@ impl App {
         if fewer && self.invitation.is_some() {
             fx.push(Effect::Request(Request::Invites));
         }
-        self.record_history(&status);
         if !self.wizard_offered {
             self.wizard_offered = true;
             if status.state == SiteState::Unconfigured {
@@ -1177,10 +1198,42 @@ impl App {
                 self.request_interfaces(fx);
             }
         }
-        self.overview_selected = self
-            .overview_selected
-            .min((status.peers.len() + status.sites.len()).saturating_sub(1));
+        // The cursor of the overview stays on its peer or site, also when
+        // rows come or go above it.
+        let item = self.overview_item();
+        let count = status.peers.len() + status.sites.len();
         self.status = Some(status);
+        let found = item.and_then(|(peer, name)| {
+            let status = self.status.as_ref()?;
+            if peer {
+                status.peers.iter().position(|p| p.name == name)
+            } else {
+                self.overview_sites()
+                    .iter()
+                    .position(|s| s.name == name)
+                    .map(|i| status.peers.len() + i)
+            }
+        });
+        self.overview_selected = found
+            .unwrap_or(self.overview_selected)
+            .min(count.saturating_sub(1));
+    }
+
+    /// What the cursor of the overview is on: a peer (`true`) or a site of
+    /// the network list, by name.
+    fn overview_item(&self) -> Option<(bool, String)> {
+        let status = self.status.as_ref()?;
+        let peers = status.peers.len();
+        if self.overview_selected < peers {
+            status
+                .peers
+                .get(self.overview_selected)
+                .map(|p| (true, p.name.clone()))
+        } else {
+            self.overview_sites()
+                .get(self.overview_selected - peers)
+                .map(|s| (false, s.name.clone()))
+        }
     }
 
     /// The pending change disappeared without a confirm/rollback from here:
@@ -1536,23 +1589,24 @@ impl App {
         fx.push(Effect::Request(Request::Invites));
     }
 
-    /// Stores the traffic per VLAN and records one sample per VLAN.
+    /// Stores the traffic per VLAN and records one sample per VLAN (an
+    /// answer without ports, e.g. after a read error, keeps the history).
     fn on_vlan_traffic(&mut self, traffic: VlanTraffic) {
         self.in_flight.vlans = None;
         self.vlan_traffic_error = None;
-        let totals = traffic::vlan_totals(&traffic);
-        for (&vid, &(rx_bps, tx_bps)) in &totals {
-            let samples = self.vlan_history.entry(vid).or_default();
-            samples.push_back(Sample {
-                rx_bps,
-                tx_bps,
-                rtt_ms: None,
-            });
-            while samples.len() > HISTORY_LEN {
-                samples.pop_front();
+        if traffic.available && !traffic.ports.is_empty() {
+            let now = super::history::wall_ms();
+            let oldest = now.saturating_sub(super::history::KEEP_MS);
+            let totals = traffic::vlan_totals(&traffic);
+            for (&vid, &(rx_bps, tx_bps)) in &totals {
+                let samples = self.vlan_history.entry(vid).or_default();
+                samples.push_back(TrafficPoint(now, rx_bps, tx_bps));
+                while samples.front().is_some_and(|p| p.0 < oldest) {
+                    samples.pop_front();
+                }
             }
+            self.vlan_history.retain(|vid, _| totals.contains_key(vid));
         }
-        self.vlan_history.retain(|vid, _| totals.contains_key(vid));
         self.vlan_traffic = Some(traffic);
     }
 
@@ -1560,23 +1614,6 @@ impl App {
     fn open_peer(&mut self, name: String, fx: &mut Vec<Effect>) {
         self.modal = Some(Modal::Peer { name, vlan: None });
         self.request_vlan_traffic(fx);
-    }
-
-    /// Records one traffic sample per peer from a status answer.
-    fn record_history(&mut self, status: &Status) {
-        for peer in &status.peers {
-            let samples = self.history.entry(peer.name.clone()).or_default();
-            samples.push_back(Sample {
-                rx_bps: peer.rx_bps,
-                tx_bps: peer.tx_bps,
-                rtt_ms: peer.rtt_ms,
-            });
-            while samples.len() > HISTORY_LEN {
-                samples.pop_front();
-            }
-        }
-        self.history
-            .retain(|name, _| status.peers.iter().any(|p| &p.name == name));
     }
 
     /// The site that manages this one, if this site is restricted: then it
@@ -1619,6 +1656,38 @@ impl App {
             .find(|(_, new)| new == site)?
             .0;
         running.site(&old)
+    }
+
+    /// The graphs show the next time range.
+    fn next_range(&mut self) {
+        self.graph_range = self.graph_range.next();
+        self.say(
+            MessageKind::Info,
+            format!("The graphs show the last {}.", self.graph_range.label()),
+        );
+    }
+
+    /// The name a site of the draft runs under (another one while the
+    /// draft renames it): its tunnel and its peer row have that one.
+    pub fn running_name(&self, site: &str) -> String {
+        self.running_entry(site)
+            .map_or_else(|| site.to_string(), |e| e.name.clone())
+    }
+
+    /// The name in the draft of a site that runs as `running`.
+    fn draft_name(&self, running: &str) -> String {
+        let renamed = self
+            .running
+            .as_ref()
+            .and_then(|r| r.network.as_ref())
+            .zip(self.draft.as_ref())
+            .and_then(|(net, d)| {
+                wanderlan_core::rename::renames(net, &d.network)
+                    .into_iter()
+                    .find(|(old, _)| old == running)
+                    .map(|(_, new)| new)
+            });
+        renamed.unwrap_or_else(|| running.to_string())
     }
 
     fn may_change(&mut self, site: &str) -> bool {
@@ -1991,6 +2060,10 @@ impl App {
                         };
                         self.overview_selected = peers + next;
                     }
+                    // The wheel over the ports scrolls them, not the VLAN.
+                    Some(ListId::VlanPorts) => {
+                        self.scrolls.vlan_ports.scroll_by(if up { -1 } else { 1 });
+                    }
                     Some(ListId::Peers) => {
                         let peers = self.status.as_ref().map_or(0, |s| s.peers.len());
                         let at = self.overview_selected.min(peers.saturating_sub(1));
@@ -2030,6 +2103,7 @@ impl App {
             (Some(Modal::Invites { .. }), _) => vec![(ListId::Invites, &self.scrolls.invites)],
             (Some(Modal::Ports(_)), _) => vec![(ListId::Ports, &self.scrolls.ports)],
             (Some(Modal::Peer { .. }), _) => vec![(ListId::PeerVlans, &self.scrolls.peer_vlans)],
+            (Some(Modal::Vlan { .. }), _) => vec![(ListId::VlanPorts, &self.scrolls.vlan_ports)],
             (Some(_), _) => Vec::new(),
             (None, View::Overview) => vec![
                 (ListId::Peers, &self.scrolls.peers),
@@ -2126,6 +2200,7 @@ impl App {
                 }
                 again
             }
+            ListId::VlanPorts => false,
             // A click on the row under the cursor ticks it.
             ListId::Ports => {
                 let Some(Modal::Ports(picker)) = &mut self.modal else {
@@ -2526,6 +2601,10 @@ impl App {
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => None,
+            KeyCode::Char('z') => {
+                self.next_range();
+                Some(Modal::Peer { name, vlan })
+            }
             KeyCode::Enter => match vids.get(at) {
                 Some(&vid) => {
                     self.request_vlan_traffic(fx);
@@ -2565,9 +2644,19 @@ impl App {
         key: &KeyEvent,
         fx: &mut Vec<Effect>,
     ) -> Option<Modal> {
+        let page = isize::try_from(self.scrolls.vlan_ports.page()).unwrap_or(1);
         let step = match key.code {
             KeyCode::Up | KeyCode::Char('k') => -1,
             KeyCode::Down | KeyCode::Char('j') => 1,
+            // The ports table scrolls (Up/Down choose the VLAN).
+            KeyCode::PageUp => {
+                self.scrolls.vlan_ports.scroll_by(-page);
+                return Some(Modal::Vlan { vid, back });
+            }
+            KeyCode::PageDown => {
+                self.scrolls.vlan_ports.scroll_by(page);
+                return Some(Modal::Vlan { vid, back });
+            }
             KeyCode::Esc => {
                 return back.map(|name| Modal::Peer {
                     name,
@@ -2575,6 +2664,10 @@ impl App {
                 });
             }
             KeyCode::Char('q') => return None,
+            KeyCode::Char('z') => {
+                self.next_range();
+                return Some(Modal::Vlan { vid, back });
+            }
             KeyCode::Char('m') => {
                 self.macs.filter.set(format!("vlan:{vid}"));
                 self.macs.selected = 0;
@@ -2754,7 +2847,22 @@ impl App {
 
                         _ => {}
                     }
+                    let breakouts_before = self.breakout_rows();
                     self.draft = Some(new);
+                    // The cursor on the breakout just saved (rows are by site
+                    // and VLAN: a new one may sit above the cursor).
+                    if let FormKind::Breakout(old) = &form.kind {
+                        let after = self.breakout_rows();
+                        let at = after
+                            .iter()
+                            .position(|r| !breakouts_before.contains(r))
+                            .or_else(|| {
+                                old.as_ref().and_then(|o| after.iter().position(|r| r == o))
+                            });
+                        if let Some(i) = at {
+                            self.breakouts_selected = i;
+                        }
+                    }
                     self.clamp_selection();
                     let text = if self.draft.as_ref().is_some_and(|d| d.errors() > 0) {
                         "Saved in the draft. The draft still has errors (marked red)."
@@ -3096,7 +3204,7 @@ impl App {
                     .overview_sites()
                     .get(self.overview_selected.saturating_sub(peers))
                     .filter(|_| self.overview_selected >= peers)
-                    .map(|s| s.name.clone());
+                    .map(|s| self.draft_name(&s.name));
                 let index = name.as_ref().and_then(|n| {
                     self.draft
                         .as_ref()?
@@ -3120,6 +3228,7 @@ impl App {
                     ),
                 }
             }
+            KeyCode::Char('z') => self.next_range(),
             KeyCode::Char('p') if self.is_connected() => {
                 fx.push(Effect::Request(Request::ProbeNow));
             }
@@ -3287,6 +3396,10 @@ impl App {
             key.code,
             KeyCode::Enter | KeyCode::Char('e' | 'N' | 'o' | 'd' | 'u') | KeyCode::Delete
         );
+        if row_key && self.draft.is_none() {
+            self.not_configured();
+            return;
+        }
         if row_key
             && !self
                 .visible_sites()
@@ -3401,11 +3514,10 @@ impl App {
                 }));
             }
             KeyCode::Char('u') if selected < count => {
-                let port = draft
-                    .network
-                    .sites
-                    .get(selected)
-                    .map(|s| tunnel_name(&s.name))
+                // The tunnel has the name the site runs under.
+                let name = draft.network.sites.get(selected).map(|s| s.name.clone());
+                let port = name
+                    .map(|n| tunnel_name(&self.running_name(&n)))
                     .unwrap_or_default();
                 let state = self
                     .status
@@ -3440,6 +3552,10 @@ impl App {
             key.code,
             KeyCode::Enter | KeyCode::Char('e' | 'd') | KeyCode::Delete
         );
+        if edits && self.draft.is_none() {
+            self.not_configured();
+            return;
+        }
         if edits && !self.visible_maps().contains(&self.maps_selected) {
             self.say(
                 MessageKind::Info,

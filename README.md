@@ -554,9 +554,19 @@ hq
   ens20 ── wl-ens20 ───── vx-dc     ══ dc
 ```
 
+**Traffic graphs.** The daemon records the traffic of its tunnels and trunk
+ports (every 2 s) and every round trip of the last hour, so the graphs are
+full as soon as `wanderlan` starts. What came in is drawn above the line
+(green), what went out below it (magenta), each with a round scale of its
+own; the title shows now, the mean and the peak. `z` switches between the
+last 2 minutes, 10 minutes and the hour. The Overview shows all tunnels
+together (on a tall enough terminal) and a LOAD column per neighbour on one
+scale; the details of a neighbour its traffic and, below it, its round trips
+with the lost probes in red.
+
 **Watch the traffic of one VLAN.** Overview (`1`), `Enter` on a neighbour:
 beside its traffic graph the VLANs of the tunnel with what comes in and goes
-out now, the busiest first. `Up`/`Down` chooses one, `Enter` opens it: every
+out now, those that carried traffic first. `Up`/`Down` chooses one, `Enter` opens it: every
 port of this site with the VLAN (tunnels and trunk ports), in and out now,
 bytes and packets, the MAC addresses behind each port, a graph, where the
 VLAN is on the trunk (mapped or not), which tunnels carry it and where this
@@ -861,7 +871,7 @@ clicked.
 
 | Key | View |
 |-----|------|
-| `1` | Overview: this site with its role, the tunnel neighbours live (reply, round trip, path MTU, MSS, port state, MAC addresses, throughput, config in sync or `refused`), traffic of the tunnels and of every trunk, and all known sites with role and link (`via hq` for sites without a tunnel from here), each server with its clients indented below. One cursor runs through the neighbours and the sites. `Enter` on a neighbour: traffic graph, the VLANs of the tunnel with their live traffic (Up/Down, `Enter` opens one: every port, MACs, graph; `m` its MAC table), round-trip history, min/avg/max round trip, jitter, probe loss, latency, counters, where it is probed (its address and ports) and, without answers, what to check (Left/Right: the next neighbour); on a site: its details. `o` on a site takes it online or offline (to the review), `u` / `U` unblock the port of a neighbour / a trunk port, `p` measures the path MTU. |
+| `1` | Overview: this site with its role, the tunnel neighbours live (reply, round trip, path MTU, MSS, port state, MAC addresses, throughput, config in sync or `refused`), traffic of the tunnels and of every trunk, a graph of all tunnels and the LOAD of each over time (`z`: 2 min, 10 min, 1 h), and all known sites with role and link (`via hq` for sites without a tunnel from here), each server with its clients indented below. One cursor runs through the neighbours and the sites. `Enter` on a neighbour: traffic graph, the VLANs of the tunnel with their live traffic (Up/Down, `Enter` opens one: every port, MACs, graph; `m` its MAC table, PgUp/PgDn scroll its ports), round-trip graph with the lost probes, min/avg/max round trip, jitter, probe loss, counters, where it is probed (its address and ports) and, without answers, what to check (Left/Right: the next neighbour); on a site: its details. `o` on a site takes it online or offline (to the review), `u` / `U` unblock the port of a neighbour / a trunk port, `p` measures the path MTU. |
 | `2` | Sites: name, address, VLANs, role, manager, tunnel; clients indented below their server. `Enter`: details (role, address and ports, VLANs, every tunnel with what it carries, mappings, who may change it; Up/Down: the next site). Invite (`i`), open invitations (`I`), online/offline (`o`), new (`n`), edit (`e`: name, address, VLANs, "Server", "Changes"), rename (`N`), delete (`d`), the VLANs of the network (`m`), trunk ports of this host (`l`). |
 | `3` | VLANs: the VLANs of the network (`v`), the own VLANs of this site (`o`) and the mappings (`n`, `Enter`, `d`) with their site and its role; conflicts are marked right away. `t` switches to the tunnels: what each carries, its limit (`Enter`, `d`). |
 | `4` | MAC addresses: filter (`/`; `vlan:20` for one VLAN), sort (`s`, `o`). |
@@ -1041,6 +1051,9 @@ or `WANDERLAN_SOCKET`.
   use rtnetlink; nftables is driven through its JSON interface (the
   `nftables` crate, hence the dependency on the `nftables` package; a test
   guards a workaround for swapped `<`/`>` in its 0.6.3 release).
+* **The history for the graphs lives in the daemon**: an hour of samples
+  per tunnel and trunk port in memory (a few tens of KB each), fetched by
+  the terminal UI once and then only what is new (`history` request).
 * **Fixed interface names** `br0`, `wl-<interface>`, `vx-<site>` and
   `wlbo<vid>`/`wlbp<vid>`; site names have at most 12 characters so that
   `vx-<site>` fits.

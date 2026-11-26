@@ -762,10 +762,18 @@ fn trunk_mapping(cfg: &Config, shared: &PortVlans) -> (PortVlans, Vec<TcRule>) {
             action: TcAction::Translate(*local),
         });
     }
-    for target in targets.iter().filter(|t| !locals.contains(t)) {
+    // Tagged frames with a target VID (translated, or untagged native) do
+    // not enter it from the trunk as well: they would merge with it.
+    for target in targets
+        .iter()
+        .copied()
+        .chain(native)
+        .filter(|t| !locals.contains(t))
+        .collect::<BTreeSet<u16>>()
+    {
         rules.push(TcRule {
             direction: Direction::Ingress,
-            vid: *target,
+            vid: target,
             action: TcAction::Drop,
         });
     }
@@ -1043,7 +1051,11 @@ mod tests {
     fn translation_rules_for_haus3() {
         let d = derive(&config("haus3"), &Runtime::default());
         let rules: Vec<String> = d.trunk().tc.iter().map(TcRule::cookie).collect();
-        assert_eq!(rules, vec!["wl:i30x", "wl:i130>30", "wl:e30>130"]);
+        // Native is 20 there: tagged 20 from the trunk is dropped too.
+        assert_eq!(
+            rules,
+            vec!["wl:i20x", "wl:i30x", "wl:i130>30", "wl:e30>130"]
+        );
         assert!(
             derive(&config("heim"), &Runtime::default())
                 .trunk()

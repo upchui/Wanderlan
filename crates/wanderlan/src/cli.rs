@@ -1799,17 +1799,7 @@ fn print_breakouts(st: &Status) {
 
 /// A rate in bit/s, short.
 fn format_rate(bps: u64) -> String {
-    #[allow(clippy::cast_precision_loss)]
-    let v = bps as f64;
-    if v >= 1e9 {
-        format!("{:.1} Gbit/s", v / 1e9)
-    } else if v >= 1e6 {
-        format!("{:.1} Mbit/s", v / 1e6)
-    } else if v >= 1e3 {
-        format!("{:.0} kbit/s", v / 1e3)
-    } else {
-        format!("{bps} bit/s")
-    }
+    crate::tui::format::rate_unit(bps)
 }
 
 /// `wanderlan breakout` without arguments.
@@ -2042,7 +2032,17 @@ async fn vlan(socket: &Path, vid: &str, json: bool) -> Result<ExitCode> {
             })?,
     };
     let client = connect(socket).await?;
-    let traffic: VlanTraffic = client.call(Request::VlanTraffic).await?;
+    let mut traffic: VlanTraffic = client.call(Request::VlanTraffic).await?;
+    // The daemon counts per VLAN only while someone asks: without rates yet,
+    // ask again once it has measured (two of its 2 s samples).
+    let measured = traffic.ports.iter().any(|p| p.rx_bps > 0 || p.tx_bps > 0);
+    if traffic.available && !measured {
+        if !json {
+            eprintln!("Measuring the traffic for 4 s ...");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(4500)).await;
+        traffic = client.call(Request::VlanTraffic).await?;
+    }
     let macs: Vec<MacEntry> = client.call(Request::MacTable).await?;
     let ports: Vec<&VlanPortTraffic> = traffic.ports.iter().filter(|p| p.vid == vid).collect();
     let macs: Vec<&MacEntry> = macs.iter().filter(|m| m.vlan == Some(vid)).collect();
@@ -2096,17 +2096,7 @@ async fn vlan(socket: &Path, vid: &str, json: bool) -> Result<ExitCode> {
 
 /// Formats a bit rate.
 pub fn rate(bps: u64) -> String {
-    #[allow(clippy::cast_precision_loss)]
-    let v = bps as f64;
-    if v >= 1e9 {
-        format!("{:.1}Gbit/s", v / 1e9)
-    } else if v >= 1e6 {
-        format!("{:.1}Mbit/s", v / 1e6)
-    } else if v >= 1e3 {
-        format!("{:.1}kbit/s", v / 1e3)
-    } else {
-        format!("{bps}bit/s")
-    }
+    format!("{}bit/s", crate::tui::format::rate(bps))
 }
 
 async fn log(socket: &Path, follow: bool) -> Result<ExitCode> {

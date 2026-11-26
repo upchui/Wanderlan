@@ -50,6 +50,7 @@ use crate::api_server;
 use crate::events::EventLog;
 use crate::fdb_guard::{self, LoopReport, PortMap};
 use crate::files::Paths;
+use crate::history::{self, History, SharedHistory};
 use crate::invites::{Invite, Invites};
 use crate::keepalive;
 use crate::probe::{self, Me, PeerKeys, ProbeConfig, ProbeEvent, ProbeTable};
@@ -275,6 +276,10 @@ struct Controller {
     ports: watch::Sender<PortMap>,
     rates: Rates,
     vlan_rates: VlanRates,
+    /// The traffic of the last hour, for the graphs.
+    history: SharedHistory,
+    /// When the daemon started (ms since the Unix epoch).
+    started_ms: u64,
     inputs: mpsc::Sender<Input>,
     /// Fingerprints not to fetch again, until when.
     rejected: Rejected,
@@ -304,6 +309,10 @@ struct Controller {
     /// network (authenticated), e.g. a server that became a client of
     /// another site learns so from its old peers.
     grace_keys: BTreeMap<String, PeerKeys>,
+    /// Changes of clients of this site (by client, their fingerprint) that
+    /// this client passed on and its uplink has not taken over yet: if the
+    /// uplink refuses, so does this site, and the client learns why.
+    relayed: BTreeMap<String, String>,
     generation: u64,
     invites: Invites,
     join_failures: BTreeMap<Ipv4Addr, VecDeque<Instant>>,
@@ -350,6 +359,7 @@ pub async fn run(args: Args) -> Result<()> {
     let (keepalive_tx, keepalive_rx) = watch::channel(keepalive::Keepalives::default());
     let rates: Rates = Arc::new(RwLock::new(BTreeMap::new()));
     let vlan_rates: VlanRates = Arc::new(RwLock::new(stats::VlanTraffic::default()));
+    let history: SharedHistory = Arc::new(RwLock::new(History::default()));
 
     let mut tasks = vec![
         (
@@ -360,7 +370,12 @@ pub async fn run(args: Args) -> Result<()> {
         ("keepalive", keepalive::spawn(keepalive_rx)),
         (
             "statistics",
-            stats::spawn(sys.clone(), rates.clone(), vlan_rates.clone()),
+            stats::spawn(
+                sys.clone(),
+                rates.clone(),
+                vlan_rates.clone(),
+                history.clone(),
+            ),
         ),
         (
             "API",
@@ -400,6 +415,8 @@ pub async fn run(args: Args) -> Result<()> {
         ports: ports_tx,
         rates,
         vlan_rates,
+        history,
+        started_ms: history::now_ms(),
         inputs: inputs_tx,
         rejected: Rejected::default(),
         refused: BTreeMap::new(),
@@ -414,6 +431,7 @@ pub async fn run(args: Args) -> Result<()> {
         fetch_backoff: BTreeMap::new(),
         grace: BTreeMap::new(),
         grace_keys: BTreeMap::new(),
+        relayed: BTreeMap::new(),
         generation: 0,
         invites,
         join_failures: BTreeMap::new(),
@@ -1038,8 +1056,9 @@ impl Controller {
         let now = Instant::now();
         for (name, addr) in old_peers {
             // A renamed peer is still there under its new name: its old name
-            // must not answer for its address.
-            if !new_peers.contains_key(&name) && !new_peers.values().any(|a| *a == addr) {
+            // must not answer for it. (Several clients behind one NAT share
+            // an address: a removed one gets its grace all the same.)
+            if !new_peers.contains_key(&name) && !renamed.iter().any(|(old, _)| *old == name) {
                 // The keys are still those of the old peers here.
                 if let Some(k) = self.peer_keys.get(&name) {
                     self.grace_keys.insert(name.clone(), k.clone());
@@ -1082,6 +1101,15 @@ impl Controller {
                     .flatten()
                     .collect()
             });
+        // The graphs: the tunnels to the peers and the trunk ports.
+        let wanted: BTreeSet<String> = new_peers
+            .keys()
+            .map(|p| topology::tunnel_name(p))
+            .chain(trunk_ports.iter().map(|p| (*p).clone()))
+            .collect();
+        if let Ok(mut h) = self.history.write() {
+            h.want(wanted);
+        }
         self.runtime.blocked.retain(|port| {
             new_peers.keys().any(|p| topology::tunnel_name(p) == *port)
                 || trunk_ports.contains(port)
@@ -1151,6 +1179,9 @@ impl Controller {
             move_key(&mut self.runtime.direct, old, new);
             move_key(&mut self.peer_keys, old, new);
             move_key(&mut self.control_endpoints, old, new);
+            if let Ok(mut h) = self.history.write() {
+                h.rename(&topology::tunnel_name(old), &topology::tunnel_name(new));
+            }
             self.grace.remove(old);
             self.grace_keys.remove(old);
             if self.runtime.blocked.remove(&topology::tunnel_name(old)) {
@@ -1178,9 +1209,7 @@ impl Controller {
         let responders: BTreeMap<String, Ipv4Addr> = self
             .grace
             .iter()
-            .filter(|(n, (a, until))| {
-                *until > now && !peers.contains_key(*n) && !peers.values().any(|p| p == a)
-            })
+            .filter(|(n, (_, until))| *until > now && !peers.contains_key(*n))
             .map(|(n, (a, _))| (n.clone(), *a))
             .collect();
         // A client listens on every address: behind NAT the address in the
@@ -1223,6 +1252,9 @@ impl Controller {
                 let own = render_network_wire(&c.network);
                 let uplink = c.self_site().and_then(|s| s.uplink.as_deref());
                 for (name, addr) in peers.iter().chain(responders.iter()) {
+                    // By address only what no current peer has: a former
+                    // peer behind the same NAT fetches with its key.
+                    let by_address = peers.contains_key(name) || !peers.values().any(|a| a == addr);
                     let client = c
                         .network
                         .site(name)
@@ -1241,10 +1273,14 @@ impl Controller {
                             None => render_network_wire(&v),
                         };
                         texts.insert(name.clone(), text.clone());
-                        views.insert(*addr, text);
+                        if by_address {
+                            views.insert(*addr, text);
+                        }
                     } else {
                         texts.insert(name.clone(), own.clone());
-                        views.insert(*addr, own.clone());
+                        if by_address {
+                            views.insert(*addr, own.clone());
+                        }
                     }
                 }
                 version(&c.network)
@@ -1299,7 +1335,17 @@ impl Controller {
             announce,
             announce_to,
             me: self.identity.clone().map(Me),
-            keys: self.peer_keys.clone(),
+            // Former peers (in grace) are told apart by their key too.
+            keys: self
+                .peer_keys
+                .iter()
+                .chain(
+                    self.grace_keys
+                        .iter()
+                        .filter(|(n, _)| responders.contains_key(*n)),
+                )
+                .map(|(n, k)| (n.clone(), k.clone()))
+                .collect(),
             passive,
             tests,
             direct: self.runtime.direct.clone(),
@@ -1734,6 +1780,8 @@ impl Controller {
                     }
                     if *kind == TunnelKind::Uplink {
                         self.diverged_since = None;
+                        // The uplink has what this site passed on.
+                        self.relayed.clear();
                     }
                 }
                 _ if rejected.contains(&theirs.fingerprint) => {}
@@ -1944,11 +1992,29 @@ impl Controller {
     /// A client pushed its network: taken over like a fetched one (what the
     /// client may change), if nothing else is pending.
     async fn pushed_to_us(&mut self, peer: &str, text: String) -> sync_net::PushAnswer {
-        if self.pending.is_some() || self.fetching {
+        let now = Instant::now();
+        // Busy, or the last attempt failed a moment ago (tried again later).
+        if self.pending.is_some()
+            || self.fetching
+            || self.fetch_backoff.get(peer).is_some_and(|t| *t > now)
+        {
             return sync_net::PushAnswer::Busy;
         }
         if !self.peer_keys.contains_key(peer) {
             return sync_net::PushAnswer::Refused("not a client with a key".into());
+        }
+        // A change rolled back or refused here is not taken over again.
+        if let Some(network) = config::parse_network(&text).ok().and_then(|p| p.network)
+            && self
+                .rejected
+                .active(now)
+                .contains(&config::fingerprint(&network))
+        {
+            let reason = self.refused.get(peer).map_or_else(
+                || "it was rolled back or refused here".to_string(),
+                |r| r.reason.clone(),
+            );
+            return sync_net::PushAnswer::Refused(reason);
         }
         self.events.emit(
             Level::Info,
@@ -2004,7 +2070,11 @@ impl Controller {
                 debug!("\"{peer}\" took over the change of this site");
             }
             // Pushed again soon.
-            Ok(sync_net::PushAnswer::Busy) => self.pushed = None,
+            // Pushed again in a moment (not every second while it is busy).
+            Ok(sync_net::PushAnswer::Busy) => {
+                self.pushed = None;
+                self.push_retry_at = Instant::now() + PUSH_RETRY;
+            }
             // The uplink's view says why (`refused`): fetched at once, its
             // configuration applies again.
             Ok(sync_net::PushAnswer::Refused(reason)) => {
@@ -2093,6 +2163,15 @@ impl Controller {
                     "Your change was not taken over by \"{peer}\": {reason}"
                 ));
                 self.diverged_since = None;
+                // The changes of its clients in it: refused here too, so they
+                // are not merged and passed on again (they learn why).
+                for (client, fingerprint) in std::mem::take(&mut self.relayed) {
+                    self.refuse_client(
+                        &client,
+                        Some(fingerprint),
+                        format!("\"{peer}\" refused it: {reason}"),
+                    );
+                }
                 network
             }
             FetchMode::Replace => {
@@ -2147,11 +2226,21 @@ impl Controller {
                 }
                 let source = ChangeSource::Sync { peer: peer.clone() };
                 let result = self.apply(cfg, source, None, None, false).await;
+                // What was announced is rejected too on a rollback (an
+                // identity claimed here makes the result differ from it).
                 if result.is_ok()
-                    && mode == FetchMode::Merge
                     && let Some(p) = &mut self.pending
                 {
                     p.announced = Some(fingerprint.clone());
+                }
+                // A client's change this site passes on to its own uplink.
+                let has_uplink = self
+                    .confirmed
+                    .as_ref()
+                    .and_then(|c| c.self_site())
+                    .is_some_and(|s| s.uplink.is_some());
+                if result.is_ok() && mode == FetchMode::Merge && has_uplink {
+                    self.relayed.insert(peer.clone(), fingerprint.clone());
                 }
                 if let Err(e) = result {
                     // Possibly transient (e.g. a busy kernel); try again later.
@@ -2211,6 +2300,7 @@ impl Controller {
             Request::Interfaces => to_value(&self.interfaces().await?),
             Request::MacTable => to_value(&self.mac_table().await?),
             Request::VlanTraffic => to_value(&self.vlan_traffic().await?),
+            Request::History(params) => to_value(&self.history(params.since_ms)),
             Request::Unblock(params) => {
                 if !self.runtime.blocked.remove(&params.port) {
                     return Err(ApiError::new(format!(
@@ -2616,6 +2706,7 @@ impl Controller {
         self.fetch_backoff.clear();
         self.grace.clear();
         self.grace_keys.clear();
+        self.relayed.clear();
         self.flushes.clear();
         self.invites.clear();
         self.join_failures.clear();
@@ -2935,6 +3026,12 @@ impl Controller {
                 Err(e) => self.events.error(format!("{e:#}")),
             }
         }
+        // Peers it removed get the new network only from now on (until now
+        // the confirmed one was offered): their grace starts here.
+        let until = Instant::now() + GRACE;
+        for (_, t) in self.grace.values_mut() {
+            *t = until;
+        }
         self.confirmed = Some(cfg.clone());
         self.set_config(Some(cfg.clone()));
         // A change the user confirmed lifts the blocks of the loop guard
@@ -2963,6 +3060,27 @@ impl Controller {
                 self.reject(pending.fingerprint.clone());
                 if let Some(announced) = &pending.announced {
                     self.reject(announced.clone());
+                }
+                // A change of a client of this site: the client learns that
+                // it was rolled back (else it sends it again at once).
+                let me = pending.previous.as_ref().map(|c| c.self_name().to_string());
+                let client = pending.previous.as_ref().is_some_and(|c| {
+                    c.network
+                        .site(peer)
+                        .is_some_and(|s| s.uplink.as_deref() == me.as_deref())
+                });
+                if client {
+                    self.relayed.remove(peer);
+                    self.refused.insert(
+                        peer.clone(),
+                        Refusal {
+                            reason: format!(
+                                "it was rolled back at \"{}\": {reason}",
+                                me.unwrap_or_default()
+                            ),
+                            at: std::time::Instant::now(),
+                        },
+                    );
                 }
                 Some(peer.clone())
             }
@@ -3252,6 +3370,54 @@ impl Controller {
     }
 
     /// The traffic per VLAN on the ports of our bridges.
+    /// The traffic of the tunnels and trunk ports and the round trips of
+    /// the peers recorded after `since_ms` (all of the last hour without).
+    fn history(&self, since_ms: Option<u64>) -> wanderlan_core::api::History {
+        use wanderlan_core::api::{History as Answer, PeerHistory, PortHistory};
+        let since = since_ms.unwrap_or(0);
+        let trunks: Vec<String> = self.config.as_ref().map_or_else(Vec::new, |cfg| {
+            let mut ports: Vec<String> = std::iter::once(&cfg.local.trunk)
+                .chain(cfg.local.tunnel_trunks.values())
+                .flatten()
+                .cloned()
+                .collect();
+            ports.sort();
+            ports.dedup();
+            ports
+        });
+        let recorded = self.history.read().ok();
+        let probes = self.probes.read().ok();
+        let traffic = |name: &str| {
+            recorded
+                .as_ref()
+                .map_or_else(Vec::new, |h| h.since(name, since))
+        };
+        Answer {
+            now_ms: history::now_ms(),
+            started_ms: self.started_ms,
+            interval_ms: history::duration_ms(stats::INTERVAL),
+            peers: self
+                .direct_peers()
+                .into_keys()
+                .map(|name| PeerHistory {
+                    traffic: traffic(&topology::tunnel_name(&name)),
+                    rtt: probes
+                        .as_ref()
+                        .and_then(|t| t.get(&name).map(|p| p.rtt_since(since)))
+                        .unwrap_or_default(),
+                    name,
+                })
+                .collect(),
+            trunks: trunks
+                .into_iter()
+                .map(|port| PortHistory {
+                    traffic: traffic(&port),
+                    port,
+                })
+                .collect(),
+        }
+    }
+
     async fn vlan_traffic(&self) -> Result<VlanTraffic, ApiError> {
         let links = self.sys.links().await.map_err(api_err)?;
         let bridges = owned_bridges(&links);
@@ -3530,7 +3696,8 @@ impl Controller {
                         .and_then(|p| p.last_reply)
                         .and_then(|r| r.elapsed().ok())
                         .map(|d| d.as_secs()),
-                    rtt_ms: probe.and_then(|p| p.rtt_ms),
+                    // The last answer's, only while it answers.
+                    rtt_ms: probe.filter(|p| p.reachable).and_then(|p| p.rtt_ms),
                     rtt_stats: probe.and_then(probe::PeerProbe::rtt_stats),
                     traffic: link.map(|l| l.traffic).unwrap_or_default(),
                     pmtu: probe.and_then(|p| p.pmtu),

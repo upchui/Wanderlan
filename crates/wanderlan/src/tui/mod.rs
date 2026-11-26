@@ -13,8 +13,9 @@ mod filter;
 #[cfg(test)]
 mod fixtures;
 mod form;
-mod format;
+pub(crate) mod format;
 mod help;
+mod history;
 mod input;
 mod localtime;
 mod log;
@@ -259,6 +260,7 @@ async fn perform(client: &Client, request: Request) -> Result<Reply, ClientError
         r @ Request::Interfaces => Reply::Interfaces(client.call(r).await?),
         r @ Request::MacTable => Reply::Macs(client.call(r).await?),
         r @ Request::VlanTraffic => Reply::VlanTraffic(client.call(r).await?),
+        r @ Request::History(_) => Reply::Traffic(Box::new(client.call(r).await?)),
         r @ Request::Validate(_) => {
             let _: api::Validation = client.call(r).await?;
             Reply::Done

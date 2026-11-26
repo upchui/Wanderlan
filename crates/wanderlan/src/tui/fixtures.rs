@@ -2,8 +2,8 @@
 //! different states.
 
 use wanderlan_core::api::{
-    ConfigTexts, Event, Interface, Level, MacEntry, PeerStatus, PortState, SiteState, SiteSummary,
-    Status, VlanPortTraffic, VlanTraffic,
+    ConfigTexts, Event, History, Interface, Level, MacEntry, PeerHistory, PeerStatus, PortState,
+    RttPoint, SiteState, SiteSummary, Status, TrafficPoint, VlanPortTraffic, VlanTraffic,
 };
 use wanderlan_core::config::{Local, fingerprint, parse_network, render_local, render_network};
 
@@ -370,4 +370,46 @@ pub fn events() -> Vec<Event> {
             "haus6 does not answer control probes",
         ),
     ]
+}
+
+/// The clock of [`history`] (ms since the Unix epoch).
+pub const HISTORY_NOW_MS: u64 = 1_800_000_000_000;
+
+/// What the daemon recorded: the last 10 minutes of buero (busy), haus3 and
+/// haus5, every 2 s; buero's probes every 5 s, some lost.
+pub fn history() -> History {
+    let traffic = |rx: u64, tx: u64, step: u64| -> Vec<TrafficPoint> {
+        (0..300u64)
+            .map(|i| {
+                TrafficPoint(
+                    HISTORY_NOW_MS - (299 - i) * 2_000,
+                    rx + (i % 60) * step,
+                    tx + ((i * 7) % 40) * step / 4,
+                )
+            })
+            .collect()
+    };
+    #[allow(clippy::cast_precision_loss)]
+    let rtt: Vec<RttPoint> = (0..120u64)
+        .map(|i| {
+            let ms = (i % 37 != 5).then_some(4.0 + (i % 5) as f32 * 0.5);
+            RttPoint(HISTORY_NOW_MS - (119 - i) * 5_000, ms)
+        })
+        .collect();
+    let peer = |name: &str, traffic: Vec<TrafficPoint>, rtt: Vec<RttPoint>| PeerHistory {
+        name: name.into(),
+        traffic,
+        rtt,
+    };
+    History {
+        now_ms: HISTORY_NOW_MS,
+        started_ms: HISTORY_NOW_MS - 3_600_000,
+        interval_ms: 2_000,
+        peers: vec![
+            peer("buero", traffic(1_000_000, 300_000, 50_000), rtt),
+            peer("haus3", traffic(60_000, 20_000, 1_000), Vec::new()),
+            peer("haus5", traffic(40_000, 15_000, 500), Vec::new()),
+        ],
+        trunks: Vec::new(),
+    }
 }

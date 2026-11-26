@@ -638,13 +638,28 @@ fn after_the_setup_the_invitation_form_opens() {
 #[test]
 fn enter_on_a_peer_opens_its_details_and_history_grows() {
     let mut app = connected();
-    for _ in 0..3 {
-        app.update(reply(
-            Request::Status,
-            Reply::Status(Box::new(fixtures::status())),
-        ));
-    }
-    assert_eq!(app.history.get("buero").map(VecDeque::len), Some(4));
+    // The graphs: first the whole recorded hour, then what is new.
+    let asked = |fx: &[Effect]| {
+        fx.iter().find_map(|e| match e {
+            Effect::Request(Request::History(p)) => Some(p.since_ms),
+            _ => None,
+        })
+    };
+    let fx = app.update(Msg::Tick);
+    assert_eq!(asked(&fx), Some(None));
+    app.update(reply(
+        Request::History(HistoryParams::default()),
+        Reply::Traffic(Box::new(fixtures::history())),
+    ));
+    assert_eq!(
+        app.recorded.peers.get("buero").map(|p| p.traffic.len()),
+        Some(300)
+    );
+    let fx = app.update(Msg::Tick);
+    assert_eq!(asked(&fx), Some(Some(fixtures::HISTORY_NOW_MS)));
+    // z: another time range.
+    app.update(ch('z'));
+    assert_eq!(app.graph_range, crate::tui::history::Range::Long);
     app.update(key(KeyCode::Enter));
     assert!(matches!(&app.modal, Some(Modal::Peer { name, .. }) if name == "buero"));
     app.update(key(KeyCode::Esc));
@@ -1085,8 +1100,13 @@ fn from_the_peer_details_to_one_vlan_and_back() {
         Request::VlanTraffic,
         Reply::VlanTraffic(fixtures::vlan_traffic()),
     ));
-    // buero's VLANs, the busiest first: 20, 10, 30.
+    // buero's VLANs, those that carried traffic first: 10, 20, then 30.
     app.update(key(KeyCode::Down));
+    assert!(matches!(
+        &app.modal,
+        Some(Modal::Peer { vlan: Some(20), .. })
+    ));
+    app.update(key(KeyCode::Up));
     assert!(matches!(
         &app.modal,
         Some(Modal::Peer { vlan: Some(10), .. })
@@ -1134,7 +1154,13 @@ fn the_vlan_history_follows_the_answers() {
     let samples = app.vlan_history.get(&20).expect("VLAN 20");
     assert_eq!(samples.len(), 3);
     // All ports: vx-buero 2.4M + vx-haus2 300k + ens19 2.1M in.
-    assert_eq!(samples[0].rx_bps, 4_800_000);
+    assert_eq!(samples[0].1, 4_800_000);
+    // An answer without ports (a read error) keeps the history.
+    app.update(reply(
+        Request::VlanTraffic,
+        Reply::VlanTraffic(VlanTraffic::default()),
+    ));
+    assert_eq!(app.vlan_history.get(&20).map(VecDeque::len), Some(3));
 }
 
 #[test]

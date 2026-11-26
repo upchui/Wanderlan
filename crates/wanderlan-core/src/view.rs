@@ -227,12 +227,17 @@ fn merge_named(full: &Network, view: &Network, from: &str) -> Result<Network, St
     }
 
     // The VLANs of its own tunnels as in the view; the others as received.
-    let touches_own = |t: &TunnelVlans| t.sites.iter().any(|s| names.contains(s.as_str()));
+    // Its own are those with both ends in its view: a limit towards a site
+    // it does not see (left over from where it hung before) stays.
+    let own_tunnel = |t: &TunnelVlans| {
+        t.sites.iter().any(|s| names.contains(s.as_str()))
+            && t.sites.iter().all(|s| view.site(s).is_some())
+    };
     let foreign = |n: &Network| -> Vec<TunnelVlans> {
         let mut list: Vec<TunnelVlans> = n
             .tunnels
             .iter()
-            .filter(|t| !touches_own(t))
+            .filter(|t| !own_tunnel(t))
             .cloned()
             .collect();
         list.sort_by(|x, y| x.sites.cmp(&y.sites));
@@ -245,8 +250,8 @@ fn merge_named(full: &Network, view: &Network, from: &str) -> Result<Network, St
     }
     merged
         .tunnels
-        .retain(|t| !touches_own(t) || view.tunnels.contains(t));
-    for tunnel in view.tunnels.iter().filter(|t| touches_own(t)) {
+        .retain(|t| !own_tunnel(t) || view.tunnels.contains(t));
+    for tunnel in view.tunnels.iter().filter(|t| own_tunnel(t)) {
         if !merged.tunnels.contains(tunnel) {
             merged.tunnels.push(tunnel.clone());
         }
@@ -412,7 +417,10 @@ mod tests {
         // x (a client of marcel) invites z and sets its own ports.
         let mut at_x = view_for(&network, "x");
         at_x.revision = 8;
-        at_x.sites.push(site("z", 9, Some("x")));
+        // z joined x with ports of its own.
+        let mut z = site("z", 9, Some("x"));
+        z.ports.control = Some(52100);
+        at_x.sites.push(z);
         at_x.sites
             .iter_mut()
             .find(|s| s.name == "x")
@@ -427,6 +435,7 @@ mod tests {
         let at_alex = merge(&network, &at_marcel, "marcel").unwrap().network;
         assert_eq!(at_alex.site("z").unwrap().uplink.as_deref(), Some("x"));
         assert_eq!(at_alex.control_port_of("x"), 52000);
+        assert_eq!(at_alex.control_port_of("z"), 52100);
         // And down again: x knows z.
         assert_eq!(names(&view_for(&at_alex, "x")), ["marcel", "x", "w", "z"]);
         // marcel may not set the ports of x itself, nor change its server.
@@ -446,6 +455,38 @@ mod tests {
             .unwrap()
             .online = false;
         assert!(merge(&view_for(&network, "marcel"), &up, "x").is_err());
+    }
+
+    #[test]
+    fn what_a_client_does_not_see_stays_as_it_is() {
+        let mut network = full();
+        // A limit left over towards dc (x hung off it before): x's client
+        // marcel does not see dc.
+        network.set_tunnel_limit("dc", "x", Some(VlanSet::from_range(10, 20)));
+        let mut view = view_for(&network, "marcel");
+        view.revision = 8;
+        view.sites
+            .iter_mut()
+            .find(|s| s.name == "x")
+            .unwrap()
+            .online = false;
+        let merged = merge(&network, &view, "marcel").unwrap().network;
+        assert_eq!(
+            merged.tunnel_limit("dc", "x"),
+            Some(&VlanSet::from_range(10, 20))
+        );
+        // marcel is restricted, x released below it: the VLANs of the
+        // network still need marcel's rights.
+        let site = |n: &mut Network, name: &str| -> usize {
+            n.sites.iter().position(|s| s.name == name).unwrap()
+        };
+        let m = site(&mut network, "marcel");
+        network.sites[m].self_managed = false;
+        let mut view = view_for(&network, "marcel");
+        view.revision = 8;
+        view.vlans = VlanSet::from_range(10, 40);
+        let err = merge(&network, &view, "marcel").unwrap_err();
+        assert!(err.contains("VLANs of the network"), "{err}");
     }
 
     #[test]

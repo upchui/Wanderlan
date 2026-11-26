@@ -163,7 +163,8 @@ impl Validator {
             return;
         }
         let mut names: BTreeMap<&str, usize> = BTreeMap::new();
-        let mut addresses: BTreeMap<std::net::Ipv4Addr, &str> = BTreeMap::new();
+        // Every site seen at an address: each new one is compared with all.
+        let mut addresses: BTreeMap<std::net::Ipv4Addr, Vec<&str>> = BTreeMap::new();
         let mut ids: BTreeMap<crate::identity::SiteId, &str> = BTreeMap::new();
         for (i, site) in network.sites.iter().enumerate() {
             let name = site.name.as_str();
@@ -194,9 +195,13 @@ impl Validator {
             // Boxes with an identity are told apart by it: several clients
             // behind one NAT share its address. Servers (and sites of older
             // versions) need their own.
-            if let Some(other) = addresses.insert(addr, name)
-                && !shares_address(network, name, other)
-            {
+            let at = addresses.entry(addr).or_default();
+            let clash = at
+                .iter()
+                .copied()
+                .find(|other| !shares_address(network, name, other));
+            at.push(name);
+            if let Some(other) = clash {
                 self.error(
                     FieldPath::site_field(i, "address"),
                     format!("site \"{name}\": address {addr} is already used by site \"{other}\""),
@@ -444,20 +449,30 @@ impl Validator {
         let mut shareds: BTreeMap<(&str, u16), usize> = BTreeMap::new();
         for (i, map) in network.maps.iter().enumerate() {
             let site = map.site.as_str();
-            let site_vlans = network.site(site).map(|s| network.vlans_of(s));
+            let site_vlans = network
+                .site(site)
+                .map(|s| (network.vlans_of(s), s.own_vlans.as_ref()));
             match site_vlans {
                 None => self.error(
                     FieldPath::map_field(i, "site"),
                     format!("map #{}: site \"{site}\" does not exist", i + 1),
                 ),
-                Some(vlans) if map.shared != NATIVE_VID && !vlans.contains(map.shared) => self.error(
+                // Its VLANs or its own VLANs (on its trunk and towards its
+                // clients).
+                Some((vlans, own))
+                    if map.shared != NATIVE_VID
+                        && !vlans.contains(map.shared)
+                        && !own.is_some_and(|o| o.contains(map.shared)) =>
+                {
+                    self.error(
                     FieldPath::map_field(i, "shared"),
                     format!(
-                        "map #{}: source VLAN {} is not one of the VLANs of site \"{site}\" ({vlans})",
+                        "map #{}: source VLAN {} is not one of the VLANs of site \"{site}\" ({vlans}) nor of its own VLANs",
                         i + 1,
                         map.shared,
                     ),
-                ),
+                    );
+                }
                 Some(_) => {}
             }
             if map.shared == NATIVE_VID {
@@ -518,7 +533,7 @@ impl Validator {
                 );
             }
             if let LocalVid::Vid(local) = map.local
-                && site_vlans.is_some_and(|v| v.contains(local))
+                && site_vlans.is_some_and(|(v, _)| v.contains(local))
             {
                 self.warning(
                     FieldPath::map_field(i, "local"),

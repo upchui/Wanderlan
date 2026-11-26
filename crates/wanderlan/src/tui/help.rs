@@ -45,9 +45,13 @@ pub const SECTIONS: &[Section] = &[
             ("u", "unblock the port of the peer (loop guard)"),
             ("U", "unblock a trunk port (loop guard)"),
             ("p", "measure the path MTU to all peers now"),
+            ("z", "the graphs: the last 2 min, 10 min or 1 h"),
         ],
         text: "Green: reachable and up. Yellow: degraded (port down or offline, \
-               config differs, late replies). Red: unreachable or blocked by the loop guard.",
+               config differs, late replies). Red: unreachable or blocked by the loop guard. \
+               The graphs show what came in above the line (green) and what went out \
+               below it (magenta), each on its own scale; the daemon records the last hour, \
+               LOAD compares the tunnels.",
     },
     Section {
         title: "2 Sites",
@@ -185,10 +189,12 @@ pub const SECTIONS: &[Section] = &[
     Section {
         title: "Peer details and VLANs",
         keys: &[
-            ("Up/Down", "a VLAN of the tunnel (the busiest first)"),
+            ("Up/Down", "a VLAN of the tunnel (those with traffic first)"),
             ("Enter", "that VLAN live: every port, its MACs, a graph"),
             ("Left/Right", "the previous / next peer"),
             ("VLAN: Up/Down", "the previous / next VLAN of this site"),
+            ("z", "the graphs: the last 2 min, 10 min or 1 h"),
+            ("VLAN: PgUp/PgDn", "scroll its ports (also the mouse wheel)"),
             ("VLAN: m", "the MAC table of this VLAN"),
             ("VLAN: Esc", "back to the peer"),
         ],
@@ -291,11 +297,13 @@ pub fn bar(app: &App) -> Vec<Binding> {
                 ("Up/Down", "VLAN"),
                 ("Enter", "open VLAN"),
                 ("Left/Right", "other peer"),
+                ("z", "range"),
                 ("Esc", "close"),
             ],
             Modal::Vlan { back, .. } => vec![
                 ("Up/Down", "other VLAN"),
                 ("m", "its MACs"),
+                ("z", "range"),
                 ("Esc", if back.is_some() { "back" } else { "close" }),
             ],
             Modal::Site { .. } => vec![

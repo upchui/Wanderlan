@@ -644,7 +644,11 @@ async fn translation_rules_are_installed_once() {
     assert!(tc.clsact);
     let mut cookies: Vec<String> = tc.ours.iter().map(TcRule::cookie).collect();
     cookies.sort();
-    assert_eq!(cookies, vec!["wl:e30>130", "wl:i130>30", "wl:i30x"]);
+    // haus3 also has native = 20: tagged 20 is dropped.
+    assert_eq!(
+        cookies,
+        vec!["wl:e30>130", "wl:i130>30", "wl:i20x", "wl:i30x"]
+    );
     net.take_calls();
     assert!(run(&net, &d).await.is_empty());
     assert!(net.take_calls().is_empty());
@@ -665,10 +669,10 @@ async fn translation_rules_of_an_older_version_move_into_one_priority() {
         .iter()
         .filter(|c| matches!(c, Change::AddTcRule { .. }))
         .count();
-    assert_eq!((dels, adds), (3, 3), "{changes:?}");
+    assert_eq!((dels, adds), (4, 4), "{changes:?}");
     let tc = net.tc("ens19");
     assert!(!tc.legacy);
-    assert_eq!(tc.ours.len(), 3);
+    assert_eq!(tc.ours.len(), 4);
     assert!(run(&net, &d).await.is_empty(), "once");
 }
 
@@ -687,9 +691,22 @@ async fn removing_the_mapping_removes_rules_and_qdisc() {
     );
     let mut cookies: Vec<String> = net.tc("ens19").ours.iter().map(TcRule::cookie).collect();
     cookies.sort();
-    assert_eq!(cookies, vec!["wl:e31>131", "wl:i131>31", "wl:i31x"]);
+    assert_eq!(
+        cookies,
+        vec!["wl:e31>131", "wl:i131>31", "wl:i20x", "wl:i31x"]
+    );
 
+    // Only the native mapping left: only its drop rule.
     let network = NETWORK.replace("[[map]]\nsite = \"haus3\"\nlocal = 130\nshared = 30\n", "");
+    let d = derive(&config_from(&network, "haus3"), &Runtime::default());
+    run(&net, &d).await;
+    let cookies: Vec<String> = net.tc("ens19").ours.iter().map(TcRule::cookie).collect();
+    assert_eq!(cookies, vec!["wl:i20x"]);
+    // No mapping at all: nothing left.
+    let network = network.replace(
+        "[[map]]\nsite = \"haus3\"\nlocal = \"native\"\nshared = 20\n",
+        "",
+    );
     let d = derive(&config_from(&network, "haus3"), &Runtime::default());
     run(&net, &d).await;
     assert_eq!(net.tc("ens19"), IfTc::default());
@@ -702,7 +719,7 @@ async fn foreign_filters_are_kept() {
     run(&net, &desired("haus3")).await;
     let tc = net.tc("ens19");
     assert_eq!(tc.foreign, 1);
-    assert_eq!(tc.ours.len(), 3);
+    assert_eq!(tc.ours.len(), 4);
     teardown(&net, |_| {}).await.unwrap();
     let tc = net.tc("ens19");
     assert!(tc.clsact, "the clsact qdisc is still used by someone else");

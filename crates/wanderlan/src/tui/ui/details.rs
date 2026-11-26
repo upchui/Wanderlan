@@ -4,17 +4,14 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{
-    Axis, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Sparkline, Table, Wrap,
-};
+use ratatui::widgets::{Cell, Clear, Paragraph, Row, Table, Wrap};
 use wanderlan_core::api::{PeerStatus, Traffic};
 use wanderlan_core::config::LocalVid;
 use wanderlan_core::{policy, topology};
 
 use super::{health_style, list, port_state, titled};
-use crate::tui::app::{App, HISTORY_LEN};
+use crate::tui::app::App;
 use crate::tui::{format, theme, traffic};
 
 fn label(text: &str) -> Span<'static> {
@@ -33,42 +30,32 @@ fn counters(t: &Traffic, rx: bool) -> String {
     )
 }
 
+/// The round trip now and over the last probes (about 5 minutes), with
+/// the share of lost probes.
 fn rtt_line(peer: &PeerStatus) -> Line<'static> {
     let Some(s) = peer.rtt_stats else {
         return Line::from(vec![label("Round trip"), Span::raw("no answers yet")]);
     };
     let now = peer.rtt_ms.map_or_else(|| "-".into(), format::rtt);
+    let loss_style = if s.loss_percent > 0.0 {
+        theme::warn()
+    } else {
+        theme::dim()
+    };
     Line::from(vec![
         label("Round trip"),
         Span::styled(now, theme::bold()),
         Span::raw(format!(
-            "  min {} avg {} max {}  jitter {}",
+            "  min {} avg {} max {} jitter {}",
             format::rtt(s.min_ms),
             format::rtt(s.avg_ms),
             format::rtt(s.max_ms),
             format::rtt(s.jitter_ms)
         )),
-    ])
-}
-
-fn quality_line(peer: &PeerStatus) -> Line<'static> {
-    let (loss, samples) = peer
-        .rtt_stats
-        .map_or((0.0, 0), |s| (s.loss_percent, s.samples));
-    let loss_style = if loss > 0.0 {
-        theme::warn()
-    } else {
-        Style::new()
-    };
-    let latency = peer
-        .rtt_stats
-        .map_or_else(|| "-".into(), |s| format::rtt(s.avg_ms / 2.0));
-    Line::from(vec![
-        label("Probe loss"),
-        Span::styled(format!("{loss:.0} %"), loss_style),
-        Span::raw(format!(" of {samples} probes   ")),
-        Span::styled("latency ", theme::dim()),
-        Span::raw(format!("~{latency} one way (round trip / 2)")),
+        Span::styled(
+            format!("  lost {:.0} % of {}", s.loss_percent, s.samples),
+            loss_style,
+        ),
     ])
 }
 
@@ -261,7 +248,6 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, vlan: Option<u16>, area: R
             )),
         ]),
         rtt_line(peer),
-        quality_line(peer),
         probes_line(app, peer),
         identity_line(peer),
         vxlan_line(peer),
@@ -294,12 +280,12 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, vlan: Option<u16>, area: R
         ]),
         Line::from(vec![
             label("Received"),
-            Span::styled(format!("{}bit/s", format::rate(peer.rx_bps)), theme::ok()),
+            Span::styled(format!("{}bit/s", format::rate(peer.rx_bps)), theme::rx()),
             Span::raw(format!(" now, {}", counters(&peer.traffic, true))),
         ]),
         Line::from(vec![
             label("Sent"),
-            Span::styled(format!("{}bit/s", format::rate(peer.tx_bps)), theme::warn()),
+            Span::styled(format!("{}bit/s", format::rate(peer.tx_bps)), theme::tx()),
             Span::raw(format!(" now, {}", counters(&peer.traffic, false))),
         ]),
     ];
@@ -318,84 +304,39 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, vlan: Option<u16>, area: R
             Span::styled(reason.clone(), theme::bad()),
         ]));
     }
-    // As many fact lines as there are, the graph gets the rest.
-    let [facts, graph, rtt] = Layout::vertical([
+    // As many fact lines as there are, the graphs get the rest.
+    let [facts, graphs] = Layout::vertical([
         Constraint::Length(u16::try_from(lines.len() + 1).unwrap_or(9)),
-        Constraint::Min(5),
-        Constraint::Length(2),
+        Constraint::Min(6),
     ])
     .areas(inner);
     frame.render_widget(Paragraph::new(lines), facts);
 
-    let samples: Vec<_> = app
-        .history
-        .get(name)
-        .map(|h| h.iter().copied().collect())
+    let [graphs, vlans] =
+        Layout::horizontal([Constraint::Min(30), Constraint::Length(28)]).areas(graphs);
+    // The round trips below the traffic where there is room for both.
+    let rtt_height = if graphs.height >= 13 { 6 } else { 0 };
+    let [traffic, rtt] =
+        Layout::vertical([Constraint::Min(6), Constraint::Length(rtt_height)]).areas(graphs);
+    let recorded = app.recorded.peers.get(name);
+    let points: Vec<_> = recorded
+        .map(|r| r.traffic.iter().copied().collect())
         .unwrap_or_default();
-    #[allow(clippy::cast_precision_loss)]
-    let points = |pick: fn(&crate::tui::app::Sample) -> u64| -> Vec<(f64, f64)> {
-        let offset = HISTORY_LEN.saturating_sub(samples.len());
-        samples
-            .iter()
-            .enumerate()
-            .map(|(i, s)| ((offset + i) as f64, pick(s) as f64))
-            .collect()
-    };
-    let rx = points(|s| s.rx_bps);
-    let tx = points(|s| s.tx_bps);
-    let top = rx
-        .iter()
-        .chain(tx.iter())
-        .map(|p| p.1)
-        .fold(1000.0, f64::max)
-        * 1.1;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let top_label = format::rate(top as u64);
-    #[allow(clippy::cast_precision_loss)]
-    let width = HISTORY_LEN as f64;
-    let chart = Chart::new(vec![
-        Dataset::default()
-            .name("received")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(theme::ok())
-            .data(&rx),
-        Dataset::default()
-            .name("sent")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(theme::warn())
-            .data(&tx),
-    ])
-    .block(titled(" Traffic (bit/s, last samples) "))
-    .x_axis(Axis::default().bounds([0.0, width]))
-    .y_axis(
-        Axis::default()
-            .bounds([0.0, top])
-            .labels(vec![Span::raw("0"), Span::raw(top_label)]),
+    super::graph::traffic(
+        frame,
+        traffic,
+        "Traffic",
+        &points,
+        app.recorded.now_ms,
+        app.graph_range,
     );
-    let [graph, vlans] =
-        Layout::horizontal([Constraint::Min(30), Constraint::Length(28)]).areas(graph);
-    frame.render_widget(chart, graph);
+    let probes: Vec<_> = recorded
+        .map(|r| r.rtt.iter().copied().collect())
+        .unwrap_or_default();
+    if rtt_height > 0 {
+        super::graph::rtt(frame, rtt, &probes, app.recorded.now_ms, app.graph_range);
+    }
     peer_vlans(frame, app, name, vlan, vlans);
-
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let rtts: Vec<u64> = samples
-        .iter()
-        .map(|s| s.rtt_ms.map_or(0, |r| (r * 100.0) as u64))
-        .collect();
-    let [rtt_label, rtt_spark] =
-        Layout::horizontal([Constraint::Length(14), Constraint::Min(10)]).areas(rtt);
-    // The newest samples, as many as fit (the oldest drop off the left).
-    let rtts = &rtts[rtts.len().saturating_sub(usize::from(rtt_spark.width))..];
-    frame.render_widget(
-        Paragraph::new(vec![Line::raw(" Round trip"), Line::raw(" history")]).style(theme::dim()),
-        rtt_label,
-    );
-    frame.render_widget(
-        Sparkline::default().data(rtts).style(theme::title()),
-        rtt_spark,
-    );
 }
 
 /// Everything about one site of the draft.

@@ -51,6 +51,12 @@ fn connected() -> App {
         Request::Subscribe,
         Reply::History(fixtures::events()),
     );
+    // What the daemon recorded for the graphs.
+    reply(
+        &mut app,
+        Request::History(wanderlan_core::api::HistoryParams::default()),
+        Reply::Traffic(Box::new(fixtures::history())),
+    );
     app
 }
 
@@ -455,6 +461,13 @@ fn overview_on_a_wide_terminal() {
 }
 
 #[test]
+fn peer_details_on_a_tall_terminal_with_the_round_trips() {
+    let mut app = connected();
+    key(&mut app, KeyCode::Enter);
+    insta::assert_snapshot!(render_size(&app, 100, 40));
+}
+
+#[test]
 fn a_long_form_hint_wraps() {
     let mut app = connected();
     key(&mut app, KeyCode::Char('2'));
@@ -658,6 +671,8 @@ fn one_vlan_live() {
         Request::VlanTraffic,
         Reply::VlanTraffic(fixtures::vlan_traffic()),
     );
+    // 10, then 20.
+    key(&mut app, KeyCode::Down);
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.modal, Some(Modal::Vlan { vid: 20, .. })));
     insta::assert_snapshot!(render(&app));

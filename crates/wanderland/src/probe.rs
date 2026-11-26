@@ -236,9 +236,18 @@ pub struct PeerProbe {
     /// Recent probes: round trip in ms, or `None` if unanswered.
     #[serde(skip)]
     recent: VecDeque<Option<f64>>,
+    /// Every probe of the last hour, for the graphs.
+    #[serde(skip)]
+    rtt_history: VecDeque<wanderlan_core::api::RttPoint>,
 }
 
 impl PeerProbe {
+    /// The probes after `since_ms` (ms since the Unix epoch).
+    pub fn rtt_since(&self, since_ms: u64) -> Vec<wanderlan_core::api::RttPoint> {
+        let start = self.rtt_history.partition_point(|p| p.0 <= since_ms);
+        self.rtt_history.range(start..).copied().collect()
+    }
+
     /// Round-trip statistics over the recent probes.
     pub fn rtt_stats(&self) -> Option<wanderlan_core::api::RttStats> {
         let answered: Vec<f64> = self.recent.iter().flatten().copied().collect();
@@ -357,6 +366,26 @@ struct Shared {
 }
 
 impl Shared {
+    /// Forgets the endpoints, candidates, tests and reports of every peer
+    /// for which `keep` is false.
+    fn forget_all_but(&self, keep: impl Fn(&str) -> bool) {
+        if let Ok(mut m) = self.endpoints.lock() {
+            m.retain(|n, _| keep(n));
+        }
+        if let Ok(mut m) = self.candidates.lock() {
+            m.retain(|n, _| keep(n));
+        }
+        if let Ok(mut m) = self.tests.lock() {
+            m.retain(|n, _| keep(n));
+        }
+        if let Ok(mut m) = self.reported.lock() {
+            m.retain(|n, _| keep(n));
+        }
+        if let Ok(mut m) = self.nonces.lock() {
+            m.retain(|n, _| keep(n));
+        }
+    }
+
     /// The keys towards a peer that claims `id`, derived once.
     fn claimed_keys(&self, me: &Identity, id: SiteId) -> Option<Arc<PairKeys>> {
         let mut claimed = self.claimed.lock().ok()?;
@@ -463,10 +492,15 @@ async fn run(
                 break;
             }
         }
+        // The old tasks hold the sockets: they end before the next bind
+        // (else it may find the address still in use).
         receiver.abort();
+        let _ = receiver.await;
         for (_, (_, task)) in prober {
             task.abort();
+            let _ = task.await;
         }
+        drop(shared);
         // Without a listening address (reset, unconfigured) or with a new
         // one, nothing measured or announced before is valid any more.
         if let Ok(mut t) = table.write() {
@@ -502,7 +536,9 @@ async fn bind_socket(bind: SocketAddrV4) -> anyhow::Result<UdpSocket> {
 }
 
 /// What a probe task is for: the peer's address and identity.
-type Target = (SocketAddrV4, Option<SiteId>);
+/// Where a peer is probed, with which key, and whether only where its
+/// requests come from (a passive client): a change starts its prober anew.
+type Target = (SocketAddrV4, Option<SiteId>, bool);
 
 /// Starts and stops the per-peer tasks to match the configured peers. A
 /// peer with another address or identity gets a new task and starts over.
@@ -514,10 +550,13 @@ fn sync_probers(
     events: &mpsc::Sender<ProbeEvent>,
 ) {
     let target = |name: &str| {
-        config
-            .peers
-            .get(name)
-            .map(|addr| (*addr, config.keys.get(name).map(|k| k.id)))
+        config.peers.get(name).map(|addr| {
+            (
+                *addr,
+                config.keys.get(name).map(|k| k.id),
+                config.passive.contains(name),
+            )
+        })
     };
     probers.retain(|name, (current, task)| {
         // A task that ended (it never should) is started again below.
@@ -533,6 +572,9 @@ fn sync_probers(
     if let Ok(mut t) = table.write() {
         t.retain(|name, _| config.peers.contains_key(name));
     }
+    // What was found out about a peer that is gone is forgotten: back, it
+    // is tested anew (and told so) instead of keeping an old result.
+    shared.forget_all_but(|name| config.peers.contains_key(name));
     for (name, addr) in &config.peers {
         if probers.contains_key(name) {
             continue;
@@ -1375,6 +1417,16 @@ fn update_reachability(table: &ProbeTable, name: &str, rtt: Option<Duration>) ->
         .push_back(rtt.map(|r| r.as_secs_f64() * 1000.0));
     while entry.recent.len() > RTT_WINDOW {
         entry.recent.pop_front();
+    }
+    let now = crate::history::now_ms();
+    #[allow(clippy::cast_possible_truncation)]
+    entry.rtt_history.push_back(wanderlan_core::api::RttPoint(
+        now,
+        rtt.map(|r| (r.as_secs_f64() * 1000.0) as f32),
+    ));
+    let oldest = now.saturating_sub(crate::history::duration_ms(crate::history::KEEP));
+    while entry.rtt_history.front().is_some_and(|p| p.0 < oldest) {
+        entry.rtt_history.pop_front();
     }
     match rtt {
         Some(rtt) => {

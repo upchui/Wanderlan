@@ -84,7 +84,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                         } else {
                             String::new()
                         };
-                        format!("{}/{}{segments}", short_rate(rx), short_rate(tx))
+                        format!("{}/{}{segments}", format::rate(rx), format::rate(tx))
                     } else {
                         "setting up".into()
                     },
@@ -220,21 +220,6 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     }
     lines.truncate(3);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), detail);
-}
-
-/// A rate in bit/s in a few characters: `12.4M`, `980k`, `0`.
-fn short_rate(bps: u64) -> String {
-    #[allow(clippy::cast_precision_loss)]
-    let v = bps as f64;
-    if v >= 1e9 {
-        format!("{:.1}G", v / 1e9)
-    } else if v >= 1e6 {
-        format!("{:.1}M", v / 1e6)
-    } else if v >= 1e3 {
-        format!("{:.0}k", v / 1e3)
-    } else {
-        bps.to_string()
-    }
 }
 
 /// The uplinks of this box: the interfaces with a gateway.

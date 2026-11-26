@@ -21,18 +21,30 @@ pub fn rtt(ms: f64) -> String {
     }
 }
 
-/// A bit rate without unit suffix: `950`, `12.5k`, `1.2M`, `3.4G`.
+/// A bit rate without unit suffix: `950`, `12.5k`, `1.2M`, `3.4G`. The
+/// unit follows the rounded value (999 999 is `1.0M`, never `1000.0k`).
 pub fn rate(bps: u64) -> String {
+    if bps < 1000 {
+        return bps.to_string();
+    }
     #[allow(clippy::cast_precision_loss)]
     let v = bps as f64;
-    if bps < 1000 {
-        bps.to_string()
-    } else if v < 1e6 {
-        format!("{:.1}k", v / 1e3)
-    } else if v < 1e9 {
-        format!("{:.1}M", v / 1e6)
-    } else {
-        format!("{:.1}G", v / 1e9)
+    let units = [(1e3, "k"), (1e6, "M"), (1e9, "G"), (1e12, "T")];
+    for (i, (div, unit)) in units.iter().enumerate() {
+        let x = v / div;
+        if x < 999.95 || i == units.len() - 1 {
+            return format!("{x:.1}{unit}");
+        }
+    }
+    String::new()
+}
+
+/// A bit rate with its unit: `950 bit/s`, `12.5 kbit/s`, `1.2 Mbit/s`.
+pub fn rate_unit(bps: u64) -> String {
+    let short = rate(bps);
+    match short.char_indices().last() {
+        Some((i, c)) if c.is_ascii_alphabetic() => format!("{} {c}bit/s", &short[..i]),
+        _ => format!("{short} bit/s"),
     }
 }
 
@@ -152,6 +164,11 @@ mod tests {
         assert_eq!(rate(12_500), "12.5k");
         assert_eq!(rate(1_200_000), "1.2M");
         assert_eq!(rate(3_400_000_000), "3.4G");
+        // The unit follows the rounded value.
+        assert_eq!(rate(999_999), "1.0M");
+        assert_eq!(rate(999_949), "999.9k");
+        assert_eq!(rate_unit(12_500), "12.5 kbit/s");
+        assert_eq!(rate_unit(950), "950 bit/s");
         assert_eq!(rtt(1.234), "1.2ms");
         assert_eq!(rtt(23.6), "24ms");
     }

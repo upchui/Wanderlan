@@ -4,14 +4,13 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
-use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Axis, Cell, Chart, Clear, Dataset, GraphType, Paragraph, Row, Table};
+use ratatui::widgets::{Cell, Clear, Paragraph, Row, Table};
 use wanderlan_core::config::{LocalVid, NATIVE_VID, Network};
 use wanderlan_core::{forwarding, topology};
 
 use super::{list, titled};
-use crate::tui::app::{App, HISTORY_LEN};
+use crate::tui::app::App;
 use crate::tui::{format, theme, traffic};
 
 fn label(text: &str) -> Span<'static> {
@@ -193,52 +192,22 @@ pub fn draw(frame: &mut Frame, app: &App, vid: u16, back: Option<&str>, area: Re
         list::BOXED,
     );
 
-    let samples: Vec<_> = app
+    // Recorded at the answers (the daemon counts per VLAN only while
+    // asked): "now" is the last one.
+    let points: Vec<_> = app
         .vlan_history
         .get(&vid)
         .map(|h| h.iter().copied().collect())
         .unwrap_or_default();
-    #[allow(clippy::cast_precision_loss)]
-    let points = |pick: fn(&crate::tui::app::Sample) -> u64| -> Vec<(f64, f64)> {
-        let offset = HISTORY_LEN.saturating_sub(samples.len());
-        samples
-            .iter()
-            .enumerate()
-            .map(|(i, s)| ((offset + i) as f64, pick(s) as f64))
-            .collect()
-    };
-    let rx = points(|s| s.rx_bps);
-    let tx = points(|s| s.tx_bps);
-    let top = rx
-        .iter()
-        .chain(tx.iter())
-        .map(|p| p.1)
-        .fold(1000.0, f64::max)
-        * 1.1;
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let top_label = format::rate(top as u64);
-    #[allow(clippy::cast_precision_loss)]
-    let width = HISTORY_LEN as f64;
-    let chart = Chart::new(vec![
-        Dataset::default()
-            .name("in")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(theme::ok())
-            .data(&rx),
-        Dataset::default()
-            .name("out")
-            .marker(Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(theme::warn())
-            .data(&tx),
-    ])
-    .block(titled(" All ports (bit/s, last samples) "))
-    .x_axis(Axis::default().bounds([0.0, width]))
-    .y_axis(
-        Axis::default()
-            .bounds([0.0, top])
-            .labels(vec![Span::raw("0"), Span::raw(top_label)]),
+    let now = points
+        .last()
+        .map_or(0, |p: &wanderlan_core::api::TrafficPoint| p.0);
+    super::graph::traffic(
+        frame,
+        graph_area,
+        "All ports",
+        &points,
+        now,
+        app.graph_range,
     );
-    frame.render_widget(chart, graph_area);
 }
