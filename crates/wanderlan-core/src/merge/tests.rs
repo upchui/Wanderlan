@@ -59,6 +59,7 @@ fn network(port: u16, trunk: &str, bridge: &str, vlans: &[u16], peers: &[&str]) 
         mss: BTreeSet::new(),
         split: BTreeSet::new(),
         tunnel_port: port,
+        control_port: port - 1,
         unbuilt: BTreeMap::new(),
         breakout: Vec::new(),
     }
@@ -103,7 +104,7 @@ fn networks_add_up_and_the_later_one_gives_way() {
     let twin = network(51822, "trunk2", "wl-trunk2", &[30], &["ta"]);
     let merged = merge(&[("default", &home), ("twin", &twin)]).unwrap();
     assert_eq!(merged.desired, home);
-    assert!(merged.conflicts["twin"][0].contains("UDP 51822"));
+    assert!(merged.conflicts["twin"][0].contains("port 51821"));
 
     // A port with VLAN mappings is not shared.
     let mut mapped = home.clone();

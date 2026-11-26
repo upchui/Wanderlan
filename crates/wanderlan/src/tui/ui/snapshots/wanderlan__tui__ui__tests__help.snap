@@ -1,14 +1,15 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
+assertion_line: 120
 expression: render(&app)
 ---
 " 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Breakout  8 Settings   "
 "┌ Help (Esc closes, Up/Down scrolls) ──────────────────────────────────────────┐"
 "│ 1 Overview                                                                   ║"
-"│   Up/Down             select a peer, below them a site of the network        █"
+"│   Up/Down             select a peer, below them a site of the network        ║"
 "│   Enter               details: traffic graph, round trips, counters          █"
 "│   o                   the selected site online or offline (to the review)    █"
-"│   u                   unblock the port of the peer (loop guard)              ║"
+"│   u                   unblock the port of the peer (loop guard)              █"
 "│   U                   unblock a trunk port (loop guard)                      ║"
 "│   p                   measure the path MTU to all peers now                  ║"
 "│   z                   the graphs: the last 2 min, 10 min or 1 h              ║"

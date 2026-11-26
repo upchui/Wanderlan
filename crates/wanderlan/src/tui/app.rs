@@ -373,6 +373,11 @@ pub enum Modal {
     },
     /// Choosing trunk ports from the interfaces of this host.
     Ports(PortPicker),
+    /// The networks of this box, to switch to another.
+    Networks {
+        /// Selected row.
+        selected: usize,
+    },
 }
 
 impl Modal {
@@ -419,6 +424,8 @@ pub enum Reply {
     Joined(Joined),
     /// Answer to `reset`.
     Reset(ResetReport),
+    /// Answer to `networks`.
+    Networks(Vec<wanderlan_core::api::NetworkInfo>),
     /// An empty answer.
     Done,
 }
@@ -464,6 +471,9 @@ pub enum Effect {
     Quit,
     /// Ask systemd about the daemon (state and last log lines).
     Diagnose,
+    /// Show another network of the box (`None`: the default network): a
+    /// new connection and a fresh state.
+    SwitchNetwork(Option<String>),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -624,6 +634,8 @@ pub struct App {
     pub invitation: Option<Invitation>,
     /// The open invitations (list popup).
     pub invitations: Vec<Invitation>,
+    /// The networks of this box, as listed last.
+    pub networks: Vec<wanderlan_core::api::NetworkInfo>,
     /// The code to select once the list arrived (a new invitation).
     select_invite: Option<String>,
     /// The invitation form while its request runs (back if refused).
@@ -704,6 +716,7 @@ impl App {
             wizard: Wizard::new(),
             invitation: None,
             invitations: Vec::new(),
+            networks: Vec::new(),
             select_invite: None,
             invite_pending: None,
             recorded: HistoryStore::default(),
@@ -1003,6 +1016,9 @@ impl App {
                 self.invite_pending = None;
                 self.on_invitation(inv, fx);
             }
+            (_, Ok(Reply::Networks(list))) => {
+                self.networks = list;
+            }
             (_, Ok(Reply::Invites(list))) => {
                 self.invitations = list;
                 // A used or deleted code is no longer shown anywhere; an
@@ -1132,6 +1148,7 @@ impl App {
                 "invitation"
             }
             Request::Invites | Request::DeleteInvite(_) => "invitation",
+            Request::Networks | Request::AddNetwork(_) | Request::RemoveNetwork(_) => "networks",
             Request::Join(_) => {
                 let text = match error {
                     ClientError::Api(e) => e.message.clone(),
@@ -1655,6 +1672,13 @@ impl App {
     }
 
     /// The entry of `site` as it runs.
+    /// The tag of the network in interface names.
+    fn tag(&self) -> char {
+        self.status
+            .as_ref()
+            .map_or(wanderlan_core::topology::DEFAULT_TAG, |s| s.tag)
+    }
+
     fn running_entry(&self, site: SiteId) -> Option<&wanderlan_core::config::Site> {
         self.running.as_ref()?.network.as_ref()?.site(site)
     }
@@ -2241,6 +2265,16 @@ impl App {
                 });
             }
             KeyCode::Char('M') => self.modal = Some(Modal::Messages { scroll: 0 }),
+            KeyCode::Char('B') => {
+                fx.push(Effect::Request(Request::Networks));
+                let current = self.network_name();
+                let selected = self
+                    .networks
+                    .iter()
+                    .position(|n| n.name == current)
+                    .unwrap_or(0);
+                self.modal = Some(Modal::Networks { selected });
+            }
             KeyCode::Char('q') => self.request_quit(fx),
             KeyCode::Char('a') => self.open_review(),
             KeyCode::Char('x') => self.ask_discard(),
@@ -2544,6 +2578,7 @@ impl App {
             }
             Modal::Form(form) => self.on_form_key(form, key, fx),
             Modal::Invites { selected } => self.on_invites_key(selected, key),
+            Modal::Networks { selected } => self.on_networks_key(selected, key, fx),
             Modal::Messages { scroll } => match key.code {
                 KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q' | 'M') => None,
                 KeyCode::Up | KeyCode::Char('k') => Some(Modal::Messages {
@@ -2680,6 +2715,50 @@ impl App {
             .as_ref()
             .map_or(vid, |t| traffic::next_vlan(t, vid, step));
         Some(Modal::Vlan { vid, back })
+    }
+
+    /// The network shown (the default one until the status tells).
+    pub fn network_name(&self) -> String {
+        self.status.as_ref().map_or_else(
+            || wanderlan_core::api::DEFAULT_NETWORK.to_string(),
+            |s| s.network.clone(),
+        )
+    }
+
+    fn on_networks_key(
+        &mut self,
+        selected: usize,
+        key: &KeyEvent,
+        fx: &mut Vec<Effect>,
+    ) -> Option<Modal> {
+        let count = self.networks.len();
+        if let Some(n) = nav(key.code, selected, count, count.max(1)) {
+            return Some(Modal::Networks { selected: n });
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | 'B') => None,
+            KeyCode::Enter => {
+                let Some(chosen) = self.networks.get(selected).map(|n| n.name.clone()) else {
+                    return Some(Modal::Networks { selected });
+                };
+                if chosen == self.network_name() {
+                    return None;
+                }
+                // What would be lost stays: the other network waits.
+                let losses = self.quit_losses();
+                if !losses.is_empty() {
+                    self.say(
+                        MessageKind::Error,
+                        format!("Not switched to network {chosen}: {}", losses.join(" ")),
+                    );
+                    return None;
+                }
+                let default = chosen == wanderlan_core::api::DEFAULT_NETWORK;
+                fx.push(Effect::SwitchNetwork((!default).then_some(chosen)));
+                None
+            }
+            _ => Some(Modal::Networks { selected }),
+        }
     }
 
     fn on_invites_key(&mut self, selected: usize, key: &KeyEvent) -> Option<Modal> {
@@ -3529,7 +3608,7 @@ impl App {
                 let id = draft.network.sites.get(selected).map(|s| s.id);
                 let port = id
                     .and_then(|id| self.running_entry(id).or_else(|| draft.network.site(id)))
-                    .map(tunnel_name)
+                    .map(|s| tunnel_name(self.tag(), s))
                     .unwrap_or_default();
                 let state = self
                     .status

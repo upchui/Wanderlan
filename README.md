@@ -490,6 +490,40 @@ Every change is applied immediately and must be **confirmed** within the
 commit timeout (60 s by default); otherwise the previous state comes back.
 So a change that cuts you off undoes itself.
 
+### Several networks on one box
+
+One box can take part in several independent networks, all run by the one
+daemon. The network in `/etc/wanderlan` is the **default network**; every
+further one has a name and its files in `/etc/wanderlan/networks/<name>` and
+`/var/lib/wanderlan/networks/<name>`: its own sites, its own identity of this
+box (so its own keys and VNIs), its own invitations and its own ports.
+
+```sh
+wanderlan networks add lab                 # unconfigured: then
+wanderlan --net lab                        # the setup wizard starts it, or
+wanderlan --net lab join 10.0.0.1:51831 ABCDE-FGHIJ --trunk eth1
+wanderlan --net lab status                 # every command takes --net (or WANDERLAN_NET)
+wanderlan networks                         # the networks of this box
+wanderlan networks remove lab              # reset there and gone
+```
+
+A further network gets a trunk of its own (another interface: its VLANs may
+be the same as those of the default network), or it shares a trunk with
+another network, then with VLANs of its own: a shared trunk port puts both
+segments into one bridge, and what the earlier network uses there stays its
+own. A change that would take a VLAN, a port or the breakout of another
+network of the box is refused; what a change from elsewhere (the sync) would
+take is left out, and the status says so (`LEFT OUT`). The ports are chosen
+when a network is set up or joined: if another network of the box has the
+control or tunnel port, the next free one in steps of 10 (51831, 51841, ...).
+A trunk port with VLAN mappings is not shared, and only one network of a box
+breaks out locally.
+
+The tunnels of a further network carry its tag in their names (`v` and one
+character instead of `vx`) and its name in their alias (`wanderlan
+lab/hq`). The site names of the networks are their own: a box may be `hq`
+in one network and `lab` in another.
+
 ## Everyday tasks
 
 Keys refer to the terminal UI (`wanderlan`); every change ends with `a`
@@ -939,7 +973,9 @@ the running configuration and applies it; a banner counts down until it is
 confirmed (`c`) or rolled back (`r`, asks first), also while a window is
 open. `x` discards the draft, `q` quits; where a wrong "yes" would lose
 something (reset, discard, roll back, quitting with a draft, closing a form
-with input) Enter means no and only `y` is yes. Messages that do not fit get
+with input) Enter means no and only `y` is yes. `B` lists the networks of
+the box and switches to another (`wanderlan --net <name>` starts there); the
+top line names the network when the box has several. Messages that do not fit get
 a second line, `M` shows the last ones, and the status line of every view
 names problems of this site (an error, blocked ports, refused changes,
 tunnels that are down). When the daemon is not reachable (`no daemon` in the
@@ -976,13 +1012,15 @@ and keeps trying.
 | `wanderlan init [--dir D]` / `wanderlan export` | Print or write the example configuration / print the running `network.toml` |
 | `wanderlan probe` / `wanderlan unblock <port>` | Measure the path MTU now / re-enable a port the loop guard shut down |
 | `wanderlan reset [--yes]` | Remove everything wanderlan set up on this site |
+| `wanderlan networks [list\|add <name>\|remove <name> [--yes]]` | The [networks of this box](#several-networks-on-one-box) |
 
 Commands that change the configuration (`online`, `offline`, `manage`,
 `role`, `site`, `vlans`, `map`, `trunk`, `own-vlans`, `tunnel-vlans`,
 `breakout`, `settings`) take `--confirm` to confirm right away; without it, run
 `wanderlan confirm` within the commit timeout. They wait for a change that is
 still being synchronised. The daemon's socket can be chosen with `--socket`
-or `WANDERLAN_SOCKET`.
+or `WANDERLAN_SOCKET`, the network of the box with `--net` or
+`WANDERLAN_NET` (without it: the default network).
 
 ## Troubleshooting
 
@@ -1056,6 +1094,10 @@ or `WANDERLAN_SOCKET`.
 
 ## Project decisions
 
+* **Several networks in one daemon.** One process owns the kernel state of
+  the box: every network derives what it wants, and one reconcile applies
+  all of it together, so two networks never undo each other's bridges and
+  rules. The earlier network wins a conflict (the default network first).
 * **No VPN inside wanderlan.** Transport and encryption belong to the existing
   VPN; wanderlan only does layer 2 and VLANs, and VXLAN runs unencrypted on
   top of that trusted network.

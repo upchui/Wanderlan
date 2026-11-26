@@ -123,6 +123,8 @@ pub struct Desired {
     pub split: BTreeSet<SplitRule>,
     /// The UDP port of the tunnels.
     pub tunnel_port: u16,
+    /// The control port (UDP probes, TCP sync) of the site.
+    pub control_port: u16,
     /// Tunnels that cannot be built, by peer, with the reason.
     pub unbuilt: BTreeMap<SiteId, String>,
     /// The table `ip wanderlan` (see [`crate::sys::nft_ip`]): the clients
@@ -164,7 +166,7 @@ impl Desired {
 /// The bridge of `trunk`: [`BRIDGE_NAME`] for the default trunk,
 /// `wl-<trunk>` for every other (`wl-` and a hash if the name is too long).
 pub fn bridge_for(trunk: &str, default_trunk: &str) -> String {
-    if trunk == default_trunk {
+    if !default_trunk.is_empty() && trunk == default_trunk {
         return BRIDGE_NAME.to_string();
     }
     let name = format!("{SEGMENT_PREFIX}{trunk}");
@@ -237,8 +239,34 @@ impl Runtime {
     }
 }
 
-/// Computes the desired state.
+/// Which network of the box a desired state is for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Scope {
+    /// Its tag in the names of its tunnels.
+    pub tag: char,
+    /// Its name, in the aliases of its tunnels (`<name>/<peer>`); `None`
+    /// for the default network (`<peer>`).
+    pub name: Option<String>,
+}
+
+impl Default for Scope {
+    fn default() -> Self {
+        Self {
+            tag: topology::DEFAULT_TAG,
+            name: None,
+        }
+    }
+}
+
+/// Computes the desired state of the default network.
 pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
+    derive_in(&Scope::default(), cfg, runtime)
+}
+
+/// Computes the desired state of the network `scope` (only the default
+/// network has its main trunk in [`BRIDGE_NAME`]).
+pub fn derive_in(scope: &Scope, cfg: &Config, runtime: &Runtime) -> Desired {
+    let tag = scope.tag;
     let blocked = &runtime.blocked;
     let network = &cfg.network;
     let me = cfg.self_id();
@@ -269,7 +297,11 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
         })
         .collect();
     let (trunk_vlans, tc) = trunk_mapping(cfg, &shared);
-    let default_trunk = cfg.trunk();
+    let default_trunk = if tag == topology::DEFAULT_TAG {
+        cfg.trunk()
+    } else {
+        ""
+    };
 
     let self_online = cfg.self_site().is_none_or(|s| s.online);
     // This site listens (and through NAT sends) on its own tunnel port; it
@@ -282,7 +314,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
     let mut vni_of: BTreeMap<u32, String> = BTreeMap::new();
     let mut tunnels: Vec<TunnelSpec> = Vec::new();
     for t in topology::tunnels_for(network, me) {
-        let name = t.ifname();
+        let name = t.ifname(tag);
         let peer = t.peer.id;
         let label = network.label(peer);
         // What the tunnel carries: the VLANs both ends take part in (on
@@ -354,7 +386,10 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
             down_reason,
             name,
             peer,
-            alias: tunnel_alias(&label),
+            alias: match &scope.name {
+                Some(network) => tunnel_alias(&format!("{network}/{label}")),
+                None => tunnel_alias(&label),
+            },
             peer_name: label,
             bridge: bridge_for(cfg.trunk_for(peer), default_trunk),
             params: VxlanParams {
@@ -417,6 +452,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
         .collect();
     Desired {
         tunnel_port,
+        control_port: cfg.control_port(),
         unbuilt,
         learn: LearnTable {
             rules: learn,
@@ -432,7 +468,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
             .map(|(peers, vlans)| SplitRule {
                 ports: peers
                     .iter()
-                    .filter_map(|p| network.site(*p).map(topology::tunnel_name))
+                    .filter_map(|p| network.site(*p).map(|s| topology::tunnel_name(tag, s)))
                     .collect(),
                 vlans: vlans.ranges(),
             })

@@ -25,6 +25,21 @@ use crate::tui::{self, TuiOptions};
 const EXAMPLE_NETWORK: &str = include_str!("../../../packaging/examples/network.toml");
 const EXAMPLE_LOCAL: &str = include_str!("../../../packaging/examples/local.toml");
 
+/// Environment variable that chooses the network ([`Args::net`]).
+const NET_ENV: &str = "WANDERLAN_NET";
+
+/// The network chosen on the command line (`None`: the default network).
+static NETWORK: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// The network the requests are for.
+fn chosen_network() -> Option<String> {
+    NETWORK
+        .get()
+        .cloned()
+        .flatten()
+        .filter(|n| n != api::DEFAULT_NETWORK)
+}
+
 /// Command line of `wanderlan`. Without a subcommand the interactive
 /// terminal UI starts.
 #[derive(Debug, Parser)]
@@ -33,6 +48,10 @@ pub struct Args {
     /// Socket of the daemon.
     #[arg(long, global = true, env = api::SOCKET_ENV, default_value = api::SOCKET_PATH)]
     pub socket: PathBuf,
+    /// The network of this box to work on (`wanderlan networks` lists
+    /// them); without it the default network.
+    #[arg(long = "net", global = true, env = NET_ENV, value_name = "NAME")]
+    pub net: Option<String>,
     /// Enable mouse support in the terminal UI.
     #[arg(long)]
     pub mouse: bool,
@@ -327,6 +346,33 @@ pub enum Command {
         #[arg(long)]
         yes: bool,
     },
+    /// The networks of this box: one box can take part in several
+    /// networks, each with its own sites, identity and ports.
+    Networks {
+        #[command(subcommand)]
+        action: Option<NetworksAction>,
+    },
+}
+
+/// What `wanderlan networks` does.
+#[derive(Debug, Subcommand)]
+pub enum NetworksAction {
+    /// List the networks (the default).
+    List,
+    /// Add a network, unconfigured: then `wanderlan --net <name>` (the
+    /// setup wizard starts it) or `wanderlan --net <name> join ...`.
+    Add {
+        /// Its name: lowercase letters, digits and -.
+        name: String,
+    },
+    /// Reset a network on this box and remove it.
+    Remove {
+        /// Its name.
+        name: String,
+        /// Do not ask for confirmation.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 /// Rules for the site that joins with a new invitation.
@@ -467,9 +513,28 @@ pub enum InviteAction {
 /// Runs the selected subcommand.
 pub async fn run(args: Args) -> Result<ExitCode> {
     let socket = args.socket.clone();
+    if let Some(name) = &args.net
+        && name != api::DEFAULT_NETWORK
+        && let Some(e) = api::network_name_error(name)
+    {
+        bail!("--net: {e}");
+    }
+    let _ = NETWORK.set(args.net.clone());
     match args.command {
         None => {
-            tui::run(&socket, TuiOptions { mouse: args.mouse }).await?;
+            // Whether the box has the network, before the screen changes.
+            let network = chosen_network();
+            if network.is_some() {
+                connect(&socket).await?;
+            }
+            tui::run(
+                &socket,
+                TuiOptions {
+                    mouse: args.mouse,
+                    network,
+                },
+            )
+            .await?;
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Validate { file, local }) => validate(&file, local.as_deref()),
@@ -721,8 +786,74 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             code,
             name,
             trunk,
-        }) => join_network(&socket, &target, &code, name, trunk).await,
+        }) => {
+            add_chosen_network(&socket).await?;
+            join_network(&socket, &target, &code, name, trunk).await
+        }
         Some(Command::Reset { yes }) => reset(&socket, yes).await,
+        Some(Command::Networks { action }) => networks(&socket, action).await,
+    }
+}
+
+/// `wanderlan networks`.
+async fn networks(socket: &Path, action: Option<NetworksAction>) -> Result<ExitCode> {
+    let client = Client::connect(socket).await?.0;
+    match action.unwrap_or(NetworksAction::List) {
+        NetworksAction::List => {
+            let list: Vec<api::NetworkInfo> = client.call(Request::Networks).await?;
+            for n in &list {
+                println!(
+                    "{:<12}  tag {}  {}",
+                    n.name,
+                    n.tag,
+                    n.site
+                        .as_deref()
+                        .map_or_else(|| "not configured".to_string(), |s| format!("site {s}"))
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        NetworksAction::Add { name } => {
+            let n: api::NetworkInfo = client
+                .call(Request::AddNetwork(api::NetworkParams { name }))
+                .await?;
+            println!(
+                "Network {} added (tag {}). Start it with `wanderlan --net {0}` or join with `wanderlan --net {0} join <address> <code>`.",
+                n.name, n.tag
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        NetworksAction::Remove { name, yes } => {
+            if !yes {
+                println!(
+                    "This resets network {name} on this box (its tunnels, rules, configuration,\n\
+                     identity and invitations here) and removes it."
+                );
+                print!("Type \"remove\" to continue: ");
+                std::io::stdout().flush()?;
+                let mut answer = String::new();
+                std::io::stdin().lock().read_line(&mut answer)?;
+                if answer.trim() != "remove" {
+                    println!("Nothing was changed.");
+                    return Ok(ExitCode::FAILURE);
+                }
+            }
+            let report: ResetReport = client
+                .call(Request::RemoveNetwork(api::NetworkParams {
+                    name: name.clone(),
+                }))
+                .await?;
+            if report.problems.is_empty() {
+                println!("Network {name} was removed ({} changes).", report.removed);
+                Ok(ExitCode::SUCCESS)
+            } else {
+                eprintln!(
+                    "Network {name} was removed, but: {}",
+                    report.problems.join("; ")
+                );
+                Ok(ExitCode::FAILURE)
+            }
+        }
     }
 }
 
@@ -1655,8 +1786,49 @@ async fn reset(socket: &Path, yes: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Adds the chosen network to the box if it does not have it yet (a join
+/// into a new network).
+async fn add_chosen_network(socket: &Path) -> Result<()> {
+    let Some(name) = chosen_network() else {
+        return Ok(());
+    };
+    let client = Client::connect(socket).await?.0;
+    let list: Vec<api::NetworkInfo> = client
+        .call(Request::Networks)
+        .await
+        .map_err(|e| anyhow!("the daemon cannot choose a network (an older version?): {e}"))?;
+    if !list.iter().any(|n| n.name == name) {
+        let n: api::NetworkInfo = client
+            .call(Request::AddNetwork(api::NetworkParams { name }))
+            .await?;
+        println!("Network {} added to this box (tag {}).", n.name, n.tag);
+    }
+    Ok(())
+}
+
+/// Connects to the daemon, for the chosen network; one the box does not
+/// have is an error (with the ones it has).
 async fn connect(socket: &Path) -> Result<Client> {
-    Ok(Client::connect(socket).await?.0)
+    connect_to(socket, chosen_network()).await
+}
+
+async fn connect_to(socket: &Path, network: Option<String>) -> Result<Client> {
+    let client = Client::connect(socket).await?.0;
+    let Some(name) = network else {
+        return Ok(client);
+    };
+    let list: Vec<api::NetworkInfo> = client
+        .call(Request::Networks)
+        .await
+        .map_err(|e| anyhow!("the daemon cannot choose a network (an older version?): {e}"))?;
+    if !list.iter().any(|n| n.name == name) {
+        let names: Vec<&str> = list.iter().map(|n| n.name.as_str()).collect();
+        bail!(
+            "this box has no network {name} (it has: {}); `wanderlan networks add {name}` adds it",
+            names.join(", ")
+        );
+    }
+    Ok(client.for_network(Some(name)))
 }
 
 fn validate(file: &Path, local: Option<&Path>) -> Result<ExitCode> {
@@ -1914,6 +2086,24 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
             "This site is not configured yet: run `wanderlan` to start a new network, or `wanderlan join <address> <code>` with an invitation."
         ),
     }
+    if st.network != api::DEFAULT_NETWORK {
+        println!("Network {} of this box (tag {})", st.network, st.tag);
+    }
+    let others: Vec<&str> = st
+        .networks
+        .iter()
+        .map(String::as_str)
+        .filter(|n| *n != st.network)
+        .collect();
+    if !others.is_empty() {
+        println!(
+            "Other networks on this box: {} (`wanderlan --net <name> status`)",
+            others.join(", ")
+        );
+    }
+    for conflict in &st.conflicts {
+        println!("LEFT OUT (another network of this box has it): {conflict}");
+    }
     if let Some(id) = &st.site_id {
         println!("Identity of this box: {id}");
     }
@@ -2152,6 +2342,7 @@ pub fn rate(bps: u64) -> String {
 
 async fn log(socket: &Path, follow: bool) -> Result<ExitCode> {
     let (client, mut events) = Client::connect(socket).await?;
+    let client = client.for_network(chosen_network());
     let history: Vec<Event> = client.call(Request::Subscribe).await?;
     for e in &history {
         print_event(e);

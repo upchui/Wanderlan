@@ -61,6 +61,8 @@ pub struct Client {
     writer: Arc<Mutex<OwnedWriteHalf>>,
     pending: Pending,
     next_id: Arc<AtomicU64>,
+    /// The network of the box the requests are for (`None`: the default).
+    network: Option<String>,
 }
 
 impl Client {
@@ -111,9 +113,17 @@ impl Client {
                 writer: Arc::new(Mutex::new(write)),
                 pending,
                 next_id: Arc::new(AtomicU64::new(1)),
+                network: None,
             },
             events_rx,
         ))
+    }
+
+    /// The same connection, for the requests about `network` (`None`: the
+    /// default network).
+    pub fn for_network(mut self, network: Option<String>) -> Self {
+        self.network = network;
+        self
     }
 
     /// Sends a request and decodes the result.
@@ -121,8 +131,13 @@ impl Client {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().await.insert(id, tx);
-        let mut line = serde_json::to_string(&RequestEnvelope { id, request })
-            .map_err(|e| ClientError::Protocol(e.to_string()))?;
+        let envelope = RequestEnvelope {
+            id,
+            network: self.network.clone(),
+            request,
+        };
+        let mut line =
+            serde_json::to_string(&envelope).map_err(|e| ClientError::Protocol(e.to_string()))?;
         line.push('\n');
         {
             let mut writer = self.writer.lock().await;

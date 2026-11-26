@@ -18,10 +18,10 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 use wanderlan_core::api::{
-    ApiError, Applied, BreakoutFamily, BreakoutStatus, ChangeSource, ConfigInput, ConfigTexts,
-    Confirmed, Done, Interface, Invitation, JoinParams, Joined, Level, MacEntry, PeerStatus,
-    PendingChange, PortState, PortTraffic, Request, ResetReport, SiteState, SiteSummary, Status,
-    UplinkStatus, Validation, VlanPortTraffic, VlanTraffic,
+    self, ApiError, Applied, BreakoutFamily, BreakoutStatus, ChangeSource, ConfigInput,
+    ConfigTexts, Confirmed, Done, Interface, Invitation, JoinParams, Joined, Level, MacEntry,
+    PeerStatus, PendingChange, PortState, PortTraffic, Request, ResetReport, SiteState,
+    SiteSummary, Status, UplinkStatus, Validation, VlanPortTraffic, VlanTraffic,
 };
 use wanderlan_core::config::{
     self, Config, ConfigFile, Diagnostic, Loaded, Network, render_local, render_network,
@@ -47,10 +47,12 @@ use wanderlan_core::view;
 
 use crate::Args;
 use crate::api_server;
+use crate::api_server::{Control, Registry, Route};
 use crate::events::EventLog;
 use crate::fdb_guard::{self, LoopReport, PortMap};
-use crate::files::Paths;
+use crate::files::{Layout, Paths};
 use crate::history::{self, History, SharedHistory};
+use crate::host::Host;
 use crate::invites::{Invite, Invites};
 use crate::keepalive;
 use crate::probe::{self, Me, PeerKeys, ProbeConfig, ProbeEvent, ProbeTable};
@@ -131,8 +133,6 @@ impl Rejected {
 const MIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Name of the netlink connection among the background tasks.
 const NETLINK_TASK: &str = "netlink connection";
-/// The longest one reconcile may take.
-const RECONCILE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// What became of a network taken over from a peer.
 #[derive(Debug)]
@@ -194,6 +194,8 @@ pub enum Input {
         /// The answer, or why there is none.
         result: Result<sync_net::PushAnswer, String>,
     },
+    /// SIGHUP: the files were changed by hand.
+    Reload,
     /// The inviting site answered our join request.
     JoinAnswer {
         /// What the user asked for.
@@ -263,9 +265,23 @@ struct Derived {
     confirmed: Option<Version>,
 }
 
-/// State of the daemon.
+/// State of one network of the daemon.
 struct Controller {
     sys: LinuxSystem,
+    /// The box: applies what the networks want.
+    host: Arc<Host>,
+    /// The name of the network (see [`crate::files`]).
+    network: String,
+    /// Its tag in interface names ([`topology::DEFAULT_TAG`] for the
+    /// default network).
+    tag: char,
+    /// The name of this box's site in the network (for the list of
+    /// networks).
+    site_name: Arc<RwLock<Option<String>>>,
+    /// The bridges of this network's segments, as applied last.
+    bridges: Vec<String>,
+    /// What this network lost to another one on the box.
+    conflicts: Vec<String>,
     paths: Paths,
     events: Arc<EventLog>,
     /// The confirmed configuration (on disk, announced to peers).
@@ -360,6 +376,25 @@ struct Controller {
     keepalive: watch::Sender<keepalive::Keepalives>,
 }
 
+/// A network of the daemon: its controller and how to reach it.
+struct NetworkHandle {
+    name: String,
+    inputs: mpsc::Sender<Input>,
+    route: Route,
+    task: JoinHandle<anyhow::Error>,
+}
+
+/// What every network shares: the box.
+#[derive(Clone)]
+struct Shared {
+    sys: LinuxSystem,
+    host: Arc<Host>,
+    rates: Rates,
+    vlan_rates: VlanRates,
+    history: SharedHistory,
+    reconcile_interval: u64,
+}
+
 /// Runs the daemon until SIGTERM or SIGINT.
 pub async fn run(args: Args) -> Result<()> {
     info!("wanderland {} starting", wanderlan_core::version_line());
@@ -368,169 +403,92 @@ pub async fn run(args: Args) -> Result<()> {
     let mut sigint = signal(SignalKind::interrupt()).context("cannot handle SIGINT")?;
     let mut sighup = signal(SignalKind::hangup()).context("cannot handle SIGHUP")?;
 
-    let events = EventLog::new();
-    let (inputs_tx, mut inputs) = mpsc::channel::<Input>(256);
-    let (probe_tx, probe_rx) = watch::channel(ProbeConfig::default());
-    let (probe_event_tx, mut probe_events) = mpsc::channel(64);
-    let probes: ProbeTable = Arc::new(RwLock::new(BTreeMap::new()));
-    let (offer_tx, offer_rx) = watch::channel(Offer::default());
-    let (ports_tx, ports_rx) = watch::channel(PortMap::default());
-    let (keepalive_tx, keepalive_rx) = watch::channel(keepalive::Keepalives::default());
     let rates: Rates = Arc::new(RwLock::new(BTreeMap::new()));
     let vlan_rates: VlanRates = Arc::new(RwLock::new(stats::VlanTraffic::default()));
     let history: SharedHistory = Arc::new(RwLock::new(History::default()));
-
-    let mut tasks = vec![
-        (
-            "probes",
-            probe::spawn(probe_rx, probes.clone(), probe_event_tx, history.clone()),
+    let mut tasks = vec![(
+        "statistics",
+        stats::spawn(
+            sys.clone(),
+            rates.clone(),
+            vlan_rates.clone(),
+            history.clone(),
         ),
-        ("sync", sync_net::spawn(offer_rx, inputs_tx.clone())),
-        ("keepalive", keepalive::spawn(keepalive_rx)),
-        (
-            "statistics",
-            stats::spawn(
-                sys.clone(),
-                rates.clone(),
-                vlan_rates.clone(),
-                history.clone(),
-            ),
-        ),
-        (
-            "API",
-            api_server::spawn(args.socket.clone(), events.clone(), inputs_tx.clone())
-                .context("cannot start the API")?,
-        ),
-    ];
-    tasks.push((
-        "loop guard",
-        fdb_guard::spawn(&sys, ports_rx, inputs_tx.clone()),
-    ));
+    )];
     // Without the netlink connection nothing works any more: its end ends
     // the daemon, and systemd starts it again.
     if let Some(connection) = sys.net.take_connection() {
         tasks.push((NETLINK_TASK, connection));
     }
-
-    let paths = Paths {
+    let layout = Layout {
         config_dir: args.config_dir.clone(),
         state_dir: args.state_dir.clone(),
     };
-    let invites = Invites::load(paths.invites());
-    let mut ctl = Controller {
+    let found = layout.scan();
+    let names: Vec<String> = found.iter().map(|(n, _)| n.clone()).collect();
+    let host = Host::new(sys.clone(), names);
+    let shared = Shared {
         sys,
-        paths,
-        events,
-        confirmed: None,
-        config: None,
-        pending: None,
-        runtime: Runtime::default(),
-        applied_key: None,
-        last_error: None,
-        flushes: BTreeSet::new(),
-        probe_config: probe_tx,
-        probes,
-        offer: offer_tx,
-        ports: ports_tx,
+        host: host.clone(),
         rates,
         vlan_rates,
         history,
-        started_ms: history::now_ms(),
-        forward_drops: Vec::new(),
-        inputs: inputs_tx,
-        rejected: Rejected::default(),
-        refused: BTreeMap::new(),
-        diverged_since: None,
-        sync_problem: None,
-        expected: BTreeMap::new(),
-        renamed_from: None,
-        fdb_cache: std::sync::Mutex::new(None),
-        config_id: 0,
-        derived: std::sync::Mutex::new(None),
-        fetching: false,
-        fetch_backoff: BTreeMap::new(),
-        grace: BTreeMap::new(),
-        grace_keys: BTreeMap::new(),
-        grace_added: Vec::new(),
-        relayed: BTreeMap::new(),
-        own_change_up: false,
-        generation: 0,
-        invites,
-        join_failures: BTreeMap::new(),
-        join_nonces: BTreeMap::new(),
-        joining: false,
-        last_repeated: None,
-        identity: None,
-        keyring: None,
-        peer_keys: BTreeMap::new(),
-        control_endpoints: BTreeMap::new(),
-        learn_next: Instant::now(),
-        pushing: false,
-        push_retry_at: Instant::now(),
-        pushed: None,
-        keepalive: keepalive_tx,
+        reconcile_interval: args.reconcile_interval.max(1),
     };
-    ctl.startup();
-    ctl.seed_measurements().await;
-    ctl.seed_identities().await;
-    if let Some(warning) = bridge_netfilter_warning() {
-        warn!("{warning}");
-        ctl.events.warn(warning);
+    let mut networks: Vec<NetworkHandle> = Vec::new();
+    for (name, tag) in found {
+        let paths = layout.paths(&name);
+        if name != api::DEFAULT_NETWORK {
+            info!(
+                "Network \"{name}\" (tag {tag}) in {}",
+                paths.config_dir.display()
+            );
+        }
+        networks.push(Controller::spawn(name, tag, paths, &shared));
     }
+    let (control_tx, mut control) = mpsc::channel::<Control>(8);
+    let registry = Registry::new(
+        networks.iter().map(|n| n.route.clone()).collect(),
+        control_tx,
+    );
+    tasks.push((
+        "API",
+        api_server::spawn(args.socket.clone(), registry.clone()).context("cannot start the API")?,
+    ));
 
-    let mut ticker = tokio::time::interval(Duration::from_secs(args.reconcile_interval.max(1)));
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut second = tokio::time::interval(Duration::from_secs(1));
-    second.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    loop {
-        let next_flush = ctl.flushes.first().copied();
-        let deadline = ctl.pending.as_ref().map(|p| p.deadline);
+    let failure = loop {
         tokio::select! {
-            _ = ticker.tick() => ctl.reconcile().await,
-            _ = second.tick() => ctl.every_second().await,
-            Some(input) = inputs.recv() => ctl.handle(input).await,
-            Some(event) = probe_events.recv() => ctl.handle(Input::Probe(event)).await,
-            () = sleep_until_opt(deadline) => {
-                if let Err(e) = ctl.rollback("the change was not confirmed in time").await {
-                    ctl.events.error(e.message);
-                }
-            }
-            () = sleep_until_opt(next_flush) => {
-                if let Some(at) = next_flush {
-                    ctl.flushes.remove(&at);
-                }
-                ctl.flush_bridges().await;
-            }
             _ = sighup.recv() => {
                 info!("SIGHUP: reloading the configuration files");
-                ctl.reload_files().await;
+                for network in &networks {
+                    let _ = network.inputs.send(Input::Reload).await;
+                }
             }
             (name, why) = first_finished(&mut tasks) => {
-                // Clean up as far as possible (systemd's ExecStopPost does
-                // the rest), then exit: systemd starts the daemon again,
-                // which builds everything anew.
-                for (task_name, task) in &tasks {
-                    if *task_name != NETLINK_TASK {
-                        task.abort();
-                    }
-                }
-                if let Err(e) = teardown_for_exit(&ctl.sys, STOP_TEARDOWN).await {
-                    warn!("{e:#}");
-                }
-                for (_, task) in &tasks {
-                    task.abort();
-                }
-                anyhow::bail!(
-                    "internal error: the {name} service stopped ({why}); exiting so that systemd restarts wanderland"
-                );
+                break Some(format!("the {name} service stopped ({why})"));
             }
-            _ = sigterm.recv() => break,
-            _ = sigint.recv() => break,
+            (name, why) = first_stopped(&mut networks) => {
+                break Some(format!("network \"{name}\" stopped ({why})"));
+            }
+            Some(request) = control.recv() => match request {
+                Control::Add { name, reply } => {
+                    let result = add_network(&layout, &shared, &registry, &mut networks, &name).await;
+                    let _ = reply.send(result);
+                }
+                Control::Remove { name, reply } => {
+                    let result = remove_network(&layout, &shared, &registry, &mut networks, &name).await;
+                    let _ = reply.send(result);
+                }
+            },
+            _ = sigterm.recv() => break None,
+            _ = sigint.recv() => break None,
         }
-    }
+    };
 
     // The netlink connection stays until everything is removed.
+    for network in &networks {
+        network.task.abort();
+    }
     let mut connection = None;
     for (name, task) in tasks {
         if name == NETLINK_TASK {
@@ -539,14 +497,261 @@ pub async fn run(args: Args) -> Result<()> {
             task.abort();
         }
     }
+    if let Some(why) = failure {
+        // Clean up as far as possible (systemd's ExecStopPost does the
+        // rest), then exit: systemd starts the daemon again, which builds
+        // everything anew.
+        if let Err(e) = host.teardown(STOP_TEARDOWN).await {
+            warn!("{e:#}");
+        }
+        if let Some(task) = connection {
+            task.abort();
+        }
+        anyhow::bail!("internal error: {why}; exiting so that systemd restarts wanderland");
+    }
     info!("Stopping; removing everything wanderlan created");
-    let removed = teardown_for_exit(&ctl.sys, STOP_TEARDOWN).await?;
+    let removed = host.teardown(STOP_TEARDOWN).await?;
     if let Some(task) = connection {
         task.abort();
     }
     let _ = std::fs::remove_file(&args.socket);
     info!("Stopped ({} changes undone)", removed.len());
     Ok(())
+}
+
+impl Controller {
+    /// Starts the controller of network `name` and its services.
+    fn spawn(name: String, tag: char, paths: Paths, shared: &Shared) -> NetworkHandle {
+        let events = EventLog::new();
+        let site_name: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
+        let (inputs_tx, inputs) = mpsc::channel::<Input>(256);
+        let (probe_tx, probe_rx) = watch::channel(ProbeConfig::default());
+        let (probe_event_tx, probe_events) = mpsc::channel(64);
+        let probes: ProbeTable = Arc::new(RwLock::new(BTreeMap::new()));
+        let (offer_tx, offer_rx) = watch::channel(Offer::default());
+        let (ports_tx, ports_rx) = watch::channel(PortMap::default());
+        let (keepalive_tx, keepalive_rx) = watch::channel(keepalive::Keepalives::default());
+        let services = vec![
+            (
+                "probes",
+                probe::spawn(
+                    probe_rx,
+                    probes.clone(),
+                    probe_event_tx,
+                    shared.history.clone(),
+                ),
+            ),
+            ("sync", sync_net::spawn(offer_rx, inputs_tx.clone())),
+            ("keepalive", keepalive::spawn(keepalive_rx)),
+            (
+                "loop guard",
+                fdb_guard::spawn(&shared.sys, ports_rx, inputs_tx.clone()),
+            ),
+        ];
+        let invites = Invites::load(paths.invites());
+        let ctl = Controller {
+            sys: shared.sys.clone(),
+            host: shared.host.clone(),
+            network: name.clone(),
+            tag,
+            site_name: site_name.clone(),
+            bridges: Vec::new(),
+            conflicts: Vec::new(),
+            paths,
+            events: events.clone(),
+            confirmed: None,
+            config: None,
+            pending: None,
+            runtime: Runtime::default(),
+            applied_key: None,
+            last_error: None,
+            flushes: BTreeSet::new(),
+            probe_config: probe_tx,
+            probes,
+            offer: offer_tx,
+            ports: ports_tx,
+            rates: shared.rates.clone(),
+            vlan_rates: shared.vlan_rates.clone(),
+            history: shared.history.clone(),
+            started_ms: history::now_ms(),
+            forward_drops: Vec::new(),
+            inputs: inputs_tx.clone(),
+            rejected: Rejected::default(),
+            refused: BTreeMap::new(),
+            diverged_since: None,
+            sync_problem: None,
+            expected: BTreeMap::new(),
+            renamed_from: None,
+            fdb_cache: std::sync::Mutex::new(None),
+            config_id: 0,
+            derived: std::sync::Mutex::new(None),
+            fetching: false,
+            fetch_backoff: BTreeMap::new(),
+            grace: BTreeMap::new(),
+            grace_keys: BTreeMap::new(),
+            grace_added: Vec::new(),
+            relayed: BTreeMap::new(),
+            own_change_up: false,
+            generation: 0,
+            invites,
+            join_failures: BTreeMap::new(),
+            join_nonces: BTreeMap::new(),
+            joining: false,
+            last_repeated: None,
+            identity: None,
+            keyring: None,
+            peer_keys: BTreeMap::new(),
+            control_endpoints: BTreeMap::new(),
+            learn_next: Instant::now(),
+            pushing: false,
+            push_retry_at: Instant::now(),
+            pushed: None,
+            keepalive: keepalive_tx,
+        };
+        let interval = shared.reconcile_interval;
+        let task = tokio::spawn(ctl.run(inputs, probe_events, services, interval));
+        NetworkHandle {
+            route: Route {
+                name: name.clone(),
+                tag,
+                inputs: inputs_tx.clone(),
+                events,
+                site: site_name,
+            },
+            name,
+            inputs: inputs_tx,
+            task,
+        }
+    }
+
+    /// The controller's loop; ends only when one of its services stopped
+    /// (they never should), with why.
+    async fn run(
+        mut self,
+        mut inputs: mpsc::Receiver<Input>,
+        mut probe_events: mpsc::Receiver<ProbeEvent>,
+        mut services: Vec<(&'static str, JoinHandle<()>)>,
+        reconcile_interval: u64,
+    ) -> anyhow::Error {
+        self.startup();
+        self.seed_measurements().await;
+        self.seed_identities().await;
+        if let Some(warning) = bridge_netfilter_warning() {
+            warn!("{warning}");
+            self.events.warn(warning);
+        }
+        let mut ticker = tokio::time::interval(Duration::from_secs(reconcile_interval));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut second = tokio::time::interval(Duration::from_secs(1));
+        second.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let next_flush = self.flushes.first().copied();
+            let deadline = self.pending.as_ref().map(|p| p.deadline);
+            tokio::select! {
+                _ = ticker.tick() => self.reconcile().await,
+                _ = second.tick() => self.every_second().await,
+                Some(input) = inputs.recv() => self.handle(input).await,
+                Some(event) = probe_events.recv() => self.handle(Input::Probe(event)).await,
+                () = sleep_until_opt(deadline) => {
+                    if let Err(e) = self.rollback("the change was not confirmed in time").await {
+                        self.events.error(e.message);
+                    }
+                }
+                () = sleep_until_opt(next_flush) => {
+                    if let Some(at) = next_flush {
+                        self.flushes.remove(&at);
+                    }
+                    self.flush_bridges().await;
+                }
+                (name, why) = first_finished(&mut services) => {
+                    for (_, task) in &services {
+                        task.abort();
+                    }
+                    return anyhow::anyhow!("its {name} service stopped ({why})");
+                }
+            }
+        }
+    }
+}
+
+/// Adds network `name` to the box and starts its controller.
+async fn add_network(
+    layout: &Layout,
+    shared: &Shared,
+    registry: &Registry,
+    networks: &mut Vec<NetworkHandle>,
+    name: &str,
+) -> Result<api::NetworkInfo, ApiError> {
+    let tag = layout
+        .add(name)
+        .map_err(|e| ApiError::new(format!("{e:#}")))?;
+    shared.host.add_network(name).await;
+    let handle = Controller::spawn(name.to_string(), tag, layout.paths(name), shared);
+    registry.add(handle.route.clone());
+    networks.push(handle);
+    info!("Network \"{name}\" (tag {tag}) added");
+    Ok(api::NetworkInfo {
+        name: name.to_string(),
+        tag,
+        site: None,
+    })
+}
+
+/// Resets network `name`, stops its controller and removes its files.
+async fn remove_network(
+    layout: &Layout,
+    shared: &Shared,
+    registry: &Registry,
+    networks: &mut Vec<NetworkHandle>,
+    name: &str,
+) -> Result<ResetReport, ApiError> {
+    if name == api::DEFAULT_NETWORK {
+        return Err(ApiError::new(
+            "the default network cannot be removed; `wanderlan reset` empties it",
+        ));
+    }
+    let Some(at) = networks.iter().position(|n| n.name == name) else {
+        return Err(ApiError::new(format!("this box has no network \"{name}\"")));
+    };
+    let (reply, answer) = oneshot::channel();
+    let asked = networks[at].inputs.send(Input::Api {
+        request: Request::Reset,
+        reply,
+    });
+    if asked.await.is_err() {
+        return Err(ApiError::new(format!("network \"{name}\" does not answer")));
+    }
+    let value = answer
+        .await
+        .map_err(|_| ApiError::new(format!("network \"{name}\" does not answer")))??;
+    let mut report: ResetReport = serde_json::from_value(value).map_err(api_err)?;
+    let handle = networks.remove(at);
+    handle.task.abort();
+    registry.remove(name);
+    shared.host.remove_network(name).await;
+    if let Err(e) = layout.remove(name) {
+        report.problems.push(format!("{e:#}"));
+    }
+    info!("Network \"{name}\" removed");
+    Ok(report)
+}
+
+/// Waits until the controller of a network ends (it never should), with
+/// its name and why. Must not be polled again after it returned.
+async fn first_stopped(networks: &mut [NetworkHandle]) -> (String, String) {
+    std::future::poll_fn(|cx| {
+        for network in networks.iter_mut() {
+            if let std::task::Poll::Ready(result) = std::pin::Pin::new(&mut network.task).poll(cx) {
+                let why = match result {
+                    Ok(e) => format!("{e:#}"),
+                    Err(e) => e.to_string(),
+                };
+                return std::task::Poll::Ready((network.name.clone(), why));
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
 }
 
 /// Why a tunnel runs as it does, for the status.
@@ -655,14 +860,6 @@ pub async fn cleanup(args: &Args) -> Result<()> {
     // The socket also after a failure.
     let _ = std::fs::remove_file(&args.socket);
     result
-}
-
-/// Removes everything at an end of the daemon, at most `limit` long.
-async fn teardown_for_exit(sys: &LinuxSystem, limit: Duration) -> Result<Vec<Change>> {
-    tokio::time::timeout(limit, reconcile::teardown(sys, |c| info!("{c}")))
-        .await
-        .map_err(|_| anyhow::anyhow!("did not finish within {} s", limit.as_secs()))?
-        .context("cleanup failed")
 }
 
 /// wanderlan's bridges (index, name): br0 and those of further trunks.
@@ -929,7 +1126,7 @@ impl Controller {
         };
         let peers = self.direct_peers();
         for rule in rules.iter().filter(|r| r.dir == PortDir::Out && !r.ipv6) {
-            if let Some(peer) = topology::peer_of(&cfg.network, &rule.port)
+            if let Some(peer) = topology::peer_of(&cfg.network, self.tag, &rule.port)
                 && peers.contains_key(&peer.id)
             {
                 self.runtime.pmtu.insert(
@@ -951,7 +1148,7 @@ impl Controller {
             self.config
                 .as_ref()
                 .and_then(|cfg| cfg.network.site(id))
-                .map(topology::tunnel_name)
+                .map(|s| topology::tunnel_name(self.tag, s))
         };
         let mut adopted = Vec::new();
         for (peer, vni) in &self.runtime.vnis {
@@ -976,7 +1173,7 @@ impl Controller {
             topology::tunnels_for(&cfg.network, cfg.self_id())
                 .into_iter()
                 .filter(|t| t.kind == TunnelKind::Client)
-                .map(|t| (t.peer.id, t.ifname()))
+                .map(|t| (t.peer.id, t.ifname(self.tag)))
                 .collect()
         });
         for (peer, name) in clients {
@@ -997,7 +1194,7 @@ impl Controller {
             .config
             .as_ref()
             .and_then(|cfg| cfg.network.site(cfg.self_site()?.uplink?))
-            .map(topology::tunnel_name);
+            .map(|s| topology::tunnel_name(self.tag, s));
         if let Some(uplink) = uplink
             && let Some(link) = actual.links.get(&uplink)
             && link.admin_up
@@ -1094,6 +1291,9 @@ impl Controller {
     /// Switches to a new configuration in effect and updates the background
     /// services. The announced version is always the confirmed one.
     fn set_config(&mut self, cfg: Option<Config>) {
+        if let Ok(mut site) = self.site_name.write() {
+            *site = cfg.as_ref().map(|c| c.self_name().to_string());
+        }
         let old_peers = self.direct_peers();
         self.grace_added.clear();
         let old_uplink = self
@@ -1164,7 +1364,7 @@ impl Controller {
             .collect();
         let peers: BTreeSet<SiteId> = new_peers.keys().copied().collect();
         if let Ok(mut h) = self.history.write() {
-            h.want(wanted, &peers);
+            h.want(&self.network, wanted, peers);
         }
         self.runtime
             .blocked
@@ -1225,7 +1425,7 @@ impl Controller {
         self.config.as_ref().map_or_else(BTreeSet::new, |cfg| {
             topology::tunnels_for(&cfg.network, cfg.self_id())
                 .iter()
-                .map(topology::Tunnel::ifname)
+                .map(|t| t.ifname(self.tag))
                 .collect()
         })
     }
@@ -1346,7 +1546,7 @@ impl Controller {
                 return None;
             }
             Some(probe::UplinkTunnel {
-                interface: topology::tunnel_name(cfg.network.site(peer)?),
+                interface: topology::tunnel_name(self.tag, cfg.network.site(peer)?),
                 peer,
                 direct: self.runtime.uplink_direct,
             })
@@ -1363,6 +1563,7 @@ impl Controller {
                 .collect()
         });
         self.probe_config.send_replace(ProbeConfig {
+            other_ports: self.host.ports_of_others(&self.network),
             bind,
             tunnel_port: self
                 .config
@@ -1449,7 +1650,7 @@ impl Controller {
                 .filter(|t| {
                     t.kind == TunnelKind::Uplink && self.runtime.mode(t) == config::TunnelMode::Nat
                 })
-                .map(|t| t.ifname())
+                .map(|t| t.ifname(self.tag))
                 .collect()
         });
         let fingerprint = self.own_id().map(|id| id.fingerprint()).unwrap_or_default();
@@ -1463,6 +1664,7 @@ impl Controller {
 
     async fn handle(&mut self, input: Input) {
         match input {
+            Input::Reload => self.reload_files().await,
             Input::Api {
                 request: Request::Join(params),
                 reply,
@@ -1537,7 +1739,8 @@ impl Controller {
             Input::Loop(report) => {
                 if self.runtime.blocked.insert(report.port.clone()) {
                     let peer = self.config.as_ref().and_then(|c| {
-                        topology::peer_of(&c.network, &report.port).map(|s| c.network.label(s.id))
+                        topology::peer_of(&c.network, self.tag, &report.port)
+                            .map(|s| c.network.label(s.id))
                     });
                     self.events
                         .emit(Level::Warn, peer.as_deref(), report.message);
@@ -1673,7 +1876,7 @@ impl Controller {
             .iter()
             .filter_map(|r| {
                 Some((
-                    topology::peer_of(&network, &r.client)?.id,
+                    topology::peer_of(&network, self.tag, &r.client)?.id,
                     r.client.as_str(),
                 ))
             })
@@ -2438,6 +2641,9 @@ impl Controller {
             }
             Request::Join(_) => Err(ApiError::new("join requests are handled separately")),
             Request::Reset => to_value(&self.reset().await?),
+            Request::Networks | Request::AddNetwork(_) | Request::RemoveNetwork(_) => Err(
+                ApiError::new("the networks of the box are handled by the daemon itself"),
+            ),
         }
     }
 
@@ -2448,10 +2654,16 @@ impl Controller {
             .as_ref()
             .and_then(|c| c.self_site().map(|s| (s.address, c.control_port())))
             .map(|(address, port)| {
-                if port == config::DEFAULT_CONTROL_PORT {
-                    format!("wanderlan join {address} {}", invite.code)
+                // The same name on the new box is a good guess.
+                let net = if self.network == api::DEFAULT_NETWORK {
+                    String::new()
                 } else {
-                    format!("wanderlan join {address}:{port} {}", invite.code)
+                    format!("--net {} ", self.network)
+                };
+                if port == config::DEFAULT_CONTROL_PORT {
+                    format!("wanderlan {net}join {address} {}", invite.code)
+                } else {
+                    format!("wanderlan {net}join {address}:{port} {}", invite.code)
                 }
             })
             .unwrap_or_default();
@@ -2883,11 +3095,16 @@ impl Controller {
             trunk: vec![params.trunk.clone()],
             ..Default::default()
         };
-        let cfg = sync::accept(network, &local, None, false, self.own_id()).map_err(|e| {
+        let mut cfg = sync::accept(network, &local, None, false, self.own_id()).map_err(|e| {
             ApiError::new(format!(
                 "the configuration from \"{via}\" cannot be used: {e}"
             ))
         })?;
+        // Ports another network of the box has: this site takes others (its
+        // own change, passed on like every other).
+        if self.choose_free_ports(&mut cfg) {
+            cfg.network.revision = config::next_revision(cfg.network.revision);
+        }
         let revision = cfg.network.revision;
         let sites = cfg.network.sites.len();
         let inviter = cfg.self_site().and_then(|s| s.uplink);
@@ -2902,6 +3119,41 @@ impl Controller {
             sites,
             revision,
         })
+    }
+
+    /// Gives this site ports no other network of the box takes if its own
+    /// are taken (a new network, a join); true if it changed them.
+    fn choose_free_ports(&self, cfg: &mut Config) -> bool {
+        let taken = self.host.ports_of_others(&self.network);
+        let uses = |control: u16, tunnel: u16| {
+            [control, tunnel, tunnel.saturating_add(1)]
+                .iter()
+                .any(|p| taken.contains(p))
+        };
+        let me = cfg.self_id();
+        let control = cfg.network.control_port_of(me);
+        if !uses(control, cfg.network.tunnel_port_of(me)) {
+            return false;
+        }
+        // In steps of 10: easy to read in a firewall.
+        let Some(port) = (1..=500u16)
+            .filter_map(|k| control.checked_add(k * 10))
+            .filter(|p| *p < 65000)
+            .find(|p| !uses(*p, config::tunnel_port_for(*p)))
+        else {
+            return false;
+        };
+        let Some(site) = cfg.network.site_mut(me) else {
+            return false;
+        };
+        site.ports.control = Some(port);
+        site.ports.tunnel = None;
+        self.events.info(format!(
+            "Another network of this box has UDP/TCP {control}: this site takes port {port} (and {} for its tunnels) in network \"{}\"",
+            config::tunnel_port_for(port),
+            self.network
+        ));
+        true
     }
 
     /// Back to the state after installation: everything wanderlan created is
@@ -2948,7 +3200,7 @@ impl Controller {
         }
         self.publish();
         let mut problems = Vec::new();
-        let removed = match reconcile::teardown(&self.sys, |c| info!("{c}")).await {
+        let removed = match self.host.reset(&self.network, |c| info!("{c}")).await {
             Ok(changes) => changes.len(),
             Err(e) => {
                 problems.push(format!("removing the interfaces and rules failed: {e}"));
@@ -2960,7 +3212,10 @@ impl Controller {
         if let Err(e) = self.paths.reset() {
             problems.push(format!("{e:#}"));
         }
+        // What other networks of the box have stays.
+        let alone = !self.host.others_configured(&self.network).await;
         match reconcile::Actual::observe(&self.sys).await {
+            Ok(_) if !alone => {}
             Ok(actual) => {
                 let left: Vec<String> = reconcile::plan_teardown(&actual)
                     .iter()
@@ -3120,6 +3375,30 @@ impl Controller {
         {
             policy::check_edit(&confirmed.network, &cfg.network, confirmed.self_id())
                 .map_err(ApiError::new)?;
+        }
+        if source == ChangeSource::Local {
+            // The first configuration takes ports no other network of the
+            // box has (a later change of them is checked below).
+            if self.confirmed.is_none() && self.choose_free_ports(&mut cfg) {
+                cfg.network.revision = config::next_revision(cfg.network.revision);
+            }
+            // What another network of the box has stays its own: a change
+            // here does not take it (a synced one is applied, and the
+            // status tells what it lost).
+            let wanted = desired::derive_in(&self.scope(), &cfg, &self.runtime);
+            let lost: Vec<String> = self
+                .host
+                .check(&self.network, &wanted)
+                .await
+                .into_iter()
+                .filter(|c| !self.conflicts.contains(c))
+                .collect();
+            if !lost.is_empty() {
+                return Err(ApiError::new(format!(
+                    "another network of this box has it: {}",
+                    lost.join("; ")
+                )));
+            }
         }
         let warnings: Vec<Diagnostic> = config::validate(&cfg.network, Some(&cfg.local))
             .into_iter()
@@ -3419,30 +3698,37 @@ impl Controller {
     async fn reconcile_once(&mut self) -> Result<Vec<Change>, reconcile::ReconcileError> {
         // Loaded by a firewall at any time: looked at before every round.
         self.runtime.conntrack = std::path::Path::new(CONNTRACK_MAX).exists();
+        let events = self.events.clone();
         let Some(cfg) = self.config.clone() else {
+            // The host waits for every network to say what it wants.
+            self.host
+                .reconcile(&self.network, None, |c| events.info(c.to_string()))
+                .await?;
             return Ok(Vec::new());
         };
         self.runtime.underlay_mtu = self.underlay_mtus(&cfg).await;
         self.refresh_breakout(&cfg).await;
-        let desired = desired::derive(&cfg, &self.runtime);
+        let desired = Arc::new(desired::derive_in(&self.scope(), &cfg, &self.runtime));
         for (peer, reason) in &desired.unbuilt {
             let peer = cfg.network.label(*peer);
             self.error_once(format!("No tunnel to site \"{peer}\": {reason}"));
         }
-        let events = self.events.clone();
-        // A hanging kernel or nft call must not block the daemon (and with
-        // it the API and the rollback deadline).
-        let changes = tokio::time::timeout(
-            RECONCILE_TIMEOUT,
-            reconcile::reconcile(&self.sys, &desired, |c| events.info(c.to_string())),
-        )
-        .await
-        .map_err(|_| {
-            reconcile::ReconcileError::Sys(wanderlan_core::sys::SysError::new(
-                "apply the configuration",
-                format!("no answer within {} s", RECONCILE_TIMEOUT.as_secs()),
-            ))
-        })??;
+        let applied = self
+            .host
+            .reconcile(&self.network, Some(desired.clone()), |c| {
+                events.info(c.to_string());
+            })
+            .await?;
+        let changes = applied.changes;
+        for conflict in &applied.conflicts {
+            self.error_once(format!(
+                "Left out because another network on this box has it: {conflict}"
+            ));
+        }
+        self.conflicts = applied.conflicts;
+        if !applied.bridges.is_empty() {
+            self.bridges = applied.bridges;
+        }
         // A tunnel was built or now sends elsewhere: a keepalive through
         // NAT at once, so that the uplink learns where this site is now
         // (instead of with the next one, up to 15 s later).
@@ -3454,8 +3740,8 @@ impl Controller {
         }
         let key = topology::forwarding_key(&cfg.network);
         let network_changed = self.applied_key.as_ref().is_some_and(|k| *k != key);
-        if network_changed || reconcile::ports_changed(&changes) {
-            let bridges: Vec<&str> = desired.bridges().collect();
+        if (network_changed || reconcile::ports_changed(&changes)) && !self.bridges.is_empty() {
+            let bridges = &self.bridges;
             info!(
                 "Flushing learned MAC addresses of {} because the topology changed",
                 bridges.join(", ")
@@ -3535,16 +3821,45 @@ impl Controller {
                 .exists();
     }
 
-    /// Forgets the learned MAC addresses of all of wanderlan's bridges.
+    /// Forgets the learned MAC addresses of the bridges of this network.
     async fn flush_bridges(&self) {
-        let Ok(links) = self.sys.links().await else {
-            return;
-        };
-        for (_, name) in owned_bridges(&links) {
-            if let Err(e) = reconcile::flush_learned(&self.sys, &name).await {
+        for name in &self.bridges {
+            if let Err(e) = reconcile::flush_learned(&self.sys, name).await {
                 warn!("{e}");
             }
         }
+    }
+
+    /// wanderlan's bridges with segments of this network: as the host put
+    /// them last (another network may share one), until then as derived.
+    fn own_bridges(&self, links: &[wanderlan_core::sys::LinkState]) -> Vec<(u32, String)> {
+        let mine: BTreeSet<String> = if self.bridges.is_empty() {
+            self.derived()
+                .desired
+                .map(|d| d.bridges().map(str::to_string).collect())
+                .unwrap_or_default()
+        } else {
+            self.bridges.iter().cloned().collect()
+        };
+        owned_bridges(links)
+            .into_iter()
+            .filter(|(_, name)| mine.contains(name))
+            .collect()
+    }
+
+    /// This network, for its desired state.
+    fn scope(&self) -> desired::Scope {
+        desired::Scope {
+            tag: self.tag,
+            name: (self.network != api::DEFAULT_NETWORK).then(|| self.network.clone()),
+        }
+    }
+
+    /// True for a tunnel interface of this network (of any version).
+    fn is_own_tunnel(&self, name: &str) -> bool {
+        topology::tunnel_tag(name) == Some(self.tag)
+            || (self.tag == topology::DEFAULT_TAG
+                && name.starts_with(topology::LEGACY_TUNNEL_PREFIX))
     }
 
     /// Tells the loop guard which interfaces are bridges and tunnel ports.
@@ -3552,11 +3867,15 @@ impl Controller {
         let Ok(links) = self.sys.links().await else {
             return;
         };
-        let bridges: BTreeSet<u32> = owned_bridges(&links).into_iter().map(|(i, _)| i).collect();
+        let bridges: BTreeSet<u32> = self
+            .own_bridges(&links)
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
         let tunnels = links
             .iter()
             .filter(|l| {
-                topology::is_tunnel_name(&l.name) && l.master.is_some_and(|m| bridges.contains(&m))
+                self.is_own_tunnel(&l.name) && l.master.is_some_and(|m| bridges.contains(&m))
             })
             .map(|l| (l.index, (l.name.clone(), l.isolated.unwrap_or(false))))
             .collect();
@@ -3683,7 +4002,7 @@ impl Controller {
                 topology::tunnels_for(&cfg.network, cfg.self_id())
                     .iter()
                     .map(|t| PeerHistory {
-                        traffic: traffic(&t.ifname()),
+                        traffic: traffic(&t.ifname(self.tag)),
                         rtt: recorded
                             .as_ref()
                             .map_or_else(Vec::new, |h| h.rtt_since(t.peer.id, since)),
@@ -3703,7 +4022,7 @@ impl Controller {
 
     async fn vlan_traffic(&self) -> Result<VlanTraffic, ApiError> {
         let links = self.sys.links().await.map_err(api_err)?;
-        let bridges = owned_bridges(&links);
+        let bridges = self.own_bridges(&links);
         let without: Vec<&str> = links
             .iter()
             .filter(|l| bridges.iter().any(|(i, _)| *i == l.index))
@@ -3753,7 +4072,7 @@ impl Controller {
             .filter(|((port, _), _)| ports_of_ours.contains(port.as_str()))
             .map(|((port, vid), r)| VlanPortTraffic {
                 peer: self.config.as_ref().and_then(|c| {
-                    topology::peer_of(&c.network, &port).map(|s| c.network.label(s.id))
+                    topology::peer_of(&c.network, self.tag, &port).map(|s| c.network.label(s.id))
                 }),
                 port,
                 vid,
@@ -3791,7 +4110,7 @@ impl Controller {
             desired: self
                 .config
                 .as_ref()
-                .map(|cfg| Arc::new(desired::derive(cfg, &self.runtime))),
+                .map(|cfg| Arc::new(desired::derive_in(&self.scope(), cfg, &self.runtime))),
             fingerprint: self
                 .config
                 .as_ref()
@@ -3844,7 +4163,11 @@ impl Controller {
         let fdb = self.sys.fdb().await.map_err(api_err)?;
         // Fresh anyway: the status gets the counts from it too.
         self.count_macs(&fdb);
-        let bridges: BTreeSet<u32> = owned_bridges(&links).into_iter().map(|(i, _)| i).collect();
+        let bridges: BTreeSet<u32> = self
+            .own_bridges(&links)
+            .into_iter()
+            .map(|(i, _)| i)
+            .collect();
         let names: std::collections::HashMap<u32, &str> =
             links.iter().map(|l| (l.index, l.name.as_str())).collect();
         let name_of = |i: u32| {
@@ -3911,6 +4234,10 @@ impl Controller {
                 site_id: self.own_id().map(|id| id.to_string()),
                 breakout: Vec::new(),
                 uplinks: Vec::new(),
+                network: self.network.clone(),
+                tag: self.tag,
+                networks: self.host.networks().await,
+                conflicts: Vec::new(),
             };
         };
         let desired = derived
@@ -3923,7 +4250,7 @@ impl Controller {
         let peers = tunnels
             .iter()
             .map(|t| {
-                let port = t.ifname();
+                let port = t.ifname(self.tag);
                 let link = links.iter().find(|l| l.name == port);
                 let self_online = me.is_none_or(|s| s.online);
                 let port_state = if self.runtime.blocked.contains(&port) {
@@ -4183,6 +4510,10 @@ impl Controller {
             site_id: self.own_id().map(|id| id.to_string()),
             breakout,
             uplinks,
+            network: self.network.clone(),
+            tag: self.tag,
+            networks: self.host.networks().await,
+            conflicts: self.conflicts.clone(),
         }
     }
 }

@@ -10,10 +10,119 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
-use wanderlan_core::api::{ApiError, Request, RequestEnvelope, ResponseEnvelope, ServerMessage};
+use wanderlan_core::api::{
+    ApiError, DEFAULT_NETWORK, NetworkInfo, Request, RequestEnvelope, ResetReport,
+    ResponseEnvelope, ServerMessage,
+};
 
 use crate::daemon::Input;
 use crate::events::EventLog;
+
+/// How the API reaches one network of the box.
+#[derive(Debug, Clone)]
+pub struct Route {
+    /// The name of the network.
+    pub name: String,
+    /// Its tag in interface names.
+    pub tag: char,
+    /// Its controller.
+    pub inputs: mpsc::Sender<Input>,
+    /// Its events.
+    pub events: Arc<EventLog>,
+    /// The name of this box's site in it, once it is configured.
+    pub site: Arc<std::sync::RwLock<Option<String>>>,
+}
+
+impl Route {
+    fn info(&self) -> NetworkInfo {
+        NetworkInfo {
+            name: self.name.clone(),
+            tag: self.tag,
+            site: self
+                .site
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        }
+    }
+}
+
+/// What the daemon itself does for the API: add and remove networks.
+#[derive(Debug)]
+pub enum Control {
+    /// Adds a network.
+    Add {
+        /// Its name.
+        name: String,
+        /// Where the answer goes.
+        reply: oneshot::Sender<Result<NetworkInfo, ApiError>>,
+    },
+    /// Resets and removes a network.
+    Remove {
+        /// Its name.
+        name: String,
+        /// Where the answer goes.
+        reply: oneshot::Sender<Result<ResetReport, ApiError>>,
+    },
+}
+
+/// The networks of the box, as the API reaches them.
+#[derive(Debug)]
+pub struct Registry {
+    routes: std::sync::RwLock<Vec<Route>>,
+    control: mpsc::Sender<Control>,
+}
+
+impl Registry {
+    /// The registry with the networks in `routes` (the default one first).
+    pub fn new(routes: Vec<Route>, control: mpsc::Sender<Control>) -> Arc<Self> {
+        Arc::new(Self {
+            routes: std::sync::RwLock::new(routes),
+            control,
+        })
+    }
+
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<Route>> {
+        self.routes
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Adds the route of a new network.
+    pub fn add(&self, route: Route) {
+        self.routes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(route);
+    }
+
+    /// Removes the route of a network.
+    pub fn remove(&self, name: &str) {
+        self.routes
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|r| r.name != name);
+    }
+
+    /// The route to `network` (`None`: the default network).
+    fn route(&self, network: Option<&str>) -> Result<Route, ApiError> {
+        let name = network.unwrap_or(DEFAULT_NETWORK);
+        self.read()
+            .iter()
+            .find(|r| r.name == name)
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::new(format!(
+                    "this box has no network \"{name}\" (`wanderlan networks` lists them)"
+                ))
+            })
+    }
+
+    /// The networks of the box.
+    fn infos(&self) -> Vec<NetworkInfo> {
+        self.read().iter().map(Route::info).collect()
+    }
+}
 
 /// Group whose members may use the socket.
 const GROUP: &str = "wanderlan";
@@ -39,11 +148,7 @@ fn file_id(path: &Path) -> Option<FileId> {
 /// Creates the socket and serves connections. If the socket file disappears
 /// or is replaced (someone deleted it, or a daemon started by mistake took
 /// it over), the server creates it again within a few seconds.
-pub fn spawn(
-    path: PathBuf,
-    events: Arc<EventLog>,
-    inputs: mpsc::Sender<Input>,
-) -> Result<JoinHandle<()>> {
+pub fn spawn(path: PathBuf, registry: Arc<Registry>) -> Result<JoinHandle<()>> {
     let (mut listener, mut id) = bind(&path)?;
     Ok(tokio::spawn(async move {
         let mut check = tokio::time::interval(SOCKET_CHECK);
@@ -52,7 +157,7 @@ pub fn spawn(
             tokio::select! {
                 accepted = listener.accept() => match accepted {
                     Ok((stream, _)) => {
-                        tokio::spawn(serve(stream, events.clone(), inputs.clone()));
+                        tokio::spawn(serve(stream, registry.clone()));
                     }
                     Err(e) => {
                         warn!("API socket accept failed: {e}");
@@ -122,7 +227,7 @@ fn group_id(name: &str) -> Option<u32> {
     })
 }
 
-async fn serve(stream: UnixStream, events: Arc<EventLog>, inputs: mpsc::Sender<Input>) {
+async fn serve(stream: UnixStream, registry: Arc<Registry>) {
     let (read, mut write) = stream.into_split();
     let (out_tx, mut out_rx) = mpsc::channel::<String>(OUT_QUEUE);
     let writer = tokio::spawn(async move {
@@ -179,41 +284,65 @@ async fn serve(stream: UnixStream, events: Arc<EventLog>, inputs: mpsc::Sender<I
             }
         };
         let id = envelope.id;
-        let result = if envelope.request == Request::Subscribe {
-            let (history, mut rx) = events.subscribe();
-            let tx = out_tx.clone();
-            if let Some(f) = forwarder.take() {
-                f.abort();
+        let route = registry.route(envelope.network.as_deref());
+        let result = match (envelope.request, route) {
+            (Request::Networks, _) => {
+                serde_json::to_value(registry.infos()).map_err(|e| ApiError::new(e.to_string()))
             }
-            forwarder = Some(tokio::spawn(async move {
-                loop {
-                    match rx.recv().await {
-                        // A client that does not read gets no more events.
-                        Ok(event) => {
-                            if !send(&tx, &ServerMessage::Event { event }) {
-                                break;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
-                            debug!("subscriber lagged by {n} events");
-                        }
-                        Err(_) => break,
-                    }
+            (Request::AddNetwork(params), _) => {
+                let (reply, answer) = oneshot::channel();
+                let asked = registry.control.send(Control::Add {
+                    name: params.name,
+                    reply,
+                });
+                control_answer(asked.await.is_ok(), answer).await
+            }
+            (Request::RemoveNetwork(params), _) => {
+                let (reply, answer) = oneshot::channel();
+                let asked = registry.control.send(Control::Remove {
+                    name: params.name,
+                    reply,
+                });
+                control_answer(asked.await.is_ok(), answer).await
+            }
+            (_, Err(e)) => Err(e),
+            (Request::Subscribe, Ok(route)) => {
+                let (history, mut rx) = route.events.subscribe();
+                let tx = out_tx.clone();
+                if let Some(f) = forwarder.take() {
+                    f.abort();
                 }
-            }));
-            serde_json::to_value(history).map_err(|e| ApiError::new(e.to_string()))
-        } else {
-            let (reply_tx, reply_rx) = oneshot::channel();
-            let input = Input::Api {
-                request: envelope.request,
-                reply: reply_tx,
-            };
-            if inputs.send(input).await.is_err() {
-                Err(ApiError::new("the daemon is shutting down"))
-            } else {
-                reply_rx
-                    .await
-                    .unwrap_or_else(|_| Err(ApiError::new("the daemon is shutting down")))
+                forwarder = Some(tokio::spawn(async move {
+                    loop {
+                        match rx.recv().await {
+                            // A client that does not read gets no more events.
+                            Ok(event) => {
+                                if !send(&tx, &ServerMessage::Event { event }) {
+                                    break;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                debug!("subscriber lagged by {n} events");
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }));
+                serde_json::to_value(history).map_err(|e| ApiError::new(e.to_string()))
+            }
+            (request, Ok(route)) => {
+                let (reply_tx, reply_rx) = oneshot::channel();
+                let input = Input::Api {
+                    request,
+                    reply: reply_tx,
+                };
+                if route.inputs.send(input).await.is_err() {
+                    Err(ApiError::new("the daemon is shutting down"))
+                } else {
+                    reply_rx
+                        .await
+                        .unwrap_or_else(|_| Err(ApiError::new("the daemon is shutting down")))
+                }
             }
         };
         let resp = match result {
@@ -237,6 +366,21 @@ async fn serve(stream: UnixStream, events: Arc<EventLog>, inputs: mpsc::Sender<I
     }
     drop(out_tx);
     let _ = writer.await;
+}
+
+/// The answer of the daemon to a [`Control`] request.
+async fn control_answer<T: serde::Serialize>(
+    asked: bool,
+    answer: oneshot::Receiver<Result<T, ApiError>>,
+) -> Result<serde_json::Value, ApiError> {
+    if !asked {
+        return Err(ApiError::new("the daemon is shutting down"));
+    }
+    match answer.await {
+        Ok(Ok(value)) => serde_json::to_value(value).map_err(|e| ApiError::new(e.to_string())),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(ApiError::new("the daemon is shutting down")),
+    }
 }
 
 /// Queues a message for the client; false if the client does not keep up

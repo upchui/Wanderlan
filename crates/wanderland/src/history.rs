@@ -18,8 +18,10 @@ pub type SharedHistory = Arc<RwLock<History>>;
 /// The recorded traffic per interface.
 #[derive(Debug, Default)]
 pub struct History {
-    /// The interfaces to record (tunnels and trunk ports), set by the
-    /// controller; the others are dropped.
+    /// The interfaces (tunnels and trunk ports) and peers to record, by
+    /// network, set by its controller.
+    wants: BTreeMap<String, (BTreeSet<String>, BTreeSet<SiteId>)>,
+    /// The interfaces of all networks; the others are dropped.
     wanted: BTreeSet<String>,
     series: BTreeMap<String, VecDeque<TrafficPoint>>,
     /// Every probe per peer: its round trip, or lost.
@@ -27,10 +29,14 @@ pub struct History {
 }
 
 impl History {
-    /// Records only these interfaces and the probes of these peers from now
-    /// on. A peer keeps its history when it is renamed: its identity and the
-    /// name of its tunnel stay.
-    pub fn want(&mut self, names: BTreeSet<String>, peers: &BTreeSet<SiteId>) {
+    /// Records only these interfaces and the probes of these peers of
+    /// `network` from now on (and those of the other networks). A peer keeps
+    /// its history when it is renamed: its identity and the name of its
+    /// tunnel stay.
+    pub fn want(&mut self, network: &str, names: BTreeSet<String>, peers: BTreeSet<SiteId>) {
+        self.wants.insert(network.to_string(), (names, peers));
+        let names: BTreeSet<String> = self.wants.values().flat_map(|(n, _)| n.clone()).collect();
+        let peers: BTreeSet<SiteId> = self.wants.values().flat_map(|(_, p)| p.clone()).collect();
         self.series.retain(|name, _| names.contains(name));
         self.rtt.retain(|peer, _| peers.contains(peer));
         self.wanted = names;
@@ -116,7 +122,9 @@ mod tests {
     fn an_hour_of_the_wanted_interfaces() {
         let a = SiteId::from_bytes([1; 32]);
         let mut h = History::default();
-        h.want(["vx-a".to_string()].into(), &[a].into());
+        h.want("default", ["vx-a".to_string()].into(), [a].into());
+        // Another network does not take the interfaces of the first.
+        h.want("lab", ["va-b".to_string()].into(), BTreeSet::new());
         let rates: BTreeMap<String, (u64, u64)> =
             [("vx-a".to_string(), (10, 20)), ("eth9".to_string(), (1, 1))].into();
         let hour = duration_ms(KEEP);
@@ -136,7 +144,7 @@ mod tests {
         // The clock went back: a new history.
         h.record(2_000, &[("vx-a".to_string(), (1, 1))].into());
         assert_eq!(h.since("vx-a", 0), [TrafficPoint(2_000, 1, 1)]);
-        h.want(BTreeSet::new(), &BTreeSet::new());
+        h.want("default", BTreeSet::new(), BTreeSet::new());
         assert!(h.since("vx-a", 0).is_empty());
         assert!(h.rtt_since(a, 0).is_empty());
     }

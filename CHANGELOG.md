@@ -7,6 +7,24 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
+### Several networks on one box
+
+- One daemon takes part in several independent networks:
+  `wanderlan networks add|remove|list`, every command (and the TUI) takes
+  `--net <name>` or `WANDERLAN_NET`, `B` in the TUI switches. A further
+  network keeps its files in `/etc/wanderlan/networks/<name>` and
+  `/var/lib/wanderlan/networks/<name>` with an identity of its own; the
+  network in `/etc/wanderlan` stays as it is (the default network).
+- A further network has a trunk of its own (then its VLANs may overlap) or
+  shares one with other VLANs; one reconcile applies what all networks want,
+  the earlier network keeps what two want. A change that takes something of
+  another network is refused, the status names what a network lost.
+- Ports another network of the box has are given up when a network is set
+  up or joined (the next free ones in steps of 10); tunnels of a further
+  network are called `v<tag>…` with the alias `wanderlan <network>/<site>`.
+- The table `ip wanderlan` has its rules per tunnel port (rewritten once
+  after the update).
+
 ### Identities instead of names
 
 - Every reference to a site is its identity: `network.toml` has a table

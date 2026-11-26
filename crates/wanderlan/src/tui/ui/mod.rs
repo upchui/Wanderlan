@@ -83,6 +83,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Modal::Vlan { vid, back } => vlan::draw(frame, app, *vid, back.as_deref(), body),
             Modal::Site { name, scroll } => details::site(frame, app, name, *scroll, body),
             Modal::Ports(p) => ports::draw(frame, app, p, body),
+            Modal::Networks { selected } => details::networks(frame, app, *selected, body),
         }
     }
 }
@@ -101,6 +102,15 @@ fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
             Style::new()
         };
         spans.push(Span::styled(label, style));
+    }
+    // Another network than the default one, or the box has several: which.
+    if let Some(st) = &app.status
+        && (st.network != wanderlan_core::api::DEFAULT_NETWORK || st.networks.len() > 1)
+    {
+        spans.push(Span::styled(
+            format!("  network {} (B)", st.network),
+            theme::bold(),
+        ));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }

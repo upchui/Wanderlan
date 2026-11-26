@@ -22,24 +22,38 @@ use std::collections::BTreeSet;
 use crate::config::{Network, Site, VlanSet};
 use crate::identity::{IFNAME_PART_LEN, SiteId};
 
-/// Prefix of the tunnel (VXLAN) interfaces created by wanderlan.
+/// Prefix of the tunnel (VXLAN) interfaces of the default network towards
+/// a peer without an identity (`vx-<name>`).
 pub const TUNNEL_PREFIX: &str = "vx-";
-/// Prefix of the tunnel interfaces named by the identity of the peer.
-pub const TUNNEL_ID_PREFIX: &str = "vx";
 /// Prefix of the GRETAP interfaces of older versions (removed on upgrade).
 pub const LEGACY_TUNNEL_PREFIX: &str = "gt-";
+/// The tag of the default network in interface names (`vx…`); every other
+/// network of a box has a tag of its own (a lowercase letter or a digit).
+pub const DEFAULT_TAG: char = 'x';
 
-/// True for the name of a tunnel interface of wanderlan (also of an older
-/// version).
+/// True for a tag of a network in interface names.
+pub fn is_tag(c: char) -> bool {
+    c.is_ascii_lowercase() || c.is_ascii_digit()
+}
+
+/// The tag of the network whose tunnel interface `name` is, if it is one
+/// (`v`, the tag, then `-` and a name or the start of an identity).
+pub fn tunnel_tag(name: &str) -> Option<char> {
+    let rest = name.strip_prefix('v')?;
+    let tag = rest.chars().next().filter(|c| is_tag(*c))?;
+    let rest = &rest[1..];
+    let named = rest.strip_prefix('-').is_some_and(|n| !n.is_empty());
+    let by_id = rest.len() == IFNAME_PART_LEN
+        && rest
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || (b'2'..=b'7').contains(&c));
+    (named || by_id).then_some(tag)
+}
+
+/// True for the name of a tunnel interface of wanderlan, of any network
+/// (also of an older version).
 pub fn is_tunnel_name(name: &str) -> bool {
-    name.starts_with(TUNNEL_PREFIX)
-        || name.starts_with(LEGACY_TUNNEL_PREFIX)
-        || name.strip_prefix(TUNNEL_ID_PREFIX).is_some_and(|rest| {
-            rest.len() == IFNAME_PART_LEN
-                && rest
-                    .bytes()
-                    .all(|c| c.is_ascii_lowercase() || (b'2'..=b'7').contains(&c))
-        })
+    name.starts_with(LEGACY_TUNNEL_PREFIX) || tunnel_tag(name).is_some()
 }
 
 /// What a tunnel connects, seen from the local site.
@@ -63,9 +77,9 @@ pub struct Tunnel<'a> {
 }
 
 impl Tunnel<'_> {
-    /// Name of the tunnel interface.
-    pub fn ifname(&self) -> String {
-        tunnel_name(self.peer)
+    /// Name of the tunnel interface in the network with `tag`.
+    pub fn ifname(&self, tag: char) -> String {
+        tunnel_name(tag, self.peer)
     }
 
     /// Server-to-server ports are isolated (split horizon); the ports of a
@@ -75,21 +89,22 @@ impl Tunnel<'_> {
     }
 }
 
-/// Name of the tunnel interface towards a peer: `vx` and the start of its
-/// identity, so that it stays when the peer is renamed and two peers with
-/// the same name get their own; `vx-<name>` for a peer of an older version
-/// without an identity.
-pub fn tunnel_name(peer: &Site) -> String {
+/// Name of the tunnel interface towards a peer in the network with `tag`:
+/// `v`, the tag and the start of the peer's identity, so that it stays when
+/// the peer is renamed and two peers with the same name get their own;
+/// `v<tag>-<name>` for a peer of an older version without an identity.
+pub fn tunnel_name(tag: char, peer: &Site) -> String {
     if peer.has_identity() {
-        format!("{TUNNEL_ID_PREFIX}{}", peer.id.ifname_part())
+        format!("v{tag}{}", peer.id.ifname_part())
     } else {
-        format!("{TUNNEL_PREFIX}{}", peer.name)
+        format!("v{tag}-{}", peer.name)
     }
 }
 
-/// The peer the tunnel interface `ifname` leads to.
-pub fn peer_of<'a>(network: &'a Network, ifname: &str) -> Option<&'a Site> {
-    network.sites.iter().find(|s| tunnel_name(s) == ifname)
+/// The peer the tunnel interface `ifname` of the network with `tag` leads
+/// to.
+pub fn peer_of<'a>(network: &'a Network, tag: char, ifname: &str) -> Option<&'a Site> {
+    network.sites.iter().find(|s| tunnel_name(tag, s) == ifname)
 }
 
 /// True for a server (a site without uplink).
@@ -398,7 +413,7 @@ mod tests {
         let network = example();
         let names: Vec<String> = tunnels_for(&network, id("heim"))
             .iter()
-            .map(Tunnel::ifname)
+            .map(|t| t.ifname(DEFAULT_TAG))
             .collect();
         assert_eq!(names, vec!["vx-buero", "vx-haus2"], "known by their names");
         assert!(
@@ -412,11 +427,15 @@ mod tests {
         let mut with_id = example();
         with_id.sites[1].id = SiteId::from_bytes([0; 32]);
         let tunnels = tunnels_for(&with_id, id("heim"));
-        assert_eq!(tunnels[0].ifname(), "vxaaaaaaaaaaaaa");
+        assert_eq!(tunnels[0].ifname(DEFAULT_TAG), "vxaaaaaaaaaaaaa");
+        assert_eq!(tunnels[0].ifname('a'), "vaaaaaaaaaaaaaa");
         assert!(is_tunnel_name("vxaaaaaaaaaaaaa"));
+        assert_eq!(tunnel_tag("v3aaaaaaaaaaaaa"), Some('3'));
+        assert_eq!(tunnel_tag("vb-lab"), Some('b'));
         assert!(!is_tunnel_name("vxaaaaaaaaaaaa"));
+        assert!(!is_tunnel_name("veth1a2b3c4"));
         assert_eq!(
-            peer_of(&with_id, "vxaaaaaaaaaaaaa").map(|s| s.name.as_str()),
+            peer_of(&with_id, DEFAULT_TAG, "vxaaaaaaaaaaaaa").map(|s| s.name.as_str()),
             Some("buero")
         );
     }

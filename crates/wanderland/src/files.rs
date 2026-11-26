@@ -20,16 +20,139 @@ use anyhow::{Context as _, Result};
 use wanderlan_core::config::{Config, render_local, render_network};
 use wanderlan_core::identity::Identity;
 
-/// File locations.
+/// The directory of the other networks of the box, in the configuration and
+/// in the state directory (`networks/<name>`).
+pub const NETWORKS_DIR: &str = "networks";
+/// The file with the tag of a network (in its state directory).
+const TAG_FILE: &str = "tag";
+/// What a reset of the default network keeps in its state directory: it
+/// belongs to the box (the other networks, the sysctls a breakout changed).
+const BOX_STATE: &[&str] = &[NETWORKS_DIR, "breakout-sysctl"];
+/// What a reset of another network keeps: its tag.
+const NETWORK_STATE: &[&str] = &[TAG_FILE];
+/// The tags the other networks can get (`x` is the default network's).
+const TAGS: &str = "abcdefghijklmnopqrstuvwyz0123456789";
+
+/// File locations of one network.
 #[derive(Debug, Clone)]
 pub struct Paths {
+    /// `/etc/wanderlan` (`/etc/wanderlan/networks/<name>`).
+    pub config_dir: PathBuf,
+    /// `/var/lib/wanderlan` (`/var/lib/wanderlan/networks/<name>`).
+    pub state_dir: PathBuf,
+    /// What a reset keeps in the state directory.
+    keep: &'static [&'static str],
+}
+
+/// Where the networks of the box are.
+#[derive(Debug, Clone)]
+pub struct Layout {
     /// `/etc/wanderlan`.
     pub config_dir: PathBuf,
     /// `/var/lib/wanderlan`.
     pub state_dir: PathBuf,
 }
 
+impl Layout {
+    /// The files of network `name`.
+    pub fn paths(&self, name: &str) -> Paths {
+        if name == wanderlan_core::api::DEFAULT_NETWORK {
+            return Paths::new(self.config_dir.clone(), self.state_dir.clone());
+        }
+        Paths {
+            config_dir: self.config_dir.join(NETWORKS_DIR).join(name),
+            state_dir: self.state_dir.join(NETWORKS_DIR).join(name),
+            keep: NETWORK_STATE,
+        }
+    }
+
+    /// The networks of the box with their tags: the default network first,
+    /// then the others in the order they were added.
+    pub fn scan(&self) -> Vec<(String, char)> {
+        let mut found: Vec<(std::time::SystemTime, String, char)> = Vec::new();
+        let dir = self.state_dir.join(NETWORKS_DIR);
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if wanderlan_core::api::network_name_error(&name).is_some() {
+                continue;
+            }
+            let file = entry.path().join(TAG_FILE);
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let Some(tag) = text.trim().chars().next().filter(|c| TAGS.contains(*c)) else {
+                continue;
+            };
+            // The tag file is never written again: its time is when the
+            // network was added.
+            let added = std::fs::metadata(&file)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            if found.iter().all(|(_, _, t)| *t != tag) {
+                found.push((added, name, tag));
+            }
+        }
+        found.sort();
+        let mut out = vec![(
+            wanderlan_core::api::DEFAULT_NETWORK.to_string(),
+            wanderlan_core::topology::DEFAULT_TAG,
+        )];
+        out.extend(found.into_iter().map(|(_, name, tag)| (name, tag)));
+        out
+    }
+
+    /// Adds network `name` (unconfigured) and gives it a tag.
+    pub fn add(&self, name: &str) -> Result<char> {
+        if let Some(e) = wanderlan_core::api::network_name_error(name) {
+            anyhow::bail!("{e}");
+        }
+        let networks = self.scan();
+        if networks.iter().any(|(n, _)| n == name) {
+            anyhow::bail!("this box already has a network \"{name}\"");
+        }
+        let Some(tag) = TAGS.chars().find(|c| networks.iter().all(|(_, t)| t != c)) else {
+            anyhow::bail!("this box has as many networks as it can have");
+        };
+        let paths = self.paths(name);
+        for dir in [&paths.config_dir, &paths.state_dir] {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("cannot create {}", dir.display()))?;
+        }
+        write_atomic(&paths.network(), TEMPLATE_NETWORK)?;
+        write_atomic(&paths.local(), TEMPLATE_LOCAL)?;
+        write_atomic(&paths.state_dir.join(TAG_FILE), &format!("{tag}\n"))?;
+        Ok(tag)
+    }
+
+    /// Removes network `name` and its files.
+    pub fn remove(&self, name: &str) -> Result<()> {
+        if name == wanderlan_core::api::DEFAULT_NETWORK {
+            anyhow::bail!("the default network cannot be removed (`wanderlan reset` empties it)");
+        }
+        let paths = self.paths(name);
+        for dir in [&paths.config_dir, &paths.state_dir] {
+            match std::fs::remove_dir_all(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(e).with_context(|| format!("cannot remove {}", dir.display()));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Paths {
+    /// The files of the default network.
+    pub fn new(config_dir: PathBuf, state_dir: PathBuf) -> Self {
+        Self {
+            config_dir,
+            state_dir,
+            keep: BOX_STATE,
+        }
+    }
+
     /// `network.toml` in the configuration directory.
     pub fn network(&self) -> PathBuf {
         self.config_dir.join("network.toml")
@@ -259,6 +382,9 @@ impl Paths {
         match std::fs::read_dir(&self.state_dir) {
             Ok(entries) => {
                 for entry in entries.flatten() {
+                    if self.keep.iter().any(|k| entry.file_name() == *k) {
+                        continue;
+                    }
                     let path = entry.path();
                     let removed = if path.is_dir() && !path.is_symlink() {
                         std::fs::remove_dir_all(&path)
@@ -295,6 +421,7 @@ impl Paths {
             let names: Vec<String> = entries
                 .flatten()
                 .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| !self.keep.contains(&n.as_str()))
                 .collect();
             if !names.is_empty() {
                 left.push(format!(
@@ -410,10 +537,7 @@ mod tests {
     fn temp_paths(name: &str) -> (PathBuf, Paths) {
         let base = std::env::temp_dir().join(format!("wl-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let paths = Paths {
-            config_dir: base.join("etc"),
-            state_dir: base.join("state"),
-        };
+        let paths = Paths::new(base.join("etc"), base.join("state"));
         std::fs::create_dir_all(&paths.config_dir).unwrap();
         (base, paths)
     }
@@ -539,10 +663,7 @@ mod tests {
     #[test]
     fn restore_keeps_rejected_files() {
         let base = std::env::temp_dir().join(format!("wl-files-{}", std::process::id()));
-        let paths = Paths {
-            config_dir: base.join("etc"),
-            state_dir: base.join("state"),
-        };
+        let paths = Paths::new(base.join("etc"), base.join("state"));
         std::fs::create_dir_all(&paths.config_dir).unwrap();
         std::fs::write(paths.network(), "good").unwrap();
         std::fs::write(paths.local(), "local").unwrap();
@@ -581,10 +702,7 @@ mod tests {
     #[test]
     fn reset_restores_the_templates_and_clears_the_state() {
         let base = std::env::temp_dir().join(format!("wl-reset-{}", std::process::id()));
-        let paths = Paths {
-            config_dir: base.join("etc"),
-            state_dir: base.join("state"),
-        };
+        let paths = Paths::new(base.join("etc"), base.join("state"));
         std::fs::create_dir_all(&paths.config_dir).unwrap();
         std::fs::write(paths.network(), "configured").unwrap();
         std::fs::write(paths.local(), "self = \"a\"").unwrap();
@@ -618,10 +736,7 @@ mod tests {
         // Like systemd's StateDirectory under ProtectSystem=strict: the state
         // directory is writable, /var/lib above it is not.
         let base = std::env::temp_dir().join(format!("wl-reset-ro-{}", std::process::id()));
-        let paths = Paths {
-            config_dir: base.join("etc"),
-            state_dir: base.join("lib").join("wanderlan"),
-        };
+        let paths = Paths::new(base.join("etc"), base.join("lib").join("wanderlan"));
         std::fs::create_dir_all(&paths.config_dir).unwrap();
         std::fs::write(paths.network(), "configured").unwrap();
         paths.save_copy().unwrap();

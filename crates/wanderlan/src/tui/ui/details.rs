@@ -518,6 +518,49 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, scroll: u16, area: Rect) {
 }
 
 /// The open invitations with their rules.
+/// The networks of the box, to switch to another (`N`).
+pub fn networks(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
+    let rows = app.networks.len().max(1);
+    let height = u16::try_from(rows + 5).unwrap_or(u16::MAX);
+    let popup = area.centered(Constraint::Max(60), Constraint::Max(height));
+    super::clear_around(frame, popup);
+    let block = titled(" Networks of this box ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let current = app.network_name();
+    let table_rows: Vec<Row> = if app.networks.is_empty() {
+        vec![Row::new(vec![Cell::from("asking the daemon...")]).style(theme::dim())]
+    } else {
+        app.networks
+            .iter()
+            .enumerate()
+            .map(|(i, n)| {
+                let mark = if n.name == current { "* " } else { "  " };
+                let row = Row::new(vec![
+                    Cell::from(format!("{mark}{}", n.name)),
+                    Cell::from(n.site.clone().unwrap_or_else(|| "not configured".into())),
+                ]);
+                if i == selected {
+                    row.style(theme::selected())
+                } else {
+                    row
+                }
+            })
+            .collect()
+    };
+    let [list_area, hint] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).areas(inner);
+    frame.render_widget(
+        Table::new(table_rows, [Constraint::Length(16), Constraint::Min(10)])
+            .header(Row::new(vec!["  NETWORK", "THIS SITE"]).style(theme::header())),
+        list_area,
+    );
+    frame.render_widget(
+        Paragraph::new(" `wanderlan networks add <name>` adds one.").style(theme::dim()),
+        hint,
+    );
+}
+
 pub fn invites(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
     let rows = app.invitations.len().max(1);
     // The selected invitation in full below the list (a row is cut at 80

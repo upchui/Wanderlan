@@ -26,6 +26,10 @@ pub fn socket_path() -> std::path::PathBuf {
 pub struct RequestEnvelope {
     /// Echoed in the response.
     pub id: u64,
+    /// The network of the box the request is for; `None`: the default
+    /// network ([`DEFAULT_NETWORK`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
     /// The request.
     #[serde(flatten)]
     pub request: Request,
@@ -77,6 +81,32 @@ pub enum Request {
     /// Removes the bridge, the tunnels, all rules, the configuration and the
     /// invitations: the site is unconfigured again → [`ResetReport`].
     Reset,
+    /// The networks of the box (for every request the same, whatever
+    /// network it names) → [`Vec<NetworkInfo>`].
+    Networks,
+    /// Adds a network to the box, unconfigured → [`NetworkInfo`].
+    AddNetwork(NetworkParams),
+    /// Resets a network and removes it from the box (not the default
+    /// network) → [`ResetReport`].
+    RemoveNetwork(NetworkParams),
+}
+
+/// Parameters of [`Request::AddNetwork`] and [`Request::RemoveNetwork`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkParams {
+    /// The name of the network.
+    pub name: String,
+}
+
+/// One network of the box.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkInfo {
+    /// Its name ([`DEFAULT_NETWORK`] for the one in `/etc/wanderlan`).
+    pub name: String,
+    /// Its tag in interface names.
+    pub tag: char,
+    /// The name of this box's site in it, once it is configured.
+    pub site: Option<String>,
 }
 
 /// A configuration given as TOML texts.
@@ -651,6 +681,54 @@ pub struct Status {
     /// while this site has a breakout).
     #[serde(default)]
     pub uplinks: Vec<UplinkStatus>,
+    /// The network of the box this status is of.
+    #[serde(default = "default_network")]
+    pub network: String,
+    /// Its tag in interface names ([`crate::topology::DEFAULT_TAG`] for
+    /// the default network).
+    #[serde(default = "default_tag")]
+    pub tag: char,
+    /// The networks of the box, in their order (the default one first).
+    #[serde(default)]
+    pub networks: Vec<String>,
+    /// What this network lost to an earlier network on the box.
+    #[serde(default)]
+    pub conflicts: Vec<String>,
+}
+
+/// The name of the network in `/etc/wanderlan` itself.
+pub const DEFAULT_NETWORK: &str = "default";
+/// The longest name of a network.
+pub const MAX_NETWORK_NAME_LEN: usize = 12;
+
+/// Why `name` cannot be the name of a further network of a box, if it
+/// cannot: lowercase letters, digits and `-` (not first), at most
+/// [`MAX_NETWORK_NAME_LEN`] characters, not [`DEFAULT_NETWORK`].
+pub fn network_name_error(name: &str) -> Option<String> {
+    if name == DEFAULT_NETWORK {
+        return Some(format!(
+            "\"{DEFAULT_NETWORK}\" is the network in /etc/wanderlan itself"
+        ));
+    }
+    let valid = !name.is_empty()
+        && name.len() <= MAX_NETWORK_NAME_LEN
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-');
+    (!valid).then(|| {
+        format!(
+            "\"{name}\" is no network name: lowercase letters, digits and - (not first), at most {MAX_NETWORK_NAME_LEN} characters"
+        )
+    })
+}
+
+fn default_network() -> String {
+    DEFAULT_NETWORK.to_string()
+}
+
+fn default_tag() -> char {
+    crate::topology::DEFAULT_TAG
 }
 
 /// The local breakout of one VLAN in one segment of this site.
@@ -909,11 +987,20 @@ mod tests {
     fn request_json_shape() {
         let req = RequestEnvelope {
             id: 1,
+            network: None,
             request: Request::Status,
         };
         assert_eq!(
             serde_json::to_string(&req).unwrap(),
             r#"{"id":1,"method":"status"}"#
+        );
+        let req = RequestEnvelope {
+            network: Some("lab".into()),
+            ..req
+        };
+        assert_eq!(
+            serde_json::to_string(&req).unwrap(),
+            r#"{"id":1,"network":"lab","method":"status"}"#
         );
         let req: RequestEnvelope =
             serde_json::from_str(r#"{"id":2,"method":"unblock","params":{"port":"vx-a"}}"#)

@@ -55,6 +55,8 @@ pub struct TuiOptions {
     /// Enable mouse support. Off by default so that the terminal's own text
     /// selection keeps working.
     pub mouse: bool,
+    /// The network of the box to show (`None`: the default network).
+    pub network: Option<String>,
 }
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -62,7 +64,7 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 /// Runs the TUI until the user quits.
 pub async fn run(socket: &Path, options: TuiOptions) -> Result<()> {
     let mut terminal = setup(options.mouse).context("cannot initialise the terminal")?;
-    let result = event_loop(&mut terminal, socket, options.mouse).await;
+    let result = event_loop(&mut terminal, socket, options.mouse, options.network).await;
     restore(options.mouse);
     result
 }
@@ -126,7 +128,12 @@ async fn next_daemon_event(conn: &mut Option<Connection>) -> Option<api::Event> 
     }
 }
 
-async fn event_loop(terminal: &mut Term, socket: &Path, mouse: bool) -> Result<()> {
+async fn event_loop(
+    terminal: &mut Term,
+    socket: &Path,
+    mouse: bool,
+    mut network: Option<String>,
+) -> Result<()> {
     let mut app = App::new(socket.display().to_string(), mouse);
     app.log.zone = localtime::load();
     let (answers_tx, mut answers) = mpsc::unbounded_channel::<(u64, Msg)>();
@@ -150,7 +157,7 @@ async fn event_loop(terminal: &mut Term, socket: &Path, mouse: bool) -> Result<(
                     let msg = match Client::connect(socket).await {
                         Ok((client, events)) => {
                             conn = Some(Connection {
-                                client,
+                                client: client.for_network(network.clone()),
                                 events,
                                 generation,
                             });
@@ -162,6 +169,15 @@ async fn event_loop(terminal: &mut Term, socket: &Path, mouse: bool) -> Result<(
                         }
                     };
                     effects.extend(app.update(msg));
+                }
+                Effect::SwitchNetwork(chosen) => {
+                    network = chosen;
+                    conn = None;
+                    generation += 1;
+                    app = App::new(socket.display().to_string(), mouse);
+                    app.log.zone = localtime::load();
+                    effects.extend(app.start());
+                    redraw = true;
                 }
                 Effect::Diagnose => {
                     let tx = local_tx.clone();
@@ -269,6 +285,12 @@ async fn perform(client: &Client, request: Request) -> Result<Reply, ClientError
         r @ Request::Join(_) => Reply::Joined(client.call(r).await?),
         r @ Request::Reset => Reply::Reset(client.call(r).await?),
         r @ Request::Invites => Reply::Invites(client.call(r).await?),
+        r @ Request::Networks => Reply::Networks(client.call(r).await?),
+        r @ Request::AddNetwork(_) => {
+            let _: api::NetworkInfo = client.call(r).await?;
+            Reply::Done
+        }
+        r @ Request::RemoveNetwork(_) => Reply::Reset(client.call(r).await?),
         r @ (Request::Rollback
         | Request::Unblock(_)
         | Request::ProbeNow

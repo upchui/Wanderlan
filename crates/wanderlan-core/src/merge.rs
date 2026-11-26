@@ -10,9 +10,9 @@
 //!   (the one of the earlier network). Their VLANs on it must differ: the
 //!   later network loses the VLANs the earlier one uses there. A port with
 //!   VLAN mappings (tc) is not shared: the later network loses it.
-//! - **The tunnel port** (UDP) is the network's own: a network with the
-//!   tunnel port of an earlier one gets no tunnels (the kernel takes one
-//!   VNI per port).
+//! - **The ports** are the network's own: a network with the tunnel or
+//!   control port of an earlier one gets nothing (the kernel takes one VNI
+//!   per tunnel port, a socket takes a control port once).
 //! - **A local breakout** is made by one network on the box at most.
 //!
 //! The rest (tunnels, MSS clamping, split horizon, the learn table) only
@@ -41,7 +41,7 @@ pub fn merge(parts: &[(&str, &Desired)]) -> Option<Merged> {
     };
     let mut conflicts: BTreeMap<String, Vec<String>> = BTreeMap::new();
     // Who has what, for the messages.
-    let mut port_of: BTreeMap<u16, &str> = BTreeMap::from([(first.1.tunnel_port, first.0)]);
+    let mut port_of: BTreeMap<u16, &str> = ports(first.1).map(|p| (p, first.0)).collect();
     let mut trunk_of: BTreeMap<String, &str> = first
         .1
         .trunks
@@ -51,15 +51,14 @@ pub fn merge(parts: &[(&str, &Desired)]) -> Option<Merged> {
     let mut breakout_of: Option<&str> = (!first.1.breakout.is_empty()).then_some(first.0);
     for (network, part) in rest {
         let mut lost = Vec::new();
-        if let Some(other) = port_of.get(&part.tunnel_port) {
+        if let Some((port, other)) = ports(part).find_map(|p| Some((p, port_of.get(&p)?))) {
             lost.push(format!(
-                "no tunnels: UDP {} is the tunnel port of network \"{other}\"",
-                part.tunnel_port
+                "everything: port {port} is a port of network \"{other}\" (`wanderlan settings` gives this site other ports)"
             ));
             conflicts.insert(network.to_string(), lost);
             continue;
         }
-        port_of.insert(part.tunnel_port, network);
+        port_of.extend(ports(part).map(|p| (p, *network)));
         let mut part = (*part).clone();
         // Where the bridges of this network go: into the bridge of an
         // earlier network that has one of its ports, else its own.
@@ -212,6 +211,17 @@ pub fn merge(parts: &[(&str, &Desired)]) -> Option<Merged> {
         desired: out,
         conflicts,
     })
+}
+
+/// The ports a network takes on the box: its control port, its tunnel port
+/// and the one above (the source ports through NAT).
+pub fn ports(desired: &Desired) -> impl Iterator<Item = u16> + use<> {
+    [
+        desired.control_port,
+        desired.tunnel_port,
+        desired.tunnel_port.saturating_add(1),
+    ]
+    .into_iter()
 }
 
 /// Leaves out the tunnels `names` and what belongs to them.

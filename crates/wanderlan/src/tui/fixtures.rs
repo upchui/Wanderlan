@@ -169,6 +169,10 @@ pub fn status() -> Status {
         site_id: Some("hEiM1x2y3z4w5v6u7t8s9r0qPoNmLkJiHgFeDcBa0Q8=".into()),
         breakout: Vec::new(),
         uplinks: Vec::new(),
+        network: "default".into(),
+        tag: 'x',
+        networks: vec!["default".into()],
+        conflicts: Vec::new(),
         peers: vec![
             PeerStatus {
                 macs: 12,
@@ -250,6 +254,10 @@ pub fn unconfigured_status() -> Status {
         site_id: None,
         breakout: Vec::new(),
         uplinks: Vec::new(),
+        network: "default".into(),
+        tag: 'x',
+        networks: vec!["default".into()],
+        conflicts: Vec::new(),
         peers: Vec::new(),
         sites: Vec::new(),
         blocked: Vec::new(),

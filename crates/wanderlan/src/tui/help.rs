@@ -31,6 +31,7 @@ pub const SECTIONS: &[Section] = &[
             ("r", "roll a pending change back now (asks first)"),
             ("?", "this help"),
             ("M", "the last messages of the status line"),
+            ("B", "the networks of this box: switch to another"),
             ("q", "quit (asks if the draft has unapplied changes)"),
             ("Ctrl-C", "quit immediately"),
         ],
@@ -288,6 +289,9 @@ pub fn bar(app: &App) -> Vec<Binding> {
             }
             Modal::Ask(_) => vec![("y", "yes"), ("n/Enter/Esc", "no")],
             Modal::Messages { .. } => vec![("Up/Down", "scroll"), ("Esc", "close")],
+            Modal::Networks { .. } => {
+                vec![("Up/Down", "choose"), ("Enter", "switch"), ("Esc", "close")]
+            }
             Modal::Invites { .. } => vec![
                 ("Up/Down", "choose"),
                 ("n", "new"),

@@ -146,6 +146,8 @@ pub struct ProbeConfig {
     pub uplink: Option<UplinkTunnel>,
     /// How the peers are called, for messages.
     pub names: BTreeMap<SiteId, String>,
+    /// The ports the other networks of the box take.
+    pub other_ports: BTreeSet<u16>,
 }
 
 /// The tunnel of a client to its uplink, for the test.
@@ -167,6 +169,7 @@ impl ProbeConfig {
             ports.push(tunnel);
             ports.push(tunnel.saturating_add(1));
         }
+        ports.extend(self.other_ports.iter().copied());
         ports
     }
 
