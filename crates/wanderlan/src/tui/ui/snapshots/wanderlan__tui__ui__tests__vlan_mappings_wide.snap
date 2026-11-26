@@ -2,7 +2,7 @@
 source: crates/wanderlan/src/tui/ui/tests.rs
 expression: "render_size(&app, 120, 24)"
 ---
-" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings  8 Breakout                                "
+" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Breakout  8 Settings                                "
 "┌ VLANs of the network (v) ────────────────────────────────────────────────────────────────────────────────────────────┐"
 "│ 10-50  (41 VLANs)                                                                                                    │"
 "│ Default of every site (native = untagged); limit a site in Sites (2).                                                │"

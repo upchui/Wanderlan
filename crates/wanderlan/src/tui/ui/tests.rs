@@ -161,7 +161,7 @@ fn daemon_not_running() {
 #[test]
 fn settings_view() {
     let mut app = connected();
-    key(&mut app, KeyCode::Char('7'));
+    key(&mut app, KeyCode::Char('8'));
     key(&mut app, KeyCode::Down);
     insta::assert_snapshot!(render(&app));
 }
@@ -174,7 +174,7 @@ fn settings_trunk_per_tunnel() {
             .tunnel_trunks
             .insert("haus2".into(), vec!["ens20".into()]);
     }
-    key(&mut app, KeyCode::Char('7'));
+    key(&mut app, KeyCode::Char('8'));
     // Down to "to haus2": the fixed rows, then buero, then haus2.
     for _ in 0..super::settings::ROWS.len() + 1 {
         key(&mut app, KeyCode::Down);
@@ -389,7 +389,7 @@ fn the_help_bar_always_offers_help_and_quit() {
         d.network.sites[2].uplink = Some("heim".into());
         d.revalidate();
     }
-    for view in ['1', '2', '3', '4', '5', '6', '7'] {
+    for view in ['1', '2', '3', '4', '5', '6', '7', '8'] {
         key(&mut app, KeyCode::Char(view));
         let screen = render(&app);
         let bar = screen.lines().last().unwrap_or_default();
@@ -573,7 +573,7 @@ fn the_mouse_selects_opens_and_scrolls() {
 #[test]
 fn several_trunk_ports_in_the_settings() {
     let mut app = connected();
-    key(&mut app, KeyCode::Char('7'));
+    key(&mut app, KeyCode::Char('8'));
     // The trunk row: the fixed network rows, then "This site", then "Trunk".
     let trunk_row = super::settings::ROWS
         .iter()
@@ -626,7 +626,7 @@ fn trunk_ports_of_a_tunnel() {
         Request::Interfaces,
         Reply::Interfaces(fixtures::interfaces()),
     );
-    key(&mut app, KeyCode::Char('7'));
+    key(&mut app, KeyCode::Char('8'));
     // "to haus2": the fixed rows, then buero, then haus2.
     for _ in 0..=super::settings::ROWS.len() {
         key(&mut app, KeyCode::Down);
@@ -767,7 +767,7 @@ fn with_breakouts() -> App {
 #[test]
 fn breakout_view() {
     let mut app = with_breakouts();
-    key(&mut app, KeyCode::Char('8'));
+    key(&mut app, KeyCode::Char('7'));
     key(&mut app, KeyCode::Down);
     insta::assert_snapshot!(render(&app));
 }
@@ -775,7 +775,7 @@ fn breakout_view() {
 #[test]
 fn breakout_form() {
     let mut app = with_breakouts();
-    key(&mut app, KeyCode::Char('8'));
+    key(&mut app, KeyCode::Char('7'));
     key(&mut app, KeyCode::Char('n'));
     insta::assert_snapshot!(render(&app));
 }

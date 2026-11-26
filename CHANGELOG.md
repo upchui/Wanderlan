@@ -26,14 +26,14 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
   afterwards, written down in `/var/lib/wanderlan/breakout-sysctl`). The
   unit may write `/proc/sys/net/ipv{4,6}/conf` and loads `veth`.
 - Its manager decides, like for the VLANs of a site. TUI: new view Breakout
-  (`8`); CLI: `wanderlan breakout`; `wanderlan status` shows it. With eight
+  (`7`, before Settings `8`); CLI: `wanderlan breakout`; `wanderlan status` shows it. With eight
   views the brand in the tab bar shows from 90 columns on.
 - Update all sites before using it: older ones do not read a network with
   a breakout (networks without one stay as they were).
 
 ### Settings of a site only on that site
 
-- Every setting of the Settings view (`7`) changes this site only, in the
+- Every setting of the Settings view (`8`) changes this site only, in the
   TUI and with `wanderlan settings [<setting> <value|default>]`: the commit
   timeout, the path MTU check and a fixed MSS go into `local.toml`; the
   control port and the tunnel port into the site's own entry of the network

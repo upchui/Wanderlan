@@ -499,7 +499,7 @@ fn a_restricted_site_changes_no_vlans() {
     app.update(ch('e'));
     assert!(refused(&app));
     // The settings of this host stay its own.
-    app.update(ch('7'));
+    app.update(ch('8'));
     app.settings_selected = 2;
     app.update(key(KeyCode::Enter));
     assert!(matches!(app.modal, Some(Modal::Form(_))));
@@ -546,7 +546,7 @@ fn enter_on_a_peer_opens_its_details_and_history_grows() {
 #[test]
 fn settings_open_the_form_at_the_chosen_setting() {
     let mut app = connected();
-    app.update(ch('7'));
+    app.update(ch('8'));
     // This site, Trunk, then Commit timeout: a setting of this host.
     app.update(key(KeyCode::Down));
     app.update(key(KeyCode::Down));
@@ -579,7 +579,7 @@ fn picker(app: &App) -> &PortPicker {
 #[test]
 fn a_tunnel_gets_its_own_trunk_in_the_settings() {
     let mut app = connected();
-    app.update(ch('7'));
+    app.update(ch('8'));
     // The fixed settings come first, then one row per tunnel (buero, haus2, ...).
     app.settings_selected = crate::tui::ui::settings::ROWS.len() + 1;
     let fx = app.update(key(KeyCode::Enter));

@@ -500,7 +500,7 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, scroll: u16, area: Rect) {
         lines.push(Line::from(vec![
             label("Trunk here"),
             Span::raw(ports.join(", ")),
-            dim("   a segment of its own on this host (Settings, 7)"),
+            dim("   a segment of its own on this host (Settings, 8)"),
         ]));
     }
     let title = format!(" {name}   Up/Down: next site   PgUp/PgDn: scroll   e: edit   Esc: close ");

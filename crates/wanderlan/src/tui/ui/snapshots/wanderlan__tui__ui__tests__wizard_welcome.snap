@@ -2,7 +2,7 @@
 source: crates/wanderlan/src/tui/ui/tests.rs
 expression: render(&app)
 ---
-" 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings  8 Breakout   "
+" 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Breakout  8 Settings   "
 "┌ Setup: Welcome ──────────────────────────────────────────────────────────────┐"
 "│                                                                              │"
 "│ wanderlan connects sites on layer 2 like one big switch: VLANs pass between  │"

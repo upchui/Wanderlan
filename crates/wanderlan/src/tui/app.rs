@@ -83,8 +83,8 @@ impl View {
         Self::Macs,
         Self::Log,
         Self::Setup,
-        Self::Settings,
         Self::Breakout,
+        Self::Settings,
     ];
 
     /// Tab title.
@@ -3069,7 +3069,7 @@ impl App {
                 };
                 if draft.local.self_name.as_deref() == Some(site.name.as_str()) {
                     let text = format!(
-                        "{} is this site and cannot be removed (change \"This site\" in the settings, 7, first).",
+                        "{} is this site and cannot be removed (change \"This site\" in the settings, 8, first).",
                         site.name
                     );
                     self.say(MessageKind::Error, text);

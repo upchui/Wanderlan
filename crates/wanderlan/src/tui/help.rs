@@ -129,13 +129,7 @@ pub const SECTIONS: &[Section] = &[
                (address of the inviting site and the code).",
     },
     Section {
-        title: "7 Settings",
-        keys: &[("Up/Down", "choose a setting"), ("Enter", "change it")],
-        text: "Every setting of the network and of this host, with an explanation. \
-               Trunk and the trunk per tunnel open a list of the interfaces of this host.",
-    },
-    Section {
-        title: "8 Breakout",
+        title: "7 Breakout",
         keys: &[
             ("n", "a VLAN of a site uses its own uplink to the internet"),
             (
@@ -148,6 +142,12 @@ pub const SECTIONS: &[Section] = &[
                that site (masqueraded); its devices keep their gateway and DHCP. Private \
                destinations and the exceptions still go through the tunnel. Its manager \
                decides, like for its VLANs.",
+    },
+    Section {
+        title: "8 Settings",
+        keys: &[("Up/Down", "choose a setting"), ("Enter", "change it")],
+        text: "Every setting of the network and of this host, with an explanation. \
+               Trunk and the trunk per tunnel open a list of the interfaces of this host.",
     },
     Section {
         title: "Trunk ports",

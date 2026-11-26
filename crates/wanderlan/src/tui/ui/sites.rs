@@ -1,4 +1,4 @@
-//! View 2: the sites of the draft (network and host settings: Settings, 7).
+//! View 2: the sites of the draft (network and host settings: Settings, 8).
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -187,7 +187,7 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
         {
             lines.push(Line::styled(
                 format!(
-                    " The tunnel to {} has its own trunk {trunk} here (Settings, 7).",
+                    " The tunnel to {} has its own trunk {trunk} here (Settings, 8).",
                     site.name
                 ),
                 theme::dim(),
@@ -195,7 +195,7 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
         }
     }
     if lines.is_empty() {
-        let marks = "+ new, * changed (not applied yet). a: review and apply the draft. Network and host settings: m, l or Settings (7).";
+        let marks = "+ new, * changed (not applied yet). a: review and apply the draft. Network and host settings: m, l or Settings (8).";
         lines.push(Line::styled(format!(" {marks}"), theme::dim()));
     }
     lines.truncate(3);

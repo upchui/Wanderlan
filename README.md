@@ -359,7 +359,7 @@ default route on the chosen interface, forwarding cannot be switched on), it
 goes through the tunnel as before, and the status says why.
 
 A breakout bypasses the firewall of the network, so **its manager decides**,
-like for the VLANs of a site (Breakout (`8`), or `wanderlan breakout`).
+like for the VLANs of a site (Breakout (`7`), or `wanderlan breakout`).
 
 
 ### Who knows what
@@ -476,7 +476,7 @@ the server manages everything else. CLI: `wanderlan own-vlans <site> 50,60`
 site, source VLAN (e.g. `30`), mapped VLAN `native` (or the VLAN ID on that
 site's trunk, e.g. `130`).
 
-**Let a VLAN use the internet of its own site.** Breakout (`8`), `n`: site,
+**Let a VLAN use the internet of its own site.** Breakout (`7`), `n`: site,
 VLAN, uplink (empty: the default route; the window names the interfaces of
 this box) and exceptions; `Enter` changes one, `d` removes it. The view
 shows for this site where IPv4 and IPv6 leave now and the traffic. CLI:
@@ -497,7 +497,7 @@ change one of the two sites may limit their tunnel.
 
 **Use several trunk ports.** The trunk can be several local interfaces;
 they are bridged like the ports of a switch and all carry the same VLANs and
-mappings (the first is the main port). Settings (`7`), "Trunk", lists the
+mappings (the first is the main port). Settings (`8`), "Trunk", lists the
 interfaces of the host: `Space` chooses one or more, `m` makes one the main
 port, a name that is not there yet goes in the last row; interfaces that
 cannot be a trunk port are grey with the reason (in a bridge of someone
@@ -517,7 +517,7 @@ tunnel can be bridged with other local interfaces instead, as a segment of
 its own at this site (bridge `wl-<first interface>`, same VLANs and
 mappings): only the network on those interfaces reaches the other site
 through this one. So a server says for each site exactly which ports carry
-it, and a client which ports are its trunk. Settings (`7`), "Trunk per
+it, and a client which ports are its trunk. Settings (`8`), "Trunk per
 tunnel" (the same list of interfaces; nothing chosen is the default trunk),
 or `wanderlan trunk <site> ens20` / `ens20,ens21` (`default` to undo).
 
@@ -620,7 +620,7 @@ sites with older and newer versions keep working together.
 ### Settings
 
 Every site sets its own settings, each on itself (`wanderlan settings`, or
-Settings `7` in the terminal UI): the commit timeout, the path MTU check
+Settings `8` in the terminal UI): the commit timeout, the path MTU check
 and a fixed MSS in its `local.toml`, its ports in its own entry of the
 network (the other sites connect there; only the site itself may change
 them). The values of `[network]` are only the defaults of the sites
@@ -838,8 +838,8 @@ clicked.
 | `4` | MAC addresses: filter (`/`; `vlan:20` for one VLAN), sort (`s`, `o`). |
 | `5` | Log: live events in local time (`t`: UTC), filter by level (`l`), site (`p`) and text (`/`). |
 | `6` | Setup: new network or join; on a configured site invite (`i`) and reset (`R`). |
-| `7` | Settings of this host only (this site, trunk, commit timeout, path MTU check, MSS, its ports), each with an explanation, the trunk of every tunnel, and the role and rights of this site. `Enter` on a trunk lists the interfaces of the host to choose from (`Space`, `m`: main port). |
-| `8` | Breakout: the [local breakouts](#local-breakout) of all sites, per VLAN, with uplink and exceptions; for this site where IPv4 and IPv6 leave now (or why they go through the tunnel) and the traffic, above it the uplinks of this box. New (`n`), edit (`Enter`), remove (`d`). |
+| `7` | Breakout: the [local breakouts](#local-breakout) of all sites, per VLAN, with uplink and exceptions; for this site where IPv4 and IPv6 leave now (or why they go through the tunnel) and the traffic, above it the uplinks of this box. New (`n`), edit (`Enter`), remove (`d`). |
+| `8` | Settings of this host only (this site, trunk, commit timeout, path MTU check, MSS, its ports), each with an explanation, the trunk of every tunnel, and the role and rights of this site. `Enter` on a trunk lists the interfaces of the host to choose from (`Space`, `m`: main port). |
 
 Changes are collected in a draft; the status line says how many it holds,
 and new or changed rows are marked `+` or `*`. `a` shows the difference to
