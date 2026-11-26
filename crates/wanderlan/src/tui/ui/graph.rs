@@ -17,6 +17,32 @@ use crate::tui::theme;
 
 /// The smallest top of a traffic scale (bit/s): idle shows as idle.
 const MIN_TOP_BPS: u64 = 1_000;
+/// How often the traffic is sampled (the daemon's rates, the answers of the
+/// VLAN window): a part of the graph is never narrower.
+const TRAFFIC_STEP_MS: u64 = 2_000;
+/// How often a peer is probed.
+const RTT_STEP_MS: u64 = 5_000;
+
+/// [`buckets`] for `columns` columns of dots, never narrower than `step_ms`
+/// (where the samples are farther apart than a column, each column shows
+/// the part it lies in: no gaps between them).
+#[allow(clippy::too_many_arguments)]
+fn columns<T>(
+    points: &[T],
+    now_ms: u64,
+    range_ms: u64,
+    columns: usize,
+    step_ms: u64,
+    at: impl Fn(&T) -> u64,
+    values: impl Fn(&T) -> Option<(f64, f64)>,
+) -> Vec<Option<(f64, f64)>> {
+    let columns = columns.max(1);
+    let count = usize::try_from(range_ms / step_ms.max(1))
+        .unwrap_or(columns)
+        .clamp(1, columns);
+    let parts = buckets(points, now_ms, range_ms, count, at, values);
+    (0..columns).map(|c| parts[c * count / columns]).collect()
+}
 
 /// The next round value at or above `value`: 1, 2 or 5 times a power of ten.
 pub fn nice(value: f64) -> f64 {
@@ -153,11 +179,12 @@ pub fn traffic(
     let label_width = rx_label.len().max(tx_label.len()).max(1) as u16;
     // Two columns of dots per cell (braille).
     let plot = usize::from(inner.width.saturating_sub(label_width + 1)).max(1) * 2;
-    let parts = buckets(
+    let parts = columns(
         &shown,
         now_ms,
         range.ms(),
         plot,
+        TRAFFIC_STEP_MS,
         |p| p.0,
         |p| Some((p.1 as f64, p.2 as f64)),
     );
@@ -269,11 +296,12 @@ pub fn rtt(frame: &mut Frame, area: Rect, points: &[RttPoint], now_ms: u64, rang
     let top = nice(answered.iter().copied().fold(1.0, f64::max));
     let top_label = format::rtt(top);
     let plot = usize::from(inner.width.saturating_sub(top_label.len() as u16 + 1)).max(1) * 2;
-    let parts = buckets(
+    let parts = columns(
         &shown,
         now_ms,
         range.ms(),
         plot,
+        RTT_STEP_MS,
         |p| p.0,
         |p| {
             Some((
@@ -397,6 +425,26 @@ mod tests {
         assert_eq!(parts[1], None, "nothing recorded: a gap");
         assert_eq!(parts[4], Some((5.0, 5.0)));
         assert_eq!(parts.len(), 5, "after now: left out");
+    }
+
+    #[test]
+    fn parts_never_narrower_than_the_samples() {
+        // One sample every 2 s over 20 s on 40 columns: 10 parts, each on
+        // 4 columns, no gaps.
+        let points: Vec<TrafficPoint> = (0..10)
+            .map(|i| TrafficPoint(1_000 + i * 2_000, 5, 5))
+            .collect();
+        let cols = columns(
+            &points,
+            20_000,
+            20_000,
+            40,
+            2_000,
+            |p| p.0,
+            |p| Some((p.1 as f64, p.2 as f64)),
+        );
+        assert_eq!(cols.len(), 40);
+        assert!(cols.iter().all(Option::is_some), "{cols:?}");
     }
 
     #[test]

@@ -30,6 +30,9 @@ use crate::breakout::{
     BACK_TABLE_BASE, MARK_BASE, MARK_MASK, OUT_TABLE_BASE, mac_text, not_public_v4, not_public_v6,
 };
 
+/// How long a learned IPv6 router stays without a new advertisement.
+const ROUTER_TIMEOUT_SECS: u32 = 7200;
+
 /// Name of both nftables tables (families bridge and inet).
 pub const TABLE: &str = "wanderlan-breakout";
 /// Start of the comment of the tables; the hash of their rules follows.
@@ -155,6 +158,10 @@ pub struct Changed {
     pub original: String,
     /// The value wanderlan wrote.
     pub set: String,
+    /// For IPv4 forwarding of an interface: whether forwarding was on for
+    /// the whole box then (`ip_forward`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub global: Option<String>,
 }
 
 /// Everything of the breakouts besides their veth pairs.
@@ -222,12 +229,18 @@ pub fn wanted(specs: &[BreakoutSpec]) -> BreakoutState {
         for (v6, egress) in [(false, &spec.v4), (true, &spec.v6)] {
             let Ok(egress) = egress else { continue };
             let back = BACK_TABLE_BASE | u32::from(spec.id);
-            state.rules.insert(RuleSpec {
-                v6,
-                fwmark: Some(spec.mark()),
-                iif: None,
-                table: back,
-            });
+            // The answers come in from the uplink; the box's own messages
+            // about them (ICMP errors) from itself. Packets with the mark
+            // from elsewhere (a tool that copies conntrack marks to all
+            // packets) keep their way.
+            for iif in [egress.dev(), "lo"] {
+                state.rules.insert(RuleSpec {
+                    v6,
+                    fwmark: Some(spec.mark()),
+                    iif: Some(iif.to_string()),
+                    table: back,
+                });
+            }
             state.routes.insert(RouteSpec {
                 v6,
                 table: back,
@@ -288,6 +301,7 @@ fn nft_body(specs: &[BreakoutSpec]) -> String {
         .iter()
         .map(|s| format!("\"{}\" . {}", s.port, mac_text(&s.mac)))
         .collect();
+    let routermacs: Vec<String> = specs.iter().map(|s| mac_text(&s.mac)).collect();
 
     // The bridge: which frames go to a router, and that nothing of a
     // router reaches a tunnel (or a router anything but its own frames).
@@ -310,6 +324,11 @@ fn nft_body(specs: &[BreakoutSpec]) -> String {
         "  set portmacs {{ type ifname . ether_addr; elements = {{ {} }} }}",
         portmacs.join(", ")
     );
+    let _ = writeln!(
+        out,
+        "  set routermacs {{ type ether_addr; elements = {{ {} }} }}",
+        routermacs.join(", ")
+    );
     for spec in specs {
         let (v4, v6) = keep(spec);
         let _ = writeln!(
@@ -324,11 +343,40 @@ fn nft_body(specs: &[BreakoutSpec]) -> String {
             spec.id,
             v6.join(", ")
         );
+        // The routers of the VLAN (IPv6): learned from their router
+        // advertisements and their neighbour advertisements with the
+        // router flag.
+        let _ = writeln!(
+            out,
+            "  set gw6_{} {{ type ether_addr; size 64; flags dynamic,timeout; timeout {}s; }}",
+            spec.id, ROUTER_TIMEOUT_SECS
+        );
     }
     // Before the VLAN of an untagged frame is known (its port's PVID) and
     // before the forwarding lookup.
     out.push_str("  chain prerouting {\n");
     out.push_str("    type filter hook prerouting priority -200; policy accept;\n");
+    for spec in specs.iter().filter(|s| s.v6.is_ok()) {
+        let vlan = [
+            format!("meta ibrname \"{}\" vlan id {}", spec.bridge, spec.vid),
+            format!(
+                "meta ibrname \"{}\" ether type != 8021q meta ibrpvid {}",
+                spec.bridge, spec.vid
+            ),
+        ];
+        for this in vlan {
+            let _ = writeln!(
+                out,
+                "    {this} icmpv6 type nd-router-advert add @gw6_{} {{ ether saddr }}",
+                spec.id
+            );
+            let _ = writeln!(
+                out,
+                "    {this} icmpv6 type nd-neighbor-advert @th,32,1 1 add @gw6_{} {{ ether saddr }}",
+                spec.id
+            );
+        }
+    }
     out.push_str("    iifname != @trunks accept\n");
     out.push_str("    meta pkttype { broadcast, multicast } accept\n");
     for spec in specs.iter().filter(|s| s.active()) {
@@ -354,17 +402,23 @@ fn nft_body(specs: &[BreakoutSpec]) -> String {
                 spec.id
             );
         }
+        // IPv6 only what goes to a router (not to another device of the
+        // VLAN with a global address).
         if spec.v6.is_ok() {
             let _ = writeln!(
                 out,
-                "    meta protocol ip6 ip6 daddr != @keep6_{} ether daddr set {mac} accept",
-                spec.id
+                "    meta protocol ip6 ether daddr @gw6_{id} ip6 daddr != @keep6_{id} ether daddr set {mac} accept",
+                id = spec.id
             );
         }
         out.push_str("  }\n");
     }
     out.push_str("  chain forward {\n");
     out.push_str("    type filter hook forward priority 0; policy accept;\n");
+    // A frame for a router goes to its port and nowhere else: also while
+    // the port is gone and a rewrite is still in place (it would flood the
+    // tunnels).
+    out.push_str("    ether daddr @routermacs oifname != @ports drop\n");
     out.push_str("    iifname @ports jump from_port\n");
     out.push_str("    oifname @ports jump to_port\n");
     out.push_str("  }\n");
@@ -439,8 +493,30 @@ fn nft_body(specs: &[BreakoutSpec]) -> String {
             spec.router, spec.id
         );
     }
+    // Only out of its uplink (not into other networks of the box).
+    for spec in specs {
+        for (family, egress) in [("ipv4", &spec.v4), ("ipv6", &spec.v6)] {
+            if let Ok(egress) = egress {
+                let _ = writeln!(
+                    out,
+                    "    iifname \"{}\" meta nfproto {family} oifname != \"{}\" drop",
+                    spec.router,
+                    egress.dev()
+                );
+            }
+        }
+    }
     out.push_str("    iifname @routers tcp flags syn tcp option maxseg size set rt mtu\n");
     out.push_str("    oifname @routers tcp flags syn tcp option maxseg size set rt mtu\n");
+    out.push_str("  }\n");
+    // What the box itself says about a breakout packet (an ICMP error,
+    // e.g. "packet too big") takes the way back to the device too.
+    out.push_str("  chain output {\n");
+    out.push_str("    type route hook output priority mangle; policy accept;\n");
+    let _ = writeln!(
+        out,
+        "    ct state related ct mark and 0x{MARK_MASK:08x} == 0x{MARK_BASE:08x} meta mark set ct mark"
+    );
     out.push_str("  }\n");
     // The box itself is not reachable from the VLAN (only its neighbour
     // discovery answers).
@@ -460,6 +536,50 @@ fn nft_body(specs: &[BreakoutSpec]) -> String {
     out.push_str("  }\n");
     out.push_str("}\n");
     out
+}
+
+/// The base chains of other tables on the forward hook that drop what they
+/// do not accept (Docker, ufw): a packet must pass all of them, so the
+/// breakout's forwarding does not work through them. From `nft -j list
+/// chains`.
+pub fn forward_drops(json: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    value
+        .get("nftables")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("chain"))
+        .filter(|c| {
+            c.get("hook").and_then(serde_json::Value::as_str) == Some("forward")
+                && c.get("policy").and_then(serde_json::Value::as_str) == Some("drop")
+                && c.get("table").and_then(serde_json::Value::as_str) != Some(TABLE)
+        })
+        .map(|c| {
+            let text = |k: &str| c.get(k).and_then(serde_json::Value::as_str).unwrap_or("?");
+            format!(
+                "table {} {} chain {}",
+                text("family"),
+                text("table"),
+                text("name")
+            )
+        })
+        .collect()
+}
+
+/// Reads [`forward_drops`] from the system.
+pub async fn read_forward_drops() -> Vec<String> {
+    match nftables::helper::get_current_ruleset_raw_async(
+        nftables::helper::DEFAULT_NFT,
+        ["list", "chains"],
+    )
+    .await
+    {
+        Ok(json) => forward_drops(&json),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// The hash of the rules (16 hex digits).
@@ -694,7 +814,14 @@ impl Sysctls {
             }
         }
         self.save(&record)?;
-        for (path, value) in wanted {
+        // `accept_ra` first: IPv6 forwarding on drops the default routes
+        // learned from router advertisements where they do not count with
+        // forwarding (accept_ra 2).
+        let ra_first = wanted
+            .iter()
+            .filter(|(p, _)| p.ends_with("/accept_ra"))
+            .chain(wanted.iter().filter(|(p, _)| !p.ends_with("/accept_ra")));
+        for (path, value) in ra_first {
             let current = self.read(path);
             if current.as_deref() == Some(value.as_str()) {
                 continue;
@@ -705,6 +832,9 @@ impl Sysctls {
                     Changed {
                         original: current.unwrap_or_default(),
                         set: value.clone(),
+                        global: is_v4_forwarding(path)
+                            .then(|| self.read(IP_FORWARD))
+                            .flatten(),
                     },
                 );
                 // Written down before it is changed.
@@ -727,12 +857,29 @@ impl Sysctls {
     /// A value goes back only if it is still the one wanderlan set (and the
     /// interface is still there).
     fn put_back(&self, path: &str, changed: &Changed) {
+        // IPv4 forwarding switched on for the whole box since (by another
+        // tool, e.g. Docker; wanderlan never does): its forwarding per
+        // interface stays.
+        let switched_on = is_v4_forwarding(path)
+            && changed.global.as_deref() == Some("0")
+            && self.read(IP_FORWARD).as_deref() == Some("1");
+        if switched_on {
+            return;
+        }
         if self.read(path).as_deref() == Some(changed.set.as_str())
             && let Err(e) = self.write(path, &changed.original)
         {
             tracing::warn!("{e}");
         }
     }
+}
+
+/// IPv4 forwarding of the whole box.
+const IP_FORWARD: &str = "ipv4/ip_forward";
+
+/// True for IPv4 forwarding of one interface.
+fn is_v4_forwarding(path: &str) -> bool {
+    path.starts_with("ipv4/conf/") && path.ends_with("/forwarding")
 }
 
 /// True for the sysctls of the breakout's own interfaces.
@@ -787,6 +934,33 @@ mod tests {
     }
 
     #[test]
+    fn other_firewalls_that_drop_forwarded_packets_are_found() {
+        let json = r#"{"nftables": [{"metainfo": {}},
+            {"chain": {"family": "ip", "table": "filter", "name": "FORWARD", "hook": "forward", "policy": "drop"}},
+            {"chain": {"family": "inet", "table": "wanderlan-breakout", "name": "forward", "hook": "forward", "policy": "drop"}},
+            {"chain": {"family": "inet", "table": "x", "name": "fw", "hook": "forward", "policy": "accept"}}]}"#;
+        assert_eq!(forward_drops(json), ["table ip filter chain FORWARD"]);
+    }
+
+    #[test]
+    fn routers_are_guarded_ipv6_goes_by_the_learned_router_out_of_the_uplink() {
+        let mut s = spec(10);
+        s.v6 = Ok(Egress::Main {
+            dev: "ens18".into(),
+        });
+        let script = nft_script(&[s]);
+        // Nothing for a router floods the tunnels (its port gone).
+        assert!(script.contains("ether daddr @routermacs oifname != @ports drop"));
+        // IPv6 only to a router of the VLAN, learned from its advertisements.
+        assert!(script.contains("icmpv6 type nd-router-advert add @gw6_10 { ether saddr }"));
+        assert!(script.contains("icmpv6 type nd-neighbor-advert @th,32,1 1 add @gw6_10"));
+        assert!(script.contains("ether daddr @gw6_10 ip6 daddr != @keep6_10 ether daddr set"));
+        // Only out of the uplink, ICMP errors back to the device.
+        assert!(script.contains("iifname \"wlbo10\" meta nfproto ipv4 oifname != \"ens18\" drop"));
+        assert!(script.contains("type route hook output priority mangle"));
+    }
+
+    #[test]
     fn the_wanted_state_has_a_way_back_per_family() {
         let mut s = spec(10);
         s.v6 = Ok(Egress::Fixed {
@@ -794,7 +968,15 @@ mod tests {
             gateway: None,
         });
         let state = wanted(&[s]);
-        assert_eq!(state.rules.len(), 3, "{:?}", state.rules);
+        // Per family the way back from the uplink and from the box itself,
+        // and the way out of wg0.
+        assert_eq!(state.rules.len(), 5, "{:?}", state.rules);
+        assert!(state.rules.contains(&RuleSpec {
+            v6: true,
+            fwmark: Some(MARK_BASE | 10),
+            iif: Some("wg0".into()),
+            table: BACK_TABLE_BASE | 10,
+        }));
         assert!(state.rules.contains(&RuleSpec {
             v6: true,
             fwmark: None,

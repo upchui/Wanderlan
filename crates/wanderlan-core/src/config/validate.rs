@@ -475,6 +475,19 @@ impl Validator {
                 }
                 Some(_) => {}
             }
+            // The VLAN on its trunk is a VLAN ID too (an invitation over the
+            // API is not checked by the forms).
+            if let LocalVid::Vid(local) = map.local
+                && !(1..=4094).contains(&local)
+            {
+                self.error(
+                    FieldPath::map_field(i, "local"),
+                    format!(
+                        "map #{}: mapped VLAN {local} is not a VLAN ID (1 to 4094)",
+                        i + 1
+                    ),
+                );
+            }
             if map.shared == NATIVE_VID {
                 self.error(
                     FieldPath::map_field(i, "shared"),

@@ -820,6 +820,7 @@ impl super::breakout::BreakoutOps for FakeNet {
                     super::breakout::Changed {
                         original: current.unwrap_or_default(),
                         set: value.clone(),
+                        global: None,
                     },
                 );
             }

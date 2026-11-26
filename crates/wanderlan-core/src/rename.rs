@@ -20,9 +20,16 @@ pub fn renames(old: &Network, new: &Network) -> Vec<(String, String)> {
         .iter()
         .filter(|s| old.site(&s.name).is_none())
         .filter_map(|s| {
+            // Its old name may already belong to another box (a new one
+            // joined under it): the identity tells.
             old.sites
                 .iter()
-                .find(|o| same_box(o, s) && new.site(&o.name).is_none())
+                .find(|o| {
+                    same_box(o, s)
+                        && new
+                            .site(&o.name)
+                            .is_none_or(|n| matches!((n.id, o.id), (Some(a), Some(b)) if a != b))
+                })
                 .map(|o| (o.name.clone(), s.name.clone()))
         })
         .collect()
@@ -200,6 +207,17 @@ mod tests {
         other.sites[2].name = "z".into();
         other.sites[2].id = id(9);
         assert!(renames(&old, &other).is_empty());
+        // Renamed while its old name went to a new box: still a rename.
+        let mut reused = old.clone();
+        reused.rename_site("x", "x-old");
+        reused.sites.push(Site {
+            id: id(9),
+            ..site("x", 8, Some("c"))
+        });
+        assert_eq!(
+            renames(&old, &reused),
+            [("x".to_string(), "x-old".to_string())]
+        );
     }
 
     #[test]

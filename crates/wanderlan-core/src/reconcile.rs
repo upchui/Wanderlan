@@ -1233,6 +1233,11 @@ pub async fn reconcile<N: System>(
     let mut breakout_failed: Option<SysError> = None;
     let sysctls = desired.breakout_sysctls();
     let breakout = (!desired.breakout.is_empty()).then_some(sysctls.as_slice());
+    let wanted_pairs: BTreeSet<&str> = desired
+        .breakout
+        .iter()
+        .flat_map(|b| [b.router.as_str(), b.port.as_str()])
+        .collect();
     for _ in 0..MAX_ROUNDS {
         let mut actual = Actual::observe_with(net, breakout).await?;
         let mut changes = plan(desired, &actual)?;
@@ -1245,6 +1250,17 @@ pub async fn reconcile<N: System>(
         if breakout_failed.is_some() {
             changes.retain(|c| !is_breakout(c));
         }
+        // The pair of a breakout that goes is deleted after the rules that
+        // send frames to it, and only once they are gone: else frames for
+        // its router would flood the tunnels.
+        let going = |c: &Change| {
+            matches!(c, Change::DeleteLink { name, .. }
+                if is_breakout_name(name) && !wanted_pairs.contains(name.as_str()))
+        };
+        if breakout_failed.is_some() || actual.breakout_error.is_some() {
+            changes.retain(|c| !going(c));
+        }
+        changes.sort_by_key(going);
         if changes.is_empty() {
             let breakout_error = breakout_failed.or_else(|| {
                 (!desired.breakout.is_empty())
@@ -1263,6 +1279,9 @@ pub async fn reconcile<N: System>(
             };
         }
         for change in changes {
+            if going(&change) && breakout_failed.is_some() {
+                continue;
+            }
             log(&change);
             match apply(net, &actual, &change).await {
                 Ok(()) => {}

@@ -231,7 +231,9 @@ fn merge_named(full: &Network, view: &Network, from: &str) -> Result<Network, St
     // it does not see (left over from where it hung before) stays.
     let own_tunnel = |t: &TunnelVlans| {
         t.sites.iter().any(|s| names.contains(s.as_str()))
-            && t.sites.iter().all(|s| view.site(s).is_some())
+            && t.sites
+                .iter()
+                .all(|s| view.site(s).is_some() || names.contains(s.as_str()))
     };
     let foreign = |n: &Network| -> Vec<TunnelVlans> {
         let mut list: Vec<TunnelVlans> = n
@@ -256,6 +258,11 @@ fn merge_named(full: &Network, view: &Network, from: &str) -> Result<Network, St
             merged.tunnels.push(tunnel.clone());
         }
     }
+    // A limit towards a site it removed goes with it.
+    let sites: BTreeSet<String> = merged.sites.iter().map(|s| s.name.clone()).collect();
+    merged
+        .tunnels
+        .retain(|t| t.sites.iter().all(|s| sites.contains(s)));
 
     Ok(merged)
 }
@@ -455,6 +462,25 @@ mod tests {
             .unwrap()
             .online = false;
         assert!(merge(&view_for(&network, "marcel"), &up, "x").is_err());
+    }
+
+    #[test]
+    fn a_site_with_tunnel_limits_is_removed_with_them() {
+        let mut network = full();
+        network.set_tunnel_limit("marcel", "x", Some(VlanSet::from_range(10, 20)));
+        network.set_tunnel_limit("dc", "x", Some(VlanSet::from_range(10, 30)));
+        // marcel removes x (and w below it).
+        let mut view = view_for(&network, "marcel");
+        view.revision = 8;
+        view.sites.retain(|s| s.name != "x" && s.name != "w");
+        view.tunnels.retain(|t| !t.sites.iter().any(|s| s == "x"));
+        let merged = merge(&network, &view, "marcel").unwrap().network;
+        assert!(merged.site("x").is_none());
+        assert!(merged.tunnel_limit("marcel", "x").is_none());
+        assert!(
+            merged.tunnel_limit("dc", "x").is_none(),
+            "towards a site it did not see"
+        );
     }
 
     #[test]

@@ -88,29 +88,72 @@ pub struct HistoryStore {
     pub peers: BTreeMap<String, PeerSeries>,
     /// Per trunk port.
     pub trunks: BTreeMap<String, VecDeque<TrafficPoint>>,
+    /// The traffic of all tunnels together, per sample.
+    pub total: VecDeque<TrafficPoint>,
+    /// The next request asks for everything (a renamed peer, the clock
+    /// went back): its answer replaces what is here.
+    refetch: bool,
+    /// The request that runs asked for everything.
+    asked_all: bool,
 }
 
 impl HistoryStore {
-    /// What to ask for next: what came after the last answer.
-    pub fn since(&self) -> Option<u64> {
-        self.started_ms.map(|_| self.now_ms)
+    /// What to ask for next: what came after the last answer, or
+    /// everything (the first time, or when it has to be fetched again).
+    pub fn next_since(&mut self) -> Option<u64> {
+        let since = self
+            .started_ms
+            .filter(|_| !self.refetch)
+            .map(|_| self.now_ms);
+        self.asked_all = since.is_none();
+        since
     }
 
     /// Takes over an answer: new points are added (a daemon that started
     /// again brings a history of its own), peers and ports that are gone
     /// are dropped, nothing older than an hour is kept.
     pub fn merge(&mut self, answer: History) {
-        if self.started_ms != Some(answer.started_ms) {
+        // Another daemon, or everything asked for: what came replaces it.
+        if self.started_ms != Some(answer.started_ms) || self.asked_all {
             *self = Self {
                 started_ms: Some(answer.started_ms),
                 ..Self::default()
             };
+        } else if answer.now_ms < self.now_ms {
+            // The clock went back: the daemon starts its history again.
+            self.refetch = true;
+            return;
+        }
+        // A peer new here may be one renamed: its hour is fetched.
+        let renamed = !self.peers.is_empty()
+            && answer
+                .peers
+                .iter()
+                .any(|p| !self.peers.contains_key(&p.name));
+        if renamed {
+            self.refetch = true;
         }
         self.now_ms = answer.now_ms;
         self.interval_ms = answer.interval_ms;
         let oldest = answer.now_ms.saturating_sub(KEEP_MS);
         let names: Vec<&str> = answer.peers.iter().map(|p| p.name.as_str()).collect();
         self.peers.retain(|name, _| names.contains(&name.as_str()));
+        // The sum of what is new, per sample (all tunnels are sampled at
+        // the same moments).
+        let last_total = self.total.back().map(TrafficPoint::at);
+        let mut sum: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+        for p in answer.peers.iter().flat_map(|p| &p.traffic) {
+            if last_total.is_none_or(|l| p.0 > l) {
+                let e = sum.entry(p.0).or_default();
+                e.0 = e.0.saturating_add(p.1);
+                e.1 = e.1.saturating_add(p.2);
+            }
+        }
+        let new_total = sum
+            .into_iter()
+            .map(|(at, (rx, tx))| TrafficPoint(at, rx, tx))
+            .collect();
+        append(&mut self.total, new_total, TrafficPoint::at, oldest);
         for peer in answer.peers {
             let series = self.peers.entry(peer.name).or_default();
             append(&mut series.traffic, peer.traffic, TrafficPoint::at, oldest);
@@ -122,21 +165,6 @@ impl HistoryStore {
             let series = self.trunks.entry(port.port).or_default();
             append(series, port.traffic, TrafficPoint::at, oldest);
         }
-    }
-
-    /// The traffic of all tunnels together, per sample.
-    pub fn tunnels_total(&self) -> Vec<TrafficPoint> {
-        let mut sum: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
-        for series in self.peers.values() {
-            for p in &series.traffic {
-                let e = sum.entry(p.0).or_default();
-                e.0 = e.0.saturating_add(p.1);
-                e.1 = e.1.saturating_add(p.2);
-            }
-        }
-        sum.into_iter()
-            .map(|(at, (rx, tx))| TrafficPoint(at, rx, tx))
-            .collect()
     }
 }
 
@@ -180,16 +208,25 @@ mod tests {
     #[test]
     fn new_points_are_added_and_a_new_daemon_starts_over() {
         let mut store = HistoryStore::default();
-        assert_eq!(store.since(), None, "the first time: everything");
+        assert_eq!(store.next_since(), None, "the first time: everything");
         store.merge(answer(1, 10_000, &[(6_000, 1), (8_000, 2)]));
-        assert_eq!(store.since(), Some(10_000));
+        assert_eq!(store.next_since(), Some(10_000));
         // Again with one old and one new point.
         store.merge(answer(1, 12_000, &[(8_000, 2), (12_000, 3)]));
         assert_eq!(store.peers["buero"].traffic.len(), 3);
-        assert_eq!(
-            store.tunnels_total().last(),
-            Some(&TrafficPoint(12_000, 3, 3))
-        );
+        assert_eq!(store.total.back(), Some(&TrafficPoint(12_000, 3, 3)));
+        assert_eq!(store.total.len(), 3);
+        // A peer new here (maybe renamed): everything once more.
+        let mut renamed = answer(1, 14_000, &[(14_000, 4)]);
+        renamed.peers[0].name = "office".into();
+        store.merge(renamed);
+        assert_eq!(store.next_since(), None);
+        store.merge(answer(1, 16_000, &[(8_000, 2), (16_000, 5)]));
+        assert_eq!(store.peers["buero"].traffic.len(), 2, "replaced, not added");
+        assert_eq!(store.next_since(), Some(16_000));
+        // The clock went back: everything again.
+        store.merge(answer(1, 9_000, &[]));
+        assert_eq!(store.next_since(), None);
         // The daemon started again: its own history.
         store.merge(answer(2, 3_000, &[(2_000, 9)]));
         assert_eq!(store.peers["buero"].traffic.len(), 1);

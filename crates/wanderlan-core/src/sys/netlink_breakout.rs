@@ -227,8 +227,12 @@ impl Netlink {
                     Some(IpAddr::V4(a)) if msg.header.scope == AddressScope::Universe => {
                         uplink.v4.push(a);
                     }
+                    // A global unicast address (2000::/3): a ULA alone
+                    // does not reach the internet.
                     Some(IpAddr::V6(a))
-                        if msg.header.scope == AddressScope::Universe && !unusable =>
+                        if msg.header.scope == AddressScope::Universe
+                            && !unusable
+                            && a.segments()[0] & 0xe000 == 0x2000 =>
                     {
                         uplink.v6.push(a);
                     }

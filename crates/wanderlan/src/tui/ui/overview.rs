@@ -85,7 +85,7 @@ pub fn draw(frame: &mut Frame, app: &App, status: &Status, area: Rect) {
             frame,
             graph,
             "All tunnels",
-            &app.recorded.tunnels_total(),
+            &app.recorded.total.iter().copied().collect::<Vec<_>>(),
             app.recorded.now_ms,
             app.graph_range,
         );

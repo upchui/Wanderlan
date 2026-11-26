@@ -41,7 +41,17 @@ wait_for 30 "site2 took the breakout of site3 over by sync" \
 expect_ping c-site3 203.0.113.1 "VLAN 44: IPv4 to the internet through site3's uplink"
 check "the internet sees site3's uplink address, nothing unmasked" \
   eval '[ "$(seen uplink)" -gt 0 ] && [ "$(seen unmasked)" = 0 ]'
+# IPv6 breaks out by the router of the VLAN, learned from its neighbour
+# advertisement (asked for anew here).
+x c-site3 "ip -6 neigh flush dev trunk0.44" >/dev/null 2>&1 || true
 expect_ping c-site3 2001:db8:ffff::1 "VLAN 44: IPv6 to the internet through site3's uplink too"
+check "site3 learned the router of VLAN 44" \
+  x site3 "nft list set bridge wanderlan-breakout gw6_44 | grep -q 'elements = {'"
+client_vlan c-site1 44 10.44.0.11/24
+x c-site1 "ip -6 addr add 2001:db8:44::11/64 dev trunk0.44 nodad 2>/dev/null || true"
+expect_ping c-site3 2001:db8:44::11 "VLAN 44: IPv6 to another device of the VLAN stays in the tunnel"
+check "a frame for a router goes to its port only (never into a tunnel)" \
+  x site3 "nft list table bridge wanderlan-breakout | grep -q 'ether daddr @routermacs oifname != @ports drop'"
 # Only what goes through a tunnel gets a smaller MSS: the breakout keeps the
 # one of the devices (1460 behind a trunk of 1500).
 x router "rm -f /tmp/syn44.txt; (timeout 60 nc -l 5002 >/dev/null) >/dev/null 2>&1 &
@@ -77,3 +87,4 @@ expect_no_ping c-site3 203.0.113.1 "VLAN 44 goes through the tunnel again"
 x router "nft delete table inet bo" || true
 client_vlan_del c-site2 44
 client_vlan_del c-site3 44
+client_vlan_del c-site1 44

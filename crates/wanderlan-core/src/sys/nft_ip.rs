@@ -47,7 +47,9 @@ const LEARN_CHAIN: &str = "wl-learn";
 /// The base chain of the packets this site sends (output), for `notrack`.
 const OUT_CHAIN: &str = "out";
 /// Comment of the rules that exempt the tunnel packets from tracking.
-const NOTRACK: &str = "wl notrack";
+/// Tunnel packets to the box itself skip connection tracking (forwarded
+/// ones, of a local breakout, keep it: they are masqueraded).
+const NOTRACK: &str = "wl notrack local";
 /// Comment prefix of the rules that set the source port: port and VNI.
 const FIXED_PREFIX: &str = "wl fixed ";
 /// Prefix of the set of one client.
@@ -186,7 +188,7 @@ pub fn learn_script(
     if notrack {
         let _ = writeln!(
             out,
-            "add rule {t} {CHAIN} udp dport {port} notrack comment \"{NOTRACK}\""
+            "add rule {t} {CHAIN} udp dport {port} fib daddr type local notrack comment \"{NOTRACK}\""
         );
         let _ = writeln!(
             out,
@@ -479,8 +481,8 @@ mod tests {
             "flush chain ip wanderlan pre",
             "delete set ip wanderlan ep-old",
             "add set ip wanderlan ep-lab { type ipv4_addr . inet_service; flags dynamic,timeout; timeout 90s; size 8; }",
-            "add rule ip wanderlan pre udp dport 51822 notrack comment \"wl notrack\"",
-            "add rule ip wanderlan out udp sport 51822 notrack comment \"wl notrack\"",
+            "add rule ip wanderlan pre udp dport 51822 fib daddr type local notrack comment \"wl notrack local\"",
+            "add rule ip wanderlan out udp sport 51822 notrack comment \"wl notrack local\"",
             "add rule ip wanderlan pre udp dport 51822 @th,224,16 0x88b5 jump wl-learn comment \"wl learn gate 51822\"",
             "add rule ip wanderlan wl-learn @th,64,8 0x08 @th,96,24 1193046 update @ep-lab { ip saddr . udp sport } comment \"wl learn lab 1193046\"",
             // The tunnel port as source port again.
@@ -511,7 +513,7 @@ mod tests {
             {"set": {"family": "ip", "name": "ep-lab2", "table": "wanderlan", "type": ["ipv4_addr", "inet_service"], "handle": 4}},
             {"rule": {"family": "ip", "table": "wanderlan", "chain": "pre", "handle": 5, "comment": "wl learn gate 51822", "expr": []}},
             {"rule": {"family": "ip", "table": "wanderlan", "chain": "wl-learn", "handle": 6, "comment": "wl learn lab 1193046", "expr": []}},
-            {"rule": {"family": "ip", "table": "wanderlan", "chain": "pre", "handle": 7, "comment": "wl notrack", "expr": []}},
+            {"rule": {"family": "ip", "table": "wanderlan", "chain": "pre", "handle": 7, "comment": "wl notrack local", "expr": []}},
             {"rule": {"family": "ip", "table": "wanderlan", "chain": "out", "handle": 8, "comment": "wl fixed 51822 1193046", "expr": []}}
         ]}"#;
         let state = parse_state(json).unwrap();

@@ -236,18 +236,9 @@ pub struct PeerProbe {
     /// Recent probes: round trip in ms, or `None` if unanswered.
     #[serde(skip)]
     recent: VecDeque<Option<f64>>,
-    /// Every probe of the last hour, for the graphs.
-    #[serde(skip)]
-    rtt_history: VecDeque<wanderlan_core::api::RttPoint>,
 }
 
 impl PeerProbe {
-    /// The probes after `since_ms` (ms since the Unix epoch).
-    pub fn rtt_since(&self, since_ms: u64) -> Vec<wanderlan_core::api::RttPoint> {
-        let start = self.rtt_history.partition_point(|p| p.0 <= since_ms);
-        self.rtt_history.range(start..).copied().collect()
-    }
-
     /// Round-trip statistics over the recent probes.
     pub fn rtt_stats(&self) -> Option<wanderlan_core::api::RttStats> {
         let answered: Vec<f64> = self.recent.iter().flatten().copied().collect();
@@ -363,6 +354,8 @@ struct Shared {
     /// The nonce of the last verified request per peer: a new one means
     /// that its daemon started again.
     nonces: Mutex<HashMap<String, wire2::Nonce>>,
+    /// The round trips of the last hour, for the graphs.
+    history: crate::history::SharedHistory,
 }
 
 impl Shared {
@@ -404,8 +397,9 @@ pub fn spawn(
     config: watch::Receiver<ProbeConfig>,
     table: ProbeTable,
     events: mpsc::Sender<ProbeEvent>,
+    history: crate::history::SharedHistory,
 ) -> JoinHandle<()> {
-    tokio::spawn(run(config, table, events))
+    tokio::spawn(run(config, table, events, history))
 }
 
 /// How often the probe tasks are checked.
@@ -415,6 +409,7 @@ async fn run(
     mut config: watch::Receiver<ProbeConfig>,
     table: ProbeTable,
     events: mpsc::Sender<ProbeEvent>,
+    history: crate::history::SharedHistory,
 ) {
     loop {
         let bind = config.borrow().bind;
@@ -465,6 +460,7 @@ async fn run(
             tests: Mutex::new(HashMap::new()),
             reported: Mutex::new(HashMap::new()),
             nonces: Mutex::new(HashMap::new()),
+            history: history.clone(),
         });
         let receiver = tokio::spawn(receive(shared.clone(), table.clone(), events.clone()));
         let mut prober: BTreeMap<String, (Target, JoinHandle<()>)> = BTreeMap::new();
@@ -1151,6 +1147,15 @@ async fn probe_peer(
             }
         }
         let became_reachable = update_reachability(&table, &name, rtt);
+        // For the graphs (kept apart from the table, which is copied often).
+        if let Ok(mut h) = shared.history.write() {
+            #[allow(clippy::cast_possible_truncation)]
+            h.record_rtt(
+                &name,
+                crate::history::now_ms(),
+                rtt.map(|r| (r.as_secs_f64() * 1000.0) as f32),
+            );
+        }
         if became_reachable {
             info!("Peer \"{name}\" ({addr}) is reachable");
             next_mtu = Some(Instant::now());
@@ -1418,16 +1423,6 @@ fn update_reachability(table: &ProbeTable, name: &str, rtt: Option<Duration>) ->
     while entry.recent.len() > RTT_WINDOW {
         entry.recent.pop_front();
     }
-    let now = crate::history::now_ms();
-    #[allow(clippy::cast_possible_truncation)]
-    entry.rtt_history.push_back(wanderlan_core::api::RttPoint(
-        now,
-        rtt.map(|r| (r.as_secs_f64() * 1000.0) as f32),
-    ));
-    let oldest = now.saturating_sub(crate::history::duration_ms(crate::history::KEEP));
-    while entry.rtt_history.front().is_some_and(|p| p.0 < oldest) {
-        entry.rtt_history.pop_front();
-    }
     match rtt {
         Some(rtt) => {
             let was = entry.reachable;
@@ -1513,6 +1508,7 @@ mod tests {
             tests: Mutex::new(HashMap::new()),
             reported: Mutex::new(HashMap::new()),
             nonces: Mutex::new(HashMap::new()),
+            history: std::sync::Arc::default(),
         });
         let table: ProbeTable = Arc::new(RwLock::new(BTreeMap::new()));
         let (events, _) = mpsc::channel(16);

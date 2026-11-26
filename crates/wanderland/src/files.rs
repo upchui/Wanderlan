@@ -136,7 +136,21 @@ impl Paths {
     pub fn restore_confirmed(&self) -> Result<bool> {
         let dir = self.confirmed_dir();
         if !dir.join("network.toml").exists() {
-            return Ok(false);
+            // Nothing confirmed yet (a first configuration from files): the
+            // rejected files are set aside, the site is unconfigured again.
+            let mut moved = false;
+            for name in ["network.toml", "local.toml"] {
+                let current = self.config_dir.join(name);
+                if current.exists() {
+                    let aside = self.config_dir.join(format!("{name}.rejected"));
+                    std::fs::rename(&current, &aside).with_context(|| {
+                        format!("cannot move {} to {}", current.display(), aside.display())
+                    })?;
+                    moved = true;
+                }
+            }
+            self.clear_marker();
+            return Ok(moved);
         }
         for name in ["network.toml", "local.toml"] {
             let current = self.config_dir.join(name);

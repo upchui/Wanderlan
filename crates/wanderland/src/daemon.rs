@@ -224,6 +224,8 @@ const JOIN_BUSY_RETRY: Duration = Duration::from_secs(60);
 const JOIN_MAX_FAILURES: usize = 5;
 /// Window for counting wrong invitation codes.
 const JOIN_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+/// How long a joining box has to answer with its proof.
+const JOIN_PROOF_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A change waiting for confirmation.
 #[derive(Debug)]
@@ -238,6 +240,9 @@ struct Pending {
     /// For changes of a client merged here: the fingerprint the client
     /// announced, rejected too on a rollback (else fetched again at once).
     announced: Option<String>,
+    /// The peers this change removed (in grace): their grace starts again
+    /// when it is confirmed.
+    graced: Vec<String>,
 }
 
 /// Learned MAC addresses per bridge port index.
@@ -280,6 +285,9 @@ struct Controller {
     history: SharedHistory,
     /// When the daemon started (ms since the Unix epoch).
     started_ms: u64,
+    /// Base chains of other firewalls that drop forwarded packets (only
+    /// read while this site has a breakout).
+    forward_drops: Vec<String>,
     inputs: mpsc::Sender<Input>,
     /// Fingerprints not to fetch again, until when.
     rejected: Rejected,
@@ -309,13 +317,22 @@ struct Controller {
     /// network (authenticated), e.g. a server that became a client of
     /// another site learns so from its old peers.
     grace_keys: BTreeMap<String, PeerKeys>,
+    /// The peers the last configuration change put in grace (taken by the
+    /// pending change it makes).
+    grace_added: Vec<String>,
     /// Changes of clients of this site (by client, their fingerprint) that
     /// this client passed on and its uplink has not taken over yet: if the
     /// uplink refuses, so does this site, and the client learns why.
     relayed: BTreeMap<String, String>,
+    /// A change made on this site itself (not passed on from a client) is
+    /// in what the uplink has not taken over yet: a refusal may be about it.
+    own_change_up: bool,
     generation: u64,
     invites: Invites,
     join_failures: BTreeMap<Ipv4Addr, VecDeque<Instant>>,
+    /// The nonces sent to boxes that join with an identity already in the
+    /// network (they prove it holds the key), with when.
+    join_nonces: BTreeMap<(Ipv4Addr, SiteId), (Vec<u8>, Instant)>,
     joining: bool,
     /// The last error of a step retried every second, logged once.
     last_repeated: Option<String>,
@@ -364,7 +381,7 @@ pub async fn run(args: Args) -> Result<()> {
     let mut tasks = vec![
         (
             "probes",
-            probe::spawn(probe_rx, probes.clone(), probe_event_tx),
+            probe::spawn(probe_rx, probes.clone(), probe_event_tx, history.clone()),
         ),
         ("sync", sync_net::spawn(offer_rx, inputs_tx.clone())),
         ("keepalive", keepalive::spawn(keepalive_rx)),
@@ -417,6 +434,7 @@ pub async fn run(args: Args) -> Result<()> {
         vlan_rates,
         history,
         started_ms: history::now_ms(),
+        forward_drops: Vec::new(),
         inputs: inputs_tx,
         rejected: Rejected::default(),
         refused: BTreeMap::new(),
@@ -431,10 +449,13 @@ pub async fn run(args: Args) -> Result<()> {
         fetch_backoff: BTreeMap::new(),
         grace: BTreeMap::new(),
         grace_keys: BTreeMap::new(),
+        grace_added: Vec::new(),
         relayed: BTreeMap::new(),
+        own_change_up: false,
         generation: 0,
         invites,
         join_failures: BTreeMap::new(),
+        join_nonces: BTreeMap::new(),
         joining: false,
         last_repeated: None,
         identity: None,
@@ -1036,6 +1057,7 @@ impl Controller {
     /// services. The announced version is always the confirmed one.
     fn set_config(&mut self, cfg: Option<Config>) {
         let old_peers = self.direct_peers();
+        self.grace_added.clear();
         let old_uplink = self
             .config
             .as_ref()
@@ -1063,6 +1085,7 @@ impl Controller {
                 if let Some(k) = self.peer_keys.get(&name) {
                     self.grace_keys.insert(name.clone(), k.clone());
                 }
+                self.grace_added.push(name.clone());
                 self.grace.insert(name, (addr, now + GRACE));
             }
         }
@@ -1091,6 +1114,9 @@ impl Controller {
             .and_then(|c| c.self_site().and_then(|s| s.uplink.clone()));
         if uplink != followed {
             self.runtime.uplink_direct = false;
+            // What was passed on to the old one is no longer in question.
+            self.relayed.clear();
+            self.own_change_up = false;
         }
         // A port shut by the loop guard stays shut while it exists: tunnels
         // of peers that are gone and trunk ports no longer used are freed.
@@ -1180,7 +1206,7 @@ impl Controller {
             move_key(&mut self.peer_keys, old, new);
             move_key(&mut self.control_endpoints, old, new);
             if let Ok(mut h) = self.history.write() {
-                h.rename(&topology::tunnel_name(old), &topology::tunnel_name(new));
+                h.rename(old, new);
             }
             self.grace.remove(old);
             self.grace_keys.remove(old);
@@ -1782,6 +1808,7 @@ impl Controller {
                         self.diverged_since = None;
                         // The uplink has what this site passed on.
                         self.relayed.clear();
+                        self.own_change_up = false;
                     }
                 }
                 _ if rejected.contains(&theirs.fingerprint) => {}
@@ -2163,14 +2190,19 @@ impl Controller {
                     "Your change was not taken over by \"{peer}\": {reason}"
                 ));
                 self.diverged_since = None;
-                // The changes of its clients in it: refused here too, so they
-                // are not merged and passed on again (they learn why).
-                for (client, fingerprint) in std::mem::take(&mut self.relayed) {
-                    self.refuse_client(
-                        &client,
-                        Some(fingerprint),
-                        format!("\"{peer}\" refused it: {reason}"),
-                    );
+                // Only changes of its clients in it: refused here too, so they
+                // are not merged and passed on again (they learn why). With a
+                // change of its own in it the refusal may be about that one:
+                // the clients' changes are passed on again by themselves.
+                let relayed = std::mem::take(&mut self.relayed);
+                if !std::mem::take(&mut self.own_change_up) {
+                    for (client, fingerprint) in relayed {
+                        self.refuse_client(
+                            &client,
+                            Some(fingerprint),
+                            format!("\"{peer}\" refused it: {reason}"),
+                        );
+                    }
                 }
                 network
             }
@@ -2183,6 +2215,9 @@ impl Controller {
                         .insert(peer, Instant::now() + FETCH_BACKOFF);
                     return TakeOver::Applied;
                 }
+                // What the uplink has now replaces what this site passed on.
+                self.relayed.clear();
+                self.own_change_up = false;
                 network
             }
         };
@@ -2436,6 +2471,14 @@ impl Controller {
                 request.version
             ));
         };
+        // An identity that is already a site: the box proves it holds its
+        // key (else anyone with an invitation could pose as a site that is
+        // down and get its traffic).
+        if confirmed.network.sites.iter().any(|s| s.id == Some(id))
+            && let Err(reply) = self.check_join_proof(from, id, &request)
+        {
+            return reply;
+        }
         let joiner = join::Joiner {
             name: &request.name,
             name_is_default: request.name_is_default,
@@ -2479,15 +2522,14 @@ impl Controller {
             );
         }
         let via = confirmed.self_name().to_string();
+        // Nothing changes here (the same box at the same place): the code
+        // is not used up, the box may still fail to come up.
         if !admission.changed {
-            if let Err(e) = self.invites.remove(&invite.code) {
-                warn!("{e:#}");
-            }
             self.events.emit(
                 Level::Info,
                 Some(&admission.name),
                 format!(
-                    "Site \"{}\" at {from} joined again with invitation {}",
+                    "Site \"{}\" at {from} joined again with invitation {}; nothing changed, the invitation stays open",
                     admission.name, invite.code
                 ),
             );
@@ -2517,6 +2559,19 @@ impl Controller {
         match self.apply(cfg, source, None, None, false).await {
             Ok(_) => {
                 self.invites.reserve(&invite.code);
+                if let Err(answer) = self.uplink_takes_join().await {
+                    let why = match &answer {
+                        JoinReply::Error { message } => message.clone(),
+                        _ => "the server of this site is busy".into(),
+                    };
+                    self.events.warn(format!(
+                        "Site \"{site}\" at {from} cannot join through this site now: {why}"
+                    ));
+                    if let Err(e) = self.rollback(&why).await {
+                        self.events.error(e.message);
+                    }
+                    return answer;
+                }
                 self.events.emit(
                     Level::Info,
                     Some(&site),
@@ -2528,6 +2583,86 @@ impl Controller {
                 JoinReply::Ok { site, via, network }
             }
             Err(e) => error(format!("cannot add the site here: {}", e.message)),
+        }
+    }
+
+    /// Asks a box that joins with an identity of the network for its proof,
+    /// or checks the proof it sent.
+    fn check_join_proof(
+        &mut self,
+        from: Ipv4Addr,
+        id: SiteId,
+        request: &JoinRequest,
+    ) -> Result<(), JoinReply> {
+        let now = Instant::now();
+        self.join_nonces
+            .retain(|_, (_, at)| now.duration_since(*at) < JOIN_PROOF_TIMEOUT);
+        let Some(me) = self.identity.clone() else {
+            return Ok(());
+        };
+        let Some(proof) = &request.proof else {
+            let nonce = crate::random::bytes::<16>().map_err(|e| JoinReply::Error {
+                message: format!("{e:#}"),
+            })?;
+            self.join_nonces.insert((from, id), (nonce.to_vec(), now));
+            return Err(JoinReply::Prove {
+                id: me.id().to_string(),
+                nonce: join::to_hex(&nonce),
+            });
+        };
+        // The nonce stays until it expires: the box asks again with the same
+        // proof after "busy" or "not yet".
+        let valid = self.join_nonces.get(&(from, id)).is_some_and(|(nonce, _)| {
+            join::from_hex(&proof.nonce).as_deref() == Some(nonce.as_slice())
+                && me.pair(&id).is_some_and(|keys| {
+                    join::from_hex(&proof.tag).is_some_and(|tag| {
+                        keys.sync_verify(&join::proof_parts(nonce, &request.code), &tag)
+                    })
+                })
+        });
+        if valid {
+            Ok(())
+        } else {
+            self.events.warn(format!(
+                "The box at {from} claims the identity {} of a site but cannot prove it holds its key",
+                id.fingerprint()
+            ));
+            Err(JoinReply::Error {
+                message: "this box could not prove that it holds the key of its identity".into(),
+            })
+        }
+    }
+
+    /// A client that admits a site: its own server takes the change over
+    /// at once (it knows the whole network: names, addresses and identities
+    /// outside this site's part). The answer for the joining box if not.
+    async fn uplink_takes_join(&mut self) -> Result<(), JoinReply> {
+        let Some(cfg) = self.config.clone() else {
+            return Ok(());
+        };
+        let Some(up) = cfg.self_site().and_then(|s| s.uplink.clone()) else {
+            return Ok(());
+        };
+        let unreachable = |why: String| JoinReply::Error {
+            message: format!("the server of this site (\"{up}\") cannot be asked: {why}"),
+        };
+        let Some(target) = self.control_target(&up) else {
+            return Err(unreachable("its address is unknown".into()));
+        };
+        let (Some(me), Some(k)) = (self.own_id(), self.peer_keys.get(&up).cloned()) else {
+            return Err(unreachable("its identity is not known yet".into()));
+        };
+        let text = render_network_wire(&cfg.network);
+        match sync_net::push_sync(target, me, k.id, &k.keys, &text).await {
+            Ok(sync_net::PushAnswer::Ok) => {
+                self.pushed = Some(config::fingerprint(&cfg.network));
+                Ok(())
+            }
+            Ok(sync_net::PushAnswer::Busy) => Err(JoinReply::Busy),
+            Ok(sync_net::PushAnswer::Refused(reason)) => Err(JoinReply::Error {
+                message: format!("the server of this site (\"{up}\") refused it: {reason}"),
+            }),
+            Err(e) => Err(unreachable(format!("{e:#}"))),
         }
     }
 
@@ -2596,12 +2731,32 @@ impl Controller {
             name_is_default: params.name_is_default,
             version: wanderlan_core::version_line().into(),
             id: identity.id().to_string(),
+            proof: None,
         };
         let inputs = self.inputs.clone();
+        let mut request = request;
         tokio::spawn(async move {
             let start = Instant::now();
+            let mut proved = false;
             let result = loop {
                 match sync_net::join(target, &request).await {
+                    // The identity is already a site: prove it (once).
+                    Ok(JoinReply::Prove { id, nonce }) if !proved => {
+                        proved = true;
+                        let keys = id.parse::<SiteId>().ok().and_then(|id| identity.pair(&id));
+                        match (keys, join::from_hex(&nonce)) {
+                            (Some(keys), Some(bytes)) => {
+                                let tag = keys.sync_tag(&join::proof_parts(&bytes, &request.code));
+                                request.proof = Some(join::JoinProof {
+                                    nonce,
+                                    tag: join::to_hex(&tag),
+                                });
+                            }
+                            _ => {
+                                break Err("the inviting site sent an invalid proof request".into());
+                            }
+                        }
+                    }
                     Ok(JoinReply::Busy) if start.elapsed() < JOIN_BUSY_RETRY => {
                         tokio::time::sleep(Duration::from_secs(3)).await;
                     }
@@ -2639,6 +2794,11 @@ impl Controller {
             JoinReply::Busy => {
                 return Err(ApiError::new(
                     "the inviting site is busy with another change; try again in a minute",
+                ));
+            }
+            JoinReply::Prove { .. } => {
+                return Err(ApiError::new(
+                    "the inviting site did not accept the proof of this box's identity",
                 ));
             }
             JoinReply::Error { message } | JoinReply::Retry { message } => {
@@ -2707,6 +2867,7 @@ impl Controller {
         self.grace.clear();
         self.grace_keys.clear();
         self.relayed.clear();
+        self.own_change_up = false;
         self.flushes.clear();
         self.invites.clear();
         self.join_failures.clear();
@@ -2918,6 +3079,7 @@ impl Controller {
             from_files,
             fingerprint,
             announced: None,
+            graced: std::mem::take(&mut self.grace_added),
         });
         self.events.emit(
             Level::Info,
@@ -3011,14 +3173,10 @@ impl Controller {
             self.rejected.clear();
             // A change of its own: the last refusal is history.
             self.sync_problem = None;
+            self.own_change_up = true;
         }
-        if let Err(e) = self.paths.write_confirmed(&cfg) {
-            self.pending = Some(pending);
-            return Err(ApiError::new(format!(
-                "cannot write the configuration files: {e:#}"
-            )));
-        }
-        self.paths.clear_marker();
+        // The invitation is used up before the new site is written down: a
+        // crash in between loses the code rather than letting it in twice.
         if matches!(pending.source, ChangeSource::Join { .. }) {
             match self.invites.consume_reserved() {
                 Ok(Some(code)) => self.events.info(format!("Invitation {code} is used up")),
@@ -3026,11 +3184,26 @@ impl Controller {
                 Err(e) => self.events.error(format!("{e:#}")),
             }
         }
+        if let Err(e) = self.paths.write_confirmed(&cfg) {
+            // /etc does not run ahead of what is in effect (written in part).
+            if let Some(previous) = &self.confirmed
+                && let Err(again) = self.paths.write_confirmed(previous)
+            {
+                self.events.error(format!("{again:#}"));
+            }
+            self.pending = Some(pending);
+            return Err(ApiError::new(format!(
+                "cannot write the configuration files: {e:#}"
+            )));
+        }
+        self.paths.clear_marker();
         // Peers it removed get the new network only from now on (until now
         // the confirmed one was offered): their grace starts here.
         let until = Instant::now() + GRACE;
-        for (_, t) in self.grace.values_mut() {
-            *t = until;
+        for name in &pending.graced {
+            if let Some((_, t)) = self.grace.get_mut(name) {
+                *t = until;
+            }
         }
         self.confirmed = Some(cfg.clone());
         self.set_config(Some(cfg.clone()));
@@ -3228,8 +3401,10 @@ impl Controller {
         }
         if cfg.self_site().is_none_or(|s| s.breakout.is_empty()) {
             self.runtime.sysctls.clear();
+            self.forward_drops.clear();
             return;
         }
+        self.forward_drops = wanderlan_core::sys::breakout::read_forward_drops().await;
         let uplinks = &self.runtime.uplinks;
         let mut devs: BTreeSet<String> = BTreeSet::new();
         devs.extend(uplinks.auto4.clone());
@@ -3259,6 +3434,10 @@ impl Controller {
         }
         self.runtime.sysctls = values;
         self.runtime.sysctl_writable = sysctls.writable();
+        self.runtime.ipv6_disabled =
+            !std::path::Path::new(wanderlan_core::sys::breakout::SYSCTL_ROOT)
+                .join("ipv6")
+                .exists();
     }
 
     /// Forgets the learned MAC addresses of all of wanderlan's bridges.
@@ -3386,7 +3565,6 @@ impl Controller {
             ports
         });
         let recorded = self.history.read().ok();
-        let probes = self.probes.read().ok();
         let traffic = |name: &str| {
             recorded
                 .as_ref()
@@ -3401,10 +3579,9 @@ impl Controller {
                 .into_keys()
                 .map(|name| PeerHistory {
                     traffic: traffic(&topology::tunnel_name(&name)),
-                    rtt: probes
+                    rtt: recorded
                         .as_ref()
-                        .and_then(|t| t.get(&name).map(|p| p.rtt_since(since)))
-                        .unwrap_or_default(),
+                        .map_or_else(Vec::new, |h| h.rtt_since(&name, since)),
                     name,
                 })
                 .collect(),
@@ -3823,6 +4000,13 @@ impl Controller {
                     ipv6: family(&b.v6),
                     ready: router.is_some_and(|l| l.admin_up)
                         && port.is_some_and(|l| l.admin_up && l.master.is_some()),
+                    blocked: (!self.forward_drops.is_empty()).then(|| {
+                        format!(
+                            "{} drops forwarded packets (its policy): it must accept those of {} (e.g. Docker: DOCKER-USER, ufw: route allow)",
+                            self.forward_drops.join(", "),
+                            b.router
+                        )
+                    }),
                     rx_bps,
                     tx_bps,
                     traffic: router.map(|l| l.traffic).unwrap_or_default(),

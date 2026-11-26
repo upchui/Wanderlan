@@ -385,6 +385,10 @@ impl Modal {
     }
 }
 
+/// The most samples kept of the VLAN the VLAN window shows (an hour of
+/// answers every 2 s).
+const VLAN_HISTORY_MAX: usize = 1800;
+
 /// A typed answer of the daemon.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Reply {
@@ -895,7 +899,7 @@ impl App {
                 if self.recorded_error.is_none() && self.may_send(self.in_flight.history) {
                     self.in_flight.history = Some(self.ticks);
                     fx.push(Effect::Request(Request::History(HistoryParams {
-                        since_ms: self.recorded.since(),
+                        since_ms: self.recorded.next_since(),
                     })));
                 }
                 let vlan_open = matches!(self.modal, Some(Modal::Vlan { .. }));
@@ -1594,18 +1598,28 @@ impl App {
     fn on_vlan_traffic(&mut self, traffic: VlanTraffic) {
         self.in_flight.vlans = None;
         self.vlan_traffic_error = None;
-        if traffic.available && !traffic.ports.is_empty() {
+        // Only the VLAN the window shows (with all VLANs there are thousands).
+        let shown = match &self.modal {
+            Some(Modal::Vlan { vid, .. }) => Some(*vid),
+            _ => None,
+        };
+        self.vlan_history.retain(|vid, _| Some(*vid) == shown);
+        if let Some(vid) = shown
+            && traffic.available
+            && !traffic.ports.is_empty()
+        {
             let now = super::history::wall_ms();
             let oldest = now.saturating_sub(super::history::KEEP_MS);
-            let totals = traffic::vlan_totals(&traffic);
-            for (&vid, &(rx_bps, tx_bps)) in &totals {
-                let samples = self.vlan_history.entry(vid).or_default();
-                samples.push_back(TrafficPoint(now, rx_bps, tx_bps));
-                while samples.front().is_some_and(|p| p.0 < oldest) {
-                    samples.pop_front();
-                }
+            let (rx_bps, tx_bps) = traffic::vlan_totals(&traffic)
+                .get(&vid)
+                .copied()
+                .unwrap_or_default();
+            let samples = self.vlan_history.entry(vid).or_default();
+            samples.push_back(TrafficPoint(now, rx_bps, tx_bps));
+            while samples.front().is_some_and(|p| p.0 < oldest) || samples.len() > VLAN_HISTORY_MAX
+            {
+                samples.pop_front();
             }
-            self.vlan_history.retain(|vid, _| totals.contains_key(vid));
         }
         self.vlan_traffic = Some(traffic);
     }

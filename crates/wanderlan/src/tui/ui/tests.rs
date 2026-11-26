@@ -675,6 +675,12 @@ fn one_vlan_live() {
     key(&mut app, KeyCode::Down);
     key(&mut app, KeyCode::Enter);
     assert!(matches!(app.modal, Some(Modal::Vlan { vid: 20, .. })));
+    // The window records what comes while it is open.
+    reply(
+        &mut app,
+        Request::VlanTraffic,
+        Reply::VlanTraffic(fixtures::vlan_traffic()),
+    );
     insta::assert_snapshot!(render(&app));
 }
 
@@ -733,6 +739,7 @@ fn with_breakouts() -> App {
             ipv4: out("ens18"),
             ipv6: out("ens18"),
             ready: true,
+            blocked: None,
             rx_bps: 12_400_000,
             tx_bps: 98_000_000,
             traffic: Traffic::default(),
@@ -752,6 +759,7 @@ fn with_breakouts() -> App {
                 ..BreakoutFamily::default()
             },
             ready: true,
+            blocked: None,
             rx_bps: 0,
             tx_bps: 0,
             traffic: Traffic::default(),

@@ -175,6 +175,10 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             Vec::new()
         };
         let several = states.len() > 1;
+        // Another firewall drops what is forwarded: first, it stops it all.
+        if let Some(why) = states.iter().find_map(|b| b.blocked.clone()) {
+            lines.push(Line::styled(format!(" {why}"), theme::bad()));
+        }
         for b in states {
             // Several segments: each named by its bridge.
             let at = if several {

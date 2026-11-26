@@ -109,6 +109,10 @@ services:
     environment:
       ROLE: client
       TRUNK_NET: "10.200.1."
+    # A device of VLAN 44 with IPv6 too (the breakout keeps it in the tunnel).
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "0"
+      net.ipv6.conf.default.disable_ipv6: "0"
     networks:
       tr-site1: { ipv4_address: 10.200.1.20 }
 
@@ -130,9 +134,13 @@ services:
     environment:
       ROLE: client
       TRUNK_NET: "10.200.2."
+    # The gateway of VLAN 44: a router for IPv6 (its neighbour
+    # advertisements carry the router flag), it routes nowhere though.
     sysctls:
       net.ipv6.conf.all.disable_ipv6: "0"
       net.ipv6.conf.default.disable_ipv6: "0"
+      net.ipv6.conf.all.forwarding: "1"
+      net.ipv6.conf.default.forwarding: "1"
     networks:
       tr-site2: { ipv4_address: 10.200.2.20 }
 

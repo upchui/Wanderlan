@@ -1187,8 +1187,9 @@ async fn a_breakout_builds_its_pair_and_goes_again() {
     assert!(net.link("wlbo20").unwrap().admin_up);
     let state = net.state().breakout;
     assert!(state.nft.is_some());
-    // Two ways back, one way out of eth1.
-    assert_eq!(state.rules.len(), 3, "{:?}", state.rules);
+    // Two ways back (each from its uplink and from the box itself), one
+    // way out of eth1.
+    assert_eq!(state.rules.len(), 5, "{:?}", state.rules);
     assert_eq!(
         net.sysctl("ipv4/conf/eth1/forwarding").as_deref(),
         Some("1")

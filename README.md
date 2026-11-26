@@ -360,6 +360,13 @@ answers come back to them. Everything else keeps going through the tunnel:
 * the **exceptions** of the VLAN, e.g. a service that only lets in the
   public address of the central site (`except = ["203.0.113.0/24"]`).
 
+IPv6 breaks out only what goes **to a router of the VLAN**: the box learns
+its MAC address from its router advertisements and its neighbour
+advertisements (router flag). So devices of the VLAN with global addresses
+still reach each other directly, and until a router was seen IPv6 stays in
+the tunnel. The router's own public address breaks out too; add it to the
+exceptions if it must be reached through the tunnel.
+
 The **uplink** is the interface of the box's default route, or one chosen
 per VLAN (`uplink = "ens20"`, e.g. a second line; it needs a default route
 of its own, with any metric, or a point-to-point link such as WireGuard).
@@ -978,7 +985,8 @@ or `WANDERLAN_SOCKET`.
 * **A breakout VLAN does not reach the internet**: `wanderlan breakout` says
   where IPv4 and IPv6 leave, or why they go through the tunnel. A firewall
   on the box that drops forwarded traffic (ufw's default, Docker's `FORWARD`
-  policy) must let the traffic from `wlbo*` out to the uplink. Where
+  policy) must let the traffic from `wlbo*` out to the uplink; the status
+  and the Breakout view (`7`) name such a chain. Where
   `/proc/sys` is read-only (a container), forwarding must be on already and
   the source checks loose (`net.ipv4.conf.all.rp_filter = 2`). A VLAN with
   public addresses of its own (a DMZ) needs its network as an exception.

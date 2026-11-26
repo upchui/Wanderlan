@@ -195,6 +195,8 @@ pub struct Runtime {
     pub sysctls: BTreeMap<String, String>,
     /// The sysctls can be written (not in a container).
     pub sysctl_writable: bool,
+    /// The kernel has no IPv6 (`ipv6.disable=1`): no IPv6 sysctls either.
+    pub ipv6_disabled: bool,
 }
 
 impl Runtime {
@@ -449,6 +451,9 @@ fn breakouts(
                         "{dev} is a trunk port or an interface of wanderlan, not an uplink"
                     ));
                 }
+                if v6 && runtime.ipv6_disabled {
+                    return Err("IPv6 is disabled on this box".into());
+                }
                 let egress = egress(v6, uplink, &runtime.uplinks)?;
                 forwarding(v6, egress.dev(), &router, runtime)?;
                 Ok(egress)
@@ -613,20 +618,37 @@ fn breakout_sysctls(
             }
         }
     }
-    if let Ok(egress) = v6 {
-        let dev = egress.dev();
+    if v6.is_ok() {
         set(conf(true, "all", "forwarding"), "1");
         set(conf(true, router, "disable_ipv6"), "0");
         if writable {
             set(conf(true, router, "accept_ra"), "0");
             set(conf(true, router, "autoconf"), "0");
-            // Forwarding on: router advertisements count only with 2.
-            if value(&conf(true, dev, "accept_ra")) == Some("1") {
-                set(conf(true, dev, "accept_ra"), "2");
+            // Forwarding on: router advertisements count only with 2, on
+            // every interface that takes them now (else their default
+            // routes go when forwarding is switched on), not only on the
+            // uplink of the breakout.
+            let taking: Vec<String> = runtime
+                .sysctls
+                .iter()
+                .filter(|(path, v)| {
+                    v.as_str() == "1"
+                        && path.starts_with("ipv6/conf/")
+                        && path.ends_with("/accept_ra")
+                })
+                .map(|(path, _)| path.clone())
+                .filter(|path| {
+                    path.split('/')
+                        .nth(2)
+                        .is_some_and(|d| d != "all" && d != "default" && d != router)
+                })
+                .collect();
+            for path in taking {
+                set(path, "2");
             }
         }
     }
-    if writable && (v4.is_ok() || v6.is_ok()) {
+    if writable && (v4.is_ok() || v6.is_ok()) && !runtime.ipv6_disabled {
         // The port end has no address of its own.
         set(conf(true, port, "disable_ipv6"), "1");
     }

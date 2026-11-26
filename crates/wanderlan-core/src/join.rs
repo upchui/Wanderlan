@@ -44,6 +44,41 @@ pub struct JoinRequest {
     /// Identity of the joining box ([`SiteId`] as text).
     #[serde(default)]
     pub id: String,
+    /// The proof that the box holds the key of its identity, asked for
+    /// ([`JoinReply::Prove`]) when that identity is already a site.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proof: Option<JoinProof>,
+}
+
+/// The proof of a joining box: the tag over [`proof_parts`] with the keys of
+/// the inviting site and the box (they derive the same ones).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JoinProof {
+    /// The nonce the inviting site sent (hex).
+    pub nonce: String,
+    /// The tag (hex).
+    pub tag: String,
+}
+
+/// What a proof is the tag of: the nonce and the invitation code.
+pub fn proof_parts<'a>(nonce: &'a [u8], code: &'a str) -> [&'a [u8]; 3] {
+    [b"wanderlan join", nonce, code.as_bytes()]
+}
+
+/// Bytes as lowercase hex.
+pub fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Hex back to bytes; `None` for anything else.
+pub fn from_hex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..text.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(text.get(i..i + 2)?, 16).ok())
+        .collect()
 }
 
 /// The answer of the inviting site (one JSON line).
@@ -73,6 +108,14 @@ pub enum JoinReply {
     Error {
         /// Why, in plain language.
         message: String,
+    },
+    /// The identity is already a site: ask again with a [`JoinProof`] over
+    /// this nonce (the identity of the inviting site gives the keys).
+    Prove {
+        /// The identity of the inviting site.
+        id: String,
+        /// The nonce (hex).
+        nonce: String,
     },
 }
 
@@ -291,7 +334,10 @@ pub fn add_site(
                 site: existing.name.clone(),
             });
         }
-        if existing.address != address && alive.contains(&existing.name) {
+        // A box that joins does not run yet: one with this identity that
+        // answers is another box with the same key (a cloned machine), also
+        // behind the same address.
+        if alive.contains(&existing.name) {
             return Err(JoinError::IdentityInUse {
                 site: existing.name.clone(),
                 address: existing.address,
@@ -777,6 +823,11 @@ mod tests {
             add_site(&base, "site1", at(elsewhere, site2, "x"), &alive, &none()),
             Err(JoinError::IdentityInUse { .. })
         ));
+        // Also at the same address (a copy behind the same NAT).
+        assert!(matches!(
+            add_site(&base, "site1", at(NEW, site2, "x"), &alive, &none()),
+            Err(JoinError::IdentityInUse { .. })
+        ));
         // A chosen other name for a member.
         let renamed = Joiner {
             name_is_default: false,
@@ -931,5 +982,30 @@ mod tests {
             serde_json::to_string(&retry).unwrap(),
             r#"{"retry":{"message":"later"}}"#
         );
+    }
+
+    #[test]
+    fn a_proof_is_the_tag_both_sides_derive() {
+        let inviter = crate::identity::Identity::from_secret([1; 32]);
+        let joiner = crate::identity::Identity::from_secret([2; 32]);
+        let nonce = [7u8; 16];
+        let text = to_hex(&nonce);
+        assert_eq!(from_hex(&text).as_deref(), Some(nonce.as_slice()));
+        assert_eq!(from_hex("abc"), None);
+        assert_eq!(from_hex("zz"), None);
+        let tag = joiner
+            .pair(&inviter.id())
+            .unwrap()
+            .sync_tag(&proof_parts(&nonce, "ABCDE-12345"));
+        let keys = inviter.pair(&joiner.id()).unwrap();
+        assert!(keys.sync_verify(&proof_parts(&nonce, "ABCDE-12345"), &tag));
+        assert!(!keys.sync_verify(&proof_parts(&nonce, "OTHER-CODE1"), &tag));
+        // Another box with the same claimed identity has no matching key.
+        let other = crate::identity::Identity::from_secret([3; 32]);
+        let forged = other
+            .pair(&inviter.id())
+            .unwrap()
+            .sync_tag(&proof_parts(&nonce, "ABCDE-12345"));
+        assert!(!keys.sync_verify(&proof_parts(&nonce, "ABCDE-12345"), &forged));
     }
 }

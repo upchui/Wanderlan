@@ -672,6 +672,10 @@ pub struct BreakoutStatus {
     pub ipv6: BreakoutFamily,
     /// The veth pair is in place (up, in its bridge and VLAN).
     pub ready: bool,
+    /// Another firewall on this box drops forwarded packets: the breakout
+    /// cannot work until it accepts them.
+    #[serde(default)]
+    pub blocked: Option<String>,
     /// Receive rate of the router in bit/s (from the devices, out to the
     /// internet).
     pub rx_bps: u64,

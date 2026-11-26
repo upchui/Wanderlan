@@ -1308,3 +1308,20 @@ fn an_own_vlan_may_be_mapped() {
         .collect();
     assert!(errs.is_empty(), "{errs:?}");
 }
+
+#[test]
+fn a_mapped_vlan_is_a_vlan_id() {
+    let mut network = parse_network(EXAMPLE_NETWORK).unwrap().network.unwrap();
+    let i = network
+        .maps
+        .iter()
+        .position(|m| matches!(m.local, crate::config::LocalVid::Vid(_)))
+        .unwrap();
+    network.maps[i].local = crate::config::LocalVid::Vid(4095);
+    let errs: Vec<String> = crate::config::validate(&network, None)
+        .into_iter()
+        .filter(Diagnostic::is_error)
+        .map(|d| d.message)
+        .collect();
+    assert!(errs.iter().any(|e| e.contains("not a VLAN ID")), "{errs:?}");
+}

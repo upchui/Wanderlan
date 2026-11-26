@@ -7,6 +7,34 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
+### Fixes, third review
+
+- Breakout: a frame for a router never floods the tunnels (also while its
+  port is gone; the pair of a breakout goes only after its rules); IPv6
+  breaks out only what goes to a router of the VLAN (learned from its
+  advertisements), devices with global addresses reach each other directly;
+  switching IPv6 forwarding on keeps the default routes learned from router
+  advertisements; router traffic leaves only by its uplink; the way back
+  only from the uplink (no clash with tools that copy conntrack marks),
+  ICMP errors of the box reach the device; breakout UDP to the tunnel port
+  is masqueraded again; works with `ipv6.disable=1`; a ULA-only uplink does
+  not count for IPv6; forwarding switched on by another tool stays; another
+  firewall that drops forwarded packets is named in the status.
+- Join: a client that invites asks its own server before the new box gets
+  its answer (no half-admitted site); a box that claims an identity of the
+  network proves that it holds its key; a cloned box is refused also behind
+  the same address; a rejoin without changes keeps the code; a rename is
+  recognised when the old name went to a new box; mapped VLANs are VLAN
+  IDs; a rolled-back first configuration from files is set aside; files do
+  not run ahead of the configuration in effect when writing fails.
+- Client + server: removing a site with tunnel limits works again; a
+  refusal goes down to the clients only when the push held nothing of this
+  site; grace times end again.
+- Graphs: the VLAN window records only its VLAN (with all VLANs it held
+  hundreds of MB); a renamed peer keeps its history; a clock going back
+  starts it again; no gaps between parts narrower than the samples; less
+  work per second.
+
 ### Traffic graphs
 
 - The daemon records the traffic of its tunnels and trunk ports and every

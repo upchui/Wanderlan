@@ -1145,6 +1145,11 @@ fn from_the_peer_details_to_one_vlan_and_back() {
 #[test]
 fn the_vlan_history_follows_the_answers() {
     let mut app = connected();
+    // Only the VLAN the window shows is recorded.
+    app.modal = Some(Modal::Vlan {
+        vid: 20,
+        back: None,
+    });
     for _ in 0..3 {
         app.update(reply(
             Request::VlanTraffic,
@@ -1161,6 +1166,14 @@ fn the_vlan_history_follows_the_answers() {
         Reply::VlanTraffic(VlanTraffic::default()),
     ));
     assert_eq!(app.vlan_history.get(&20).map(VecDeque::len), Some(3));
+    assert_eq!(app.vlan_history.len(), 1, "only VLAN 20");
+    // Closed: nothing kept.
+    app.modal = None;
+    app.update(reply(
+        Request::VlanTraffic,
+        Reply::VlanTraffic(fixtures::vlan_traffic()),
+    ));
+    assert!(app.vlan_history.is_empty());
 }
 
 #[test]

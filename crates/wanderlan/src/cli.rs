@@ -1794,6 +1794,9 @@ fn print_breakouts(st: &Status) {
         } else {
             println!("    {}: being set up", b.router);
         }
+        if let Some(why) = &b.blocked {
+            println!("    WARNING: {why}");
+        }
     }
 }
 
