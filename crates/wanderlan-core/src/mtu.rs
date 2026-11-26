@@ -208,6 +208,15 @@ pub mod wire2 {
     /// answers anyway, so that the requester learns that another box sits
     /// at the address).
     pub const FLAG_UNVERIFIED: u8 = 1;
+    /// Flag of a reply of a server to its client: the server runs their
+    /// tunnel direct (see [`crate::nat`]).
+    pub const FLAG_DIRECT: u8 = 2;
+    /// Flag of a request of a client to its server: send me a test frame
+    /// for this request (see [`crate::nat`]).
+    pub const FLAG_TEST_ME: u8 = 1;
+    /// Flag of a request of a client to its server: your last test frame
+    /// reached me.
+    pub const FLAG_REACHED: u8 = 2;
 
     /// A request, as decoded (its tag not checked yet).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,7 +225,7 @@ pub mod wire2 {
         pub seq: u32,
         /// Received payload length.
         pub len: usize,
-        /// Flags (none defined yet).
+        /// Flags ([`FLAG_TEST_ME`], [`FLAG_REACHED`]).
         pub flags: u8,
         /// The sender's configuration state.
         pub announce: Announce,
@@ -231,7 +240,7 @@ pub mod wire2 {
     pub struct Reply {
         /// Sequence number of the request.
         pub seq: u32,
-        /// Flags ([`FLAG_UNVERIFIED`]).
+        /// Flags ([`FLAG_UNVERIFIED`], [`FLAG_DIRECT`]).
         pub flags: u8,
         /// Payload length of the request as received.
         pub received: u16,
@@ -254,6 +263,7 @@ pub mod wire2 {
     pub fn request(
         seq: u32,
         ip_size: u16,
+        flags: u8,
         announce: &Announce,
         sender: &SiteId,
         nonce: &Nonce,
@@ -265,7 +275,7 @@ pub mod wire2 {
         let mut buf = Vec::with_capacity(len);
         buf.extend_from_slice(MAGIC);
         buf.push(KIND_REQUEST);
-        buf.push(0);
+        buf.push(flags);
         buf.extend_from_slice(&seq.to_be_bytes());
         buf.extend_from_slice(&announce.revision.to_be_bytes());
         buf.extend_from_slice(&announce.fingerprint);
@@ -390,12 +400,21 @@ mod tests {
             fingerprint: [9; 32],
         };
         let nonce = [5u8; wire2::NONCE_LEN];
-        let req = wire2::request(42, 1400, &announce, &a.id(), &nonce, &ab);
+        let req = wire2::request(
+            42,
+            1400,
+            wire2::FLAG_TEST_ME,
+            &announce,
+            &a.id(),
+            &nonce,
+            &ab,
+        );
         assert_eq!(req.len(), 1400 - 28);
         let wire2::Probe::Request(decoded) = wire2::decode(&req).unwrap() else {
             panic!("a request");
         };
         assert_eq!(decoded.seq, 42);
+        assert_eq!(decoded.flags, wire2::FLAG_TEST_ME);
         assert_eq!(decoded.len, 1372);
         assert_eq!(decoded.sender, a.id());
         assert_eq!(decoded.nonce, nonce);
@@ -408,7 +427,11 @@ mod tests {
         let mut forged = req.clone();
         forged[12] ^= 1;
         assert!(!wire2::verify_request(&forged, &ba));
-        let small = wire2::request(1, 10, &announce, &a.id(), &nonce, &ab);
+        // The flags are signed too.
+        let mut flagged = req.clone();
+        flagged[5] |= wire2::FLAG_REACHED;
+        assert!(!wire2::verify_request(&flagged, &ba));
+        let small = wire2::request(1, 10, 0, &announce, &a.id(), &nonce, &ab);
         assert_eq!(small.len(), wire2::REQUEST_HEADER);
         assert_eq!(wire2::REQUEST_HEADER, 114);
 

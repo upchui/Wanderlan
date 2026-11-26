@@ -331,6 +331,20 @@ impl Wizard {
     }
 
     fn text_step(&mut self, key: &KeyEvent) -> Option<Action> {
+        // The whole line the inviting site shows, pasted: address and code.
+        if key.code == KeyCode::Enter
+            && self.step == Step::Target
+            && let Some((target, code)) = split_join_line(self.target.value())
+        {
+            self.target.set(target);
+            self.code.set(code);
+            if self.check_step().is_ok() {
+                self.step = Step::Code;
+                if self.check_step().is_ok() {
+                    return Some(self.go(Step::Trunk));
+                }
+            }
+        }
         if key.code == KeyCode::Enter {
             return Some(match self.check_step() {
                 Ok(()) => self.go(self.next()),
@@ -428,6 +442,14 @@ impl Wizard {
                 "{trunk} carries the traffic to the other sites; as trunk it would cut this host off. Choose the interface that carries the VLANs."
             ));
         }
+        // What the port window refuses, the setup refuses too.
+        if let Some(why) = interfaces
+            .iter()
+            .find(|i| i.name == trunk)
+            .and_then(super::ports::blocked)
+        {
+            return Err(format!("{trunk} cannot be a trunk ({why})"));
+        }
         Ok(())
     }
 
@@ -446,7 +468,6 @@ impl Wizard {
             online: true,
             managed_by: None,
             self_managed: false,
-            tunnel_mode: Default::default(),
             uplink: None,
         });
         let local = Local {
@@ -502,6 +523,23 @@ fn parse_address(text: &str) -> Result<Ipv4Addr, String> {
         return Err(format!("{ip} is not a usable unicast address"));
     }
     Ok(ip)
+}
+
+/// `wanderlan join <address> <code>` (or just the two): address and code.
+fn split_join_line(text: &str) -> Option<(String, String)> {
+    let mut words: Vec<&str> = text.split_whitespace().collect();
+    if words.first() == Some(&"wanderlan") {
+        words.remove(0);
+    }
+    if words.first() == Some(&"join") {
+        words.remove(0);
+    }
+    match words.as_slice() {
+        [target, code] if join::normalize_code(code).len() == join::CODE_LEN => {
+            Some(((*target).to_string(), (*code).to_string()))
+        }
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -601,6 +639,18 @@ mod tests {
         assert_eq!(params.name, "wanderlan");
         assert!(params.name_is_default);
         assert_eq!(params.trunk, "ens19");
+
+        // The whole line the inviting site shows, pasted at once.
+        let mut w = Wizard::new();
+        w.mode = Mode::Join;
+        w.step = Step::Target;
+        type_text(&mut w, "wanderlan join 10.13.0.103 K7F3Q-9QX2M");
+        press(&mut w, KeyCode::Enter);
+        assert_eq!(w.step, Step::Trunk, "{:?}", w.error);
+        assert_eq!(
+            (w.target.value(), w.code.value()),
+            ("10.13.0.103", "K7F3Q-9QX2M")
+        );
     }
 
     #[test]

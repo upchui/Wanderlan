@@ -37,7 +37,6 @@ struct Rules<'a> {
     managed_by: Option<&'a str>,
     self_managed: bool,
     uplink: Option<&'a str>,
-    tunnel_mode: crate::config::TunnelMode,
     maps: Vec<&'a VlanMap>,
 }
 
@@ -51,7 +50,6 @@ fn rules<'a>(network: &'a Network, site: &'a Site) -> Rules<'a> {
         managed_by: site.managed_by.as_deref(),
         self_managed: site.self_managed,
         uplink: site.uplink.as_deref(),
-        tunnel_mode: site.tunnel_mode,
         maps,
     }
 }
@@ -262,6 +260,21 @@ fn check_changes(old: &Network, new: &Network, editor: &str) -> Result<(), Strin
         return Err(why_not_network(old, editor));
     }
     for site in &old.sites {
+        // A released site changes its VLANs, mappings and online state; who
+        // manages it, where it is plugged in and its address stay the
+        // decision of its manager.
+        if editor == site.name
+            && site.self_managed
+            && let Some(m) = manager(old, site).filter(|m| *m != editor)
+            && let Some(now) = new.site(&site.name)
+        {
+            let fixed = |s: &Site| (s.address, s.managed_by.clone(), s.uplink.clone());
+            if fixed(now) != fixed(site) {
+                return Err(format!(
+                    "this site (\"{editor}\") may not change who manages it, its server or its address: that is for \"{m}\""
+                ));
+            }
+        }
         if may_change(old, site, editor) {
             continue;
         }
@@ -358,7 +371,6 @@ mod tests {
             managed_by: managed_by.map(Into::into),
             self_managed,
             uplink: None,
-            tunnel_mode: Default::default(),
         }
     }
 
@@ -393,6 +405,16 @@ mod tests {
         assert!(check_edit(&old, &new, "d").is_ok());
         assert!(check_edit(&old, &new, "a").is_ok());
         assert!(check_edit(&old, &new, "b").is_err());
+        // Who manages it and where it is plugged in stay its manager's.
+        for change in [
+            |s: &mut Site| s.managed_by = Some("d".into()),
+            |s: &mut Site| s.uplink = Some("b".into()),
+        ] {
+            let mut new = old.clone();
+            change(&mut new.sites[3]);
+            let err = check_edit(&old, &new, "d").unwrap_err();
+            assert!(err.contains("that is for \"a\""), "{err}");
+        }
     }
 
     #[test]

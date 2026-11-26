@@ -60,7 +60,7 @@ pub struct PortPicker {
 
 /// Why `interface` cannot be a trunk port at all: it is in a bridge or bond
 /// of someone else, or of a kind a bridge does not take.
-fn blocked(interface: &Interface) -> Option<String> {
+pub(super) fn blocked(interface: &Interface) -> Option<String> {
     if let Some(master) = interface
         .master
         .as_deref()

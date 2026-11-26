@@ -106,6 +106,12 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
             theme::warn(),
         )),
     }
+    if status.site.is_some() && !status.online {
+        lines.push(Line::styled(
+            " This site is OFFLINE: its tunnels stay down (Sites (2): o, then a).",
+            theme::warn(),
+        ));
+    }
     if let Some(manager) = app.restricted_by() {
         lines.push(Line::styled(
             format!(" Managed by {manager}: VLANs, mappings and online state change only there."),
@@ -191,12 +197,23 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
             Span::styled("  (Sites: I)", theme::dim()),
         ])),
     }
-    if !status.blocked.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled(" Blocked by the loop guard: ", theme::bad()),
-            Span::styled(status.blocked.join(", "), theme::bad().patch(theme::bold())),
-            Span::styled("  (select the peer, press u)", theme::dim()),
-        ]));
+    // Tunnel ports are unblocked at their peer row, trunk ports with U.
+    let (tunnels, trunks): (Vec<&String>, Vec<&String>) = status
+        .blocked
+        .iter()
+        .partition(|b| status.peers.iter().any(|p| p.port == **b));
+    for (ports, how) in [
+        (tunnels, "  (select the peer, press u)"),
+        (trunks, "  (trunk port: U unblocks)"),
+    ] {
+        if !ports.is_empty() {
+            let names: Vec<&str> = ports.iter().map(|p| p.as_str()).collect();
+            lines.push(Line::from(vec![
+                Span::styled(" Blocked by the loop guard: ", theme::bad()),
+                Span::styled(names.join(", "), theme::bad().patch(theme::bold())),
+                Span::styled(how, theme::dim()),
+            ]));
+        }
     }
     if let Some(e) = &status.last_error {
         lines.push(Line::styled(format!(" Last error: {e}"), theme::bad()));
@@ -208,8 +225,14 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
 }
 
 fn config_cell(peer: &PeerStatus) -> String {
+    use wanderlan_core::api::IdentityState;
     if peer.refused.is_some() {
         return "refused".into();
+    }
+    match peer.identity_state {
+        Some(IdentityState::WrongKey) => return "wrong key".into(),
+        Some(IdentityState::Waiting) => return "no key yet".into(),
+        _ => {}
     }
     match (peer.revision, peer.in_sync) {
         (Some(r), Some(true)) => format!("r{r} ok"),

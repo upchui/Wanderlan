@@ -7,8 +7,8 @@
 
 use wanderlan_core::api::ConfigTexts;
 use wanderlan_core::config::{
-    Diagnostic, FieldPath, Local, Network, Severity, Site, VlanSet, parse_local, parse_network,
-    render_local, render_network, validate,
+    Diagnostic, FieldPath, Local, LocalVid, Network, Severity, Site, TunnelVlans, VlanSet,
+    parse_local, parse_network, render_local, render_network, validate,
 };
 use wanderlan_core::topology;
 
@@ -82,6 +82,8 @@ pub struct Draft {
     pub local: Local,
     /// Result of validating `network` and `local`.
     pub diagnostics: Vec<Diagnostic>,
+    /// The network the draft was copied from (what its edits are against).
+    pub base: Option<Box<Network>>,
 }
 
 impl Draft {
@@ -92,6 +94,7 @@ impl Draft {
             network,
             local,
             diagnostics: Vec::new(),
+            base: None,
         };
         draft.revalidate();
         draft
@@ -99,15 +102,99 @@ impl Draft {
 
     /// A draft of the running configuration, if it has a network.
     pub fn from_running(running: &Running) -> Option<Self> {
-        running
-            .network
-            .clone()
-            .map(|network| Self::new(running.revision, network, running.local.clone()))
+        running.network.clone().map(|network| {
+            let mut draft = Self::new(running.revision, network.clone(), running.local.clone());
+            draft.base = Some(Box::new(network));
+            draft
+        })
+    }
+
+    /// Moves the edits of the draft onto `running`, which changed while the
+    /// draft was edited (a sync, another session): per network setting,
+    /// site, mapping and tunnel limit, what the draft changed wins, the rest
+    /// is what runs now. Returns what both changed (the draft's edit wins).
+    pub fn rebase_onto(&mut self, running: &Running) -> Vec<String> {
+        let (Some(base), Some(now)) = (self.base.as_deref().cloned(), running.network.clone())
+        else {
+            self.rebase(running);
+            return Vec::new();
+        };
+        let mine = &self.network;
+        let mut both = Vec::new();
+        let mut merged = now.clone();
+        macro_rules! setting {
+            ($field:ident, $label:expr) => {
+                if mine.$field != base.$field {
+                    if now.$field != base.$field && now.$field != mine.$field {
+                        both.push($label.to_string());
+                    }
+                    merged.$field = mine.$field.clone();
+                }
+            };
+        }
+        setting!(vlans, "the VLANs of the network");
+        setting!(control_port, "the control port");
+        setting!(tunnel_port, "the tunnel port");
+        setting!(mtu_probe_interval, "the path MTU check");
+        setting!(commit_timeout, "the commit timeout");
+        setting!(mss, "the TCP MSS");
+        merged.sites = now
+            .sites
+            .iter()
+            .filter_map(|n| match (base.site(&n.name), mine.site(&n.name)) {
+                (Some(b), Some(d)) if d != b => {
+                    if n != b && n != d {
+                        both.push(format!("site {}", n.name));
+                    }
+                    Some(d.clone())
+                }
+                // Removed (or renamed) in the draft.
+                (Some(_), None) => None,
+                _ => Some(n.clone()),
+            })
+            .collect();
+        for site in &mine.sites {
+            if base.site(&site.name).is_none() && merged.site(&site.name).is_none() {
+                merged.sites.push(site.clone());
+            }
+        }
+        merged
+            .maps
+            .retain(|m| !(base.maps.contains(m) && !mine.maps.contains(m)));
+        for map in &mine.maps {
+            if !base.maps.contains(map) && !merged.maps.contains(map) {
+                merged.maps.push(map.clone());
+            }
+        }
+        for t in &base.tunnels {
+            let [a, b] = &t.sites;
+            if mine.tunnel_limit(a, b).is_none() {
+                merged.set_tunnel_limit(a, b, None);
+            }
+        }
+        for t in &mine.tunnels {
+            let [a, b] = &t.sites;
+            if base.tunnel_limit(a, b) != Some(&t.vlans) {
+                merged.set_tunnel_limit(a, b, Some(t.vlans.clone()));
+            }
+        }
+        merged.revision = now.revision;
+        self.network = merged;
+        self.rebase(running);
+        both
     }
 
     /// Validates the draft again after a change.
     pub fn revalidate(&mut self) {
         self.diagnostics = validate(&self.network, Some(&self.local));
+    }
+
+    /// Bases the draft on `running` (a change of it came back after a
+    /// rollback, for example).
+    pub fn rebase(&mut self, running: &Running) {
+        self.base_revision = running.revision;
+        self.base = running.network.clone().map(Box::new);
+        self.revalidate();
     }
 
     /// True if the draft differs from the running configuration (the
@@ -325,8 +412,23 @@ fn worst<'a>(diags: impl Iterator<Item = &'a Diagnostic>) -> Option<Severity> {
     found
 }
 
-/// Compares two networks ignoring the revision counter.
+/// Compares two networks ignoring the revision counter and the order of
+/// the mappings and tunnel limits (the daemon may return them in another).
 pub fn same_network(a: &Network, b: &Network) -> bool {
+    fn maps(n: &Network) -> Vec<(&str, u16, LocalVid)> {
+        let mut list: Vec<_> = n
+            .maps
+            .iter()
+            .map(|m| (m.site.as_str(), m.shared, m.local))
+            .collect();
+        list.sort_unstable();
+        list
+    }
+    fn tunnels(n: &Network) -> Vec<&TunnelVlans> {
+        let mut list: Vec<_> = n.tunnels.iter().collect();
+        list.sort_unstable_by(|x, y| x.sites.cmp(&y.sites));
+        list
+    }
     a.control_port == b.control_port
         && a.tunnel_port == b.tunnel_port
         && a.vlans == b.vlans
@@ -334,8 +436,8 @@ pub fn same_network(a: &Network, b: &Network) -> bool {
         && a.mss == b.mss
         && a.commit_timeout == b.commit_timeout
         && a.sites == b.sites
-        && a.maps == b.maps
-        && a.tunnels == b.tunnels
+        && maps(a) == maps(b)
+        && tunnels(a) == tunnels(b)
 }
 
 #[cfg(test)]
@@ -349,6 +451,40 @@ mod tests {
         assert_eq!(running.revision, 7);
         assert_eq!(running.network.as_ref().unwrap().sites.len(), 6);
         assert_eq!(running.local.self_name.as_deref(), Some("heim"));
+    }
+
+    #[test]
+    fn a_draft_moves_onto_a_configuration_that_changed_meanwhile() {
+        let running = Running::parse(&fixtures::config_texts()).unwrap();
+        let mut draft = Draft::from_running(&running).unwrap();
+        // Here: haus3 gets VLAN 20 only. Elsewhere (a sync): buero goes
+        // offline, revision 8.
+        draft
+            .network
+            .sites
+            .iter_mut()
+            .find(|s| s.name == "haus3")
+            .unwrap()
+            .vlans = Some(VlanSet::from_range(20, 20));
+        let mut newer = running.clone();
+        newer.revision = 8;
+        let net = newer.network.as_mut().unwrap();
+        net.revision = 8;
+        net.sites
+            .iter_mut()
+            .find(|s| s.name == "buero")
+            .unwrap()
+            .online = false;
+        assert!(draft.rebase_onto(&newer).is_empty());
+        assert_eq!(draft.base_revision, 8);
+        let n = &draft.network;
+        assert!(!n.site("buero").unwrap().online, "the other change stays");
+        assert_eq!(
+            n.site("haus3").unwrap().vlans,
+            Some(VlanSet::from_range(20, 20))
+        );
+        // The diff shows only the own edit now.
+        assert!(draft.differs_from(&newer));
     }
 
     #[test]

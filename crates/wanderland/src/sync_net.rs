@@ -24,9 +24,9 @@
 //!   A client pushes its changes this way: its server never connects to it
 //!   (it may be behind NAT).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
@@ -43,12 +43,18 @@ use crate::daemon::Input;
 /// Largest accepted network.toml.
 const MAX_SIZE: u64 = 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(10);
+/// The time for a line an honest peer sends at once (its request, its tag):
+/// a connection that sits idle holds a slot no longer.
+const LINE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Longest accepted request line.
 const MAX_LINE: u64 = 4096;
 /// Time the controller may take to answer a join request.
 const JOIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// Connections served at the same time at most; more are closed at once.
 const MAX_CONNECTIONS: usize = 64;
+/// Connections from one address at the same time at most (clients behind
+/// one NAT share it).
+const MAX_PER_ADDRESS: usize = 8;
 /// The longest one connection may take, whatever it does.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -156,11 +162,18 @@ async fn run(mut offer: watch::Receiver<Offer>, inputs: mpsc::Sender<Input>) {
         };
         info!("Serving the network configuration to peers on {bind} (TCP)");
         let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+        let per_address: PerAddress = Arc::new(Mutex::new(HashMap::new()));
         loop {
             tokio::select! {
                 accepted = listener.accept() => match accepted {
                     Ok((stream, from)) => {
-                        // Too many at once (a flood): close this one.
+                        let SocketAddr::V4(from) = from else { continue };
+                        // Too many at once from there, or at all (a flood):
+                        // close this one.
+                        let Some(per) = AddressSlot::take(&per_address, *from.ip()) else {
+                            debug!("sync request from {from} refused: too many connections from there");
+                            continue;
+                        };
                         let Ok(slot) = slots.clone().try_acquire_owned() else {
                             debug!("sync request from {from} refused: too many connections");
                             continue;
@@ -168,7 +181,7 @@ async fn run(mut offer: watch::Receiver<Offer>, inputs: mpsc::Sender<Input>) {
                         let current = offer.borrow().clone();
                         let inputs = inputs.clone();
                         tokio::spawn(async move {
-                            let _slot = slot;
+                            let _slots = (slot, per);
                             match tokio::time::timeout(
                                 CONNECTION_TIMEOUT,
                                 serve(stream, from, &current, &inputs),
@@ -200,18 +213,52 @@ async fn run(mut offer: watch::Receiver<Offer>, inputs: mpsc::Sender<Input>) {
     }
 }
 
+/// Open connections per address.
+type PerAddress = Arc<Mutex<HashMap<Ipv4Addr, usize>>>;
+
+/// One connection of an address; given back when dropped.
+struct AddressSlot {
+    map: PerAddress,
+    address: Ipv4Addr,
+}
+
+impl AddressSlot {
+    fn take(map: &PerAddress, address: Ipv4Addr) -> Option<Self> {
+        let mut counts = map.lock().ok()?;
+        let count = counts.entry(address).or_default();
+        if *count >= MAX_PER_ADDRESS {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            map: map.clone(),
+            address,
+        })
+    }
+}
+
+impl Drop for AddressSlot {
+    fn drop(&mut self) {
+        if let Ok(mut counts) = self.map.lock()
+            && let Some(count) = counts.get_mut(&self.address)
+        {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                counts.remove(&self.address);
+            }
+        }
+    }
+}
+
 async fn serve(
     stream: TcpStream,
-    from: SocketAddr,
+    from: SocketAddrV4,
     offer: &Offer,
     inputs: &mpsc::Sender<Input>,
 ) -> Result<()> {
-    let SocketAddr::V4(from) = from else {
-        bail!("IPv6 is not supported");
-    };
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
-    let line = read_line(&mut reader).await?;
+    let line = read_line(&mut reader, LINE_TIMEOUT).await?;
     let line = line.trim();
     if let Some(args) = line.strip_prefix("SYNC ") {
         return serve_sync(args, from, offer, inputs, &mut reader, &mut write).await;
@@ -238,20 +285,24 @@ async fn serve(
     Ok(())
 }
 
-/// One line of at most [`MAX_LINE`] bytes.
-async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Result<String> {
+/// One line of at most [`MAX_LINE`] bytes, within `timeout`.
+async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    timeout: Duration,
+) -> Result<String> {
     let mut line = String::new();
-    tokio::time::timeout(TIMEOUT, reader.take(MAX_LINE).read_line(&mut line))
+    tokio::time::timeout(timeout, reader.take(MAX_LINE).read_line(&mut line))
         .await
         .context("timeout")??;
     Ok(line)
 }
 
-/// `<tag> <length>` and the body after it.
+/// `<tag> <length>` (within `timeout`) and the body after it.
 async fn read_tagged<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
+    timeout: Duration,
 ) -> Result<([u8; TAG_LEN], Vec<u8>)> {
-    let line = read_line(reader).await?;
+    let line = read_line(reader, timeout).await?;
     let mut parts = line.split_whitespace();
     let tag = parts
         .next()
@@ -308,7 +359,7 @@ where
     write
         .write_all(format!("OK {me} {}\n", hex_encode(&server_nonce)).as_bytes())
         .await?;
-    let (tag, body) = read_tagged(reader).await?;
+    let (tag, body) = read_tagged(reader, LINE_TIMEOUT).await?;
     if !keyed
         .keys
         .sync_verify(&[LABEL_REQUEST, &client_nonce, &server_nonce, &body], &tag)
@@ -470,7 +521,7 @@ async fn exchange(
     write
         .write_all(format!("SYNC {me} {}\n", hex_encode(&client_nonce)).as_bytes())
         .await?;
-    let line = read_line(&mut reader).await?;
+    let line = read_line(&mut reader, TIMEOUT).await?;
     let line = line.trim();
     if let Some(reason) = line.strip_prefix("NO ") {
         bail!("{peer} refused the authenticated sync: {reason}");
@@ -496,7 +547,13 @@ async fn exchange(
         .write_all(format!("{} {}\n", hex_encode(&tag), body.len()).as_bytes())
         .await?;
     write.write_all(body.as_bytes()).await?;
-    let (tag, answer) = read_tagged(&mut reader).await?;
+    // A push waits for the decision of the server (up to JOIN_TIMEOUT).
+    let wait = if body.is_empty() {
+        TIMEOUT
+    } else {
+        JOIN_TIMEOUT + TIMEOUT
+    };
+    let (tag, answer) = read_tagged(&mut reader, wait).await?;
     if !keys.sync_verify(&[LABEL_REPLY, &client_nonce, &server_nonce, &answer], &tag) {
         bail!("{peer} answered with a wrong tag; not used");
     }
@@ -559,6 +616,9 @@ mod tests {
         let server = tokio::spawn(async move {
             loop {
                 let (stream, from) = listener.accept().await.unwrap();
+                let SocketAddr::V4(from) = from else {
+                    unreachable!()
+                };
                 let _ = serve(stream, from, &offer, &inputs).await;
             }
         });

@@ -60,7 +60,9 @@ pub fn form(frame: &mut Frame, form: &Form, area: Rect) {
         line.spans.insert(0, Span::raw(" "));
         lines.push(line);
     }
-    if form.submitted && !form.is_valid() {
+    // Only where a field is marked (a refusal of the whole stands above).
+    let marked = form.fields.iter().any(|f| f.enabled && f.error.is_some());
+    if form.submitted && !form.is_valid() && marked {
         lines.push(Line::styled(
             " Fix the marked fields to save.",
             theme::bad(),

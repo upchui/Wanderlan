@@ -28,7 +28,7 @@ pub struct SettingRow {
 }
 
 /// The settings, in display order.
-pub const ROWS: [SettingRow; 7] = [
+pub const ROWS: [SettingRow; 8] = [
     SettingRow {
         key: "vlans",
         label: "VLANs",
@@ -51,13 +51,19 @@ pub const ROWS: [SettingRow; 7] = [
         key: "mss",
         label: "TCP MSS",
         local: false,
-        help: "Empty: clamp TCP to the MSS that fits the measured path MTU (path MTU - 82). A fixed value (536-1460) replaces the measurement, e.g. if probes are filtered.",
+        help: "Empty: clamp TCP to the MSS that fits the measured path MTU (path MTU - 94). A fixed value (536-1460) replaces the measurement, e.g. if probes are filtered.",
     },
     SettingRow {
         key: "control_port",
         label: "Control port",
         local: false,
-        help: "UDP and TCP port of the daemons on the site addresses: probes, configuration sync and joining. Must be reachable between all sites.",
+        help: "UDP and TCP port of the daemons on the site addresses: probes, configuration sync and joining. Must be reachable between all sites. The tunnel port follows it unless set.",
+    },
+    SettingRow {
+        key: "tunnel_port",
+        label: "Tunnel port",
+        local: false,
+        help: "UDP port of the VXLAN tunnels (a tunnel through NAT also sends from the one above). Empty: control port + 1. Must be reachable towards the servers; a client that its server reaches there runs its tunnel direct.",
     },
     SettingRow {
         key: "self",
@@ -89,6 +95,10 @@ fn value(draft: &Draft, key: &str) -> String {
             .mss
             .map_or_else(|| "from the path MTU".into(), |v| format!("fixed {v}")),
         "control_port" => m.control_port.to_string(),
+        "tunnel_port" => match m.tunnel_port {
+            Some(p) => format!("{p} (UDP, fixed)"),
+            None => format!("{} (UDP, control port + 1)", m.tunnel_port()),
+        },
         "self" => draft.local.self_name.clone().unwrap_or_else(|| "-".into()),
         "trunk" if draft.local.trunk.is_empty() => "-".into(),
         "trunk" => draft.local.trunk.join(", "),
@@ -244,7 +254,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     rows.push(Row::new(vec![
         Cell::from(Span::styled("Role and rights", theme::header())),
         Cell::from(Span::styled(
-            "who may change VLANs: Sites (2), Enter, Changes",
+            "who may change VLANs: Sites (2), e, Changes",
             theme::dim(),
         )),
     ]));

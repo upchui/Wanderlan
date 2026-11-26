@@ -60,8 +60,11 @@ impl NetOps for LinuxSystem {
     async fn create_vxlan(&self, name: &str, params: &VxlanParams, mtu: u32) -> SysResult<()> {
         self.net.create_vxlan(name, params, mtu).await
     }
-    async fn tunnel_remotes(&self) -> SysResult<super::TunnelRemotes> {
-        self.net.tunnel_remotes().await
+    async fn tunnel_remote(
+        &self,
+        index: u32,
+    ) -> SysResult<Option<(std::net::Ipv4Addr, Option<u16>)>> {
+        self.net.tunnel_remote(index).await
     }
     async fn set_tunnel_remote(
         &self,

@@ -19,7 +19,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::{Network, Site, TunnelMode, VlanSet};
+use crate::config::{Network, Site, VlanSet};
 
 /// Prefix of the tunnel (VXLAN) interfaces created by wanderlan.
 pub const TUNNEL_PREFIX: &str = "vx-";
@@ -62,16 +62,6 @@ impl Tunnel<'_> {
     /// client and its uplink are ordinary bridge ports.
     pub fn isolated(&self) -> bool {
         self.kind == TunnelKind::Server
-    }
-
-    /// How the tunnel runs: in the mode of the client in it (`own` is this
-    /// site's); servers among each other send directly.
-    pub fn mode(&self, own: TunnelMode) -> TunnelMode {
-        match self.kind {
-            TunnelKind::Server => TunnelMode::Direct,
-            TunnelKind::Uplink => own,
-            TunnelKind::Client => self.peer.tunnel_mode,
-        }
     }
 }
 
@@ -298,7 +288,6 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
-            tunnel_mode: Default::default(),
             uplink: None,
         }
     }

@@ -19,9 +19,10 @@ pub fn bad() -> Style {
     Style::new().fg(Color::Red)
 }
 
-/// Secondary text.
+/// Secondary text: a fainter form of the terminal's own colour (dark
+/// grey is invisible on many dark themes).
 pub fn dim() -> Style {
-    Style::new().fg(Color::DarkGray)
+    Style::new().add_modifier(Modifier::DIM)
 }
 
 /// Emphasis.

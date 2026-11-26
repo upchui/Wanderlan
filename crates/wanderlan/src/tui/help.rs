@@ -1,6 +1,7 @@
 //! Key bindings: the help bar of each context and the full help screen.
 
 use super::app::{App, Conn, Modal, ReviewState, View};
+use super::form::FormKind;
 use super::format;
 use super::wizard::Step;
 
@@ -41,6 +42,7 @@ pub const SECTIONS: &[Section] = &[
             ("Up/Down", "select a peer"),
             ("Enter", "details: traffic graph, round trips, counters"),
             ("u", "unblock the port of the peer (loop guard)"),
+            ("U", "unblock a trunk port (loop guard)"),
             ("p", "measure the path MTU to all peers now"),
         ],
         text: "Green: reachable and up. Yellow: degraded (port down or offline, \
@@ -57,7 +59,7 @@ pub const SECTIONS: &[Section] = &[
             ("n", "new site by hand"),
             ("Enter", "details: role, VLANs, tunnels, mappings, rights"),
             ("e", "edit the site; \"Changes\": who may change its VLANs"),
-            ("N", "new name: this site always, others if they allow it"),
+            ("N", "new name: this site always, and the sites it manages"),
             ("d, Del", "delete the site and its VLAN mappings"),
             (
                 "m",
@@ -279,6 +281,12 @@ pub fn bar(app: &App) -> Vec<Binding> {
                 ("Space", "choose"),
                 ("m", "main port"),
                 ("Enter", "save to draft"),
+                ("Esc", "cancel"),
+            ],
+            Modal::Form(f) if f.kind == FormKind::Invite => vec![
+                ("Tab", "next field"),
+                ("Left/Right", "choose"),
+                ("Enter", "create invitation"),
                 ("Esc", "cancel"),
             ],
             Modal::Form(_) => vec![

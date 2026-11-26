@@ -11,10 +11,16 @@
 //! probe key. The first valid answer confirms the peer (its tunnel may come
 //! up); an answer with a wrong tag means another box answers at its address.
 //! A peer with a key counts as reachable only with valid answers.
+//!
+//! The probes between a client and its server also run the test whether
+//! the server reaches the client directly (see `wanderlan_core::nat`): the
+//! client asks for a test frame now and then and listens for it at its
+//! tunnel interface for a moment; the server sends it from a socket of its
+//! own (not the tunnel port) and follows what the client says about it.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -25,6 +31,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use wanderlan_core::identity::{Identity, PairKeys, PeerIdentity, SiteId};
 use wanderlan_core::mtu::{self, wire, wire2};
+use wanderlan_core::nat;
 
 /// Interval between reachability/RTT probes.
 pub const RTT_INTERVAL: Duration = Duration::from_secs(5);
@@ -47,6 +54,25 @@ const RTT_SIZE: u16 = 160;
 /// Identities claimed in requests whose keys are kept (peers this site has
 /// no identity for yet).
 const CLAIMED_MAX: usize = 64;
+/// How long a client listens for the test frame of its server.
+const TEST_WAIT: Duration = Duration::from_secs(2);
+/// A test of a client whose server reaches it directly, to see that this
+/// still holds.
+const TEST_DIRECT: Duration = Duration::from_secs(60);
+/// A test of a client whose server does not reach it directly: something
+/// may have changed (a port opened, another network).
+const TEST_NAT: Duration = Duration::from_secs(300);
+/// After a client ran direct and its server no longer reached it, the pause
+/// before the next test doubles, up to this (a NAT that keeps the tunnel
+/// port open only while the client sends from it would make it flap).
+const TEST_NAT_MAX: Duration = Duration::from_secs(24 * 3600);
+/// A test that could not be made (the tunnel interface is down): again
+/// after this.
+const TEST_LATER: Duration = Duration::from_secs(30);
+/// Failed tests in a row after which a client that ran direct goes back.
+const TEST_FAILURES: u32 = 2;
+/// A server sends at most one test frame per client this often.
+const TEST_MIN_GAP: Duration = Duration::from_secs(20);
 
 /// The keys towards one peer whose identity is known.
 #[derive(Debug, Clone)]
@@ -106,6 +132,25 @@ pub struct ProbeConfig {
     /// key, maybe behind NAT): probed only where their authenticated probes
     /// come from, once that place answered a challenge.
     pub passive: BTreeSet<String>,
+    /// The UDP port of the tunnels: where the test frames go.
+    pub tunnel_port: u16,
+    /// The VNIs of the tunnels to the passive peers (for their test frames).
+    pub vnis: BTreeMap<String, u32>,
+    /// The passive peers whose tunnels run direct, at this address.
+    pub direct: BTreeMap<String, Ipv4Addr>,
+    /// For a client: its uplink, tested through the tunnel to it.
+    pub uplink: Option<UplinkTunnel>,
+}
+
+/// The tunnel of a client to its uplink, for the test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UplinkTunnel {
+    /// The uplink.
+    pub peer: String,
+    /// The tunnel interface, where the test frame comes out.
+    pub interface: String,
+    /// The tunnel runs direct now.
+    pub direct: bool,
 }
 
 impl ProbeConfig {
@@ -163,6 +208,10 @@ pub struct PeerProbe {
     /// What the probes found about the peer's identity (peers with a key).
     #[serde(skip)]
     pub identity: Option<PeerIdentity>,
+    /// The test whether the server of a client tunnel reaches the client
+    /// directly (see the module doc).
+    #[serde(skip)]
+    pub direct_test: Option<DirectTest>,
     #[serde(skip)]
     lost: u32,
     /// Recent probes: round trip in ms, or `None` if unanswered.
@@ -203,6 +252,17 @@ impl PeerProbe {
     }
 }
 
+/// The test of a client tunnel, as far as the status shows it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DirectTest {
+    /// A test was made (by the client) or a test frame sent (by the server).
+    pub tested: bool,
+    /// The last tests reached the client.
+    pub reached: bool,
+    /// At the client: when it tests next.
+    pub next: Option<Instant>,
+}
+
 /// Shared measurement table.
 pub type ProbeTable = Arc<RwLock<BTreeMap<String, PeerProbe>>>;
 
@@ -222,23 +282,32 @@ pub enum ProbeEvent {
     /// A passive peer (a client) answered a challenge at this address: its
     /// control traffic comes from there (its NAT's address and port).
     Endpoint { peer: String, addr: SocketAddrV4 },
+    /// The tunnel of a client and its server runs direct (at that address
+    /// of the peer) or through NAT (`None`).
+    Direct { peer: String, at: Option<Ipv4Addr> },
+    /// The daemon of a peer started again (its probes carry a new nonce).
+    Restarted { peer: String },
 }
 
-/// A probe waiting for its reply: from that peer, with that sequence number.
-type PendingKey = (Ipv4Addr, u32);
+/// A probe waiting for its reply: from where it was sent to, with that
+/// sequence number.
+type PendingKey = (SocketAddrV4, u32);
 
 /// A sent probe: where its answer goes, and how to check it.
 struct Waiter {
-    tx: oneshot::Sender<Answer>,
+    tx: Option<oneshot::Sender<Answer>>,
     /// For a version 2 probe: the keys and the identity of the peer.
     keys: Option<(Arc<PairKeys>, SiteId)>,
+    /// An answer came that does not prove the peer's identity. The probe
+    /// still waits for a valid one (a forged answer does not end it).
+    wrong: Arc<AtomicBool>,
 }
 
-/// The answer to a probe.
+/// The valid answer to a probe.
 struct Answer {
     received: u16,
-    /// The answer proves the peer's identity (always true for version 1).
-    valid: bool,
+    /// Its flags (version 2).
+    flags: u8,
 }
 
 struct Shared {
@@ -256,6 +325,16 @@ struct Shared {
     /// Where authenticated requests of passive peers came from lately, to be
     /// confirmed by a challenge.
     candidates: Mutex<HashMap<String, SocketAddrV4>>,
+    /// The socket the test frames leave from (not the tunnel port).
+    test_socket: Option<UdpSocket>,
+    /// The last test frame per passive peer: to which address, when, for
+    /// which run of the peer (its nonce).
+    tests: Mutex<HashMap<String, (Ipv4Addr, Instant, wire2::Nonce)>>,
+    /// What was last reported per peer as [`ProbeEvent::Direct`].
+    reported: Mutex<HashMap<String, Option<Ipv4Addr>>>,
+    /// The nonce of the last verified request per peer: a new one means
+    /// that its daemon started again.
+    nonces: Mutex<HashMap<String, wire2::Nonce>>,
 }
 
 impl Shared {
@@ -313,6 +392,13 @@ async fn run(
             warn!("{e:#}; the probes of this run use a fixed nonce");
             [0; wire2::NONCE_LEN]
         });
+        let test_socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await {
+            Ok(s) => Some(s),
+            Err(e) => {
+                warn!("Cannot open the socket for the tests of the client tunnels: {e}");
+                None
+            }
+        };
         let shared = Arc::new(Shared {
             socket,
             pending: Mutex::new(HashMap::new()),
@@ -322,6 +408,10 @@ async fn run(
             claimed: Mutex::new(HashMap::new()),
             endpoints: Mutex::new(HashMap::new()),
             candidates: Mutex::new(HashMap::new()),
+            test_socket,
+            tests: Mutex::new(HashMap::new()),
+            reported: Mutex::new(HashMap::new()),
+            nonces: Mutex::new(HashMap::new()),
         });
         let receiver = tokio::spawn(receive(shared.clone(), table.clone(), events.clone()));
         let mut prober: BTreeMap<String, (Target, JoinHandle<()>)> = BTreeMap::new();
@@ -459,8 +549,11 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
                     if let Err(e) = shared.socket.send_to(&reply, from).await {
                         debug!("cannot answer probe from {from}: {e}");
                     }
-                    if direct {
-                        note_announce(&table, &events, &peer, announce).await;
+                    // Unauthenticated: it counts only for a peer without a
+                    // key (anyone can send it from the peer's address).
+                    let keyed = shared.config.borrow().keys.contains_key(&peer);
+                    if direct && !keyed {
+                        note_announce(&table, &events, &peer, announce);
                     }
                 }
                 wire::Probe::Reply {
@@ -469,9 +562,9 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
                     announce,
                 } => {
                     // A version 1 answer proves nothing about the identity.
-                    let valid = answer(&shared, *from.ip(), seq, received, |w| w.keys.is_none());
+                    let valid = answer(&shared, from, seq, received, 0, |w| w.keys.is_none());
                     if direct && valid {
-                        note_announce(&table, &events, &peer, announce).await;
+                        note_announce(&table, &events, &peer, announce);
                     }
                 }
             }
@@ -487,18 +580,26 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
                     // the request): the requester sees that this box has
                     // another key than it expects here.
                     let verified = wire2::verify_request(packet, &keys);
-                    let flags = if verified {
+                    let mut flags = if verified {
                         0
                     } else {
                         debug!("probe from {from} with a tag of another key");
                         wire2::FLAG_UNVERIFIED
                     };
+                    if passive
+                        && verified
+                        && serve_direct(&shared, &table, &events, &peer, from, &request, &keys)
+                            .await
+                    {
+                        flags |= wire2::FLAG_DIRECT;
+                    }
                     let reply = wire2::reply(&request, flags, &announce_self, &me.0.id(), &keys);
                     if let Err(e) = shared.socket.send_to(&reply, from).await {
                         debug!("cannot answer probe from {from}: {e}");
                     }
                     if direct && verified {
-                        note_announce(&table, &events, &peer, request.announce).await;
+                        note_announce(&table, &events, &peer, request.announce);
+                        note_nonce(&shared, &events, &peer, request.nonce);
                     }
                     // A client asks from where its NAT sends: the place to
                     // probe it, once it answers a challenge there.
@@ -516,7 +617,8 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
                     }
                 }
                 wire2::Probe::Reply(reply) => {
-                    let valid = answer(&shared, *from.ip(), reply.seq, reply.received, |w| {
+                    let (seq, received, flags) = (reply.seq, reply.received, reply.flags);
+                    let valid = answer(&shared, from, seq, received, flags, |w| {
                         w.keys.as_ref().is_some_and(|(keys, id)| {
                             reply.responder == *id
                                 && reply.flags & wire2::FLAG_UNVERIFIED == 0
@@ -524,7 +626,7 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
                         })
                     });
                     if direct && valid {
-                        note_announce(&table, &events, &peer, reply.announce).await;
+                        note_announce(&table, &events, &peer, reply.announce);
                     }
                 }
             }
@@ -532,26 +634,140 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
     }
 }
 
-/// Hands an answer to the probe waiting for it; `check` tells whether it
-/// proves the peer's identity. Returns that.
+/// Hands an answer to the probe waiting for it if `check` says that it
+/// proves the peer's identity; otherwise the probe notes it and waits on.
+/// Returns whether it was valid.
 fn answer(
     shared: &Shared,
-    from: Ipv4Addr,
+    from: SocketAddrV4,
     seq: u32,
     received: u16,
+    flags: u8,
     check: impl FnOnce(&Waiter) -> bool,
 ) -> bool {
-    let waiter = shared
-        .pending
-        .lock()
-        .ok()
-        .and_then(|mut p| p.remove(&(from, seq)));
-    let Some(waiter) = waiter else {
+    let Ok(mut pending) = shared.pending.lock() else {
         return false;
     };
-    let valid = check(&waiter);
-    let _ = waiter.tx.send(Answer { received, valid });
-    valid
+    let Some(waiter) = pending.get_mut(&(from, seq)) else {
+        return false;
+    };
+    if !check(waiter) {
+        waiter.wrong.store(true, Ordering::Relaxed);
+        return false;
+    }
+    if let Some(tx) = waiter.tx.take() {
+        let _ = tx.send(Answer { received, flags });
+    }
+    pending.remove(&(from, seq));
+    true
+}
+
+/// Notes the nonce of a verified request of `peer`: another one than
+/// before means that its daemon started again.
+fn note_nonce(shared: &Shared, events: &mpsc::Sender<ProbeEvent>, peer: &str, nonce: wire2::Nonce) {
+    let Ok(mut nonces) = shared.nonces.lock() else {
+        return;
+    };
+    if let Some(before) = nonces.insert(peer.to_string(), nonce)
+        && before != nonce
+    {
+        let _ = events.try_send(ProbeEvent::Restarted {
+            peer: peer.to_string(),
+        });
+    }
+}
+
+/// A verified request of a client of this site: sends the test frame it
+/// asks for and follows what it says about the last one. Returns whether
+/// the tunnel to it runs direct now: the client says that the test frame
+/// sent to the address the request comes from reached it.
+async fn serve_direct(
+    shared: &Shared,
+    table: &ProbeTable,
+    events: &mpsc::Sender<ProbeEvent>,
+    peer: &str,
+    from: SocketAddrV4,
+    request: &wire2::Request,
+    keys: &PairKeys,
+) -> bool {
+    let (vni, port, running) = {
+        let cfg = shared.config.borrow();
+        (
+            cfg.vnis.get(peer).copied(),
+            cfg.tunnel_port,
+            cfg.direct.get(peer).copied(),
+        )
+    };
+    let now = Instant::now();
+    let (packet, tested) = {
+        let Ok(mut tests) = shared.tests.lock() else {
+            return false;
+        };
+        // One test per gap and run of the client (a restarted client is
+        // tested at once).
+        let recent = tests.get(peer).is_some_and(|(_, at, nonce)| {
+            *nonce == request.nonce && now.duration_since(*at) < TEST_MIN_GAP
+        });
+        let packet = match vni {
+            Some(vni) if request.flags & wire2::FLAG_TEST_ME != 0 && port != 0 && !recent => {
+                tests.insert(peer.to_string(), (*from.ip(), now, request.nonce));
+                Some(nat::direct_test_packet(
+                    vni,
+                    keys,
+                    &request.nonce,
+                    request.seq,
+                ))
+            }
+            _ => None,
+        };
+        (packet, tests.get(peer).map(|(ip, ..)| *ip))
+    };
+    if let (Some(packet), Some(socket)) = (packet, &shared.test_socket) {
+        let to = SocketAddrV4::new(*from.ip(), port);
+        match socket.send_to(&packet, to).await {
+            Ok(_) => debug!("test frame for client \"{peer}\" sent to {to}"),
+            Err(e) => debug!("cannot send the test frame for client \"{peer}\" to {to}: {e}"),
+        }
+    }
+    // What runs direct stays so while the client still says that it is
+    // reached from the same address (after a restart of this daemon too).
+    let ip = *from.ip();
+    let claimed = request.flags & wire2::FLAG_REACHED != 0;
+    let at = (claimed && (tested == Some(ip) || running == Some(ip))).then_some(ip);
+    if let Ok(mut t) = table.write() {
+        t.entry(peer.to_string()).or_default().direct_test = Some(DirectTest {
+            tested: tested.is_some() || running.is_some(),
+            reached: at.is_some(),
+            next: None,
+        });
+    }
+    if at != running {
+        report_direct(shared, events, peer, at);
+    }
+    at.is_some()
+}
+
+/// Tells the controller how a client tunnel runs now (once per change; a
+/// full queue is tried again with the next probe).
+fn report_direct(
+    shared: &Shared,
+    events: &mpsc::Sender<ProbeEvent>,
+    peer: &str,
+    at: Option<Ipv4Addr>,
+) {
+    let Ok(mut reported) = shared.reported.lock() else {
+        return;
+    };
+    if reported.get(peer) == Some(&at) {
+        return;
+    }
+    let event = ProbeEvent::Direct {
+        peer: peer.to_string(),
+        at,
+    };
+    if events.try_send(event).is_ok() {
+        reported.insert(peer.to_string(), at);
+    }
 }
 
 /// The keys to check and answer a version 2 request of `peer` that claims
@@ -579,7 +795,10 @@ fn request_keys(
     }
 }
 
-async fn note_announce(
+/// Notes what a peer announced; a change is told to the controller unless
+/// its queue is full (the table holds it, the controller looks every
+/// second): the answers to the probes never wait for the controller.
+fn note_announce(
     table: &ProbeTable,
     events: &mpsc::Sender<ProbeEvent>,
     peer: &str,
@@ -596,20 +815,18 @@ async fn note_announce(
         Err(_) => false,
     };
     if changed {
-        let _ = events
-            .send(ProbeEvent::Announce {
-                peer: peer.to_string(),
-                announce,
-            })
-            .await;
+        let _ = events.try_send(ProbeEvent::Announce {
+            peer: peer.to_string(),
+            announce,
+        });
     }
 }
 
 /// The outcome of one probe.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Outcome {
-    /// The complete probe arrived and the answer is valid.
-    Answered(Duration),
+    /// The complete probe arrived and the answer is valid (with its flags).
+    Answered(Duration, u8),
     /// An answer came, but not from the box with the peer's key.
     WrongKey,
     /// No (complete) answer.
@@ -619,7 +836,7 @@ enum Outcome {
 impl Outcome {
     fn rtt(self) -> Option<Duration> {
         match self {
-            Self::Answered(rtt) => Some(rtt),
+            Self::Answered(rtt, _) => Some(rtt),
             Self::WrongKey | Self::Lost => None,
         }
     }
@@ -635,6 +852,19 @@ async fn probe_once(
     timeout: Duration,
 ) -> Outcome {
     let seq = shared.seq.fetch_add(1, Ordering::Relaxed);
+    probe_seq(shared, name, peer, size, timeout, 0, seq).await
+}
+
+/// [`probe_once`] with the flags and the sequence number of the request.
+async fn probe_seq(
+    shared: &Shared,
+    name: &str,
+    peer: SocketAddrV4,
+    size: u16,
+    timeout: Duration,
+    flags: u8,
+    seq: u32,
+) -> Outcome {
     let (announce, me, keys) = {
         let cfg = shared.config.borrow();
         (
@@ -645,15 +875,31 @@ async fn probe_once(
     };
     let (packet, keys) = match (me, keys) {
         (Some(me), Some(k)) => (
-            wire2::request(seq, size, &announce, &me.0.id(), &shared.nonce, &k.keys),
+            wire2::request(
+                seq,
+                size,
+                flags,
+                &announce,
+                &me.0.id(),
+                &shared.nonce,
+                &k.keys,
+            ),
             Some((k.keys, k.id)),
         ),
         _ => (wire::request(seq, size, &announce), None),
     };
     let (tx, rx) = oneshot::channel();
-    let key = (*peer.ip(), seq);
+    let key = (peer, seq);
+    let wrong = Arc::new(AtomicBool::new(false));
     if let Ok(mut p) = shared.pending.lock() {
-        p.insert(key, Waiter { tx, keys });
+        p.insert(
+            key,
+            Waiter {
+                tx: Some(tx),
+                keys,
+                wrong: wrong.clone(),
+            },
+        );
     }
     // Removed again also when the prober is aborted while waiting.
     let _pending = PendingGuard { shared, key };
@@ -662,10 +908,10 @@ async fn probe_once(
         // EMSGSIZE: larger than the local interface MTU.
         Err(_) => Outcome::Lost,
         Ok(_) => match tokio::time::timeout(timeout, rx).await {
-            Ok(Ok(answer)) if !answer.valid => Outcome::WrongKey,
             Ok(Ok(answer)) if usize::from(answer.received) == packet.len() => {
-                Outcome::Answered(start.elapsed())
+                Outcome::Answered(start.elapsed(), answer.flags)
             }
+            _ if wrong.load(Ordering::Relaxed) => Outcome::WrongKey,
             _ => Outcome::Lost,
         },
     }
@@ -702,7 +948,7 @@ async fn probe_peer(
         )
     };
     // A passive peer is probed only where it was confirmed.
-    let mut target = if passive {
+    let mut place = if passive {
         shared
             .endpoints
             .lock()
@@ -714,6 +960,9 @@ async fn probe_peer(
     let mut next_mtu: Option<Instant> = Some(Instant::now());
     let mut last_pmtu: Option<u16> = None;
     let mut generation = shared.config.borrow().generation;
+    // At a client, towards its uplink: the test of the tunnel.
+    let mut test: Option<UplinkTest> = None;
+    let mut lost_in_row = 0u32;
     loop {
         let current = shared.config.borrow().generation;
         if current != generation {
@@ -726,14 +975,14 @@ async fn probe_peer(
                 .lock()
                 .ok()
                 .and_then(|mut c| c.remove(&name));
-            if let Some(candidate) = candidate.filter(|c| Some(*c) != target)
+            if let Some(candidate) = candidate.filter(|c| Some(*c) != place)
                 && matches!(
                     probe_once(&shared, &name, candidate, RTT_SIZE, RTT_TIMEOUT).await,
-                    Outcome::Answered(_)
+                    Outcome::Answered(..)
                 )
             {
                 info!("Client \"{name}\" is at {candidate}");
-                target = Some(candidate);
+                place = Some(candidate);
                 if let Ok(mut e) = shared.endpoints.lock() {
                     e.insert(name.clone(), candidate);
                 }
@@ -746,13 +995,78 @@ async fn probe_peer(
                     .await;
             }
         }
-        let Some(target) = target else {
+        let Some(target) = place else {
             // Not contacted yet: nothing is sent to it.
             tokio::time::sleep(Duration::from_secs(1)).await;
             continue;
         };
-        let outcome = probe_once(&shared, &name, target, RTT_SIZE, RTT_TIMEOUT).await;
+        let uplink = shared
+            .config
+            .borrow()
+            .uplink
+            .clone()
+            .filter(|u| u.peer == name);
+        match (&uplink, &test) {
+            (Some(u), None) => test = Some(UplinkTest::new(u.direct)),
+            (None, Some(_)) => test = None,
+            _ => {}
+        }
+        let seq = shared.seq.fetch_add(1, Ordering::Relaxed);
+        let mut flags = test.as_ref().map_or(0, UplinkTest::flags);
+        let mut tap = None;
+        if let (Some(u), Some(t)) = (&uplink, test.as_mut())
+            && Instant::now() >= t.next
+        {
+            match open_test_tap(&shared, &name, &u.interface, seq) {
+                Ok(wait) => {
+                    flags |= wire2::FLAG_TEST_ME;
+                    tap = Some(wait);
+                }
+                Err(why) => t.untestable(why, Instant::now()),
+            }
+        }
+        let outcome = probe_seq(&shared, &name, target, RTT_SIZE, RTT_TIMEOUT, flags, seq).await;
+        if let (Some(u), Some(t)) = (&uplink, test.as_mut()) {
+            let seen = match tap {
+                Some(wait) => Some(wait.await.unwrap_or(false)),
+                None => None,
+            };
+            let now = Instant::now();
+            if let Some(seen) = seen {
+                match t.result(seen, now) {
+                    Some(true) => info!(
+                        "\"{name}\" reaches this site directly (its test frame came through the tunnel port)"
+                    ),
+                    Some(false) => info!(
+                        "\"{name}\" no longer reaches this site directly; next test in {} min",
+                        t.pause.as_secs() / 60
+                    ),
+                    None => {}
+                }
+            }
+            if let Outcome::Answered(_, reply_flags) = outcome {
+                t.answer(reply_flags, now);
+            }
+            if let Ok(mut table) = table.write() {
+                table.entry(name.clone()).or_default().direct_test = Some(t.status());
+            }
+            let at = t.direct().then_some(addr);
+            if at.is_some() != u.direct {
+                report_direct(&shared, &events, &name, at);
+            }
+        }
+        let flags = test.as_ref().map_or(0, UplinkTest::flags);
         let rtt = outcome.rtt();
+        lost_in_row = if rtt.is_some() { 0 } else { lost_in_row + 1 };
+        // A client that does not answer at its last mapping any more is
+        // probed again only once it came back (a new verified request).
+        if passive && lost_in_row >= LOST_LIMIT {
+            place = None;
+            lost_in_row = 0;
+            if let Ok(mut e) = shared.endpoints.lock() {
+                e.remove(&name);
+            }
+        }
         let became_reachable = update_reachability(&table, &name, rtt);
         if became_reachable {
             info!("Peer \"{name}\" ({addr}) is reachable");
@@ -787,7 +1101,9 @@ async fn probe_peer(
                 let name = name.clone();
                 async move {
                     for _ in 0..MTU_ATTEMPTS {
-                        let outcome = probe_once(&shared, &name, target, size, timeout).await;
+                        let seq = shared.seq.fetch_add(1, Ordering::Relaxed);
+                        let outcome =
+                            probe_seq(&shared, &name, target, size, timeout, flags, seq).await;
                         if outcome.rtt().is_some() {
                             return true;
                         }
@@ -834,6 +1150,149 @@ async fn probe_peer(
     }
 }
 
+/// The test of the tunnel to the uplink, at the client.
+#[derive(Debug)]
+struct UplinkTest {
+    /// The last tests reached this site.
+    reached: bool,
+    /// The server says in its answers that it runs the tunnel direct.
+    server_direct: bool,
+    /// A test was made.
+    tested: bool,
+    /// Failed tests in a row.
+    failures: u32,
+    /// When to test next.
+    next: Instant,
+    /// When the last test was made (the server answers one test in
+    /// [`TEST_MIN_GAP`]).
+    last: Option<Instant>,
+    /// The pause between tests while not reached.
+    pause: Duration,
+    /// Why the last test could not be made (logged once).
+    problem: Option<String>,
+}
+
+impl UplinkTest {
+    /// `direct`: the tunnel runs direct already (after a restart).
+    fn new(direct: bool) -> Self {
+        Self {
+            reached: direct,
+            server_direct: direct,
+            tested: false,
+            failures: 0,
+            next: Instant::now(),
+            last: None,
+            pause: TEST_NAT,
+            problem: None,
+        }
+    }
+
+    /// The flags of every request to the uplink.
+    fn flags(&self) -> u8 {
+        if self.reached { wire2::FLAG_REACHED } else { 0 }
+    }
+
+    /// The tunnel runs direct: both ends say so.
+    fn direct(&self) -> bool {
+        self.reached && self.server_direct
+    }
+
+    fn status(&self) -> DirectTest {
+        DirectTest {
+            tested: self.tested,
+            reached: self.reached,
+            next: Some(self.next),
+        }
+    }
+
+    /// No test could be made now.
+    fn untestable(&mut self, why: String, now: Instant) {
+        if self.problem.as_ref() != Some(&why) {
+            debug!("No test of the tunnel to the uplink: {why}");
+            self.problem = Some(why);
+        }
+        self.next = now + TEST_LATER;
+    }
+
+    /// Takes the result of a test. Returns the new state if it changed.
+    fn result(&mut self, seen: bool, now: Instant) -> Option<bool> {
+        self.tested = true;
+        self.problem = None;
+        self.last = Some(now);
+        if seen {
+            self.failures = 0;
+            self.next = now + TEST_DIRECT;
+            let changed = !self.reached;
+            self.reached = true;
+            return changed.then_some(true);
+        }
+        self.failures += 1;
+        if self.reached && self.failures >= TEST_FAILURES {
+            self.reached = false;
+            self.pause = (self.pause * 2).min(TEST_NAT_MAX);
+            self.next = now + self.pause;
+            return Some(false);
+        }
+        // Reached until now: soon again, to know.
+        self.next = now + if self.reached { TEST_LATER } else { self.pause };
+        None
+    }
+
+    /// Takes the flags of a valid answer of the server. A server that no
+    /// longer runs the tunnel direct (it sees this site at another address,
+    /// it was reset) gets a new test soon.
+    fn answer(&mut self, flags: u8, now: Instant) {
+        let direct = flags & wire2::FLAG_DIRECT != 0;
+        if self.server_direct && !direct && self.reached {
+            let earliest = self
+                .last
+                .map_or(now, |l| l + TEST_MIN_GAP + Duration::from_secs(1));
+            self.next = self.next.min(earliest.max(now));
+        }
+        self.server_direct = direct;
+    }
+}
+
+/// Opens the tap for a test of the tunnel to the uplink `name` with the
+/// request `seq`: the wait for the test frame, or why no test can be made.
+fn open_test_tap(
+    shared: &Shared,
+    name: &str,
+    interface: &str,
+    seq: u32,
+) -> Result<JoinHandle<bool>, String> {
+    let keys = shared
+        .config
+        .borrow()
+        .keys
+        .get(name)
+        .map(|k| k.keys.clone())
+        .ok_or_else(|| format!("the identity of \"{name}\" is not known"))?;
+    if !interface_up(interface) {
+        return Err(format!("{interface} is down"));
+    }
+    let tap = crate::rawframe::Tap::open(
+        interface,
+        wanderlan_core::sys::nft_ip::KEEPALIVE_ETHERTYPE,
+        *nat::DIRECT_MAGIC,
+    )
+    .map_err(|e| format!("cannot listen on {interface}: {e}"))?;
+    let nonce = shared.nonce;
+    Ok(tokio::task::spawn_blocking(move || {
+        tap.wait(TEST_WAIT, |frame| {
+            nat::verify_direct_frame(frame, &keys, &nonce, seq)
+        })
+    }))
+}
+
+/// True if the interface exists and is up.
+fn interface_up(interface: &str) -> bool {
+    std::fs::read_to_string(format!("/sys/class/net/{interface}/flags"))
+        .ok()
+        .and_then(|t| u32::from_str_radix(t.trim().trim_start_matches("0x"), 16).ok())
+        .is_some_and(|flags| flags & 1 != 0)
+}
+
 /// Records what a probe found about the identity of a peer with a key.
 /// Returns the new state if it changed: confirmed by the first valid answer
 /// (for good, while the task runs), a wrong key only before that.
@@ -854,7 +1313,7 @@ fn identity_change(
     let current = entry.identity.unwrap_or_default();
     let next = match (current, outcome) {
         (PeerIdentity::Confirmed, _) => PeerIdentity::Confirmed,
-        (_, Outcome::Answered(_)) => PeerIdentity::Confirmed,
+        (_, Outcome::Answered(..)) => PeerIdentity::Confirmed,
         (_, Outcome::WrongKey) => PeerIdentity::WrongKey,
         (state, Outcome::Lost) => state,
     };
@@ -953,6 +1412,10 @@ mod tests {
             claimed: Mutex::new(HashMap::new()),
             endpoints: Mutex::new(HashMap::new()),
             candidates: Mutex::new(HashMap::new()),
+            test_socket: None,
+            tests: Mutex::new(HashMap::new()),
+            reported: Mutex::new(HashMap::new()),
+            nonces: Mutex::new(HashMap::new()),
         });
         let table: ProbeTable = Arc::new(RwLock::new(BTreeMap::new()));
         let (events, _) = mpsc::channel(16);
@@ -978,15 +1441,15 @@ mod tests {
         let (sa, _) = service(&a, Some(b.id())).await;
         let (sb, _) = service(&b, Some(a.id())).await;
         let out = probe_once(&sa, "other", port(&sb), RTT_SIZE, wait).await;
-        assert!(matches!(out, Outcome::Answered(_)), "{out:?}");
+        assert!(matches!(out, Outcome::Answered(..)), "{out:?}");
         // A full-size MTU probe too.
         let out = probe_once(&sa, "other", port(&sb), mtu::PROBE_MAX, wait).await;
-        assert!(matches!(out, Outcome::Answered(_)), "{out:?}");
+        assert!(matches!(out, Outcome::Answered(..)), "{out:?}");
 
         // b does not know a's identity yet: it answers with the claimed one.
         let (sb2, _) = service(&b, None).await;
         let out = probe_once(&sa, "other", port(&sb2), RTT_SIZE, wait).await;
-        assert!(matches!(out, Outcome::Answered(_)), "{out:?}");
+        assert!(matches!(out, Outcome::Answered(..)), "{out:?}");
 
         // Another box (c) at the address a expects b at: a wrong key.
         let (sc, _) = service(&c, Some(a.id())).await;
@@ -999,13 +1462,13 @@ mod tests {
         // Without keys: version 1 between the same services.
         let (sv1, _) = service(&a, None).await;
         let out = probe_once(&sv1, "other", port(&sb), RTT_SIZE, wait).await;
-        assert!(matches!(out, Outcome::Answered(_)), "{out:?}");
+        assert!(matches!(out, Outcome::Answered(..)), "{out:?}");
     }
 
     #[test]
     fn a_confirmed_peer_stays_confirmed() {
         let table: ProbeTable = Arc::new(RwLock::new(BTreeMap::new()));
-        let ok = Outcome::Answered(Duration::from_millis(1));
+        let ok = Outcome::Answered(Duration::from_millis(1), 0);
         assert_eq!(
             identity_change(&table, "a", true, Outcome::WrongKey),
             Some(PeerIdentity::WrongKey)
@@ -1017,6 +1480,36 @@ mod tests {
         );
         assert_eq!(identity_change(&table, "a", true, Outcome::WrongKey), None);
         assert_eq!(identity_change(&table, "a", false, ok), None);
+    }
+
+    #[test]
+    fn a_client_goes_direct_at_once_and_back_only_after_two_failed_tests() {
+        let now = Instant::now();
+        let mut t = UplinkTest::new(false);
+        assert_eq!((t.flags(), t.direct()), (0, false));
+        // Not reached: the next test in 5 minutes.
+        assert_eq!(t.result(false, now), None);
+        assert_eq!(t.next, now + TEST_NAT);
+        assert_eq!(t.result(true, now), Some(true));
+        assert_eq!(t.flags(), wire2::FLAG_REACHED);
+        // Direct only once the server says so too.
+        assert!(!t.direct());
+        t.answer(wire2::FLAG_DIRECT, now);
+        assert!(t.direct());
+        // One failed test: still direct, tested again soon.
+        assert_eq!(t.result(false, now), None);
+        assert!(t.direct());
+        assert_eq!(t.next, now + TEST_LATER);
+        assert_eq!(t.result(false, now), Some(false));
+        assert!(!t.direct());
+        // The pause doubles after going back.
+        assert_eq!(t.next, now + 2 * TEST_NAT);
+        // A server that stops running direct: tested again after the gap.
+        let mut t = UplinkTest::new(true);
+        t.result(true, now);
+        t.answer(0, now);
+        assert!(!t.direct());
+        assert_eq!(t.next, now + TEST_MIN_GAP + Duration::from_secs(1));
     }
 
     #[test]

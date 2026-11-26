@@ -82,7 +82,7 @@ pub fn claim_own_id(network: &mut Network, me: &str, id: SiteId) -> bool {
     match network.sites.iter_mut().find(|s| s.name == me) {
         Some(site) if site.id.is_none() => {
             site.id = Some(id);
-            network.revision += 1;
+            network.revision = crate::config::next_revision(network.revision);
             true
         }
         _ => false,

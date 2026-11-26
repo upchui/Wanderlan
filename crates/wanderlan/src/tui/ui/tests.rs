@@ -548,7 +548,7 @@ fn the_mouse_selects_opens_and_scrolls() {
     assert!(app.modal.is_none());
     // A click on the selected row opens it.
     mouse(&mut app, MouseEventKind::Down(MouseButton::Left), 10, 5);
-    assert!(matches!(&app.modal, Some(Modal::Site { name }) if name == "buero"));
+    assert!(matches!(&app.modal, Some(Modal::Site { name, .. }) if name == "buero"));
     key(&mut app, KeyCode::Esc);
     render(&app);
     // The wheel over the list moves the selection.

@@ -1022,23 +1022,26 @@ fn errors_in_format_2_name_the_line() {
 }
 
 #[test]
-fn rename_by_manager_of_1_0_22_is_read_and_ignored() {
+fn settings_of_older_versions_are_read_and_ignored() {
     let text = edit(
         EXAMPLE_NETWORK_2,
         "[site.haus2]\naddress = \"10.8.0.11\"\n",
-        "[site.haus2]\naddress = \"10.8.0.11\"\nrename_by_manager = true\n",
+        "[site.haus2]\naddress = \"10.8.0.11\"\nrename_by_manager = true\ntunnel_mode = \"direct\"\n",
     );
     let outcome = load(&text, EXAMPLE_LOCAL).expect("still loads");
-    assert!(
-        outcome
-            .warnings
-            .iter()
-            .any(|w| w.message.contains("`rename_by_manager` is no longer used")),
-        "{:?}",
-        outcome.warnings
-    );
+    for field in ["rename_by_manager", "tunnel_mode"] {
+        assert!(
+            outcome
+                .warnings
+                .iter()
+                .any(|w| w.message.contains(&format!("`{field}` is no longer used"))),
+            "{field}: {:?}",
+            outcome.warnings
+        );
+    }
     let network = parse_network(&text).unwrap().network.unwrap();
-    assert!(!render_network(&network).contains("rename_by_manager"));
+    let rendered = render_network(&network);
+    assert!(!rendered.contains("rename_by_manager") && !rendered.contains("tunnel_mode"));
 }
 
 const ID_A: &str = "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA=";
@@ -1148,11 +1151,21 @@ fn the_tunnel_port_follows_the_control_port_unless_set() {
         parse_network(&text).unwrap().network.unwrap().tunnel_port(),
         4000
     );
-    network.tunnel_port = Some(network.control_port);
-    let errs = errors(&render_network(&network), LOCAL);
-    assert!(
-        errs.iter()
-            .any(|e| e.message.contains("tunnel_port must differ")),
-        "{errs:?}"
-    );
+    // Neither the tunnel port nor the one above it (NAT) may be the
+    // control port.
+    for port in [network.control_port, network.control_port - 1] {
+        network.tunnel_port = Some(port);
+        let errs = errors(&render_network(&network), LOCAL);
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("must differ from the control port")),
+            "{port}: {errs:?}"
+        );
+    }
+    // At the end of the port range the tunnel port goes below.
+    network.tunnel_port = None;
+    network.control_port = 65534;
+    assert_eq!(network.tunnel_port(), 65532);
+    network.tunnel_port = Some(65535);
+    assert!(!errors(&render_network(&network), LOCAL).is_empty());
 }

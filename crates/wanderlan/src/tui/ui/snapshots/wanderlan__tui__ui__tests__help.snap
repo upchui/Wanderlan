@@ -1,6 +1,5 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 114
 expression: render(&app)
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
@@ -20,10 +19,10 @@ expression: render(&app)
 "│   Up/Down             select a peer                                          ║"
 "│   Enter               details: traffic graph, round trips, counters          ║"
 "│   u                   unblock the port of the peer (loop guard)              ║"
+"│   U                   unblock a trunk port (loop guard)                      ║"
 "│   p                   measure the path MTU to all peers now                  ║"
 "│   Green: reachable and up. Yellow: degraded (port down or offline, config    ║"
 "│   differs, late replies). Red: unreachable or blocked by the loop guard.     ║"
-"│                                                                              ║"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "                                  1 blocked (see 1)  draft: no changes  heim r7 "
 " Up/Down  scroll   Esc  close                                                   "

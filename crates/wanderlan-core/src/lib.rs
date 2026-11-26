@@ -11,7 +11,6 @@ pub mod desired;
 pub mod forwarding;
 pub mod identity;
 pub mod join;
-pub mod kernel;
 pub mod loopguard;
 pub mod mtu;
 pub mod nat;

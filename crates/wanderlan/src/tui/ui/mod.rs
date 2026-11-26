@@ -38,8 +38,8 @@ pub const MIN_SIZE: (u16, u16) = (80, 24);
 /// Draws the whole screen.
 pub fn draw(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    if area.width < MIN_SIZE.0 || area.height < MIN_SIZE.1 {
-        draw_too_small(frame, area);
+    if too_small(area.width, area.height) {
+        draw_too_small(frame, app, area);
         return;
     }
     let pending = app.pending();
@@ -54,12 +54,19 @@ pub fn draw(frame: &mut Frame, app: &App) {
     .areas(area);
     draw_tabs(frame, app, tabs);
     if let Some(p) = pending {
-        let urgent = p.remaining_secs <= URGENT_SECS;
-        frame.render_widget(
-            Paragraph::new(banner_text(p, matches!(app.modal, Some(Modal::Form(_)))))
-                .style(theme::banner(urgent)),
-            banner,
-        );
+        // Without the daemon the seconds are not known.
+        let (text, urgent) = if app.is_connected() {
+            (
+                banner_text(p, !app.confirm_keys_live()),
+                p.remaining_secs <= URGENT_SECS,
+            )
+        } else {
+            (
+                " A CHANGE WAS WAITING FOR CONFIRMATION: its state is unknown until the daemon is reachable again ".to_string(),
+                true,
+            )
+        };
+        frame.render_widget(Paragraph::new(text).style(theme::banner(urgent)), banner);
     }
     draw_body(frame, app, body);
     draw_status(frame, app, status);
@@ -74,7 +81,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
             Modal::Invites { selected } => details::invites(frame, app, *selected, body),
             Modal::Peer { name, vlan } => details::peer(frame, app, name, *vlan, body),
             Modal::Vlan { vid, back } => vlan::draw(frame, app, *vid, back.as_deref(), body),
-            Modal::Site { name } => details::site(frame, app, name, body),
+            Modal::Site { name, scroll } => details::site(frame, app, name, *scroll, body),
             Modal::Ports(p) => ports::draw(frame, app, p, body),
         }
     }
@@ -168,16 +175,37 @@ fn offline(frame: &mut Frame, app: &App, error: &str, retry_in: Option<u32>, are
     );
 }
 
-fn draw_too_small(frame: &mut Frame, area: Rect) {
+/// True if the views do not fit into a terminal of this size.
+pub const fn too_small(width: u16, height: u16) -> bool {
+    width < MIN_SIZE.0 || height < MIN_SIZE.1
+}
+
+fn draw_too_small(frame: &mut Frame, app: &App, area: Rect) {
     let (w, h) = MIN_SIZE;
-    let text = vec![
+    let mut text = vec![
         Line::styled(
             format!(" Terminal too small: {}×{}", area.width, area.height),
             theme::warn(),
         ),
         Line::raw(format!(" wanderlan needs at least {w}×{h}.")),
-        Line::styled(" q quits, Ctrl-C too.", theme::dim()),
     ];
+    if app.draft_dirty() || app.pending().is_some() {
+        if app.draft_dirty() {
+            text.push(Line::raw(" The draft has changes that are not applied."));
+        }
+        if let Some(p) = app.pending() {
+            text.push(Line::raw(format!(
+                " A change waits for confirmation (rolled back in {} s).",
+                p.remaining_secs
+            )));
+        }
+        text.push(Line::styled(
+            " Enlarge the terminal to continue; Ctrl-C quits anyway.",
+            theme::dim(),
+        ));
+    } else {
+        text.push(Line::styled(" q quits, Ctrl-C too.", theme::dim()));
+    }
     frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), area);
 }
 
@@ -241,6 +269,7 @@ fn status_text(app: &App) -> Option<Line<'static>> {
                 Busy::Applying => " Applying ...",
                 Busy::Confirming => " Confirming ...",
                 Busy::RollingBack => " Rolling back ...",
+                Busy::Resetting => " Resetting this site ...",
             },
             theme::warn(),
         ),

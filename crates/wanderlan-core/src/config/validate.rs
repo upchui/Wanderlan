@@ -132,13 +132,21 @@ impl Validator {
                 ),
             );
         }
-        if network.tunnel_port() == network.control_port {
+        let tunnel_port = network.tunnel_port();
+        if tunnel_port == network.control_port
+            || tunnel_port.checked_add(1) == Some(network.control_port)
+        {
             self.error(
                 FieldPath::network("tunnel_port"),
                 format!(
-                    "network.tunnel_port must differ from the control port ({})",
+                    "network.tunnel_port and the port above it must differ from the control port ({}): a tunnel through NAT sends from both",
                     network.control_port
                 ),
+            );
+        } else if tunnel_port == u16::MAX {
+            self.error(
+                FieldPath::network("tunnel_port"),
+                "network.tunnel_port must be at most 65534: a tunnel through NAT also sends from the port above it",
             );
         }
         if let Some(mss) = network.mss.filter(|m| !(MSS_MIN..=MSS_MAX).contains(m)) {
@@ -206,15 +214,6 @@ impl Validator {
                 );
             }
 
-            // Servers among each other always send directly.
-            if site.uplink.is_none() && site.tunnel_mode != super::model::TunnelMode::default() {
-                self.error(
-                    FieldPath::site_field(i, "tunnel_mode"),
-                    format!(
-                        "site \"{name}\": tunnel_mode is only for a client (a site with `server`); the tunnels between servers always run direct"
-                    ),
-                );
-            }
             if site
                 .vlans
                 .as_ref()

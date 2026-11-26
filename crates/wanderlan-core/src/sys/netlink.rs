@@ -29,6 +29,8 @@ use super::{
 const ALL_ZEROS_MAC: [u8; 6] = [0; 6];
 /// `ENOENT`: what the kernel answers for an entry that is not there.
 const ENOENT: i32 = 2;
+/// `ENODEV`: the interface is gone.
+const ENODEV: i32 = 19;
 
 /// Network operations over an rtnetlink connection.
 ///
@@ -83,6 +85,38 @@ impl Netlink {
     /// Serialises dumps on this connection.
     pub(crate) async fn dump_guard(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.dump.lock().await
+    }
+
+    /// The addresses of the default FDB entries of all VXLAN interfaces,
+    /// by index (a dump of every forwarding table: only for a change).
+    async fn tunnel_remotes(&self) -> SysResult<super::TunnelRemotes> {
+        let _dump = self.dump_guard().await;
+        let mut msg = NeighbourMessage::default();
+        msg.header.family = AddressFamily::Bridge;
+        let mut req = NetlinkMessage::from(RouteNetlinkMessage::GetNeighbour(msg));
+        req.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
+        let mut handle = self.handle.clone();
+        let mut responses = handle
+            .request(req)
+            .map_err(|e| SysError::new("list the remotes of the VXLAN interfaces", e))?;
+        let mut out: BTreeMap<u32, Vec<(Ipv4Addr, Option<u16>)>> = BTreeMap::new();
+        while let Some(resp) = responses.next().await {
+            match resp.payload {
+                NetlinkPayload::Error(err) if err.code.is_some() => {
+                    return Err(SysError::new(
+                        "list the remotes of the VXLAN interfaces",
+                        rtnetlink::Error::NetlinkError(err),
+                    ));
+                }
+                NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(m)) => {
+                    if let Some((index, address, port)) = parse_remote(&m) {
+                        out.entry(index).or_default().push((address, port));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(out)
     }
 
     /// The underlying rtnetlink handle (used by other backends).
@@ -482,34 +516,41 @@ impl NetOps for Netlink {
             .map_err(|e| SysError::new(format!("create VXLAN interface {name}"), e))
     }
 
-    async fn tunnel_remotes(&self) -> SysResult<super::TunnelRemotes> {
-        let _dump = self.dump_guard().await;
+    async fn tunnel_remote(&self, index: u32) -> SysResult<Option<(Ipv4Addr, Option<u16>)>> {
+        // A get of the default entry of the interface itself (NTF_SELF):
+        // answered by the VXLAN driver, with its first address.
         let mut msg = NeighbourMessage::default();
         msg.header.family = AddressFamily::Bridge;
+        msg.header.ifindex = index;
+        msg.header.flags = NeighbourFlags::Own;
+        msg.attributes
+            .push(NeighbourAttribute::LinkLayerAddress(ALL_ZEROS_MAC.to_vec()));
         let mut req = NetlinkMessage::from(RouteNetlinkMessage::GetNeighbour(msg));
-        req.header.flags = NLM_F_REQUEST | NLM_F_DUMP;
+        req.header.flags = NLM_F_REQUEST;
+        let fail = |e| SysError::new(format!("read the remote of VXLAN interface {index}"), e);
         let mut handle = self.handle.clone();
-        let mut responses = handle
-            .request(req)
-            .map_err(|e| SysError::new("list the remotes of the VXLAN interfaces", e))?;
-        let mut out: BTreeMap<u32, Vec<(Ipv4Addr, Option<u16>)>> = BTreeMap::new();
+        let mut responses = handle.request(req).map_err(fail)?;
+        let mut found = None;
         while let Some(resp) = responses.next().await {
             match resp.payload {
+                // No entry, or the interface just went.
+                NetlinkPayload::Error(err)
+                    if err
+                        .code
+                        .is_some_and(|c| c.get() == -ENOENT || c.get() == -ENODEV) =>
+                {
+                    return Ok(None);
+                }
                 NetlinkPayload::Error(err) if err.code.is_some() => {
-                    return Err(SysError::new(
-                        "list the remotes of the VXLAN interfaces",
-                        rtnetlink::Error::NetlinkError(err),
-                    ));
+                    return Err(fail(rtnetlink::Error::NetlinkError(err)));
                 }
                 NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewNeighbour(m)) => {
-                    if let Some((index, address, port)) = parse_remote(&m) {
-                        out.entry(index).or_default().push((address, port));
-                    }
+                    found = parse_remote(&m).map(|(_, address, port)| (address, port));
                 }
                 _ => {}
             }
         }
-        Ok(out)
+        Ok(found)
     }
 
     async fn set_tunnel_remote(

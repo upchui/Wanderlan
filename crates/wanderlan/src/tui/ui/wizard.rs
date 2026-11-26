@@ -24,6 +24,8 @@ const INPUT_WIDTH: usize = 24;
 struct Page {
     lines: Vec<Line<'static>>,
     cursor: Option<(usize, usize)>,
+    /// The line that must stay visible (the chosen row of a list).
+    focus: Option<usize>,
     width: usize,
 }
 
@@ -96,7 +98,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         Step::Welcome => welcome(&mut page, app),
         Step::Target => {
             page.text(
-                "The address of the site that created the invitation, in the transport network (as shown by `wanderlan invite` there, e.g. 10.8.0.1).",
+                "The address of the site that created the invitation, in the transport network (as shown by `wanderlan invite` there, e.g. 10.8.0.1). Or paste the whole `wanderlan join ...` line it shows.",
                 Style::new(),
             );
             page.blank();
@@ -157,11 +159,24 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     }
     page.error(w.error.as_ref());
     let cursor = page.cursor;
-    frame.render_widget(Paragraph::new(page.lines), inner);
+    // A long list scrolls: the chosen row (or the input) stays visible,
+    // the error below it too where it fits.
+    let height = usize::from(inner.height);
+    let focus = page.focus.or(cursor.map(|(row, _)| row));
+    let bottom = if w.error.is_some() {
+        page.lines.len()
+    } else {
+        focus.map_or(0, |f| f + 1)
+    };
+    let offset = bottom
+        .saturating_sub(height)
+        .min(focus.unwrap_or(usize::MAX));
+    let scroll = u16::try_from(offset).unwrap_or_default();
+    frame.render_widget(Paragraph::new(page.lines).scroll((scroll, 0)), inner);
     if let Some((row, col)) = cursor {
         let x = inner.x + u16::try_from(col).unwrap_or_default();
-        let y = inner.y + u16::try_from(row).unwrap_or_default();
-        if y < inner.bottom() {
+        let y = inner.y + u16::try_from(row.saturating_sub(offset)).unwrap_or_default();
+        if row >= offset && y < inner.bottom() {
             frame.set_cursor_position(Position::new(x, y));
         }
     }
@@ -264,6 +279,9 @@ fn trunk(page: &mut Page, app: &App) {
         } else {
             Style::new()
         };
+        if chosen {
+            page.focus = Some(page.lines.len());
+        }
         let transport = w.transport.as_deref() == Some(iface.name.as_str());
         page.lines.push(Line::from(vec![
             Span::raw(format!("   {marker} ")),

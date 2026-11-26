@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::SiteRules;
 use crate::config::{
-    LocalVid, MAX_SITE_NAME_LEN, Network, Site, VlanMap, VlanSet, has_errors, site_name_error,
-    validate,
+    LocalVid, MAX_SITE_NAME_LEN, Network, Site, VlanMap, VlanSet, has_errors, next_revision,
+    site_name_error, validate,
 };
 use crate::identity::SiteId;
 
@@ -83,9 +83,7 @@ pub enum JoinError {
     #[error("{0}")]
     InvalidName(String),
     /// Another site has this name.
-    #[error(
-        "the name \"{name}\" is already used by the site at {address}; choose another name (--name)"
-    )]
+    #[error("the name \"{name}\" is already used by the site at {address}; choose another name")]
     NameTaken {
         /// The requested name.
         name: String,
@@ -104,7 +102,7 @@ pub enum JoinError {
     },
     /// Another box at the address of a site that still answers.
     #[error(
-        "site \"{site}\" at {address} is still running; a second box there (behind the same NAT?) needs a name of its own: join with --name <name>"
+        "site \"{site}\" at {address} is still running; a second box there (behind the same NAT?) needs a name of its own: choose another name"
     )]
     StillRunning {
         /// The address.
@@ -176,7 +174,7 @@ fn rejoin(network: &Network, inviter: &str, name: &str) -> Option<Admission> {
         steps += 1;
     }
     let mut new = network.clone();
-    new.revision = network.revision + 1;
+    new.revision = next_revision(network.revision);
     let entry = new.sites.iter_mut().find(|s| s.name == name)?;
     entry.uplink = Some(inviter.to_string());
     Some(Admission {
@@ -209,7 +207,11 @@ fn join_again(
         entry.address = address;
     }
     let changed = new != *network;
-    new.revision = network.revision + u64::from(changed);
+    new.revision = if changed {
+        next_revision(network.revision)
+    } else {
+        network.revision
+    };
     Admission {
         network: new,
         name: name.to_string(),
@@ -275,8 +277,15 @@ pub fn add_site(
     if let Some(msg) = site_name_error(name) {
         return Err(JoinError::InvalidName(msg));
     }
-    // The same box (its identity).
+    // The same box (its identity). The inviting site itself never joins
+    // (it never counts as alive here): a copy of it is refused.
     if let Some(existing) = network.sites.iter().find(|s| s.id == Some(id)) {
+        if existing.name == inviter {
+            return Err(JoinError::IdentityInUse {
+                site: existing.name.clone(),
+                address: existing.address,
+            });
+        }
         if !name_is_default && existing.name != name {
             return Err(JoinError::AlreadyMember {
                 site: existing.name.clone(),
@@ -298,6 +307,12 @@ pub fn add_site(
         .find(|s| s.address == address && s.name == name)
         .or_else(|| network.sites.iter().find(|s| s.address == address));
     if let Some(existing) = at_address {
+        if existing.name == inviter {
+            return Err(JoinError::AddressTaken {
+                address,
+                site: existing.name.clone(),
+            });
+        }
         // A client with an identity shares its address with other boxes
         // behind the same NAT: only its name claims its entry.
         let shared = existing.id.is_some() && existing.uplink.is_some();
@@ -336,7 +351,7 @@ pub fn add_site(
         ),
     };
     let mut new = network.clone();
-    new.revision = network.revision + 1;
+    new.revision = next_revision(network.revision);
     new.sites.push(Site {
         name: name.clone(),
         address,
@@ -346,7 +361,6 @@ pub fn add_site(
         online: false,
         managed_by: Some(inviter.to_string()),
         self_managed: rules.allow_self,
-        tunnel_mode: Default::default(),
         // Plugged into the inviting site: its only tunnel leads there.
         uplink: Some(inviter.to_string()),
     });
@@ -512,7 +526,6 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
-            tunnel_mode: Default::default(),
             uplink: None,
         });
         network
@@ -631,7 +644,6 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
-            tunnel_mode: Default::default(),
             uplink: None,
         });
         let moved = join(&base, "site3", "site2", false, NEW, &none()).unwrap();
@@ -669,7 +681,6 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
-            tunnel_mode: Default::default(),
             uplink: Some("site2".into()),
         });
         let no_loop = join(&chain, "site4", "site2", false, NEW, &none()).unwrap();
@@ -782,6 +793,19 @@ mod tests {
             Err(JoinError::StillRunning { .. })
         ));
 
+        // The inviting site is never taken over: a copy of it, or another
+        // box at its address.
+        let site1 = id_of(Ipv4Addr::new(10, 13, 0, 103));
+        assert!(matches!(
+            add_site(&base, "site1", at(elsewhere, site1, "x"), &nobody, &none()),
+            Err(JoinError::IdentityInUse { .. })
+        ));
+        let at_inviter = at(Ipv4Addr::new(10, 13, 0, 103), reset, "site1");
+        assert!(matches!(
+            add_site(&base, "site1", at_inviter, &nobody, &none()),
+            Err(JoinError::AddressTaken { .. })
+        ));
+
         // A site of an older version without identity is taken over as
         // before, and gets the identity.
         let mut legacy = base.clone();
@@ -826,7 +850,7 @@ mod tests {
         };
         let err = add_site(&two.network, "site1", twin, &alive, &none()).unwrap_err();
         assert!(matches!(err, JoinError::StillRunning { .. }), "{err}");
-        assert!(err.to_string().contains("--name"), "{err}");
+        assert!(err.to_string().contains("choose another name"), "{err}");
         let named = Joiner {
             name: "box2",
             name_is_default: false,

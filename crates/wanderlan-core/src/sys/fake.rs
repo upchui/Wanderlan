@@ -322,20 +322,20 @@ impl NetOps for FakeNet {
         Ok(())
     }
 
-    async fn tunnel_remotes(&self) -> SysResult<super::TunnelRemotes> {
+    async fn tunnel_remote(
+        &self,
+        index: u32,
+    ) -> SysResult<Option<(std::net::Ipv4Addr, Option<u16>)>> {
         let s = self.lock();
         // Like the kernel: the port only where it is not the interface's.
-        Ok(s.remotes
-            .iter()
-            .map(|(index, remote)| {
-                let own = s.links.get(index).and_then(|l| match l.kind {
-                    LinkKind::Vxlan(p) => Some(p.port),
-                    _ => None,
-                });
-                let port = (own != Some(remote.port())).then_some(remote.port());
-                (*index, vec![(*remote.ip(), port)])
-            })
-            .collect())
+        Ok(s.remotes.get(&index).map(|remote| {
+            let own = s.links.get(&index).and_then(|l| match l.kind {
+                LinkKind::Vxlan(p) => Some(p.port),
+                _ => None,
+            });
+            let port = (own != Some(remote.port())).then_some(remote.port());
+            (*remote.ip(), port)
+        }))
     }
 
     async fn set_tunnel_remote(

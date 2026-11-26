@@ -7,6 +7,60 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
+### Tunnel mode found out by itself; fixes
+
+- No `tunnel_mode` setting and no `wanderlan tunnel-mode` any more: a client
+  and its server find out themselves whether the tunnel can run `direct`.
+  The client asks for a test in an authenticated probe and listens at its
+  tunnel interface for two seconds; the server sends a test frame to the
+  client's address at the tunnel port from another port (a tag of the
+  tunnel's keys over the request). If it arrives, both run `direct`; two
+  failed tests in a row bring them back to `nat`, with a growing pause.
+  `wanderlan status`, the TUI (peer details) and the log tell the mode and
+  why. Old `tunnel_mode` lines are read and ignored with a warning; with
+  mixed versions a network that had `direct` set differs in its
+  fingerprint until all sites are updated.
+- Sync and joins: a revision cannot run past the largest one (a client's
+  view far ahead is refused); a push is answered "refused" or "busy" when it
+  was not taken over (it said "ok"); a join never takes over the entry of
+  the inviting site; a released client may not change who manages it or
+  its server; a client's tunnel port is taken over; the fingerprint does not
+  depend on the order of the mappings and tunnel limits (a client re-pushed
+  every 15 s); a fetched network that is not newer is not used.
+- Control port: at most 8 connections per address and 3 s for a line an
+  honest peer sends at once; a push waits for its server's decision.
+  Unauthenticated (version 1) announces count only for peers without a
+  key; a forged answer no longer ends a probe as "wrong key"; the probe
+  service never waits for the controller; a client that is gone is not
+  probed at its old NAT mapping forever; a restarted server gets the next
+  keepalive at once.
+- A renamed client keeps its tunnel up (identity, endpoint and mode move
+  with the name). `tunnel_port` must be at most 65534 and neither it nor
+  the port above may be the control port.
+- `ip_gre` is no longer unloaded (it would remove GRE tunnels of others).
+- Faster: a reconcile reads the remote of each tunnel interface with one
+  small request instead of every forwarding table of the box; a client that
+  is gone costs no `nft` every 2 s; the TUI sums the VLAN traffic in one
+  pass and does not redraw for mouse moves.
+- CLI: edit commands print why the daemon refused a change and its
+  warnings; `wanderlan trunk <site>` needs a tunnel to that site; join and
+  rename texts fixed.
+- TUI: forms find their site or mapping by name (a sync no longer makes them
+  edit another one); editing a site keeps who manages it unless "Changes"
+  is changed, a rename there follows the rename rights; a change that was
+  rolled back (also by the countdown) comes back into the draft; a draft
+  that a sync overtook builds on the new configuration; after a reset no
+  old draft is left; c and r work where the banner says so; no frozen
+  countdown without the daemon; quitting tells what would be lost; a reset
+  shows that it runs; the overview says why tunnels are down (offline, key)
+  and a blocked trunk port is freed with `U`; the setup's trunk list
+  scrolls, refuses what the port window refuses and takes the whole
+  `wanderlan join …` line; the invitation form keeps its input when refused
+  and a new invitation opens the list; a server with clients is not
+  deleted; the tunnel port is in Settings; site details scroll; the log
+  window stays full; the round-trip history shows the newest samples;
+  secondary text uses the terminal's dim colour.
+
 ### VXLAN tunnels, clients behind NAT
 
 Update all sites and open UDP 51822 (the tunnel port, `network.tunnel_port`)

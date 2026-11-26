@@ -136,7 +136,7 @@ fn peer_vlans(frame: &mut Frame, app: &App, peer: &str, vlan: Option<u16>, area:
     );
 }
 
-/// The peer's identity and how its tunnel runs.
+/// The peer's identity.
 fn identity_line(peer: &PeerStatus) -> Line<'static> {
     use wanderlan_core::api::IdentityState;
     let id = peer.identity.clone().unwrap_or_else(|| "none".into());
@@ -150,14 +150,38 @@ fn identity_line(peer: &PeerStatus) -> Line<'static> {
         label("Identity"),
         Span::raw(format!("{id}   ")),
         Span::styled(state, style),
-        Span::styled(
-            match &peer.endpoint {
-                Some(at) => format!("   VXLAN {} from {at}", peer.tunnel),
-                None => format!("   VXLAN {}", peer.tunnel),
-            },
-            theme::dim(),
-        ),
     ])
+}
+
+/// How the tunnel runs (found out by the daemons) and why, its VNI and
+/// where a client's packets come from.
+fn vxlan_line(peer: &PeerStatus) -> Line<'static> {
+    let reason = peer
+        .tunnel_reason
+        .split_once(": ")
+        .map_or("", |(_, why)| why)
+        .to_string();
+    let mut spans = vec![
+        label("VXLAN"),
+        Span::styled(peer.tunnel.to_string(), theme::ok()),
+    ];
+    if !reason.is_empty() {
+        spans.push(Span::raw(format!(" ({reason})")));
+    }
+    let mut extra = Vec::new();
+    if let Some(vni) = peer.vni {
+        extra.push(format!("VNI {vni}"));
+    }
+    if let Some(at) = &peer.endpoint {
+        extra.push(format!("from {at}"));
+    }
+    if !extra.is_empty() {
+        spans.push(Span::styled(
+            format!("   {}", extra.join("   ")),
+            theme::dim(),
+        ));
+    }
+    Line::from(spans)
 }
 
 pub fn peer(frame: &mut Frame, app: &App, name: &str, vlan: Option<u16>, area: Rect) {
@@ -210,6 +234,7 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, vlan: Option<u16>, area: R
         rtt_line(peer),
         quality_line(peer),
         identity_line(peer),
+        vxlan_line(peer),
         Line::from(vec![
             label("Path MTU"),
             Span::raw(format!(
@@ -248,6 +273,15 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, vlan: Option<u16>, area: R
             Span::raw(format!(" now, {}", counters(&peer.traffic, false))),
         ]),
     ];
+    if let Some(reason) = &peer.down_reason {
+        lines.insert(
+            1,
+            Line::from(vec![
+                label("Down"),
+                Span::styled(reason.clone(), theme::warn()),
+            ]),
+        );
+    }
     if let Some(reason) = &peer.refused {
         lines.push(Line::from(vec![
             label("Refused"),
@@ -322,18 +356,20 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, vlan: Option<u16>, area: R
         .collect();
     let [rtt_label, rtt_spark] =
         Layout::horizontal([Constraint::Length(14), Constraint::Min(10)]).areas(rtt);
+    // The newest samples, as many as fit (the oldest drop off the left).
+    let rtts = &rtts[rtts.len().saturating_sub(usize::from(rtt_spark.width))..];
     frame.render_widget(
         Paragraph::new(vec![Line::raw(" Round trip"), Line::raw(" history")]).style(theme::dim()),
         rtt_label,
     );
     frame.render_widget(
-        Sparkline::default().data(&rtts).style(theme::title()),
+        Sparkline::default().data(rtts).style(theme::title()),
         rtt_spark,
     );
 }
 
 /// Everything about one site of the draft.
-pub fn site(frame: &mut Frame, app: &App, name: &str, area: Rect) {
+pub fn site(frame: &mut Frame, app: &App, name: &str, scroll: u16, area: Rect) {
     frame.render_widget(Clear, area);
     let Some((network, site)) = app
         .draft
@@ -366,12 +402,6 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, area: Rect) {
             Span::raw(format::role(site.uplink.as_deref())),
             if site.name == me {
                 dim("   this site")
-            } else {
-                Span::raw("")
-            },
-            // A client: how its tunnel to its server runs.
-            if site.uplink.is_some() {
-                dim(&format!("   tunnel {}", site.tunnel_mode))
             } else {
                 Span::raw("")
             },
@@ -473,41 +503,66 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, area: Rect) {
             dim("   a segment of its own on this host (Settings, 7)"),
         ]));
     }
-    let title = format!(" {name}   Up/Down: next site   e: edit   Esc: close ");
+    let title = format!(" {name}   Up/Down: next site   PgUp/PgDn: scroll   e: edit   Esc: close ");
     let block = titled(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let total = lines.len();
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-    list::scrollbar(frame, area, 1, 1, total, 0, usize::from(inner.height));
+    // Wrapped lines count: the scroll ends with the last line in view.
+    let width = usize::from(inner.width.max(1));
+    let total: usize = lines.iter().map(|l| l.width().max(1).div_ceil(width)).sum();
+    let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let max = total.saturating_sub(usize::from(inner.height));
+    app.scrolls
+        .site_max
+        .set(u16::try_from(max).unwrap_or(u16::MAX));
+    let scroll = scroll.min(u16::try_from(max).unwrap_or(u16::MAX));
+    frame.render_widget(paragraph.scroll((scroll, 0)), inner);
+    list::scrollbar(
+        frame,
+        area,
+        1,
+        1,
+        total,
+        usize::from(scroll),
+        usize::from(inner.height),
+    );
 }
 
 /// The open invitations with their rules.
 pub fn invites(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
     let rows = app.invitations.len().max(1);
-    let height = u16::try_from(rows + 6).unwrap_or(u16::MAX);
+    // The selected invitation in full below the list (a row is cut at 80
+    // columns): its rules, wrapped, and the command for the new site.
+    let width = usize::from(area.width.min(100).saturating_sub(4)).max(20);
+    let rules = app
+        .invitations
+        .get(selected)
+        .map(|inv| format::wrap(&format!("Rules: {}", inv.rules.summary()), width))
+        .unwrap_or_default();
+    let below = rules.len() + 2;
+    let height = u16::try_from(rows + 4 + below).unwrap_or(u16::MAX);
     // Wider than the other windows: the rules of an invitation can be long.
     let popup = area.centered(Constraint::Max(100), Constraint::Max(height));
     frame.render_widget(Clear, popup);
     let block = titled(" Open invitations ");
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    let [rows_area, command] =
-        Layout::vertical([Constraint::Min(2), Constraint::Length(2)]).areas(inner);
+    let [rows_area, command] = Layout::vertical([
+        Constraint::Min(2),
+        Constraint::Length(u16::try_from(below).unwrap_or(u16::MAX)),
+    ])
+    .areas(inner);
     let table_rows: Vec<Row> = if app.invitations.is_empty() {
         vec![Row::new(vec![Cell::from("no open invitations")]).style(theme::dim())]
     } else {
         app.invitations
             .iter()
             .map(|inv| {
-                let state = if inv.in_use {
-                    " (a site is joining)"
-                } else {
-                    ""
-                };
+                // The state first: the rules may be cut off.
+                let state = if inv.in_use { "JOINING  " } else { "" };
                 Row::new(vec![
                     Cell::from(inv.code.clone()),
-                    Cell::from(format!("{}{state}", inv.rules.summary())),
+                    Cell::from(format!("{state}{}", inv.rules.summary())),
                 ])
             })
             .collect()
@@ -532,11 +587,11 @@ pub fn invites(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
         .get(selected)
         .map(|inv| inv.command.clone())
         .unwrap_or_default();
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::styled(" On the new site run:", theme::dim()),
-            Line::styled(format!(" {cmd}"), theme::bold()),
-        ]),
-        command,
-    );
+    let mut lines: Vec<Line> = rules
+        .into_iter()
+        .map(|l| Line::raw(format!(" {l}")))
+        .collect();
+    lines.push(Line::styled(" On the new site run:", theme::dim()));
+    lines.push(Line::styled(format!(" {cmd}"), theme::bold()));
+    frame.render_widget(Paragraph::new(lines), command);
 }

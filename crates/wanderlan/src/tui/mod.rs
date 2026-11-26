@@ -31,7 +31,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream, MouseEventKind,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
@@ -135,6 +137,7 @@ async fn event_loop(terminal: &mut Term, socket: &Path, mouse: bool) -> Result<(
     let mut tick = tokio::time::interval_at(Instant::now() + second, second);
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut effects: VecDeque<Effect> = app.start().into();
+    let mut redraw = true;
 
     loop {
         while let Some(effect) = effects.pop_front() {
@@ -165,13 +168,6 @@ async fn event_loop(terminal: &mut Term, socket: &Path, mouse: bool) -> Result<(
                         let _ = tx.send(Msg::Diagnosis(crate::service::diagnose(6)));
                     });
                 }
-                Effect::KernelCleanup(interfaces) => {
-                    let tx = local_tx.clone();
-                    tokio::task::spawn_blocking(move || {
-                        let result = wanderlan_core::kernel::remove_gre_fallback(&interfaces);
-                        let _ = tx.send(Msg::KernelCleaned(result.message()));
-                    });
-                }
                 Effect::Request(request) => {
                     if let Some(c) = &conn {
                         let client = c.client.clone();
@@ -195,9 +191,12 @@ async fn event_loop(terminal: &mut Term, socket: &Path, mouse: bool) -> Result<(
             }
         }
 
-        terminal
-            .draw(|frame| ui::draw(frame, &app))
-            .context("cannot draw the screen")?;
+        if redraw {
+            terminal
+                .draw(|frame| ui::draw(frame, &app))
+                .context("cannot draw the screen")?;
+        }
+        redraw = true;
 
         let wake = tokio::select! {
             ev = input.next() => Wake::Terminal(ev),
@@ -212,7 +211,23 @@ async fn event_loop(terminal: &mut Term, socket: &Path, mouse: bool) -> Result<(
                 return Err(e).context("cannot read terminal input");
             }
             Wake::Terminal(Some(Ok(TermEvent::Key(key)))) => Msg::Key(key),
-            Wake::Terminal(Some(Ok(TermEvent::Mouse(m)))) if mouse => Msg::Mouse(m),
+            // Only clicks and the wheel do something: a moving mouse
+            // neither updates nor redraws.
+            Wake::Terminal(Some(Ok(TermEvent::Mouse(m))))
+                if mouse
+                    && matches!(
+                        m.kind,
+                        MouseEventKind::Down(_)
+                            | MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown
+                    ) =>
+            {
+                Msg::Mouse(m)
+            }
+            Wake::Terminal(Some(Ok(TermEvent::Mouse(_)))) => {
+                redraw = false;
+                continue;
+            }
             // Resize and other events only need a redraw.
             Wake::Terminal(Some(Ok(_))) => continue,
             Wake::Answer(g, msg) if conn.as_ref().is_some_and(|c| c.generation == g) => msg,
@@ -225,6 +240,10 @@ async fn event_loop(terminal: &mut Term, socket: &Path, mouse: bool) -> Result<(
             }
             Wake::Tick => Msg::Tick,
         };
+        // The keys act only where the screen shows the views.
+        if let Ok(size) = terminal.size() {
+            app.too_small = ui::too_small(size.width, size.height);
+        }
         effects.extend(app.update(msg));
     }
 }

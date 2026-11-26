@@ -74,22 +74,22 @@ wait_for 30 "the tunnel to site5 is up at site2" \
 expect_ping c-site5 10.20.0.1 "VLAN 20: the new site reaches site1's client (through site2)"
 expect_ping c-site3 10.20.0.13 "VLAN 20: site3's client reaches the new site (through site2)"
 
-begin "Tunnel mode: a client runs nat (the default) or direct"
+begin "Tunnel mode: a client its server reaches directly runs direct by itself"
 
-check "a new client runs nat: from the tunnel port, with keepalives" \
-  x site5 "ip -d link show vx-site2 | grep -q 'srcport 51822 51823'"
-check "site2 learned where site5's tunnel packets come from" \
-  x site2 "bridge fdb show dev vx-site5 | grep -q '^00:00:00:00:00:00 dst 10.100.13.10 '"
-check "site2 lets site5 run direct" x site2 "wanderlan tunnel-mode site5 direct --confirm"
+# site2 reaches site5 at its tunnel port (no NAT in between): the test
+# finds that out, both ends run the tunnel direct.
+wait_eq 60 "site2 runs the tunnel to site5 direct, reached at its address" \
+  "direct: reached at 10.100.13.10:51822" \
+  jqs site2 '.peers[] | select(.name == "site5") | .tunnel_reason'
+wait_eq 30 "site5 runs it direct too" "direct" \
+  jqs site5 '.peers[] | select(.name == "site2") | .tunnel'
 wait_for 30 "site5 sends from a port per flow" \
   x site5 "ip -d link show vx-site2 | grep -q 'vxlan id' && ! ip -d link show vx-site2 | grep -q 'srcport 51822 51823'"
-wait_eq 30 "site2 shows the tunnel as direct" "direct" \
-  jqs site2 '.peers[] | select(.name == "site5") | .tunnel'
+check "site2 sends to site5's address" \
+  x site2 "bridge fdb show dev vx-site5 | grep -q '^00:00:00:00:00:00 dst 10.100.13.10 '"
+check "the status tells how the tunnel runs" \
+  x site5 "wanderlan status | grep -q 'Tunnel to site2: VXLAN direct: \"site2\" reaches this site at UDP 51822'"
 expect_ping c-site5 10.20.0.1 "VLAN 20: site5 reaches site1's client, direct"
-check "and back to nat" x site2 "wanderlan tunnel-mode site5 nat --confirm"
-wait_for 30 "site5 sends from the tunnel port again" \
-  x site5 "ip -d link show vx-site2 | grep -q 'srcport 51822 51823'"
-expect_ping c-site5 10.20.0.1 "VLAN 20: site5 reaches site1's client through nat again"
 
 begin "Sync: a server refuses a change of its client"
 

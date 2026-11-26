@@ -89,10 +89,12 @@ fn connects_and_retries_when_the_daemon_is_down() {
 }
 
 #[test]
-fn after_a_reset_the_kernel_devices_are_cleaned_up_and_everything_reloaded() {
-    let mut app = App::new("/s", false);
-    app.start();
-    app.update(Msg::Connected);
+fn after_a_reset_everything_is_reloaded_and_the_old_draft_is_gone() {
+    let mut app = connected();
+    if let Some(d) = &mut app.draft {
+        d.network.vlans = VlanSet::from_range(10, 60);
+        d.revalidate();
+    }
     let fx = app.update(Msg::Response {
         request: Request::Reset,
         result: Ok(Reply::Reset(ResetReport::default())),
@@ -100,20 +102,12 @@ fn after_a_reset_the_kernel_devices_are_cleaned_up_and_everything_reloaded() {
     let reqs = requests(&fx);
     assert!(reqs.contains(&&Request::Interfaces));
     assert!(reqs.contains(&&Request::Status));
+    assert!(app.draft.is_none(), "nothing of the old network to apply");
     let fx = app.update(Msg::Response {
         request: Request::Interfaces,
         result: Ok(Reply::Interfaces(vec![])),
     });
-    assert_eq!(fx, vec![Effect::KernelCleanup(vec![])]);
-    let fx = app.update(Msg::KernelCleaned(Some("Unloaded".into())));
-    assert!(
-        requests(&fx).contains(&&Request::Interfaces),
-        "the list is reloaded"
-    );
-    app.update(Msg::Response {
-        request: Request::Interfaces,
-        result: Ok(Reply::Interfaces(vec![])),
-    });
+    assert!(fx.is_empty());
     // A failed reset also reloads the real state.
     let fx = app.update(Msg::Response {
         request: Request::Reset,
@@ -230,6 +224,55 @@ fn review_shows_the_diff_and_applies_with_the_base_revision() {
     assert!(apply.config.network.contains("vlans = \"10-60\""));
     assert!(apply.config.local.contains("self = \"heim\""));
     assert_eq!(app.busy, Some(Busy::Applying));
+}
+
+#[test]
+fn a_change_that_was_rolled_back_comes_back_into_the_draft() {
+    let mut app = connected();
+    if let Some(d) = &mut app.draft {
+        d.network.vlans = VlanSet::from_range(10, 60);
+        d.revalidate();
+    }
+    app.update(ch('a'));
+    app.update(key(KeyCode::Enter));
+    app.update(reply(
+        Request::Apply(ApplyParams {
+            config: ConfigInput {
+                network: String::new(),
+                local: String::new(),
+            },
+            base_revision: None,
+            timeout_secs: None,
+        }),
+        Reply::Applied(Applied {
+            confirm_within_secs: 60,
+            diff: String::new(),
+            changes: Vec::new(),
+            warnings: Vec::new(),
+        }),
+    ));
+    with_pending(&mut app, ChangeSource::Local);
+    // The countdown ran out: no pending change, the old configuration runs.
+    app.update(reply(
+        Request::Status,
+        Reply::Status(Box::new(fixtures::status())),
+    ));
+    app.update(reply(
+        Request::GetConfig,
+        Reply::Config(fixtures::config_texts()),
+    ));
+    assert!(app.draft_dirty(), "the edit is back");
+    assert_eq!(
+        app.draft.as_ref().map(|d| d.network.vlans.to_string()),
+        Some("10-60".into())
+    );
+    assert!(
+        app.message
+            .as_ref()
+            .is_some_and(|m| m.text.contains("rolled back")),
+        "{:?}",
+        app.message
+    );
 }
 
 #[test]
@@ -640,7 +683,9 @@ fn a_restricted_site_sets_its_own_vlans() {
     let mut app = restricted();
     app.update(ch('3'));
     app.update(ch('o'));
-    assert!(matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::OwnVlans(0)));
+    assert!(
+        matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::OwnVlans("heim".into()))
+    );
     for c in "50".chars() {
         app.update(ch(c));
     }
@@ -720,7 +765,7 @@ fn page_keys_and_the_overview_cursor() {
     }
     press(&mut app, KeyCode::Enter);
     let first = app.overview_sites()[0].name.clone();
-    assert!(matches!(&app.modal, Some(Modal::Site { name }) if *name == first));
+    assert!(matches!(&app.modal, Some(Modal::Site { name, .. }) if *name == first));
     press(&mut app, KeyCode::Esc);
     press(&mut app, KeyCode::Char('2'));
     // End and Home in the sites (tree order: haus6 is the second row).
@@ -989,7 +1034,7 @@ fn a_restricted_site_renames_itself_but_not_its_manager() {
     app.sites_selected = heim;
     app.update(ch('N'));
     assert!(
-        matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::Rename(heim)),
+        matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::Rename("heim".into())),
         "{:?}",
         app.message
     );

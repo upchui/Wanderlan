@@ -11,8 +11,13 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::{Network, Site, TunnelVlans, VlanMap, fingerprint, validate};
+use crate::config::{
+    MAX_REVISION, Network, Site, TunnelVlans, VlanMap, fingerprint, next_revision, validate,
+};
 use crate::policy;
+
+/// How far a client's view may count the revision on past its uplink's.
+const MAX_REVISION_STEP: u64 = 1 << 20;
 
 /// The part of `network` the site `site` knows: everything for a server; for a
 /// client itself, its uplink (without the uplink's own uplink) and its own
@@ -101,14 +106,21 @@ pub fn merge(full: &Network, view: &Network, from: &str) -> Result<Merged, Strin
         .iter()
         .find(|(old, _)| old == from)
         .map_or(from, |(_, new)| new.as_str());
+    // A client counts on from the revision it has; one far ahead is no
+    // honest client (it would end the revisions for the whole network).
+    if view.revision > full.revision.saturating_add(MAX_REVISION_STEP) {
+        return Err(format!(
+            "its revision {} is too far ahead of {}",
+            view.revision, full.revision
+        ));
+    }
     let mut merged = merge_named(&base, view, from_now)?;
     merged.revision = if fingerprint(&merged) == fingerprint(full) {
         full.revision.max(view.revision)
-    } else if view.revision > full.revision {
-        view.revision
     } else {
-        full.revision + 1
-    };
+        view.revision.max(next_revision(full.revision))
+    }
+    .min(MAX_REVISION);
     policy::check_edit(full, &merged, from)?;
     if let Some(error) = validate(&merged, None).into_iter().find(|d| d.is_error()) {
         return Err(error.message);
@@ -161,6 +173,7 @@ fn merge_named(full: &Network, view: &Network, from: &str) -> Result<Network, St
     let mut merged = full.clone();
     merged.vlans = view.vlans.clone();
     merged.control_port = view.control_port;
+    merged.tunnel_port = view.tunnel_port;
     merged.mtu_probe_interval = view.mtu_probe_interval;
     merged.commit_timeout = view.commit_timeout;
     merged.mss = view.mss;
@@ -251,7 +264,6 @@ mod tests {
             online: true,
             managed_by: uplink.map(Into::into),
             self_managed: true,
-            tunnel_mode: Default::default(),
             uplink: uplink.map(Into::into),
         }
     }
@@ -360,6 +372,17 @@ mod tests {
             .unwrap()
             .network;
         assert_eq!(same, network);
+
+        // The network settings come with the view, the tunnel port too.
+        let mut view = view_for(&network, "site2");
+        view.tunnel_port = Some(51900);
+        let merged = merge(&network, &view, "site2").unwrap().network;
+        assert_eq!(merged.tunnel_port, Some(51900));
+        assert!(merged.revision > network.revision);
+        // A revision far ahead would end the revisions of the network.
+        let mut view = view_for(&network, "site2");
+        view.revision = crate::config::MAX_REVISION;
+        assert!(merge(&network, &view, "site2").is_err());
     }
 
     #[test]

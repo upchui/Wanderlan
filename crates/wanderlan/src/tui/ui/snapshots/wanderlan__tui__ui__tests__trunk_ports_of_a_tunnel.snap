@@ -4,9 +4,9 @@ expression: render(&app)
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
 "┌ Settings (Enter: change, Up/Down: more) ─────────────────────────────────────┐"
-"│  Path MTU check       every 5m                                               ║"
 "│  TCP MSS              from the path MTU                                      ║"
-"│  Control port         51821                                                  █"
+"│  Control port         51821                                                  ║"
+"│  Tunnel port          51822 (UDP, control port + 1)                          ║"
 "│This host                                                                     █"
 "│  This site            heim                                                   █"
 "│ ┌ Trunk ports of the tunnel to haus2 ──────────────────────────────────────┐ █"

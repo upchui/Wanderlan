@@ -34,13 +34,18 @@ case "${ROLE:-site}" in
     ip route replace default via "$GATEWAY"
     # Random ports: no port is kept, like a NAT under load. A counter of
     # the flows that come in from outside to this box (the servers must open
-    # none; multicast of the host, e.g. mDNS, does not count).
+    # none; multicast of the host, e.g. mDNS, does not count). The test
+    # frames of the server to the tunnel port are expected: they end here.
     nft -f - <<NFT
 table ip nat {
   chain post { type nat hook postrouting priority srcnat; oifname "$wan" masquerade random; }
 }
 table ip watch {
-  chain pre { type filter hook prerouting priority 0; iifname "$wan" meta pkttype host ct state new counter comment "new from wan"; }
+  chain pre {
+    type filter hook prerouting priority 0;
+    iifname "$wan" udp dport 51822 ct state new return comment "test frames"
+    iifname "$wan" meta pkttype host ct state new counter comment "new from wan"
+  }
 }
 NFT
     ;;

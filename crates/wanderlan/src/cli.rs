@@ -9,8 +9,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, Subcommand};
 use wanderlan_core::api::{
     self, Applied, ApplyFilesParams, ApplyParams, ChangeSource, ConfigInput, ConfigTexts,
-    Confirmed, Done, Event, IdentityState, Interface, Invitation, InviteParams, JoinParams, Joined,
-    Level, MacEntry, PortState, Request, ResetReport, SiteRules, SiteState, Status, UnblockParams,
+    Confirmed, Done, Event, Interface, Invitation, InviteParams, JoinParams, Joined, Level,
+    MacEntry, PortState, Request, ResetReport, SiteRules, SiteState, Status, UnblockParams,
     VlanPortTraffic, VlanTraffic,
 };
 use wanderlan_core::config::{self, ConfigFile, Severity};
@@ -19,7 +19,6 @@ use wanderlan_core::join;
 use crate::client::Client;
 use crate::hostinfo;
 use crate::tui::{self, TuiOptions};
-use wanderlan_core::kernel;
 
 const EXAMPLE_NETWORK: &str = include_str!("../../../packaging/examples/network.toml");
 const EXAMPLE_LOCAL: &str = include_str!("../../../packaging/examples/local.toml");
@@ -126,20 +125,6 @@ pub enum Command {
         #[arg(long)]
         confirm: bool,
     },
-    /// How the tunnel of a client to its server runs: "nat" (the default;
-    /// the client may sit behind NAT, its server only answers) or "direct"
-    /// (the server sends to the client's address; spreads the load over
-    /// the receive queues).
-    #[command(name = "tunnel-mode")]
-    TunnelMode {
-        /// The client.
-        site: String,
-        /// "nat" or "direct".
-        mode: wanderlan_core::config::TunnelMode,
-        /// Confirm the change right away.
-        #[arg(long)]
-        confirm: bool,
-    },
     /// Take a site offline: its tunnels go down until it is online again.
     Offline {
         /// The site.
@@ -166,9 +151,8 @@ pub enum Command {
         #[arg(long)]
         confirm: bool,
     },
-    /// Rename a site: this site always, another site if this one manages it
-    /// and it allows that (`wanderlan manage <site> --rename-by-manager yes`
-    /// on that site). Everything that names it follows, on every site.
+    /// Rename a site: this site always, another site if this site manages
+    /// it (`managed_by`). Everything that names it follows, on every site.
     ///
     /// Example: `wanderlan rename site5 lab`.
     Rename {
@@ -389,11 +373,6 @@ pub async fn run(args: Args) -> Result<ExitCode> {
         Some(Command::Offline { site, confirm }) => {
             set_online(&socket, &site, false, confirm).await
         }
-        Some(Command::TunnelMode {
-            site,
-            mode,
-            confirm,
-        }) => set_tunnel_mode(&socket, &site, mode, confirm).await,
         Some(Command::Role {
             site,
             role,
@@ -556,7 +535,7 @@ async fn join_network(
     trunk: Option<String>,
 ) -> Result<ExitCode> {
     let client = connect(socket).await?;
-    let (address, _) =
+    let (address, port) =
         join::parse_target(target, config::DEFAULT_CONTROL_PORT).map_err(|e| anyhow!(e))?;
     let (name, name_is_default) = match name {
         Some(n) => (n, false),
@@ -589,7 +568,15 @@ async fn join_network(
             name_is_default,
             trunk,
         }))
-        .await?;
+        .await
+        .map_err(|e| {
+            let text = e.to_string();
+            if text.contains("choose another name") {
+                anyhow!("{text} (`wanderlan join {target} {code} --name <name>`)")
+            } else {
+                anyhow!(e)
+            }
+        })?;
     println!(
         "Received the network configuration from \"{}\": this site is \"{}\", {} sites.",
         joined.via, joined.site, joined.sites
@@ -600,9 +587,9 @@ async fn join_network(
         let st: Status = client.call(Request::Status).await?;
         if st.state == SiteState::Unconfigured {
             bail!(
-                "\"{}\" did not answer in time; the change was rolled back. Check that both sites reach each other (GRE and UDP/TCP {} in the transport network) and join again with a new invitation.",
+                "\"{}\" did not answer in time; the change was rolled back. Check that this site reaches it in the transport network (TCP and UDP {port}, the tunnels UDP {}) and join again with a new invitation.",
                 joined.via,
-                config::DEFAULT_CONTROL_PORT
+                port.saturating_add(1)
             );
         }
         if st.pending.is_none() {
@@ -678,27 +665,6 @@ async fn set_online(socket: &Path, site: &str, online: bool, confirm: bool) -> R
     .await
 }
 
-async fn set_tunnel_mode(
-    socket: &Path,
-    site: &str,
-    mode: wanderlan_core::config::TunnelMode,
-    confirm: bool,
-) -> Result<ExitCode> {
-    edit_site(socket, site, confirm, |entry, _| {
-        if entry.uplink.is_none() {
-            return Err(format!(
-                "{site} is a server: the tunnels between servers always run direct."
-            ));
-        }
-        if entry.tunnel_mode == mode {
-            return Err(format!("The tunnel of {site} already runs {mode}."));
-        }
-        entry.tunnel_mode = mode;
-        Ok(format!("The tunnel of {site} to its server runs {mode}"))
-    })
-    .await
-}
-
 /// Sets the trunk of the tunnel to `site` (local.toml) and applies it.
 async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) -> Result<ExitCode> {
     let client = connect(socket).await?;
@@ -728,6 +694,22 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
     let back = interface == "default";
     if own && back {
         bail!("\"default\" is for the tunnel to another site; give the ports of the default trunk");
+    }
+    // A trunk of its own is only for a tunnel ("default" still removes a
+    // stale entry).
+    if !own && !back {
+        let me = local
+            .self_name
+            .as_deref()
+            .context("this site has no name")?;
+        if !wanderlan_core::topology::tunnels_for(&network, me)
+            .iter()
+            .any(|t| t.peer.name == site)
+        {
+            bail!(
+                "this site has no tunnel to \"{site}\"; a trunk of its own is only for the tunnel to a peer"
+            );
+        }
     }
     if !back {
         if ports.is_empty() {
@@ -771,16 +753,18 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let applied: Applied = client
-        .call(Request::Apply(ApplyParams {
+    let applied = send_apply(
+        &client,
+        ApplyParams {
             config: ConfigInput {
                 network: running.network,
                 local: config::render_local(&local),
             },
             base_revision: Some(running.revision),
             timeout_secs: None,
-        }))
-        .await?;
+        },
+    )
+    .await?;
     let done = if own {
         format!("The default trunk is {}", local.trunk.join(", "))
     } else if !local.tunnel_trunks.contains_key(site) {
@@ -858,16 +842,18 @@ async fn set_tunnel_vlans(
     }
     network.set_tunnel_limit(a, b, limit.clone());
     let carries = wanderlan_core::topology::tunnel_vlans(&network, a, b).unwrap_or_default();
-    let applied: Applied = client
-        .call(Request::Apply(ApplyParams {
+    let applied = send_apply(
+        &client,
+        ApplyParams {
             config: ConfigInput {
                 network: config::render_network(&network),
                 local: running.local,
             },
             base_revision: Some(running.revision),
             timeout_secs: None,
-        }))
-        .await?;
+        },
+    )
+    .await?;
     let done = match &limit {
         Some(l) => format!(
             "The tunnel between {a} and {b} carries VLANs {} (limited to {})",
@@ -926,6 +912,28 @@ async fn edit_site(
     send_edit(&client, &network, local, running.revision, confirm, &done).await
 }
 
+/// Sends an edited configuration: the warnings of a success are printed;
+/// a refusal prints its diagnostics (errors first) and fails with its
+/// reason.
+async fn send_apply(client: &Client, params: ApplyParams) -> Result<Applied> {
+    match client.call::<Applied>(Request::Apply(params)).await {
+        Ok(applied) => {
+            for w in &applied.warnings {
+                eprintln!("{w}");
+            }
+            Ok(applied)
+        }
+        Err(crate::client::ClientError::Api(e)) if !e.diagnostics.is_empty() => {
+            let (errors, rest): (Vec<_>, Vec<_>) = e.diagnostics.iter().partition(|d| d.is_error());
+            for d in errors.iter().chain(rest.iter()) {
+                eprintln!("{d}");
+            }
+            bail!("{}", e.message)
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// Applies an edited network (and `local.toml`), confirmed right away or
 /// with the usual countdown.
 async fn send_edit(
@@ -936,16 +944,18 @@ async fn send_edit(
     confirm: bool,
     done: &str,
 ) -> Result<ExitCode> {
-    let applied: Applied = client
-        .call(Request::Apply(ApplyParams {
+    let applied = send_apply(
+        client,
+        ApplyParams {
             config: ConfigInput {
                 network: config::render_network(network),
                 local,
             },
             base_revision: Some(base_revision),
             timeout_secs: None,
-        }))
-        .await?;
+        },
+    )
+    .await?;
     if confirm {
         let c: Confirmed = client.call(Request::Confirm).await?;
         println!("{done} (network revision {}).", c.revision);
@@ -1014,10 +1024,6 @@ async fn reset(socket: &Path, yes: bool) -> Result<ExitCode> {
         }
     }
     let report: ResetReport = client.call(Request::Reset).await?;
-    let interfaces: Vec<Interface> = client.call(Request::Interfaces).await.unwrap_or_default();
-    if let Some(message) = kernel::remove_gre_fallback(&interfaces).message() {
-        println!("{message}");
-    }
     if !report.problems.is_empty() {
         eprintln!("The reset is incomplete:");
         for problem in &report.problems {
@@ -1270,17 +1276,16 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
             p.refused.as_deref().unwrap_or_default()
         );
     }
+    println!();
     for p in &st.peers {
-        match p.identity_state {
-            Some(IdentityState::Waiting) => println!(
-                "Tunnel to {} waits: its identity is not confirmed yet (no authenticated answer to the control probes)",
-                p.name
-            ),
-            Some(IdentityState::WrongKey) => println!(
-                "Tunnel to {} is down: the box at {} answers with another key (another box at that address, or one that was reset?)",
-                p.name, p.address
-            ),
-            Some(IdentityState::Confirmed) | None => {}
+        let how = if p.tunnel_reason.is_empty() {
+            p.tunnel.to_string()
+        } else {
+            p.tunnel_reason.clone()
+        };
+        println!("Tunnel to {}: VXLAN {how}", p.name);
+        if let Some(why) = &p.down_reason {
+            println!("  down: {why}");
         }
     }
     Ok(ExitCode::SUCCESS)

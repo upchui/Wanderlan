@@ -109,7 +109,7 @@ fn peer(name: &str, address: &str) -> PeerStatus {
             ..wanderlan_core::api::Traffic::default()
         },
         pmtu: Some(1420),
-        mss: Some(1338),
+        mss: Some(1326),
         macs: 0,
         rx_bps: 0,
         tx_bps: 0,
@@ -118,7 +118,9 @@ fn peer(name: &str, address: &str) -> PeerStatus {
         refused: None,
         identity: Some(format!("{}Ab3dE", &name[..name.len().min(3)])),
         identity_state: Some(wanderlan_core::api::IdentityState::Confirmed),
+        down_reason: None,
         tunnel: wanderlan_core::config::TunnelMode::Direct,
+        tunnel_reason: "direct: the servers reach each other".into(),
         vni: Some(0x12_3456),
         endpoint: None,
     }
@@ -135,7 +137,6 @@ pub fn summary(name: &str, address: &str, vlans: &str) -> SiteSummary {
         uplink: (name == "haus6").then(|| "heim".to_string()),
         via: None,
         id: None,
-        tunnel_mode: (name == "haus6").then_some(wanderlan_core::config::TunnelMode::Nat),
     }
 }
 
@@ -183,7 +184,7 @@ pub fn status() -> Status {
                 last_reply_secs: Some(3),
                 rtt_ms: Some(25.0),
                 pmtu: Some(1392),
-                mss: Some(1310),
+                mss: Some(1298),
                 macs: 3,
                 rx_bps: 52_000,
                 tx_bps: 18_000,
@@ -342,7 +343,7 @@ pub fn events() -> Vec<Event> {
             3,
             Level::Info,
             Some("buero"),
-            "path MTU to buero is 1420, MSS 1338",
+            "path MTU to buero is 1420, MSS 1326",
         ),
         ev(
             65,

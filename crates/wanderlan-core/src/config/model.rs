@@ -23,6 +23,13 @@ pub const DEFAULT_CONTROL_PORT: u16 = 51821;
 pub const DEFAULT_MTU_PROBE_INTERVAL: Duration = Duration::from_secs(300);
 /// Default time to confirm a configuration change before it is rolled back.
 pub const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(60);
+/// Largest network revision (network.toml holds an i64).
+pub const MAX_REVISION: u64 = i64::MAX as u64;
+
+/// The revision after `revision`, at most [`MAX_REVISION`].
+pub fn next_revision(revision: u64) -> u64 {
+    revision.saturating_add(1).min(MAX_REVISION)
+}
 /// Maximum length of a site name (`vx-` + name must fit into IFNAMSIZ - 1).
 pub const MAX_SITE_NAME_LEN: usize = 12;
 
@@ -53,6 +60,21 @@ pub struct Network {
 }
 
 impl Network {
+    /// Puts the mappings and the tunnel limits in a fixed order: by site (in
+    /// the order of the sites, unknown ones last), then by VLAN. Their order
+    /// has no meaning, but the text has one: the fingerprint is taken over
+    /// this form, so that two sites holding the same entries agree.
+    pub fn canonicalize(&mut self) {
+        let names: Vec<String> = self.sites.iter().map(|s| s.name.clone()).collect();
+        let position = |name: &str| names.iter().position(|n| n == name).unwrap_or(usize::MAX);
+        self.maps
+            .sort_by_cached_key(|m| (position(&m.site), m.shared, m.local));
+        self.tunnels.sort_by_cached_key(|t| {
+            let (a, b) = (position(&t.sites[0]), position(&t.sites[1]));
+            (a.min(b), a.max(b), t.sites.clone())
+        });
+    }
+
     /// Creates a network with default settings and no sites.
     pub fn new(vlans: VlanSet) -> Self {
         Self {
@@ -86,14 +108,15 @@ impl Network {
         }
     }
 
-    /// The UDP port of the client tunnels: the configured one, or the port
-    /// after the control port (before it for the last port).
+    /// The UDP port of the tunnels: the configured one, or the port after
+    /// the control port. A tunnel through NAT also sends from the port above
+    /// it, so for the last control ports the tunnel port goes below.
     pub fn tunnel_port(&self) -> u16 {
         self.tunnel_port
-            .unwrap_or(if self.control_port == u16::MAX {
-                u16::MAX - 1
-            } else {
+            .unwrap_or(if self.control_port <= u16::MAX - 2 {
                 self.control_port + 1
+            } else {
+                self.control_port - 2
             })
     }
 
@@ -171,13 +194,12 @@ pub struct Site {
     /// The site this one is plugged into (a client of it): its only tunnel
     /// leads there. `None`: a server, connected with all other servers.
     pub uplink: Option<String>,
-    /// How the tunnel of a client to its server runs (servers among each
-    /// other always run [`TunnelMode::Direct`]).
-    pub tunnel_mode: TunnelMode,
 }
 
-/// How the tunnel between a client and its server runs. Both are VXLAN on
-/// the tunnel port; they differ in who may send first.
+/// How a tunnel runs. Both are VXLAN on the tunnel port; they differ in who
+/// may send first. Servers among each other always run direct; the tunnel
+/// of a client runs direct once its server reached it directly (the daemons
+/// find out by themselves, see `wanderlan_core::nat`), else through NAT.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
 )]
@@ -195,7 +217,7 @@ pub enum TunnelMode {
 }
 
 impl TunnelMode {
-    /// The word in `network.toml` and on the command line.
+    /// The word in the status.
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Nat => "nat",
@@ -518,7 +540,6 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
-            tunnel_mode: Default::default(),
             uplink: None,
         });
         network.sites.push(Site {
@@ -530,7 +551,6 @@ mod tests {
             online: true,
             managed_by: None,
             self_managed: false,
-            tunnel_mode: Default::default(),
             uplink: None,
         });
         assert!(network.site("c").is_none());

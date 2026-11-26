@@ -1065,13 +1065,13 @@ async fn a_client_behind_nat_is_reached_where_its_packets_come_from() {
     assert_eq!(net.state().remotes.get(&index), Some(&endpoint));
     assert!(run(&net, &learned).await.is_empty(), "nothing more to do");
 
-    // direct: built anew with a source port per flow, to its address.
-    let direct = network.replacen(
-        "uplink = \"heim\"",
-        "uplink = \"heim\"\ntunnel_mode = \"direct\"",
-        1,
-    );
-    let direct = derive(&config_from(&direct, "heim"), &runtime);
+    // Reached directly (the test): built anew with a source port per flow,
+    // to where it was reached.
+    let mut reached = runtime.clone();
+    reached
+        .direct
+        .insert("haus3".into(), std::net::Ipv4Addr::new(10, 8, 0, 12));
+    let direct = derive(&config_from(&network, "heim"), &reached);
     run(&net, &direct).await;
     let LinkKind::Vxlan(p) = net.link("vx-haus3").unwrap().kind else {
         panic!("a VXLAN tunnel");

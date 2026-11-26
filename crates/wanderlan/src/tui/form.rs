@@ -13,8 +13,8 @@ use std::time::Duration;
 use crossterm::event::{KeyCode, KeyEvent};
 use wanderlan_core::api::{Interface, SiteRules, Translation};
 use wanderlan_core::config::{
-    Diagnostic, FieldPath, LocalVid, Severity, Site, TunnelMode, VID_MAX, VID_MIN, VlanMap,
-    VlanSet, site_name_error,
+    Diagnostic, FieldPath, LocalVid, Severity, Site, VID_MAX, VID_MIN, VlanMap, VlanSet,
+    site_name_error,
 };
 
 use wanderlan_core::policy;
@@ -23,13 +23,14 @@ use super::draft::{Draft, is_within};
 use super::format;
 use super::input::{Outcome, TextInput};
 
-/// What a form edits.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a form edits, by name (or content): a sync or a rollback may
+/// replace the draft while the form is open, the entry is found again.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormKind {
     /// A site; `None` adds a new one.
-    Site(Option<usize>),
-    /// A VLAN mapping; `None` adds a new one.
-    Map(Option<usize>),
+    Site(Option<String>),
+    /// A VLAN mapping (as it was); `None` adds a new one.
+    Map(Option<VlanMap>),
     /// The `[network]` settings.
     Network,
     /// Only the shared VLANs.
@@ -38,14 +39,13 @@ pub enum FormKind {
     Local,
     /// Rules for a new invitation (the draft is not changed).
     Invite,
-    /// The own VLANs of one site (index in the network): on its trunk and
-    /// towards its own clients only.
-    OwnVlans(usize),
-    /// The VLANs of the tunnel between two sites (indices in the network).
-    TunnelVlans(usize, usize),
-    /// A new name for a site (index in the network); everything that names
-    /// it follows.
-    Rename(usize),
+    /// The own VLANs of one site: on its trunk and towards its own clients
+    /// only.
+    OwnVlans(String),
+    /// The VLANs of the tunnel between two sites.
+    TunnelVlans(String, String),
+    /// A new name for a site; everything that names it follows.
+    Rename(String),
 }
 
 /// The editable value of a field.
@@ -214,7 +214,7 @@ impl Form {
             }
             None => (changes_choices(&me, "the new site"), format!("only {me}")),
         };
-        let mut fields = vec![
+        let fields = vec![
             Field::text(
                 "name",
                 "Name",
@@ -245,18 +245,8 @@ impl Form {
             ),
             own_vlans_field(existing),
         ];
-        // A client (a new site is one): how its tunnel to its server runs.
-        if existing.is_none_or(|s| s.uplink.is_some()) {
-            let mode = existing.map(|s| s.tunnel_mode).unwrap_or_default();
-            fields.push(Field::choice(
-                "tunnel",
-                "Tunnel",
-                "nat: may sit behind NAT, its server only answers; direct: its server sends to its address",
-                vec![TunnelMode::Nat.to_string(), TunnelMode::Direct.to_string()],
-                mode.as_str(),
-            ));
-        }
-        Self::new(FormKind::Site(index), title, fields, draft)
+        let name = existing.map(|s| s.name.clone());
+        Self::new(FormKind::Site(name), title, fields, draft)
     }
 
     /// Form for a new invitation: rules for the site that joins with it.
@@ -366,7 +356,7 @@ impl Form {
                 local,
             ),
         ];
-        Self::new(FormKind::Map(index), title, fields, draft)
+        Self::new(FormKind::Map(existing.cloned()), title, fields, draft)
     }
 
     /// Form for the `[network]` settings.
@@ -379,6 +369,12 @@ impl Form {
                 "Control port",
                 "UDP/TCP port of the daemons on the site addresses",
                 m.control_port.to_string(),
+            ),
+            Field::text(
+                "tunnel_port",
+                "Tunnel port",
+                "UDP port of the VXLAN tunnels (NAT also the one above); empty: control port + 1",
+                m.tunnel_port.map(|p| p.to_string()).unwrap_or_default(),
             ),
             Field::text(
                 "mtu_probe_interval",
@@ -413,7 +409,7 @@ impl Form {
         let name = s.map(|s| s.name.clone()).unwrap_or_default();
         let fields = vec![own_vlans_field(s)];
         Self::new(
-            FormKind::OwnVlans(site),
+            FormKind::OwnVlans(name.clone()),
             format!("Own VLANs of {name}"),
             fields,
             draft,
@@ -435,7 +431,7 @@ impl Form {
             name.clone(),
         )];
         Self::new(
-            FormKind::Rename(site),
+            FormKind::Rename(name.clone()),
             format!("Rename site {name}"),
             fields,
             draft,
@@ -444,14 +440,6 @@ impl Form {
 
     /// Form for the VLANs of the tunnel between the sites `a` and `b`.
     pub fn tunnel_vlans(draft: &Draft, a: &str, b: &str) -> Self {
-        let index = |name: &str| {
-            draft
-                .network
-                .sites
-                .iter()
-                .position(|s| s.name == name)
-                .unwrap_or(usize::MAX)
-        };
         let value = draft
             .network
             .tunnel_limit(a, b)
@@ -470,7 +458,7 @@ impl Form {
             value,
         )];
         Self::new(
-            FormKind::TunnelVlans(index(a), index(b)),
+            FormKind::TunnelVlans(a.to_string(), b.to_string()),
             format!("VLANs of the tunnel {a} – {b}"),
             fields,
             draft,
@@ -577,6 +565,16 @@ impl Form {
 
     fn update_enabled(&mut self) {}
 
+    /// Shows an error that belongs to no single field (the daemon refused
+    /// what the form sent).
+    pub fn set_note_error(&mut self, message: String) {
+        self.notes.push(Diagnostic::error(
+            wanderlan_core::config::ConfigFile::Network,
+            FieldPath::root(),
+            message,
+        ));
+    }
+
     /// Parses the fields and validates the draft with the edit applied.
     pub fn revalidate(&mut self, draft: &Draft) {
         self.update_enabled();
@@ -641,16 +639,22 @@ impl Form {
         }
     }
 
+    /// Where the edited site is in `draft`.
+    fn site_index(draft: &Draft, name: &str) -> Option<usize> {
+        draft.network.sites.iter().position(|s| s.name == name)
+    }
+
     /// Index of the edited entity in the candidate draft.
     fn index(&self, draft: &Draft) -> Option<usize> {
-        match self.kind {
-            FormKind::Site(i) => Some(i.unwrap_or(draft.network.sites.len())),
-            FormKind::OwnVlans(i) | FormKind::Rename(i) => Some(i),
-            FormKind::Invite => Some(draft.network.sites.len()),
-            FormKind::Map(i) => Some(i.unwrap_or(draft.network.maps.len())),
+        match &self.kind {
+            FormKind::Site(None) | FormKind::Invite => Some(draft.network.sites.len()),
+            FormKind::Site(Some(name)) | FormKind::OwnVlans(name) | FormKind::Rename(name) => {
+                Self::site_index(draft, name)
+            }
+            FormKind::Map(None) => Some(draft.network.maps.len()),
+            FormKind::Map(Some(map)) => draft.network.maps.iter().position(|m| m == map),
             FormKind::TunnelVlans(a, b) => {
-                let name = |i: usize| draft.network.sites.get(i).map_or("", |s| s.name.as_str());
-                let (a, b) = (name(a), name(b));
+                let (a, b) = (a.as_str(), b.as_str());
                 Some(
                     draft
                         .network
@@ -666,7 +670,7 @@ impl Form {
 
     fn entity_path(&self, draft: &Draft) -> Option<FieldPath> {
         let i = self.index(draft)?;
-        match self.kind {
+        match &self.kind {
             FormKind::Site(_) | FormKind::Invite | FormKind::OwnVlans(_) | FormKind::Rename(_) => {
                 Some(FieldPath::site(i))
             }
@@ -679,7 +683,7 @@ impl Form {
     /// Path of a field in the candidate draft.
     fn path_of(&self, key: &str, draft: &Draft) -> FieldPath {
         let i = self.index(draft).unwrap_or_default();
-        match self.kind {
+        match &self.kind {
             FormKind::Site(_) | FormKind::Invite | FormKind::OwnVlans(_) | FormKind::Rename(_) => {
                 FieldPath::site_field(i, key)
             }
@@ -695,26 +699,55 @@ impl Form {
         self.fields.iter().any(|f| f.touched)
     }
 
+    /// The edited entry is no longer in the draft (a sync or a rollback
+    /// replaced it): nothing to save.
+    fn gone(&mut self, what: &str) -> Option<Draft> {
+        self.notes.clear();
+        self.set_note_error(format!(
+            "{what} is no longer in the network (the configuration changed); Esc closes"
+        ));
+        None
+    }
+
     /// Builds the candidate draft; records parse errors on the fields.
     fn build(&mut self, draft: &Draft) -> Option<Draft> {
         let mut candidate = draft.clone();
-        match self.kind {
-            FormKind::Site(index) => {
+        match self.kind.clone() {
+            FormKind::Site(name) => {
+                let index = match &name {
+                    Some(n) => match Self::site_index(draft, n) {
+                        Some(i) => Some(i),
+                        None => return self.gone(&format!("Site {n}")),
+                    },
+                    None => None,
+                };
                 let site = self.parse_site()?;
+                // Who may change it changes only when the field was changed.
+                let changes_touched = self.field("changes").is_some_and(|f| f.touched);
                 let (managed_by, self_managed) = parse_changes(&self.value("changes"));
-                let tunnel_mode = self.value("tunnel").parse::<TunnelMode>().ok();
                 let own_vlans = self.parse_own_vlans()?;
+                if let (Some(old), Some(me)) = (&name, draft.local.self_name.as_deref())
+                    && *old != site.name
+                    && !policy::may_rename(&draft.network, old, me)
+                {
+                    self.set_error("name", policy::why_not_rename(&draft.network, old, me));
+                    return None;
+                }
                 match index.and_then(|i| candidate.network.sites.get_mut(i)) {
                     Some(slot) => {
                         let mut site = site;
                         site.online = slot.online;
-                        site.managed_by = managed_by;
-                        site.self_managed = self_managed;
+                        if changes_touched {
+                            site.managed_by = managed_by;
+                            site.self_managed = self_managed;
+                        } else {
+                            site.managed_by = slot.managed_by.clone();
+                            site.self_managed = slot.self_managed;
+                        }
                         // Its role stays (`wanderlan role` changes it).
                         site.uplink = slot.uplink.clone();
                         // Its identity is the box's, never edited here.
                         site.id = slot.id;
-                        site.tunnel_mode = tunnel_mode.unwrap_or(slot.tunnel_mode);
                         site.own_vlans = own_vlans;
                         let old = std::mem::replace(slot, site.clone());
                         if old.name != site.name {
@@ -727,12 +760,23 @@ impl Form {
                         self_managed,
                         uplink: candidate.local.self_name.clone(),
                         own_vlans,
-                        tunnel_mode: tunnel_mode.unwrap_or_default(),
                         ..site
                     }),
                 }
             }
-            FormKind::Map(index) => {
+            FormKind::Map(old) => {
+                let index = match &old {
+                    Some(m) => match candidate.network.maps.iter().position(|x| x == m) {
+                        Some(i) => Some(i),
+                        None => {
+                            return self.gone(&format!(
+                                "The mapping {} {} = shared {}",
+                                m.site, m.local, m.shared
+                            ));
+                        }
+                    },
+                    None => None,
+                };
                 let map = self.parse_map()?;
                 match index.and_then(|i| candidate.network.maps.get_mut(i)) {
                     Some(slot) => *slot = map,
@@ -742,6 +786,7 @@ impl Form {
             FormKind::Network => {
                 let vlans = self.parse_vlans();
                 let port = self.parse_port();
+                let tunnel_port = self.parse_tunnel_port();
                 let interval = self.parse_duration("mtu_probe_interval");
                 let timeout = self.parse_duration("commit_timeout");
                 let mss = self.parse_mss();
@@ -749,6 +794,7 @@ impl Form {
                 let network = &mut candidate.network;
                 network.vlans = vlans?;
                 network.control_port = port?;
+                network.tunnel_port = tunnel_port?;
                 network.mtu_probe_interval = interval?;
                 network.commit_timeout = timeout?;
                 network.mss = mss?;
@@ -758,17 +804,22 @@ impl Form {
                 candidate.network.vlans = self.guard_network_vlans(draft, vlans)?;
             }
             FormKind::Invite => self.build_invite(&mut candidate)?,
-            FormKind::OwnVlans(site) => {
+            FormKind::OwnVlans(name) => {
+                let Some(i) = Self::site_index(draft, &name) else {
+                    return self.gone(&format!("Site {name}"));
+                };
                 let own = self.parse_own_vlans()?;
-                candidate.network.sites.get_mut(site)?.own_vlans = own;
+                candidate.network.sites.get_mut(i)?.own_vlans = own;
             }
-            FormKind::Rename(site) => {
+            FormKind::Rename(old) => {
+                if Self::site_index(draft, &old).is_none() {
+                    return self.gone(&format!("Site {old}"));
+                }
                 let new = self.value("name").trim().to_string();
                 if let Some(msg) = site_name_error(&new) {
                     self.set_error("name", msg);
                     return None;
                 }
-                let old = candidate.network.sites.get(site)?.name.clone();
                 if new != old {
                     if candidate.network.site(&new).is_some() {
                         self.set_error(
@@ -781,8 +832,12 @@ impl Form {
                 }
             }
             FormKind::TunnelVlans(a, b) => {
-                let a = candidate.network.sites.get(a)?.name.clone();
-                let b = candidate.network.sites.get(b)?.name.clone();
+                if let Some(gone) = [&a, &b]
+                    .into_iter()
+                    .find(|n| Self::site_index(draft, n).is_none())
+                {
+                    return self.gone(&format!("Site {gone}"));
+                }
                 let text = self.value("vlans");
                 let limit = match text.trim() {
                     "" | "all" => None,
@@ -876,7 +931,6 @@ impl Form {
             managed_by: candidate.local.self_name.clone(),
             uplink: candidate.local.self_name.clone(),
             self_managed: false,
-            tunnel_mode: Default::default(),
         });
         if let Some(shared) = native {
             candidate.network.maps.push(VlanMap {
@@ -940,7 +994,6 @@ impl Form {
             online: true,
             managed_by: None,
             self_managed: false,
-            tunnel_mode: Default::default(),
             uplink: None,
         })
     }
@@ -1032,6 +1085,21 @@ impl Form {
             Ok(p) if p > 0 => Some(p),
             _ => {
                 self.set_error("control_port", "a port number between 1 and 65535");
+                None
+            }
+        }
+    }
+
+    /// Empty: `None` (it follows the control port).
+    fn parse_tunnel_port(&mut self) -> Option<Option<u16>> {
+        let text = self.value("tunnel_port");
+        if text.trim().is_empty() {
+            return Some(None);
+        }
+        match text.trim().parse::<u16>() {
+            Ok(p) if (1..u16::MAX).contains(&p) => Some(Some(p)),
+            _ => {
+                self.set_error("tunnel_port", "empty or a port number between 1 and 65534");
                 None
             }
         }
@@ -1177,10 +1245,9 @@ mod tests {
         let form = Form::site(&d, None);
         assert_eq!(
             form.fields.iter().map(|f| f.key).collect::<Vec<_>>(),
-            ["name", "address", "vlans", "changes", "own_vlans", "tunnel"]
+            ["name", "address", "vlans", "changes", "own_vlans"]
         );
         assert_eq!(form.value("changes"), "only heim", "managed by this site");
-        assert_eq!(form.value("tunnel"), "nat", "a new client runs nat");
         // Empty required fields are errors, but hidden until touched.
         let name = form.field("name").unwrap();
         assert!(name.error.is_some());
@@ -1228,6 +1295,19 @@ mod tests {
         let neu = candidate.network.site("neu").unwrap();
         assert_eq!(neu.managed_by.as_deref(), Some("heim"));
         assert!(!neu.self_managed);
+        // A site without a manager keeps none when only its VLANs change.
+        let site = d
+            .network
+            .sites
+            .iter()
+            .position(|s| s.managed_by.is_none())
+            .unwrap();
+        let name = d.network.sites[site].name.clone();
+        let mut form = Form::site(&d, Some(site));
+        form.focus_on("vlans");
+        type_text(&mut form, &d, "20");
+        let edited = form.submit(&d).unwrap();
+        assert_eq!(edited.network.site(&name).unwrap().managed_by, None);
     }
 
     #[test]
@@ -1353,7 +1433,7 @@ mod tests {
     fn network_settings_parse_and_validate() {
         let d = draft();
         let mut form = Form::network(&d);
-        form.focus = 4;
+        form.focus = form.fields.iter().position(|f| f.key == "mss").unwrap();
         type_text(&mut form, &d, "100");
         let mss = form.field("mss").unwrap();
         assert!(

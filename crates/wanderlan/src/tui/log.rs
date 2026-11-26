@@ -26,6 +26,9 @@ pub struct LogState {
     /// Number of matching events hidden below the window; 0 follows new
     /// events.
     pub scroll: usize,
+    /// Events the window showed at its last size: scrolled up, the window
+    /// stays full.
+    pub window: std::cell::Cell<usize>,
     /// Text search (`/`).
     pub text: Filter,
     /// The local time zone; `None`: UTC.
@@ -145,7 +148,10 @@ impl LogState {
 
     /// Scrolling keys. Returns false if the key is not for the log.
     pub fn handle_key(&mut self, key: &KeyEvent) -> bool {
-        let max = self.filtered().len().saturating_sub(1);
+        let max = self
+            .filtered()
+            .len()
+            .saturating_sub(self.window.get().max(1));
         self.scroll = match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.scroll + 1,
             KeyCode::Down | KeyCode::Char('j') => self.scroll.saturating_sub(1),

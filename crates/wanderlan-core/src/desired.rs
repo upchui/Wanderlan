@@ -165,8 +165,32 @@ pub struct Runtime {
     /// NAT in front of them chooses the port), learned from their
     /// keepalives.
     pub endpoints: BTreeMap<String, SocketAddrV4>,
+    /// The clients of this site that it reaches directly, at this address
+    /// (they passed the test of `wanderlan_core::nat`): their tunnels run
+    /// direct.
+    pub direct: BTreeMap<String, Ipv4Addr>,
+    /// The uplink of this site (a client) reaches it directly and runs the
+    /// tunnel direct.
+    pub uplink_direct: bool,
     /// Connection tracking is loaded (it would cost every tunnel packet).
     pub conntrack: bool,
+}
+
+impl Runtime {
+    /// How the tunnel `t` runs: servers among each other direct, a client
+    /// tunnel direct once the server reached the client directly.
+    pub fn mode(&self, t: &topology::Tunnel<'_>) -> TunnelMode {
+        let direct = match t.kind {
+            TunnelKind::Server => true,
+            TunnelKind::Uplink => self.uplink_direct,
+            TunnelKind::Client => self.direct.contains_key(&t.peer.name),
+        };
+        if direct {
+            TunnelMode::Direct
+        } else {
+            TunnelMode::Nat
+        }
+    }
 }
 
 /// Computes the desired state.
@@ -205,9 +229,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
     let self_online = cfg.self_site().is_none_or(|s| s.online);
     let tunnel_port = network.tunnel_port();
     let passing = forwarding::forwarding(network, me);
-    let own_mode = cfg
-        .self_site()
-        .map_or(TunnelMode::default(), |s| s.tunnel_mode);
+    let mut has_clients = false;
     let mut unbuilt = BTreeMap::new();
     let mut learn = BTreeSet::new();
     let mut vni_of: BTreeMap<u32, String> = BTreeMap::new();
@@ -246,10 +268,12 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
         } else {
             None
         };
-        // The mode is that of the client in the tunnel; servers send
-        // directly. Through NAT the client sends from the tunnel port and
-        // its server answers where the client's packets come from.
-        let mode = t.mode(own_mode);
+        // Servers send directly to each other. Through NAT the client sends
+        // from the tunnel port and its server answers where the client's
+        // packets come from; a client its server reached directly gets its
+        // packets there.
+        let mode = runtime.mode(&t);
+        has_clients |= t.kind == TunnelKind::Client;
         let remote = match (t.kind, mode) {
             (TunnelKind::Client, TunnelMode::Nat) => {
                 learn.insert(LearnRule {
@@ -258,6 +282,10 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
                 });
                 runtime.endpoints.get(&t.peer.name).copied()
             }
+            (TunnelKind::Client, TunnelMode::Direct) => runtime
+                .direct
+                .get(&t.peer.name)
+                .map(|ip| SocketAddrV4::new(*ip, tunnel_port)),
             _ => Some(SocketAddrV4::new(t.peer.address, tunnel_port)),
         };
         let down_reason = down_reason.or_else(|| {
@@ -317,7 +345,9 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
         }
     }
 
-    let notrack = runtime.conntrack && !learn.is_empty();
+    // The packets of the client tunnels skip connection tracking on their
+    // server (a client may need it: its firewall lets the answers in).
+    let notrack = runtime.conntrack && has_clients;
     let fixed = tunnels
         .iter()
         .filter(|t| t.params.source_port.is_some())
@@ -539,9 +569,8 @@ mod tests {
 
     #[test]
     fn a_client_behind_nat_is_reached_where_its_packets_come_from() {
-        let text = format!(
-            "{NETWORK_CLIENTS}\n[site.lan]\naddress = \"10.8.0.31\"\nserver = \"heim\"\ntunnel_mode = \"direct\"\n"
-        );
+        let text =
+            format!("{NETWORK_CLIENTS}\n[site.lan]\naddress = \"10.8.0.31\"\nserver = \"heim\"\n");
         let cfg = |me: &str| match load(&text, &format!("self = \"{me}\"\ntrunk = \"ens19\"\n"))
             .unwrap()
             .loaded
@@ -551,10 +580,15 @@ mod tests {
         };
         let tunnel =
             |d: &Desired, peer: &str| d.tunnels.iter().find(|t| t.peer == peer).unwrap().clone();
-        let mut runtime = Runtime::default();
+        // "lan" passed the test: its server reached it at 10.8.0.32.
+        let lan = Ipv4Addr::new(10, 8, 0, 32);
+        let mut runtime = Runtime {
+            direct: [("lan".to_string(), lan)].into(),
+            ..Runtime::default()
+        };
         let server = derive(&cfg("heim"), &runtime);
-        // nat (the default): no remote until the client was seen, a fixed
-        // source port, learned by its VNI.
+        // nat (where every client starts): no remote until the client was
+        // seen, a fixed source port, learned by its VNI.
         let nat = tunnel(&server, "nat1");
         assert_eq!(nat.remote, None);
         assert!(!nat.enabled);
@@ -573,12 +607,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             [("nat1", nat.params.vni)]
         );
-        // direct: straight to its address, a port per flow, nothing learned.
+        // direct: straight to where it was reached, a port per flow,
+        // nothing learned.
         let direct = tunnel(&server, "lan");
-        assert_eq!(
-            direct.remote,
-            Some(SocketAddrV4::new(Ipv4Addr::new(10, 8, 0, 31), 51822))
-        );
+        assert_eq!(direct.remote, Some(SocketAddrV4::new(lan, 51822)));
         assert_eq!(direct.params.source_port, None);
         assert!(direct.enabled);
         let endpoint = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 40001);
@@ -586,7 +618,7 @@ mod tests {
         let server = derive(&cfg("heim"), &runtime);
         assert_eq!(tunnel(&server, "nat1").remote, Some(endpoint));
         assert!(tunnel(&server, "nat1").enabled);
-        // The clients follow their own mode towards the server.
+        // The clients follow what the test found towards their server.
         let client = derive(&cfg("nat1"), &Runtime::default());
         let up = tunnel(&client, "heim");
         assert_eq!(up.params.source_port, Some(51822));
@@ -596,12 +628,14 @@ mod tests {
         );
         assert_eq!(up.params.vni, nat.params.vni, "the same VNI at both ends");
         assert!(client.learn.is_empty());
-        assert_eq!(
-            tunnel(&derive(&cfg("lan"), &Runtime::default()), "heim")
-                .params
-                .source_port,
-            None
-        );
+        assert_eq!(client.fixed, [up.params.vni].into());
+        let reached = Runtime {
+            uplink_direct: true,
+            ..Runtime::default()
+        };
+        let lan_side = derive(&cfg("lan"), &reached);
+        assert_eq!(tunnel(&lan_side, "heim").params.source_port, None);
+        assert!(lan_side.fixed.is_empty());
     }
 
     #[test]

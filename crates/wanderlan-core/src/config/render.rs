@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use super::model::{Local, LocalVid, Network, TunnelMode};
+use super::model::{Local, LocalVid, Network};
 
 const NETWORK_HEADER: &str = "\
 # wanderlan network configuration, shared by all sites.
@@ -119,9 +119,6 @@ pub fn render_network(network: &Network) -> String {
             }
             if !site.online {
                 out.push_str("online = false\n");
-            }
-            if site.tunnel_mode != TunnelMode::default() {
-                let _ = writeln!(out, "tunnel_mode = {}", quote(site.tunnel_mode.as_str()));
             }
             if let Some(vlans) = &site.vlans {
                 let _ = writeln!(out, "vlans = {}", quote(&vlans.to_string()));
@@ -230,9 +227,6 @@ fn render_network_inner(network: &Network, with_revision: bool) -> String {
         if site.self_managed {
             out.push_str("self_managed = true\n");
         }
-        if site.tunnel_mode != TunnelMode::default() {
-            let _ = writeln!(out, "tunnel_mode = {}", quote(site.tunnel_mode.as_str()));
-        }
         match &site.uplink {
             Some(up) => {
                 let _ = writeln!(out, "uplink = {}", quote(up));
@@ -308,9 +302,12 @@ fn ports(ports: &[String]) -> String {
 /// SHA-256 over the canonical network form without the revision, hex encoded.
 ///
 /// Two networks with the same content have the same fingerprint regardless of
-/// their revision counter and of formatting or comments in the source file.
+/// their revision counter, of formatting or comments in the source file and
+/// of the order of their mappings and tunnel limits.
 pub fn fingerprint(network: &Network) -> String {
-    let digest = Sha256::digest(render_network_inner(network, false).as_bytes());
+    let mut canonical = network.clone();
+    canonical.canonicalize();
+    let digest = Sha256::digest(render_network_inner(&canonical, false).as_bytes());
     let mut hex = String::with_capacity(64);
     for byte in digest {
         let _ = write!(hex, "{byte:02x}");

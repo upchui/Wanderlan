@@ -8,7 +8,7 @@ expression: render(&app)
 "│-- 2026-11-24 --                                                              │"
 "│10:00:00 info  -            daemon started, network revision 7                │"
 "│10:00:02 info  buero        tunnel vx-buero is up                             │"
-"│10:00:03 info  buero        path MTU to buero is 1420, MSS 1338               │"
+"│10:00:03 info  buero        path MTU to buero is 1420, MSS 1326               │"
 "│10:01:05 warn  haus5        haus5 runs network revision 6 with a different    │"
 "│                            configuration; it will be updated by the sync     │"
 "│10:02:10 error haus2        loop detected on vx-haus2: own frames came back;  │"

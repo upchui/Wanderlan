@@ -214,11 +214,15 @@ pub trait NetOps: Send + Sync {
         mtu: u32,
     ) -> impl Future<Output = SysResult<()>> + Send;
 
-    /// Where the VXLAN interfaces send to (their default FDB entry), by
-    /// index: each address with its port, `None` where it is the
-    /// interface's own (the kernel leaves it out then). An interface
-    /// without one is missing.
-    fn tunnel_remotes(&self) -> impl Future<Output = SysResult<TunnelRemotes>> + Send;
+    /// Where the VXLAN interface `index` sends to: the first address of
+    /// its default FDB entry with its port (`None` where it is the
+    /// interface's own: the kernel leaves it out then), `None` without one.
+    /// One small request per interface: the forwarding table of the bridge
+    /// (every MAC address learned) is not read.
+    fn tunnel_remote(
+        &self,
+        index: u32,
+    ) -> impl Future<Output = SysResult<Option<(Ipv4Addr, Option<u16>)>>> + Send;
 
     /// Sets or removes where a VXLAN interface sends to, in place: the
     /// interface and its bridge port stay. `own_port` is the interface's

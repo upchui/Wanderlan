@@ -62,7 +62,9 @@ pub fn draw(frame: &mut Frame, log: &LogState, area: Rect) {
     let inner = block.inner(list);
     let height = usize::from(inner.height);
     let width = usize::from(inner.width);
-    let end = events.len().saturating_sub(log.scroll);
+    log.window.set(height);
+    let scroll = log.scroll.min(events.len().saturating_sub(height));
+    let end = events.len().saturating_sub(scroll);
     let start = end.saturating_sub(height);
     let mut lines = Vec::new();
     let mut last_date = None;

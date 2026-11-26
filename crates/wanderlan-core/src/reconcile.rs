@@ -58,22 +58,19 @@ impl Actual {
             .map(|l| (l.name.clone(), l))
             .collect();
         // The kernel names the port only where it is not the interface's.
-        let raw = net.tunnel_remotes().await?;
-        let remotes = links
-            .values()
-            .filter_map(|l| match l.kind {
-                // Exactly one: several are left over from a change that
-                // did not finish, set anew.
-                LinkKind::Vxlan(params) => match raw.get(&l.index)?.as_slice() {
-                    [(address, port)] => Some((
-                        l.name.clone(),
-                        SocketAddrV4::new(*address, port.unwrap_or(params.port)),
-                    )),
-                    _ => None,
-                },
-                _ => None,
-            })
-            .collect();
+        // A change that did not finish leaves the old address first: it is
+        // set anew (which removes the others).
+        let mut remotes = BTreeMap::new();
+        for l in links.values() {
+            if let LinkKind::Vxlan(params) = l.kind
+                && let Some((address, port)) = net.tunnel_remote(l.index).await?
+            {
+                remotes.insert(
+                    l.name.clone(),
+                    SocketAddrV4::new(address, port.unwrap_or(params.port)),
+                );
+            }
+        }
         let vlans = net.port_vlans().await?;
         let tc = net.tc_state().await?;
         // Without nftables only the MSS clamping is missing (unless the
@@ -313,7 +310,12 @@ impl fmt::Display for Change {
                 port, rules, fixed, ..
             } => {
                 let clients: Vec<&str> = rules.iter().map(|r| r.client.as_str()).collect();
-                if clients.is_empty() {
+                if clients.is_empty() && fixed.is_empty() {
+                    write!(
+                        f,
+                        "Letting the client tunnels on UDP {port} skip connection tracking (table ip wanderlan)"
+                    )
+                } else if clients.is_empty() {
                     write!(
                         f,
                         "Sending the tunnel packets through NAT from UDP {port} ({} tunnel(s), table ip wanderlan)",
@@ -631,12 +633,11 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
         )
     });
 
-    // The table `ip wanderlan` follows the tunnels through NAT.
+    // The table `ip wanderlan` follows the client tunnels.
+    let unwanted = desired.learn.is_empty() && desired.fixed.is_empty() && !desired.notrack;
     let learn_changes = match &actual.learn {
-        Some(_) if desired.learn.is_empty() && desired.fixed.is_empty() => {
-            vec![Change::DeleteLearn]
-        }
-        _ if desired.learn.is_empty() && desired.fixed.is_empty() => Vec::new(),
+        Some(_) if unwanted => vec![Change::DeleteLearn],
+        _ if unwanted => Vec::new(),
         have => {
             let port = desired.tunnel_port;
             let same = have.as_ref().is_some_and(|l| {

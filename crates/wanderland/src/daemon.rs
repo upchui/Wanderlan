@@ -131,8 +131,17 @@ const MIN_TIMEOUT: Duration = Duration::from_secs(5);
 const NETLINK_TASK: &str = "netlink connection";
 /// The longest one reconcile may take.
 const RECONCILE_TIMEOUT: Duration = Duration::from_secs(120);
-/// Largest network revision (network.toml holds an i64).
-const MAX_REVISION: u64 = i64::MAX as u64;
+
+/// What became of a network taken over from a peer.
+#[derive(Debug)]
+enum TakeOver {
+    /// Applied (or there was nothing to do).
+    Applied,
+    /// Not taken over; the client learns why.
+    Refused(String),
+    /// Could not be applied now; tried again later.
+    Failed(String),
+}
 
 /// Inputs of the controller.
 #[derive(Debug)]
@@ -493,6 +502,51 @@ pub async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
+/// Why a tunnel runs as it does, for the status.
+fn tunnel_reason(
+    t: &topology::Tunnel<'_>,
+    runtime: &desired::Runtime,
+    test: Option<probe::DirectTest>,
+    port: u16,
+) -> String {
+    let peer = &t.peer.name;
+    let test = test.unwrap_or_default();
+    let next = test.next.map(|at| {
+        let secs = at
+            .saturating_duration_since(std::time::Instant::now())
+            .as_secs();
+        if secs >= 120 {
+            format!("; next test in {} min", secs / 60)
+        } else {
+            format!("; next test in {secs} s")
+        }
+    });
+    match t.kind {
+        TunnelKind::Server => "direct: the servers reach each other".to_string(),
+        TunnelKind::Client => match runtime.direct.get(peer) {
+            Some(ip) => format!("direct: reached at {ip}:{port}"),
+            None if test.tested => format!(
+                "nat: not reachable from here at UDP {port} (behind NAT or a firewall); it opens the flows"
+            ),
+            None => "nat: not tested yet (a client tests once it is connected)".to_string(),
+        },
+        TunnelKind::Uplink => {
+            if runtime.uplink_direct {
+                format!("direct: \"{peer}\" reaches this site at UDP {port}")
+            } else if test.reached {
+                format!("nat: reached at UDP {port}, waiting for \"{peer}\" to run direct")
+            } else if test.tested {
+                format!(
+                    "nat: \"{peer}\" cannot reach this site at UDP {port} (NAT or a firewall){}",
+                    next.unwrap_or_default()
+                )
+            } else {
+                "nat: not tested yet".to_string()
+            }
+        }
+    }
+}
+
 /// The interfaces of the host for the API; `carries` maps an index to the
 /// peers whose tunnel leaves through it.
 fn interface_list(
@@ -550,16 +604,8 @@ pub async fn cleanup(args: &Args) -> Result<()> {
             CLEANUP_TIMEOUT.as_secs()
         )),
     };
-    // The socket and the GRE devices also after a failure.
+    // The socket also after a failure.
     let _ = std::fs::remove_file(&args.socket);
-    // gre0, gretap0 and erspan0 of the kernel module ip_gre.
-    let links = sys.links().await.unwrap_or_default();
-    if let Some(message) =
-        wanderlan_core::kernel::remove_gre_fallback(&interface_list(&links, &BTreeMap::new()))
-            .message()
-    {
-        info!("Cleanup: {message}");
-    }
     result
 }
 
@@ -847,7 +893,8 @@ impl Controller {
             }
         }
         // A client tunnel that ran keeps its endpoint until the next
-        // keepalive tells otherwise.
+        // keepalive tells otherwise; one that ran direct stays so until a
+        // test tells otherwise.
         let clients: Vec<String> = self.config.as_ref().map_or_else(Vec::new, |cfg| {
             topology::tunnels_for(&cfg.network, cfg.self_name())
                 .into_iter()
@@ -860,13 +907,28 @@ impl Controller {
             if let Some(link) = actual.links.get(&name)
                 && link.admin_up
                 && let LinkKind::Vxlan(p) = link.kind
-                && p.source_port.is_some()
                 && let Some(remote) = actual.remotes.get(&name)
                 && self.runtime.identity.get(&peer) == Some(&PeerIdentity::Confirmed)
             {
-                self.runtime.endpoints.insert(peer, *remote);
+                if p.source_port.is_some() {
+                    self.runtime.endpoints.insert(peer, *remote);
+                } else {
+                    self.runtime.direct.insert(peer, *remote.ip());
+                }
             }
         }
+        let uplink = self
+            .config
+            .as_ref()
+            .and_then(|cfg| cfg.self_site()?.uplink.clone());
+        if let Some(uplink) = uplink
+            && let Some(link) = actual.links.get(&topology::tunnel_name(&uplink))
+            && link.admin_up
+            && matches!(link.kind, LinkKind::Vxlan(p) if p.source_port.is_none())
+        {
+            self.runtime.uplink_direct = true;
+        }
+        self.publish();
     }
 
     /// Loads and validates the files; logs problems.
@@ -950,6 +1012,10 @@ impl Controller {
     /// services. The announced version is always the confirmed one.
     fn set_config(&mut self, cfg: Option<Config>) {
         let old_peers = self.direct_peers();
+        let old_uplink = self
+            .config
+            .as_ref()
+            .and_then(|c| c.self_site().and_then(|s| s.uplink.clone()));
         let renamed = match (&self.config, &cfg) {
             (Some(old), Some(new)) => wanderlan_core::rename::renames(&old.network, &new.network),
             _ => Vec::new(),
@@ -978,6 +1044,23 @@ impl Controller {
         self.runtime
             .pmtu
             .retain(|peer, _| new_peers.contains_key(peer));
+        self.runtime
+            .direct
+            .retain(|peer, _| new_peers.contains_key(peer));
+        // Another uplink is tested anew (a renamed one is the same).
+        let followed = old_uplink.map(|old| {
+            renamed
+                .iter()
+                .find(|(from, _)| *from == old)
+                .map_or(old, |(_, to)| to.clone())
+        });
+        let uplink = self
+            .config
+            .as_ref()
+            .and_then(|c| c.self_site().and_then(|s| s.uplink.clone()));
+        if uplink != followed {
+            self.runtime.uplink_direct = false;
+        }
         // A port shut by the loop guard stays shut while it exists: tunnels
         // of peers that are gone and trunk ports no longer used are freed.
         let trunk_ports: BTreeSet<&String> =
@@ -1036,7 +1119,9 @@ impl Controller {
     }
 
     /// Carries what is known per peer over to its new name: refusals,
-    /// backoffs, the path MTU and a port shut by the loop guard.
+    /// backoffs, the path MTU, a port shut by the loop guard, its proven
+    /// identity and keys, where a client is and how its tunnel runs (a
+    /// renamed client keeps its tunnel up).
     fn follow_renames(&mut self, renamed: &[(String, String)]) {
         fn move_key<V>(map: &mut BTreeMap<String, V>, old: &str, new: &str) {
             if let Some(value) = map.remove(old) {
@@ -1049,6 +1134,11 @@ impl Controller {
             move_key(&mut self.expected, old, new);
             move_key(&mut self.runtime.pmtu, old, new);
             move_key(&mut self.runtime.underlay_mtu, old, new);
+            move_key(&mut self.runtime.identity, old, new);
+            move_key(&mut self.runtime.endpoints, old, new);
+            move_key(&mut self.runtime.direct, old, new);
+            move_key(&mut self.peer_keys, old, new);
+            move_key(&mut self.control_endpoints, old, new);
             self.grace.remove(old);
             if self.runtime.blocked.remove(&topology::tunnel_name(old)) {
                 self.runtime.blocked.insert(topology::tunnel_name(new));
@@ -1152,6 +1242,26 @@ impl Controller {
                 .is_none()
                 .then_some(c.network.mtu_probe_interval)
         });
+        // The test whether a client tunnel can run direct: the VNIs of the
+        // clients (for the test frames), the tunnel to the uplink.
+        let vnis = self
+            .runtime
+            .vnis
+            .iter()
+            .filter(|(peer, _)| passive.contains(*peer))
+            .map(|(peer, vni)| (peer.clone(), *vni))
+            .collect();
+        let uplink = self
+            .config
+            .as_ref()
+            .and_then(|cfg| cfg.self_site()?.uplink.clone())
+            .filter(|peer| self.peer_keys.contains_key(peer))
+            .map(|peer| probe::UplinkTunnel {
+                interface: topology::tunnel_name(&peer),
+                peer,
+                direct: self.runtime.uplink_direct,
+            });
+        let tunnel_port = self.config.as_ref().map_or(0, |c| c.network.tunnel_port());
         self.probe_config.send_replace(ProbeConfig {
             bind,
             peers,
@@ -1163,6 +1273,10 @@ impl Controller {
             me: self.identity.clone().map(Me),
             keys: self.peer_keys.clone(),
             passive,
+            tunnel_port,
+            vnis,
+            direct: self.runtime.direct.clone(),
+            uplink,
         });
         let addresses = self.direct_peers();
         let clients: BTreeSet<String> = self.config.as_ref().map_or_else(BTreeSet::new, |cfg| {
@@ -1197,10 +1311,11 @@ impl Controller {
         });
         // Keepalives through the tunnel to the uplink through NAT.
         let interfaces: Vec<String> = self.config.as_ref().map_or_else(Vec::new, |cfg| {
-            let own = cfg.self_site().map(|s| s.tunnel_mode).unwrap_or_default();
             topology::tunnels_for(&cfg.network, cfg.self_name())
                 .into_iter()
-                .filter(|t| t.kind == TunnelKind::Uplink && t.mode(own) == config::TunnelMode::Nat)
+                .filter(|t| {
+                    t.kind == TunnelKind::Uplink && self.runtime.mode(t) == config::TunnelMode::Nat
+                })
                 .map(|t| t.ifname())
                 .collect()
         });
@@ -1255,6 +1370,20 @@ impl Controller {
             }
             Input::Probe(ProbeEvent::Identity { peer, state }) => {
                 self.peer_identity(&peer, state).await;
+            }
+            Input::Probe(ProbeEvent::Direct { peer, at }) => self.tunnel_direct(&peer, at).await,
+            Input::Probe(ProbeEvent::Restarted { peer }) => {
+                // The uplink started again: it learns at once where this
+                // site's tunnel packets come from (not with the next
+                // keepalive).
+                let uplink = self
+                    .config
+                    .as_ref()
+                    .and_then(|c| c.self_site()?.uplink.clone());
+                if uplink.as_deref() == Some(peer.as_str()) {
+                    debug!("\"{peer}\" started again: keepalive now");
+                    self.keepalive.send_modify(|k| k.kick += 1);
+                }
             }
             Input::Probe(ProbeEvent::Endpoint { peer, addr }) => {
                 self.control_endpoints.insert(peer, addr);
@@ -1335,6 +1464,46 @@ impl Controller {
         }
     }
 
+    /// The test of a client tunnel says how it runs now: direct (the server
+    /// reaches the client at `at`) or through NAT.
+    async fn tunnel_direct(&mut self, peer: &str, at: Option<Ipv4Addr>) {
+        let Some(cfg) = &self.config else { return };
+        let port = cfg.network.tunnel_port();
+        let kind = topology::tunnels_for(&cfg.network, cfg.self_name())
+            .into_iter()
+            .find(|t| t.peer.name == peer)
+            .map(|t| t.kind);
+        let changed = match kind {
+            Some(TunnelKind::Uplink) => {
+                let was = self.runtime.uplink_direct;
+                self.runtime.uplink_direct = at.is_some();
+                was != at.is_some()
+            }
+            Some(TunnelKind::Client) => match at {
+                Some(ip) => self.runtime.direct.insert(peer.to_string(), ip) != Some(ip),
+                None => self.runtime.direct.remove(peer).is_some(),
+            },
+            _ => false,
+        };
+        if !changed {
+            return;
+        }
+        let message = match (kind, at) {
+            (Some(TunnelKind::Client), Some(ip)) => format!(
+                "The tunnel to client \"{peer}\" runs direct now: it is reachable at {ip}:{port}"
+            ),
+            (_, Some(_)) => format!(
+                "The tunnel to \"{peer}\" runs direct now: it reaches this site at UDP {port}"
+            ),
+            (_, None) => format!(
+                "The tunnel to \"{peer}\" runs through NAT now (the client opens the flows)"
+            ),
+        };
+        self.events.emit(Level::Info, Some(peer), message);
+        self.publish();
+        self.reconcile().await;
+    }
+
     /// Reads where the tunnel packets of the clients come from (the sets of
     /// table `ip wanderlan`) and points their tunnels there. Often while a
     /// client tunnel waits for its endpoint, rarely once all are known.
@@ -1382,10 +1551,19 @@ impl Controller {
                 }
             }
         }
+        // Often only while a client that answers waits for its endpoint (one
+        // that is gone for days costs no `nft` every few seconds).
+        let answers = |client: &str| {
+            self.probes
+                .read()
+                .ok()
+                .and_then(|t| t.get(client).and_then(|p| p.last_reply_at))
+                .is_some_and(|at| at.elapsed() < ALIVE_WINDOW)
+        };
         let waiting = desired
             .learn
             .iter()
-            .any(|r| !endpoints.contains_key(&r.client));
+            .any(|r| !endpoints.contains_key(&r.client) && answers(&r.client));
         self.learn_next = Instant::now() + if waiting { LEARN_WAITING } else { LEARN_KNOWN };
         if endpoints != self.runtime.endpoints {
             for (client, addr) in &endpoints {
@@ -1498,7 +1676,7 @@ impl Controller {
                 continue;
             };
             // A revision that no network.toml can hold is not adopted.
-            if announce.revision > MAX_REVISION {
+            if announce.revision > config::MAX_REVISION {
                 continue;
             }
             let theirs = Version {
@@ -1722,12 +1900,45 @@ impl Controller {
             Some(peer),
             format!("Client \"{peer}\" sent changes"),
         );
-        self.take_over(peer.to_string(), FetchMode::Merge, text)
-            .await;
-        match self.refused.get(peer) {
-            Some(r) => sync_net::PushAnswer::Refused(r.reason.clone()),
-            None => sync_net::PushAnswer::Ok,
+        match self
+            .take_over(peer.to_string(), FetchMode::Merge, text)
+            .await
+        {
+            TakeOver::Applied => sync_net::PushAnswer::Ok,
+            TakeOver::Refused(reason) => sync_net::PushAnswer::Refused(reason),
+            // Sent again soon.
+            TakeOver::Failed(why) => {
+                debug!("The change of client \"{peer}\" is not applied now: {why}");
+                sync_net::PushAnswer::Busy
+            }
         }
+    }
+
+    /// A change of client `peer` is not taken over: the client learns why
+    /// (in the answer to its push, with its next fetch).
+    fn refuse_client(
+        &mut self,
+        peer: &str,
+        fingerprint: Option<String>,
+        reason: String,
+    ) -> TakeOver {
+        if let Some(fingerprint) = fingerprint {
+            self.reject(fingerprint);
+        }
+        self.events.emit(
+            Level::Warn,
+            Some(peer),
+            format!("Not taking over the changes of client \"{peer}\": {reason}"),
+        );
+        self.refused.insert(
+            peer.to_string(),
+            Refusal {
+                reason: reason.clone(),
+                at: std::time::Instant::now(),
+            },
+        );
+        self.publish();
+        TakeOver::Refused(reason)
     }
 
     /// The uplink answered the push of this site's network.
@@ -1758,14 +1969,17 @@ impl Controller {
     }
 
     /// Takes over a network from `peer` (fetched, or pushed by a client).
-    async fn take_over(&mut self, peer: String, mode: FetchMode, text: String) {
+    async fn take_over(&mut self, peer: String, mode: FetchMode, text: String) -> TakeOver {
         let Some(local) = self.confirmed.as_ref().map(|c| c.local.clone()) else {
-            return;
+            return TakeOver::Failed("this site is not configured".into());
         };
         let parsed = match config::parse_network(&text) {
             Ok(p) => p.network,
             Err(diags) => {
                 let msg = diags.first().map_or_else(String::new, ToString::to_string);
+                if mode == FetchMode::Merge {
+                    return self.refuse_client(&peer, None, format!("it cannot be read: {msg}"));
+                }
                 self.events.emit(
                     Level::Warn,
                     Some(&peer),
@@ -1773,24 +1987,26 @@ impl Controller {
                 );
                 self.fetch_backoff
                     .insert(peer, Instant::now() + FETCH_BACKOFF);
-                return;
+                return TakeOver::Failed(msg);
             }
         };
         let Some(network) = parsed else {
+            if mode == FetchMode::Merge {
+                return self.refuse_client(&peer, None, "it is empty".into());
+            }
             // Nothing in it (e.g. only comments): not again every second.
             self.fetch_backoff
                 .insert(peer, Instant::now() + FETCH_BACKOFF);
-            return;
+            return TakeOver::Failed("empty".into());
         };
         let fingerprint = config::fingerprint(&network);
         let network = match mode {
             FetchMode::Merge => {
                 let Some(own) = self.confirmed.as_ref().map(|c| c.network.clone()) else {
-                    return;
+                    return TakeOver::Failed("this site is not configured".into());
                 };
                 match view::merge(&own, &network, &peer) {
                     Ok(merged) => {
-                        self.refused.remove(&peer);
                         for (old, new) in &merged.renamed {
                             self.events.emit(
                                 Level::Info,
@@ -1800,25 +2016,7 @@ impl Controller {
                         }
                         merged.network
                     }
-                    Err(e) => {
-                        self.reject(fingerprint);
-                        self.events.emit(
-                            Level::Warn,
-                            Some(&peer),
-                            format!("Not taking over the changes of client \"{peer}\": {e}"),
-                        );
-                        // The client learns why from the answer to its
-                        // push or with its next fetch.
-                        self.refused.insert(
-                            peer,
-                            Refusal {
-                                reason: e,
-                                at: std::time::Instant::now(),
-                            },
-                        );
-                        self.publish();
-                        return;
-                    }
+                    Err(e) => return self.refuse_client(&peer, Some(fingerprint), e),
                 }
             }
             FetchMode::Resync => {
@@ -1827,7 +2025,7 @@ impl Controller {
                     // change for an uplink with a key is sent again (it may
                     // have forgotten a refusal, e.g. by a restart).
                     self.pushed = None;
-                    return;
+                    return TakeOver::Applied;
                 };
                 self.events.emit(
                     Level::Warn,
@@ -1842,7 +2040,17 @@ impl Controller {
                 self.diverged_since = None;
                 network
             }
-            FetchMode::Replace => network,
+            FetchMode::Replace => {
+                // Fetched because it was announced newer: what came must be.
+                let ours = self.confirmed.as_ref().map(|c| Version::of(&c.network));
+                if ours.is_some_and(|o| !Version::of(&network).is_newer_than(&o)) {
+                    debug!("The configuration fetched from \"{peer}\" is not newer; not used");
+                    self.fetch_backoff
+                        .insert(peer, Instant::now() + FETCH_BACKOFF);
+                    return TakeOver::Applied;
+                }
+                network
+            }
         };
         let previous = self.confirmed.as_ref().map(|c| c.network.clone());
         // This site's own name back: its change was refused (Resync), or the
@@ -1866,6 +2074,9 @@ impl Controller {
             taken_back,
             self.own_id(),
         ) {
+            Err(e) if mode == FetchMode::Merge => {
+                self.refuse_client(&peer, Some(fingerprint), e.to_string())
+            }
             Err(e) => {
                 self.reject(fingerprint);
                 self.events.emit(
@@ -1873,8 +2084,12 @@ impl Controller {
                     Some(&peer),
                     format!("Not using the configuration from \"{peer}\": {e}"),
                 );
+                TakeOver::Failed(e.to_string())
             }
             Ok(cfg) => {
+                if mode == FetchMode::Merge {
+                    self.refused.remove(&peer);
+                }
                 let source = ChangeSource::Sync { peer: peer.clone() };
                 let result = self.apply(cfg, source, None, None, false).await;
                 if result.is_ok()
@@ -1895,7 +2110,9 @@ impl Controller {
                             e.message
                         ),
                     );
+                    return TakeOver::Failed(e.message);
                 }
+                TakeOver::Applied
             }
         }
     }
@@ -2642,10 +2859,7 @@ impl Controller {
             if changed {
                 let base = previous_version.map_or(0, |v| v.revision);
                 // The files hold at most an i64.
-                cfg.network.revision = base
-                    .max(cfg.network.revision)
-                    .saturating_add(1)
-                    .min(MAX_REVISION);
+                cfg.network.revision = config::next_revision(base.max(cfg.network.revision));
             }
             self.rejected.clear();
             // A change of its own: the last refusal is history.
@@ -3195,6 +3409,12 @@ impl Controller {
                             .to_string()
                     })
                     .unwrap_or_default();
+                let down_reason = desired
+                    .tunnels
+                    .iter()
+                    .find(|d| d.name == port)
+                    .and_then(|d| d.down_reason.clone())
+                    .or_else(|| desired.unbuilt.get(&t.peer.name).cloned());
                 PeerStatus {
                     name: t.peer.name.clone(),
                     address: t.peer.address.to_string(),
@@ -3236,7 +3456,14 @@ impl Controller {
                             .unwrap_or_default()
                             .into()
                     }),
-                    tunnel: t.mode(me.map(|s| s.tunnel_mode).unwrap_or_default()),
+                    down_reason,
+                    tunnel: self.runtime.mode(t),
+                    tunnel_reason: tunnel_reason(
+                        t,
+                        &self.runtime,
+                        probe.and_then(|p| p.direct_test),
+                        desired.tunnel_port,
+                    ),
                     vni,
                     endpoint: self
                         .runtime
@@ -3269,7 +3496,6 @@ impl Controller {
                 uplink: s.uplink.clone(),
                 id: s.id.map(|id| id.fingerprint()),
                 via: topology::via(&cfg.network, cfg.self_name(), &s.name).map(str::to_string),
-                tunnel_mode: s.uplink.is_some().then_some(s.tunnel_mode),
             })
             .collect();
         let trunks: Vec<PortTraffic> = desired

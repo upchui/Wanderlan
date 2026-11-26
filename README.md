@@ -244,27 +244,41 @@ clients behind the same NAT share its address and are told apart by their
 identity.
 
 Every tunnel is **VXLAN** on the tunnel port (UDP 51822), one interface per
-neighbour. How the tunnel between a client and its server runs is the
-client's **tunnel mode** (`tunnel_mode` in `network.toml`, `wanderlan
-tunnel-mode <client> nat|direct`, or the site form in the terminal UI):
+neighbour. The tunnel between a client and its server runs in one of two
+modes; there is nothing to set, the two daemons find out which one fits:
 
-* **`nat`** (the default, also right after joining): the client may sit
-  behind NAT. It sends from the tunnel port, and every 15 s a small
-  keepalive frame through its tunnel; that keeps the NAT's mapping open and
-  shows the server which address and port the NAT uses for the client
-  (nftables table `ip wanderlan`). When the NAT changes the port (it forgot
-  the mapping, the router restarted), the server follows with the next
-  keepalive, in place.
-* **`direct`**: the client is reachable at its address (the same LAN, a
-  public address, a VPN). Its server sends there directly, both ends from a
-  source port per connection, which spreads the load over the receive
-  queues of the network cards; no keepalives, nothing to learn.
+* **`nat`** (where every client tunnel starts): the client may sit behind
+  NAT. It sends from the tunnel port, and every 15 s a small keepalive frame
+  through its tunnel; that keeps the NAT's mapping open and shows the server
+  which address and port the NAT uses for the client (nftables table
+  `ip wanderlan`). When the NAT changes the port (it forgot the mapping, the
+  router restarted), the server follows with the next keepalive, in place.
+* **`direct`**: the server reaches the client at its address (the same LAN,
+  a public address, a VPN). It sends there directly, both ends from a source
+  port per connection, which spreads the load over the receive queues and
+  cores of the network cards; no keepalives, nothing to learn.
+
+**How it finds out:** now and then (at the start, then every 5 minutes, every
+minute while it runs `direct`) the client asks its server for a test in one
+of its authenticated probes and listens at its tunnel interface for two
+seconds. The server sends a small test frame to the client's address at the
+tunnel port, from another port than the tunnel port: a packet that no NAT
+mapping and no firewall connection lets in unless the client is reachable
+from outside. It carries a tag of the tunnel's keys over the request, so
+nobody else can send it. If it arrives, both ends switch the tunnel to
+`direct`; after two failed tests in a row they go back to `nat`, and the
+pause before the next test doubles (up to a day), so a NAT that only stays
+open while the client sends from the tunnel port cannot make it flap. Behind
+NAT the test frame simply ends at the NAT. An older server or client never
+tests: its tunnels stay `nat`. The mode and why show in `wanderlan status`
+(`Tunnel to … : VXLAN direct: reached at …`), in the peer details of the
+terminal UI and in the log.
 
 Between servers the tunnels always run `direct`. Where connection tracking
-is loaded (a firewall), a server with clients behind NAT exempts the tunnel
-packets from it (`notrack`, table `ip wanderlan`): tracking them would cost
-every packet. A stateful firewall on such a server must therefore accept UDP
-to the tunnel port by its port, not only as an established connection.
+is loaded (a firewall), a server with clients exempts the tunnel packets
+from it (`notrack`, table `ip wanderlan`): tracking them would cost every
+packet. A stateful firewall on such a server must therefore accept UDP to
+the tunnel port by its port, not only as an established connection.
 
 A site with clients of its own must be reachable for them, so it cannot sit
 behind NAT itself. A carrier-grade NAT that gives the control traffic and the
@@ -571,7 +585,6 @@ sites with older and newer versions keep working together.
 | `network.mss` | unset | Fixed TCP MSS (536 to 1460) instead of the measured value. |
 | `network.control_port` | `51821` | UDP and TCP port of the daemons on the site addresses. |
 | `network.tunnel_port` | control port + 1 (`51822`) | UDP port of the tunnels (VXLAN). |
-| `site.<name>.tunnel_mode` | `nat` | Only for a client: `nat` (it may sit behind NAT; its server answers only) or `direct` (its server sends to its address). See [Clients behind NAT](#clients-behind-nat). |
 | `network.revision` | `0` | Revision counter of the sync; raised by the daemon. |
 | `[site.<name>]` | | One table per site. The name is unique; `a-z`, `0-9` and `-`, at most 12 characters (it is part of the interface name `vx-<name>`). |
 | `site.<name>.address` | | Unique IPv4 address of the site in the transport network. |
@@ -609,10 +622,7 @@ client of its manager.
 
 The daemon creates, and removes again whenever the service ends (a stop,
 an update, a crash or a kill: systemd then runs `wanderland --cleanup`, and
-once more before every start in case that could not run; after an update
-from an older version it also unloads the kernel module `ip_gre` of its GRE
-tunnels and with it its devices `gre0`, `gretap0` and `erspan0`, unless
-something else uses it or this is a container):
+once more before every start in case that could not run):
 
 * `br0`: a bridge with VLAN filtering, STP off, no default VLAN and no
   netfilter calls of its own (if `br_netfilter` is loaded, e.g. by Docker,
@@ -642,7 +652,7 @@ something else uses it or this is a container):
 * the nftables table `bridge wanderlan` for MSS clamping: every bridged
   frame of the host passes one rule there, only TCP SYNs go on to the MSS
   rules (chain `wl-mss`);
-* with tunnels in `nat` mode: the nftables table `ip wanderlan`. Both ends
+* with client tunnels: the nftables table `ip wanderlan`. In `nat` mode both ends
   send from the tunnel port: the VXLAN interface sends from it or the port
   above (Linux includes the upper end of a port range since March 2026), and
   a rule in output (chain `out`) puts the tunnel port back into the packets
@@ -716,8 +726,8 @@ passes VLANs on between servers uses nftables rules (`wl split` in table
 The loop guard watches the forwarding database of every bridge: if a MAC
 address keeps moving between the trunk and a tunnel, or between two tunnels
 (5 times within 10 s), it shuts the tunnel port down (never the trunk),
-logs it and shows it in the TUI until `wanderlan unblock vx-<site>` (`u` in
-the TUI) or the configuration changes.
+logs it and shows it in the TUI until `wanderlan unblock vx-<site>` (`u` on
+the peer in the TUI; a blocked trunk port: `U`) or the configuration changes.
 
 ### Operation
 
@@ -775,7 +785,6 @@ its last log lines and keeps trying.
 | `wanderlan invite list` / `wanderlan invite delete <code>` | Open invitations of this site |
 | `wanderlan join <address>[:port] <code> [--name N] [--trunk IF]` | Join a network (on an unconfigured site) |
 | `wanderlan online <site>` / `wanderlan offline <site>` | Take a site online or offline |
-| `wanderlan tunnel-mode <client> nat\|direct` | How the tunnel of a client to its server runs (`nat`: it may sit behind NAT; `direct`: its server sends to its address) |
 | `wanderlan manage <site> [--by S] [--self-managed yes\|no]` | Who may change (and rename) a site |
 | `wanderlan rename <site> <new-name>` | Rename a site: this site always, a site it manages too |
 | `wanderlan role <site> server\|client <server>` | Make a site a server or a client |
@@ -869,8 +878,9 @@ or `WANDERLAN_SOCKET`.
 * **The client opens every flow (`nat`).** A server never contacts a client
   in `nat` mode first, so clients work behind NAT; the server learns the
   NAT's port from the client's keepalives in the kernel (nftables), so
-  nothing per packet runs in user space. A client that is reachable runs
-  `direct`, like the servers among each other.
+  nothing per packet runs in user space. A client that its server reaches
+  directly runs `direct`, like the servers among each other; the daemons
+  find that out by themselves with a test frame (no setting).
 * **A site is a box with a key, not an address.** Every box has an X25519
   identity; the keys of a tunnel are derived from the two identities
   (Diffie-Hellman, HKDF-SHA256), so they never travel and no third site knows

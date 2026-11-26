@@ -178,6 +178,8 @@ pub enum Busy {
     Confirming,
     /// `rollback` was sent.
     RollingBack,
+    /// `reset` was sent.
+    Resetting,
 }
 
 /// What a confirmation question does when answered with yes.
@@ -333,6 +335,8 @@ pub enum Modal {
     Site {
         /// The site.
         name: String,
+        /// First visible line (PgUp/PgDn).
+        scroll: u16,
     },
     /// Traffic and details of one peer, with its VLANs.
     Peer {
@@ -423,8 +427,6 @@ pub enum Msg {
     Event(Event),
     /// What systemd knows about the daemon (while it is not reachable).
     Diagnosis(Diagnosis),
-    /// Result of removing the kernel's GRE fallback devices after a reset.
-    KernelCleaned(Option<String>),
 }
 
 /// Output of [`App::update`], executed by the event loop.
@@ -440,9 +442,6 @@ pub enum Effect {
     Quit,
     /// Ask systemd about the daemon (state and last log lines).
     Diagnose,
-    /// Remove the kernel's GRE fallback devices if that is safe; the list
-    /// is the current interface list.
-    KernelCleanup(Vec<Interface>),
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -483,6 +482,8 @@ pub struct Scrolls {
     pub vlan_ports: list::Scroll,
     /// Largest scroll offset of the help screen at its last size.
     pub help_max: std::cell::Cell<u16>,
+    /// Largest scroll offset of the site details at their last size.
+    pub site_max: std::cell::Cell<u16>,
     /// Keys of the help bar as drawn: first and last column, label.
     pub bar: std::cell::RefCell<Vec<(u16, u16, &'static str)>>,
     /// Screen row of the help bar.
@@ -562,9 +563,6 @@ pub struct App {
     pub interfaces_error: Option<String>,
     /// What systemd says about the daemon while it is not reachable.
     pub diagnosis: Option<Diagnosis>,
-    /// Remove the kernel's GRE fallback devices once the interface list
-    /// after a reset arrived.
-    cleanup_after_reset: bool,
     /// Open the invitation form once the configuration of a new network
     /// arrived.
     invite_after_setup: bool,
@@ -594,6 +592,10 @@ pub struct App {
     pub invitation: Option<Invitation>,
     /// The open invitations (list popup).
     pub invitations: Vec<Invitation>,
+    /// The code to select once the list arrived (a new invitation).
+    select_invite: Option<String>,
+    /// The invitation form while its request runs (back if refused).
+    invite_pending: Option<Form>,
     /// Traffic history per peer, oldest first.
     pub history: BTreeMap<String, VecDeque<Sample>>,
     /// The traffic per VLAN and port, as read last.
@@ -614,6 +616,15 @@ pub struct App {
     pub messages: VecDeque<Message>,
     /// A running confirm/rollback/apply.
     pub busy: Option<Busy>,
+    /// The terminal is smaller than the views need: only q and Ctrl-C act.
+    pub too_small: bool,
+    /// The draft that was applied last, until the change is confirmed:
+    /// back into the draft if it is rolled back.
+    applied_draft: Option<Draft>,
+    /// The pending change ended without a confirm from here: once the
+    /// configuration arrived, the applied draft comes back if it is not in
+    /// effect (with this message).
+    restore_draft: Option<String>,
     wizard_offered: bool,
     in_flight: InFlight,
     seen: Option<(u64, String, bool, SiteState)>,
@@ -636,7 +647,6 @@ impl App {
             interfaces_loaded: false,
             interfaces_error: None,
             diagnosis: None,
-            cleanup_after_reset: false,
             invite_after_setup: false,
             log: LogState::default(),
             macs: MacState::default(),
@@ -651,6 +661,8 @@ impl App {
             wizard: Wizard::new(),
             invitation: None,
             invitations: Vec::new(),
+            select_invite: None,
+            invite_pending: None,
             history: BTreeMap::new(),
             vlan_traffic: None,
             vlan_traffic_error: None,
@@ -661,6 +673,9 @@ impl App {
             message: None,
             messages: VecDeque::new(),
             busy: None,
+            too_small: false,
+            applied_draft: None,
+            restore_draft: None,
             wizard_offered: false,
             in_flight: InFlight::default(),
             seen: None,
@@ -684,12 +699,6 @@ impl App {
             Msg::Connected => self.on_connected(&mut fx),
             Msg::ConnectFailed(e) | Msg::Disconnected(e) => self.on_down(&e, &mut fx),
             Msg::Diagnosis(d) => self.diagnosis = Some(d),
-            Msg::KernelCleaned(message) => {
-                if let Some(m) = message {
-                    self.say(MessageKind::Info, m);
-                }
-                self.request_interfaces(&mut fx);
-            }
             Msg::Response { request, result } => self.on_response(request, result, &mut fx),
             Msg::Event(event) => self.log.push(event),
         }
@@ -897,7 +906,7 @@ impl App {
             (_, Ok(Reply::Status(status))) => self.on_status(*status, fx),
             (_, Ok(Reply::Config(texts))) => self.on_config(&texts),
             (_, Ok(Reply::History(events))) => self.log.set_history(events),
-            (_, Ok(Reply::Interfaces(list))) => self.on_interfaces(list, fx),
+            (_, Ok(Reply::Interfaces(list))) => self.on_interfaces(list),
             (_, Ok(Reply::Macs(entries))) => {
                 self.in_flight.macs = None;
                 self.macs.set_entries(entries);
@@ -918,14 +927,34 @@ impl App {
                 MessageKind::Info,
                 "Measuring the path MTU to all peers; the overview updates shortly.",
             ),
-            (Request::Invite(_), Ok(Reply::Invitation(inv))) => self.on_invitation(inv, fx),
+            (Request::Invite(_), Ok(Reply::Invitation(inv))) => {
+                self.invite_pending = None;
+                self.on_invitation(inv, fx);
+            }
             (_, Ok(Reply::Invites(list))) => {
                 self.invitations = list;
+                // A used or deleted code is no longer shown anywhere.
+                if self
+                    .invitation
+                    .as_ref()
+                    .is_some_and(|i| !self.invitations.iter().any(|o| o.code == i.code))
+                {
+                    self.invitation = None;
+                }
+                let wanted = self
+                    .select_invite
+                    .take()
+                    .and_then(|code| self.invitations.iter().position(|i| i.code == code));
                 if let Some(Modal::Invites { selected }) = &mut self.modal {
-                    *selected = (*selected).min(self.invitations.len().saturating_sub(1));
+                    *selected = wanted
+                        .unwrap_or(*selected)
+                        .min(self.invitations.len().saturating_sub(1));
                 }
             }
             (Request::DeleteInvite(p), Ok(_)) => {
+                if self.invitation.as_ref().is_some_and(|i| i.code == p.code) {
+                    self.invitation = None;
+                }
                 self.say(
                     MessageKind::Success,
                     format!("Invitation {} deleted.", p.code),
@@ -985,13 +1014,35 @@ impl App {
             Request::Unblock(_) => "unblock",
             Request::ProbeNow => "MTU probe",
             Request::Validate(_) | Request::Apply(_) | Request::ApplyFiles(_) => "apply",
-            Request::Invite(_) | Request::Invites | Request::DeleteInvite(_) => "invitation",
+            Request::Invite(_) => {
+                if let Some(mut form) = self.invite_pending.take() {
+                    form.set_note_error(match error {
+                        ClientError::Api(e) => e.message.clone(),
+                        other => other.to_string(),
+                    });
+                    if self.modal.is_none() {
+                        self.modal = Some(Modal::Form(form));
+                        return;
+                    }
+                }
+                "invitation"
+            }
+            Request::Invites | Request::DeleteInvite(_) => "invitation",
             Request::Join(_) => {
-                self.wizard.step = Step::Summary;
-                self.wizard.error = Some(match error {
+                let text = match error {
                     ClientError::Api(e) => e.message.clone(),
                     other => other.to_string(),
-                });
+                };
+                // Back to the step that fixes it.
+                self.wizard.step = if text.contains("another name")
+                    || text.contains("already site")
+                    || text.contains("site name")
+                {
+                    Step::Name
+                } else {
+                    Step::Summary
+                };
+                self.wizard.error = Some(text);
                 return;
             }
             Request::Reset => {
@@ -1022,6 +1073,14 @@ impl App {
         }
         if status.invites == 0 {
             self.invitation = None;
+        }
+        // A code was used or deleted elsewhere: which one the list tells.
+        let fewer = self
+            .status
+            .as_ref()
+            .is_some_and(|old| status.invites < old.invites);
+        if fewer && self.invitation.is_some() {
+            fx.push(Effect::Request(Request::Invites));
         }
         self.record_history(&status);
         if !self.wizard_offered {
@@ -1059,6 +1118,16 @@ impl App {
             }
             return;
         }
+        if self.applied_draft.is_some() {
+            // Ours: the configuration (requested with the status) tells
+            // whether it is still in effect.
+            self.restore_draft = Some(
+                "Your change was rolled back (not confirmed in time). It is kept in the draft: a applies it again, x discards it."
+                    .into(),
+            );
+            self.request_config(fx);
+            return;
+        }
         self.say(
             MessageKind::Info,
             "The pending change was confirmed or rolled back (see the log).",
@@ -1085,8 +1154,48 @@ impl App {
             (Some(d), Some(old)) => d.differs_from(old) && d.differs_from(&running),
             _ => false,
         };
-        if !keep {
+        let restored = match (self.restore_draft.take(), self.applied_draft.take()) {
+            // Not in effect: rolled back; the edits come back.
+            (Some(message), Some(mut applied)) if applied.differs_from(&running) => {
+                applied.rebase(&running);
+                self.say(MessageKind::Info, message);
+                Some(applied)
+            }
+            (Some(_), Some(_)) => {
+                self.say(MessageKind::Success, "Your change was confirmed.");
+                None
+            }
+            (None, applied) => {
+                self.applied_draft = applied;
+                None
+            }
+            (Some(_), None) => None,
+        };
+        let moved_on = self
+            .running
+            .as_ref()
+            .is_some_and(|old| old.revision != running.revision);
+        if let Some(draft) = restored {
+            self.draft = Some(draft);
+        } else if !keep {
             self.draft = Draft::from_running(&running);
+        } else if moved_on && let Some(draft) = &mut self.draft {
+            // Changed elsewhere while edited here: the edits move onto it,
+            // so the review shows only them and the apply fits.
+            let both = draft.rebase_onto(&running);
+            let text = if both.is_empty() {
+                format!(
+                    "The configuration changed (revision {}) while you edited; your draft now builds on it.",
+                    running.revision
+                )
+            } else {
+                format!(
+                    "The configuration changed (revision {}) while you edited; your draft now builds on it, your edits of {} replace the newer ones.",
+                    running.revision,
+                    both.join(", ")
+                )
+            };
+            self.say(MessageKind::Info, text);
         }
         let configured = running.network.is_some();
         self.running = Some(running);
@@ -1097,14 +1206,11 @@ impl App {
         }
     }
 
-    fn on_interfaces(&mut self, list: Vec<Interface>, fx: &mut Vec<Effect>) {
+    fn on_interfaces(&mut self, list: Vec<Interface>) {
         self.in_flight.interfaces = None;
         self.interfaces = list;
         self.interfaces_loaded = true;
         self.interfaces_error = None;
-        if std::mem::take(&mut self.cleanup_after_reset) {
-            fx.push(Effect::KernelCleanup(self.interfaces.clone()));
-        }
         // The list may be shorter now: the cursor stays on it ("other").
         if let (Some(Modal::Ports(picker)), Some(draft)) = (&mut self.modal, &self.draft) {
             let rows = picker.rows(draft, &self.interfaces).len();
@@ -1123,6 +1229,8 @@ impl App {
         }
         if origin == Origin::Wizard {
             self.wizard.step = Step::Applied;
+        } else {
+            self.applied_draft = self.draft.clone();
         }
         self.say(
             MessageKind::Success,
@@ -1147,6 +1255,8 @@ impl App {
     fn on_confirmed(&mut self, confirmed: &Confirmed, fx: &mut Vec<Effect>) {
         self.busy = None;
         self.clear_pending();
+        self.applied_draft = None;
+        self.restore_draft = None;
         if self.wizard.step == Step::Applied {
             self.setup_done(fx);
         } else {
@@ -1178,8 +1288,17 @@ impl App {
     fn on_invitation(&mut self, invitation: Invitation, fx: &mut Vec<Effect>) {
         self.say(
             MessageKind::Success,
-            format!("On the new site run: {}", invitation.command),
+            format!(
+                "Invitation {} created; the list shows the command for the new site.",
+                invitation.code
+            ),
         );
+        // The list with the new code selected: the command stays readable.
+        if self.modal.is_none() {
+            self.modal = Some(Modal::Invites { selected: 0 });
+            self.select_invite = Some(invitation.code.clone());
+            fx.push(Effect::Request(Request::Invites));
+        }
         self.invitation = Some(invitation);
         self.request_status(fx);
     }
@@ -1190,8 +1309,13 @@ impl App {
             self.say(MessageKind::Error, "Not connected to the daemon.");
             return;
         }
-        match &self.draft {
-            Some(draft) => self.modal = Some(Modal::Form(Form::invite(draft))),
+        if self.refuse_while_busy() {
+            return;
+        }
+        // The rules are checked against what runs (not the draft): that is
+        // what the new site joins.
+        match self.running.as_ref().and_then(Draft::from_running) {
+            Some(running) => self.modal = Some(Modal::Form(Form::invite(&running))),
             None => self.not_configured(),
         }
     }
@@ -1206,9 +1330,8 @@ impl App {
     fn on_vlan_traffic(&mut self, traffic: VlanTraffic) {
         self.in_flight.vlans = None;
         self.vlan_traffic_error = None;
-        let ids = traffic::vlan_ids(&traffic);
-        for &vid in &ids {
-            let (rx_bps, tx_bps) = traffic::vlan_total(&traffic, vid);
+        let totals = traffic::vlan_totals(&traffic);
+        for (&vid, &(rx_bps, tx_bps)) in &totals {
             let samples = self.vlan_history.entry(vid).or_default();
             samples.push_back(Sample {
                 rx_bps,
@@ -1219,7 +1342,7 @@ impl App {
                 samples.pop_front();
             }
         }
-        self.vlan_history.retain(|vid, _| ids.contains(vid));
+        self.vlan_history.retain(|vid, _| totals.contains_key(vid));
         self.vlan_traffic = Some(traffic);
     }
 
@@ -1377,8 +1500,10 @@ impl App {
         self.say(
             MessageKind::Success,
             format!(
-                "Joined via {} as {} ({} sites); confirmed automatically as soon as {} answers.",
-                joined.via, joined.site, joined.sites, joined.via
+                "Joined via {via} as {site} ({} sites); confirmed automatically as soon as {via} answers. {site} starts offline: its tunnel stays down until {via} takes it online (there: Sites (2), select {site}, o, then a).",
+                joined.sites,
+                via = joined.via,
+                site = joined.site,
             ),
         );
         self.request_status(fx);
@@ -1386,6 +1511,9 @@ impl App {
     }
 
     fn ask_reset(&mut self) {
+        if self.refuse_while_busy() {
+            return;
+        }
         self.modal = Some(Modal::Ask(Ask {
             title: "Reset this site".into(),
             text: "Remove the bridge, all tunnels and rules, the configuration and the invitations of this site? It becomes unconfigured, like after the installation. Other sites keep listing it until it is removed there.".into(),
@@ -1395,6 +1523,11 @@ impl App {
 
     fn on_reset(&mut self, report: &ResetReport, fx: &mut Vec<Effect>) {
         self.busy = None;
+        // Nothing of the old network is left to edit or to apply.
+        self.draft = None;
+        self.applied_draft = None;
+        self.restore_draft = None;
+        self.modal = None;
         self.wizard = Wizard::new();
         self.wizard
             .prefill(&hostinfo::hostname(), hostinfo::default_address());
@@ -1414,7 +1547,6 @@ impl App {
                 ),
             );
         }
-        self.cleanup_after_reset = true;
         self.request_status(fx);
         self.request_config(fx);
         self.request_interfaces(fx);
@@ -1434,6 +1566,12 @@ impl App {
         self.clear_pending();
         if self.wizard.step == Step::Applied {
             self.wizard.step = Step::Summary;
+        }
+        if self.applied_draft.is_some() {
+            self.restore_draft = Some(
+                "Rolled back. Your change is kept in the draft: a applies it again, x discards it."
+                    .into(),
+            );
         }
         self.say(
             MessageKind::Success,
@@ -1478,19 +1616,22 @@ impl App {
             fx.push(Effect::Quit);
             return;
         }
-        // The banner offers c and r: they work in every window that does
-        // not take text (forms: Esc first).
-        if matches!(
-            self.modal,
-            Some(
-                Modal::Help { .. }
-                    | Modal::Messages { .. }
-                    | Modal::Peer { .. }
-                    | Modal::Vlan { .. }
-                    | Modal::Site { .. }
-                    | Modal::Invites { .. }
-            )
-        ) && key.modifiers.is_empty()
+        // Too small: the screen says so; only q (and Ctrl-C) act.
+        if self.too_small {
+            if key.modifiers.is_empty()
+                && key.code == KeyCode::Char('q')
+                && self.quit_losses().is_empty()
+            {
+                fx.push(Effect::Quit);
+            }
+            return;
+        }
+        // The banner offers c and r: they work in every window that takes
+        // no text and loses nothing when closed (forms: Esc first).
+        if self.modal.is_some()
+            && !matches!(self.modal, Some(Modal::Review(ref r)) if matches!(r.state, ReviewState::Applied(_)))
+            && self.confirm_keys_live()
+            && key.modifiers.is_empty()
             && self.pending().is_some()
         {
             match key.code {
@@ -1550,7 +1691,7 @@ impl App {
     }
 
     fn on_mouse(&mut self, mouse: MouseEvent, fx: &mut Vec<Effect>) {
-        if !self.mouse {
+        if !self.mouse || self.too_small {
             return;
         }
         let (column, row) = (mouse.column, mouse.row);
@@ -1788,23 +1929,78 @@ impl App {
         }
     }
 
+    /// What would be lost by quitting now, in sentences (empty: nothing).
+    fn quit_losses(&self) -> Vec<String> {
+        let mut lost = Vec::new();
+        if self.busy == Some(Busy::Applying) {
+            lost.push("An apply is still running.".to_string());
+        }
+        if self.draft_dirty() {
+            lost.push("The draft has changes that are not applied; they are lost.".to_string());
+        }
+        if let Some(p) = self.pending() {
+            lost.push(if self.is_connected() {
+                format!(
+                    "The applied change is rolled back in {} s unless confirmed (c).",
+                    p.remaining_secs
+                )
+            } else {
+                "A change was waiting for confirmation; the daemon is not reachable, so it may be rolled back by itself.".to_string()
+            });
+        }
+        lost
+    }
+
     fn request_quit(&mut self, fx: &mut Vec<Effect>) {
-        let text = if self.draft_dirty() {
-            "The draft has changes that are not applied. Quit and discard them?".to_string()
-        } else if let Some(p) = self.pending() {
-            format!(
-                "A change is waiting for confirmation and is rolled back in {} s unless confirmed. Quit anyway?",
-                p.remaining_secs
-            )
-        } else {
+        let lost = self.quit_losses();
+        if lost.is_empty() {
             fx.push(Effect::Quit);
             return;
-        };
+        }
         self.modal = Some(Modal::Ask(Ask {
             title: "Quit".into(),
-            text,
+            text: format!("{} Quit anyway?", lost.join(" ")),
             action: AskAction::Quit,
         }));
+    }
+
+    /// True (with a message) while a reset runs: nothing else is sent.
+    fn refuse_while_busy(&mut self) -> bool {
+        if self.busy == Some(Busy::Resetting) {
+            self.say(MessageKind::Info, "The reset is still running.");
+            return true;
+        }
+        false
+    }
+
+    /// True if c and r reach the pending change in the window that is
+    /// open: no text is typed there and nothing would be lost by closing it.
+    pub fn confirm_keys_live(&self) -> bool {
+        let typing = [
+            &self.sites_filter,
+            &self.maps_filter,
+            &self.tunnels_filter,
+            &self.log.text,
+        ]
+        .iter()
+        .any(|f| f.editing);
+        let wizard_text = self.view == View::Setup
+            && self.is_connected()
+            && self.status.is_some()
+            && self.wizard.captures_text(&self.interfaces);
+        match &self.modal {
+            None => !typing && !wizard_text && !(self.view == View::Macs && self.macs.editing),
+            Some(Modal::Form(_) | Modal::Ask(_)) => false,
+            Some(Modal::Review(r)) => r.state != ReviewState::Applying,
+            Some(Modal::Ports(p)) => {
+                !p.changed()
+                    && self
+                        .draft
+                        .as_ref()
+                        .is_some_and(|d| p.cursor < p.rows(d, &self.interfaces).len())
+            }
+            Some(_) => true,
+        }
     }
 
     fn ask_discard(&mut self) {
@@ -1822,8 +2018,13 @@ impl App {
 
     fn blocked_by_pending(&mut self) -> bool {
         if let Some(p) = self.pending() {
+            let keys = if self.confirm_keys_live() {
+                "confirm it (c) or roll it back (r) first"
+            } else {
+                "close this window (Esc), then confirm it (c) or roll it back (r)"
+            };
             let text = format!(
-                "A change is waiting for confirmation ({} s left): confirm it (c) or roll it back (r) first.",
+                "A change is waiting for confirmation ({} s left): {keys}.",
                 p.remaining_secs
             );
             self.say(MessageKind::Error, text);
@@ -1837,7 +2038,7 @@ impl App {
             self.say(MessageKind::Error, "Not connected to the daemon.");
             return;
         }
-        if self.blocked_by_pending() {
+        if self.refuse_while_busy() || self.blocked_by_pending() {
             return;
         }
         let Some(draft) = &self.draft else {
@@ -1876,7 +2077,22 @@ impl App {
         }));
     }
 
+    /// True (with a message) while the daemon is not reachable.
+    fn refuse_offline(&mut self) -> bool {
+        if self.is_connected() {
+            return false;
+        }
+        self.say(
+            MessageKind::Error,
+            "Not connected to the daemon; the pending change cannot be confirmed or rolled back now.",
+        );
+        true
+    }
+
     fn confirm(&mut self, fx: &mut Vec<Effect>) {
+        if self.refuse_offline() {
+            return;
+        }
         if self.pending().is_none() {
             self.say(MessageKind::Info, "No change is waiting for confirmation.");
             return;
@@ -1890,6 +2106,9 @@ impl App {
     /// The question before rolling the pending change back, or a message
     /// that there is none.
     fn ask_rollback(&mut self) -> Option<Modal> {
+        if self.refuse_offline() {
+            return None;
+        }
         if self.pending().is_none() {
             self.say(MessageKind::Info, "No change is waiting for confirmation.");
             return None;
@@ -1983,7 +2202,7 @@ impl App {
             },
             Modal::Peer { name, vlan } => self.on_peer_key(name, vlan, key, fx),
             Modal::Vlan { vid, back } => self.on_vlan_key(vid, back, key, fx),
-            Modal::Site { name } => self.on_site_key(name, key),
+            Modal::Site { name, scroll } => self.on_site_key(name, scroll, key),
             Modal::Review(review) => self.on_review_key(review, key, fx),
             Modal::Ports(picker) => self.on_ports_key(picker, key),
         }
@@ -2232,6 +2451,8 @@ impl App {
                         );
                     } else {
                         fx.push(Effect::Request(Request::Invite(form.invite_rules())));
+                        // Kept until the daemon answers: a refusal brings it back.
+                        self.invite_pending = Some(form);
                         return None;
                     }
                 }
@@ -2245,6 +2466,7 @@ impl App {
                         FormKind::Map(None) => {
                             self.maps_selected = new.network.maps.len().saturating_sub(1);
                         }
+
                         _ => {}
                     }
                     self.draft = Some(new);
@@ -2348,7 +2570,11 @@ impl App {
             AskAction::Unblock(port) => {
                 fx.push(Effect::Request(Request::Unblock(UnblockParams { port })));
             }
-            AskAction::Reset => fx.push(Effect::Request(Request::Reset)),
+            AskAction::Reset if self.busy.is_none() => {
+                self.busy = Some(Busy::Resetting);
+                fx.push(Effect::Request(Request::Reset));
+            }
+            AskAction::Reset => {}
             AskAction::Rollback => self.rollback(fx),
             AskAction::DeleteInvite { code, .. } => {
                 fx.push(Effect::Request(Request::DeleteInvite(InviteParams {
@@ -2534,6 +2760,19 @@ impl App {
                 let port = self.selected_peer().map(|p| (p.port.clone(), p.port_state));
                 self.ask_unblock(port);
             }
+            // A trunk port the loop guard shut (no peer row to select).
+            KeyCode::Char('U') => {
+                let port = self.status.as_ref().and_then(|s| {
+                    s.blocked
+                        .iter()
+                        .find(|b| !s.peers.iter().any(|p| p.port == **b))
+                        .cloned()
+                });
+                match port {
+                    Some(port) => self.ask_unblock(Some((port, PortState::Blocked))),
+                    None => self.say(MessageKind::Info, "No trunk port is blocked."),
+                }
+            }
             KeyCode::Char('p') if self.is_connected() => {
                 fx.push(Effect::Request(Request::ProbeNow));
             }
@@ -2546,7 +2785,7 @@ impl App {
                     .get(self.overview_selected.saturating_sub(peers))
                     .map(|s| s.name.clone())
                 {
-                    self.modal = Some(Modal::Site { name });
+                    self.modal = Some(Modal::Site { name, scroll: 0 });
                 }
             }
             _ => {}
@@ -2555,7 +2794,7 @@ impl App {
 
     /// Keys of the site details: Up/Down the previous or next site (as in
     /// Sites), `e` edits it.
-    fn on_site_key(&mut self, name: String, key: &KeyEvent) -> Option<Modal> {
+    fn on_site_key(&mut self, name: String, scroll: u16, key: &KeyEvent) -> Option<Modal> {
         let names: Vec<String> = self
             .visible_sites()
             .into_iter()
@@ -2564,6 +2803,15 @@ impl App {
             .collect();
         match key.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => None,
+            // A long site scrolls; Up/Down stay the next site.
+            KeyCode::PageDown => Some(Modal::Site {
+                name,
+                scroll: scroll.saturating_add(5).min(self.scrolls.site_max.get()),
+            }),
+            KeyCode::PageUp => Some(Modal::Site {
+                name,
+                scroll: scroll.saturating_sub(5),
+            }),
             KeyCode::Char('e') => {
                 let index = self
                     .draft
@@ -2575,7 +2823,7 @@ impl App {
                         let draft = self.draft.as_ref()?;
                         Some(Modal::Form(Form::site(draft, Some(i))))
                     }
-                    _ => Some(Modal::Site { name }),
+                    _ => Some(Modal::Site { name, scroll }),
                 }
             }
             KeyCode::Char('N') => {
@@ -2589,7 +2837,7 @@ impl App {
                         let draft = self.draft.as_ref()?;
                         Some(Modal::Form(Form::rename(draft, i)))
                     }
-                    _ => Some(Modal::Site { name }),
+                    _ => Some(Modal::Site { name, scroll }),
                 }
             }
             code => {
@@ -2604,7 +2852,7 @@ impl App {
                 {
                     self.sites_selected = i;
                 }
-                Some(Modal::Site { name })
+                Some(Modal::Site { name, scroll: 0 })
             }
         }
     }
@@ -2688,6 +2936,23 @@ impl App {
     }
 
     fn on_sites_key(&mut self, key: &KeyEvent, fx: &mut Vec<Effect>) {
+        // The keys for the selected row act only on a row that is shown.
+        let row_key = matches!(
+            key.code,
+            KeyCode::Enter | KeyCode::Char('e' | 'N' | 'o' | 'd' | 'u') | KeyCode::Delete
+        );
+        if row_key
+            && !self
+                .visible_sites()
+                .iter()
+                .any(|(i, _)| *i == self.sites_selected)
+        {
+            self.say(
+                MessageKind::Info,
+                "Nothing selected: the search matches nothing (/ changes it).",
+            );
+            return;
+        }
         let selected_site = self
             .draft
             .as_ref()
@@ -2727,7 +2992,7 @@ impl App {
             KeyCode::Char('n') => self.modal = Some(Modal::Form(Form::site(draft, None))),
             KeyCode::Enter => {
                 if let Some(name) = selected_site {
-                    self.modal = Some(Modal::Site { name });
+                    self.modal = Some(Modal::Site { name, scroll: 0 });
                 }
             }
             KeyCode::Char('e') if selected < count => {
@@ -2749,6 +3014,23 @@ impl App {
                     let text = format!(
                         "{} is this site and cannot be removed (change \"This site\" in the settings, 7, first).",
                         site.name
+                    );
+                    self.say(MessageKind::Error, text);
+                    return;
+                }
+                // Its clients would hang in the air.
+                let clients: Vec<&str> = draft
+                    .network
+                    .sites
+                    .iter()
+                    .filter(|c| c.uplink.as_deref() == Some(site.name.as_str()))
+                    .map(|c| c.name.as_str())
+                    .collect();
+                if !clients.is_empty() {
+                    let text = format!(
+                        "{} still has clients ({}): delete them first.",
+                        site.name,
+                        clients.join(", ")
                     );
                     self.say(MessageKind::Error, text);
                     return;
@@ -2805,6 +3087,13 @@ impl App {
             key.code,
             KeyCode::Enter | KeyCode::Char('e' | 'd') | KeyCode::Delete
         );
+        if edits && !self.visible_maps().contains(&self.maps_selected) {
+            self.say(
+                MessageKind::Info,
+                "Nothing selected: no mapping is shown (n adds one, / changes the search).",
+            );
+            return;
+        }
         if edits
             && let Some(site) = &selected_map_site
             && !self.may_change(site)
@@ -2859,7 +3148,10 @@ impl App {
                 if let Some(map) = draft.network.maps.get(selected) {
                     self.modal = Some(Modal::Ask(Ask {
                         title: "Delete VLAN mapping".into(),
-                        text: format!("Remove VLAN mapping #{} from the draft?", selected + 1),
+                        text: format!(
+                            "Remove the VLAN mapping of {}: {} on its trunk = shared VLAN {}?",
+                            map.site, map.local, map.shared
+                        ),
                         action: AskAction::DeleteMap(map.clone()),
                     }));
                 }
@@ -2958,13 +3250,13 @@ impl App {
 }
 
 /// Text of the countdown banner, if a change waits for confirmation.
-pub fn banner_text(pending: &PendingChange, in_form: bool) -> String {
+pub fn banner_text(pending: &PendingChange, needs_esc: bool) -> String {
     let what = match &pending.source {
         ChangeSource::Local => "UNCONFIRMED CHANGE".to_string(),
         ChangeSource::Sync { peer } => format!("CHANGE FROM {peer}"),
         ChangeSource::Join { site } => format!("SITE {site} JOINING"),
     };
-    let keys = if in_form {
+    let keys = if needs_esc {
         "Esc, then c confirm / r roll back"
     } else {
         "c confirm  |  r roll back now"

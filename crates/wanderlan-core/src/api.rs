@@ -502,9 +502,16 @@ pub struct PeerStatus {
     /// For a tunnel with a key: whether the peer proved its identity.
     #[serde(default)]
     pub identity_state: Option<IdentityState>,
+    /// Why the tunnel is down (while it is).
+    #[serde(default)]
+    pub down_reason: Option<String>,
     /// How the tunnel runs (VXLAN): through NAT or direct.
     #[serde(default)]
     pub tunnel: crate::config::TunnelMode,
+    /// Why it runs so: "reached directly at …", "not reachable from
+    /// outside (NAT or firewall)", …
+    #[serde(default)]
+    pub tunnel_reason: String,
     /// The VNI of the tunnel.
     #[serde(default)]
     pub vni: Option<u32>,
@@ -573,9 +580,6 @@ pub struct SiteSummary {
     /// The short form of its identity, if it has one.
     #[serde(default)]
     pub id: Option<String>,
-    /// For a client: how its tunnel to its server runs.
-    #[serde(default)]
-    pub tunnel_mode: Option<crate::config::TunnelMode>,
 }
 
 /// Result of [`Request::Status`].

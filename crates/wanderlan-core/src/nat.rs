@@ -1,16 +1,39 @@
-//! Clients behind NAT: the endpoint of a client's tunnel and the keepalive
-//! that keeps its NAT open.
+//! Client tunnels: through NAT or direct, the endpoint of a client's tunnel,
+//! the keepalive that keeps its NAT open and the test whether its server
+//! reaches it directly.
 //!
-//! A client opens every flow towards its server: its probes, its sync and
-//! its tunnel packets (GRE inside UDP). The server answers where they come
-//! from. For the tunnel, the client sends a keepalive frame every
-//! [`KEEPALIVE`] through it, also when its LAN is quiet: that keeps the
-//! mapping of its NAT open and tells the server (table `ip wanderlan`, see
-//! [`crate::sys::nft_ip`]) which address and port the NAT uses for it.
+//! **Through NAT** (`nat`, where every client tunnel starts) a client opens
+//! every flow towards its server: its probes, its sync and its tunnel
+//! packets (VXLAN). The server answers where they come from. For the
+//! tunnel, the client sends a keepalive frame every [`KEEPALIVE`] through
+//! it, also when its LAN is quiet: that keeps the mapping of its NAT open
+//! and tells the server (table `ip wanderlan`, see [`crate::sys::nft_ip`])
+//! which address and port the NAT uses for it. Both ends send from the
+//! tunnel port, so all packets of the tunnel are one UDP flow.
+//!
+//! **Direct** (`direct`): a client that its server reaches at the tunnel
+//! port from any port gets its tunnel packets there, from a port per flow,
+//! like the servers among each other; the receivers spread the flows over
+//! their queues and cores. No keepalives, nothing learned.
+//!
+//! **The test.** Now and then the client asks for a test in one of its
+//! authenticated probes ([`crate::mtu::wire2::FLAG_TEST_ME`]); its server
+//! answers with a test frame ([`direct_test_packet`]) to the client's
+//! address at the tunnel port, sent from another port than the tunnel
+//! port: a packet that no mapping of a NAT and no connection of a firewall
+//! lets in unless the client is reachable from outside. The frame carries a
+//! tag of the pair's keys over the request, so only the server can send it
+//! and only for this request. If it arrives, the client says so in its
+//! probes ([`crate::mtu::wire2::FLAG_REACHED`]), the server runs the tunnel
+//! direct and tells it in its answers ([`crate::mtu::wire2::FLAG_DIRECT`]);
+//! the client follows. Both ends of a tunnel in different modes still work
+//! while the test holds, so neither waits for the other.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
+use crate::identity::PairKeys;
+use crate::mtu::wire2::Nonce;
 use crate::sys::nft_ip::{KEEPALIVE_ETHERTYPE, Learned};
 
 /// Interval of the keepalive frames (a NAT forgets an idle UDP flow after
@@ -70,9 +93,85 @@ pub fn keepalive_frame(fingerprint: &str) -> [u8; KEEPALIVE_LEN] {
     frame
 }
 
+/// Magic of a test frame, after the ethertype.
+pub const DIRECT_MAGIC: &[u8; 4] = b"WLDT";
+/// Label of the tag of a test frame.
+const LABEL_DIRECT: &[u8] = b"wlp2 direct test";
+/// The flags of a VXLAN header: the VNI is valid.
+const VXLAN_FLAGS: u8 = 0x08;
+
+/// The test frame for the request `seq` of a client that sent `nonce`:
+/// like a keepalive (untagged, ethertype `0x88b5`, dropped at the tunnel
+/// port), with `WLDT`, a version and the tag.
+pub fn direct_test_frame(keys: &PairKeys, nonce: &Nonce, seq: u32) -> [u8; KEEPALIVE_LEN] {
+    let mut frame = [0u8; KEEPALIVE_LEN];
+    frame[..6].copy_from_slice(&KEEPALIVE_MAC);
+    frame[6..12].copy_from_slice(&KEEPALIVE_MAC);
+    frame[12..14].copy_from_slice(&KEEPALIVE_ETHERTYPE.to_be_bytes());
+    frame[14..18].copy_from_slice(DIRECT_MAGIC);
+    frame[18] = 1;
+    frame[19..23].copy_from_slice(&seq.to_be_bytes());
+    let tag = keys.probe_tag(&[LABEL_DIRECT, nonce, &seq.to_be_bytes()]);
+    frame[23..23 + tag.len()].copy_from_slice(&tag);
+    frame
+}
+
+/// The UDP payload of a test: the VXLAN header with `vni` and the frame.
+pub fn direct_test_packet(vni: u32, keys: &PairKeys, nonce: &Nonce, seq: u32) -> Vec<u8> {
+    let mut packet = Vec::with_capacity(8 + KEEPALIVE_LEN);
+    packet.extend_from_slice(&[VXLAN_FLAGS, 0, 0, 0]);
+    packet.extend_from_slice(&(vni << 8).to_be_bytes());
+    packet.extend_from_slice(&direct_test_frame(keys, nonce, seq));
+    packet
+}
+
+/// True if `frame` (as it came out of the tunnel interface) is the test
+/// frame for the request `seq` of this run (`nonce`), sent by the server.
+pub fn verify_direct_frame(frame: &[u8], keys: &PairKeys, nonce: &Nonce, seq: u32) -> bool {
+    let tag_len = crate::identity::TAG_LEN;
+    frame.get(12..14) == Some(&KEEPALIVE_ETHERTYPE.to_be_bytes()[..])
+        && frame.get(14..18) == Some(&DIRECT_MAGIC[..])
+        && frame.get(18) == Some(&1)
+        && frame.get(19..23) == Some(&seq.to_be_bytes()[..])
+        && frame
+            .get(23..23 + tag_len)
+            .is_some_and(|tag| keys.probe_verify(&[LABEL_DIRECT, nonce, &seq.to_be_bytes()], tag))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_server_can_send_the_test_frame_for_a_request() {
+        use crate::identity::Identity;
+        let client = Identity::from_secret([1; 32]);
+        let server = Identity::from_secret([2; 32]);
+        let at_client = client.pair(&server.id()).unwrap();
+        let at_server = server.pair(&client.id()).unwrap();
+        let nonce = [7u8; crate::mtu::wire2::NONCE_LEN];
+        let packet = direct_test_packet(at_server.vni(), &at_server, &nonce, 42);
+        assert_eq!(packet[0], 0x08);
+        assert_eq!(
+            u32::from_be_bytes(packet[4..8].try_into().unwrap()) >> 8,
+            at_client.vni()
+        );
+        let frame = &packet[8..];
+        assert!(verify_direct_frame(frame, &at_client, &nonce, 42));
+        // Another request, another run or another box: no.
+        assert!(!verify_direct_frame(frame, &at_client, &nonce, 43));
+        assert!(!verify_direct_frame(frame, &at_client, &[8; 16], 42));
+        let other = Identity::from_secret([3; 32]).pair(&client.id()).unwrap();
+        let forged = direct_test_frame(&other, &nonce, 42);
+        assert!(!verify_direct_frame(&forged, &at_client, &nonce, 42));
+        // A keepalive is no test frame.
+        assert!(!verify_direct_frame(
+            &keepalive_frame("abc"),
+            &at_client,
+            &nonce,
+            42
+        ));
+    }
 
     fn learned(addr: &str, expires: u64) -> Learned {
         Learned {
@@ -112,7 +211,7 @@ mod tests {
         assert_eq!(&frame[12..14], &[0x88, 0xb5]);
         assert_eq!(&frame[14..18], b"WLKA");
         assert_eq!(&frame[19..27], b"abcdefgh");
-        // Bit 224 after the UDP header: 8 bytes UDP + 8 bytes GRE + 12
+        // Bit 224 after the UDP header: 8 bytes UDP + 8 bytes VXLAN + 12
         // bytes MAC addresses = byte 12 of the frame.
         assert_eq!(
             u16::from_be_bytes([frame[12], frame[13]]),

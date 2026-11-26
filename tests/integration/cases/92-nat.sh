@@ -38,6 +38,10 @@ for c in natc1 natc2; do
   check "site1 knows where the tunnel packets of $c come from (the NAT)" \
     grep -q '^10\.100\.20\.10:[0-9]*$' <<<"$(peer_of site1 "$c" .endpoint)"
 done
+for c in natc1 natc2; do
+  wait_eq 30 "site1 sent $c a test frame, it did not come through the NAT: nat" "nat: not reachable" \
+    eval "peer_of site1 $c .tunnel_reason | cut -d' ' -f1-3"
+done
 check "the NAT gave the two boxes different ports" \
   test "$(peer_of site1 natc1 .endpoint)" != "$(peer_of site1 natc2 .endpoint)"
 check "site1 learned them from the keepalives (table ip wanderlan)" \
