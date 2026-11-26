@@ -22,7 +22,7 @@ use serde_spanned::Spanned;
 use super::diag::{ConfigFile, Diagnostic, FieldPath, SpanMap};
 use super::model::{
     Breakout, Breakouts, DEFAULT_COMMIT_TIMEOUT, DEFAULT_CONTROL_PORT, DEFAULT_MTU_PROBE_INTERVAL,
-    Local, LocalVid, Network, Site, TunnelVlans, VlanMap, site_pair,
+    Local, LocalVid, Network, Site, SitePorts, TunnelVlans, VlanMap, site_pair,
 };
 use super::vlan::{VID_MAX, VID_MIN, VlanSet};
 use crate::identity::SiteId;
@@ -83,6 +83,8 @@ struct RawSite {
     tunnel_mode: Option<Spanned<String>>,
     /// VLAN ID (key) = its local breakout.
     breakout: Option<Spanned<Ordered<Spanned<RawBreakout>>>>,
+    control_port: Option<Spanned<i64>>,
+    tunnel_port: Option<Spanned<i64>>,
     /// Since 0.2 there are no roles; read and ignored with a warning.
     role: Option<Spanned<String>>,
     /// Since 0.2 there are no hubs; read and ignored with a warning.
@@ -180,6 +182,8 @@ struct RawSite2 {
     tunnel_vlans: Option<Spanned<Ordered<Spanned<RawVlans>>>>,
     /// VLAN ID (key) = its local breakout.
     breakout: Option<Spanned<Ordered<Spanned<RawBreakout>>>>,
+    control_port: Option<Spanned<i64>>,
+    tunnel_port: Option<Spanned<i64>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -189,6 +193,9 @@ struct RawLocal {
     self_name: Option<Spanned<String>>,
     trunk: Option<Spanned<RawPorts>>,
     tunnels: Option<std::collections::BTreeMap<String, RawLocalTunnel>>,
+    commit_timeout: Option<Spanned<String>>,
+    mtu_probe_interval: Option<Spanned<String>>,
+    mss: Option<Spanned<i64>>,
 }
 
 /// `[tunnels.<site>]` in `local.toml`.
@@ -494,6 +501,8 @@ fn parse_network_2(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
             uplink: raw_site.server,
             tunnel_mode: raw_site.tunnel_mode,
             breakout: raw_site.breakout,
+            control_port: raw_site.control_port,
+            tunnel_port: raw_site.tunnel_port,
             role: None,
             hub: None,
         };
@@ -741,6 +750,16 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
     let own_path = FieldPath::site_field(i, "own_vlans");
     let own_vlans = lw.take(&own_path, s.own_vlans);
     let breakout = lw.take(&FieldPath::site_field(i, "breakout"), s.breakout);
+    let mut port = |field: &str, value: Option<Spanned<i64>>, max: i64| {
+        let path = FieldPath::site_field(i, field);
+        let value = lw.take(&path, value)?;
+        lw.int_in_range(&path, value, 1, max)
+            .and_then(|v| u16::try_from(v).ok())
+    };
+    let ports = SitePorts {
+        control: port("control_port", s.control_port, 65535),
+        tunnel: port("tunnel_port", s.tunnel_port, 65534),
+    };
     let online = lw
         .take(&FieldPath::site_field(i, "online"), s.online)
         .unwrap_or(true);
@@ -845,6 +864,7 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
             self_managed,
             uplink,
             breakout,
+            ports,
         },
         uplink_given,
     ))
@@ -1034,10 +1054,26 @@ pub fn parse_local(text: &str) -> Result<ParsedLocal, Vec<Diagnostic>> {
             tunnel_trunks.insert(site, t.into_vec());
         }
     }
+    let path = FieldPath::local("commit_timeout");
+    let commit_timeout = lw
+        .take(&path, raw.commit_timeout)
+        .and_then(|text| lw.duration(&path, &text));
+    let path = FieldPath::local("mtu_probe_interval");
+    let mtu_probe_interval = lw
+        .take(&path, raw.mtu_probe_interval)
+        .and_then(|text| lw.duration(&path, &text));
+    let path = FieldPath::local("mss");
+    let mss = lw.take(&path, raw.mss).and_then(|v| {
+        lw.int_in_range(&path, v, 1, 65535)
+            .and_then(|v| u16::try_from(v).ok())
+    });
     let local = Local {
         self_name,
         trunk,
         tunnel_trunks,
+        commit_timeout,
+        mtu_probe_interval,
+        mss,
     };
     if lw.diags.is_empty() {
         Ok(ParsedLocal {

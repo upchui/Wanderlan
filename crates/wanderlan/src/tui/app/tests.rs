@@ -484,14 +484,13 @@ fn a_restricted_site_changes_no_vlans() {
                 .as_ref()
                 .is_some_and(|m| m.text.contains("\"buero\""))
     };
-    // The network's VLANs, in the VLAN view and in the settings.
+    // The network's VLANs, in the VLAN view and in Sites (m).
     app.update(ch('3'));
     app.update(ch('v'));
     assert!(refused(&app));
     app.message = None;
-    app.update(ch('7'));
-    app.settings_selected = 0;
-    app.update(key(KeyCode::Enter));
+    app.update(ch('2'));
+    app.update(ch('m'));
     assert!(refused(&app));
     // An open site (here buero, which has no manager).
     app.message = None;
@@ -499,9 +498,9 @@ fn a_restricted_site_changes_no_vlans() {
     app.sites_selected = 1;
     app.update(ch('e'));
     assert!(refused(&app));
-    // Technical settings stay open.
+    // The settings of this host stay its own.
     app.update(ch('7'));
-    app.settings_selected = 1;
+    app.settings_selected = 2;
     app.update(key(KeyCode::Enter));
     assert!(matches!(app.modal, Some(Modal::Form(_))));
 }
@@ -548,15 +547,26 @@ fn enter_on_a_peer_opens_its_details_and_history_grows() {
 fn settings_open_the_form_at_the_chosen_setting() {
     let mut app = connected();
     app.update(ch('7'));
+    // This site, Trunk, then Commit timeout: a setting of this host.
+    app.update(key(KeyCode::Down));
     app.update(key(KeyCode::Down));
     app.update(key(KeyCode::Enter));
     match &app.modal {
         Some(Modal::Form(form)) => {
-            assert_eq!(form.kind, FormKind::Network);
+            assert_eq!(form.kind, FormKind::Local);
             assert_eq!(form.fields[form.focus].key, "commit_timeout");
         }
-        other => panic!("expected the network form, got {other:?}"),
+        other => panic!("expected the form of this host, got {other:?}"),
     }
+    // The ports: the own entry of this site.
+    app.update(key(KeyCode::Esc));
+    app.settings_selected = 5;
+    app.update(key(KeyCode::Enter));
+    assert!(
+        matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::OwnPorts("heim".into())),
+        "{:?}",
+        app.modal
+    );
 }
 
 fn picker(app: &App) -> &PortPicker {

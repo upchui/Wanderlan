@@ -307,6 +307,7 @@ mod tests {
             self_managed: false,
             uplink: uplink.map(Into::into),
             breakout: Default::default(),
+            ports: Default::default(),
         }
     }
 

@@ -116,11 +116,25 @@ impl Network {
     /// it, so for the last control ports the tunnel port goes below.
     pub fn tunnel_port(&self) -> u16 {
         self.tunnel_port
-            .unwrap_or(if self.control_port <= u16::MAX - 2 {
-                self.control_port + 1
-            } else {
-                self.control_port - 2
-            })
+            .unwrap_or_else(|| tunnel_port_for(self.control_port))
+    }
+
+    /// The control port of `site`: its own, or the network's.
+    pub fn control_port_of(&self, site: &str) -> u16 {
+        self.site(site)
+            .and_then(|s| s.ports.control)
+            .unwrap_or(self.control_port)
+    }
+
+    /// The tunnel port of `site`: its own; with an own control port the one
+    /// that goes with it; else the network's.
+    pub fn tunnel_port_of(&self, site: &str) -> u16 {
+        let ports = self.site(site).map(|s| s.ports).unwrap_or_default();
+        match (ports.tunnel, ports.control) {
+            (Some(tunnel), _) => tunnel,
+            (None, Some(control)) => tunnel_port_for(control),
+            (None, None) => self.tunnel_port(),
+        }
     }
 
     /// Looks up a site by name.
@@ -201,6 +215,29 @@ pub struct Site {
     /// public destinations of these VLANs leave through this site's own
     /// uplink instead of the tunnel. Only its managers change it.
     pub breakout: Breakouts,
+    /// Where its daemon and its tunnels listen. Only the site itself
+    /// changes them; the other sites connect there.
+    pub ports: SitePorts,
+}
+
+/// The ports of one site; `None`: the default of the network.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct SitePorts {
+    /// UDP and TCP port of its daemon: probes, sync, joining.
+    pub control: Option<u16>,
+    /// UDP port of its tunnels (VXLAN).
+    pub tunnel: Option<u16>,
+}
+
+/// The tunnel port that goes with a control port: the one after it (a
+/// tunnel through NAT also sends from the port above the tunnel port), for
+/// the last control ports two below.
+pub const fn tunnel_port_for(control: u16) -> u16 {
+    if control <= u16::MAX - 2 {
+        control + 1
+    } else {
+        control - 2
+    }
 }
 
 /// The VLANs of a site with a local breakout, by VLAN ID in the network.
@@ -347,6 +384,13 @@ pub struct Local {
     /// is a segment of its own at this site (own bridge); all other tunnels
     /// use `trunk`.
     pub tunnel_trunks: std::collections::BTreeMap<String, Vec<String>>,
+    /// Time to confirm a change on this site; `None`: the network's.
+    pub commit_timeout: Option<Duration>,
+    /// How often this site measures the path MTU; `None`: the network's.
+    pub mtu_probe_interval: Option<Duration>,
+    /// A fixed TCP MSS on this site's tunnels; `None`: the network's (by
+    /// default measured).
+    pub mss: Option<u16>,
 }
 
 impl Local {
@@ -564,6 +608,7 @@ mod tests {
             self_managed: false,
             uplink: None,
             breakout: Breakouts::new(),
+            ports: SitePorts::default(),
         });
         network.sites.push(Site {
             name: "b".into(),
@@ -576,6 +621,7 @@ mod tests {
             self_managed: false,
             uplink: None,
             breakout: Breakouts::new(),
+            ports: SitePorts::default(),
         });
         assert!(network.site("c").is_none());
         let a = network.site("a").unwrap();

@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use wanderlan_core::api::{
     self, Applied, ApplyFilesParams, ApplyParams, ChangeSource, ConfigInput, ConfigTexts,
     Confirmed, Done, Event, Interface, Invitation, InviteParams, JoinParams, Joined, Level,
@@ -240,6 +240,20 @@ pub enum Command {
         #[arg(long)]
         confirm: bool,
     },
+    /// The settings of this site: shown, or one of them changed. They change
+    /// this site only; every site sets its own.
+    ///
+    /// Example: `wanderlan settings`, `wanderlan settings commit-timeout 2m`,
+    /// `wanderlan settings control-port 52821 --confirm`.
+    Settings {
+        /// The setting to change; without it all are shown.
+        setting: Option<SettingName>,
+        /// Its value, or "default" (the network's).
+        value: Option<String>,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// The trunk ports: of the tunnel to a site (a segment of its own on this
     /// site; "default": the default trunk again), or with this site's own
     /// name the ports of the default trunk. Several ports separated by
@@ -440,6 +454,11 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             interface,
             confirm,
         }) => set_trunk(&socket, &site, &interface, confirm).await,
+        Some(Command::Settings {
+            setting,
+            value,
+            confirm,
+        }) => settings(&socket, setting, value.as_deref(), confirm).await,
         Some(Command::OwnVlans {
             site,
             vlans,
@@ -738,6 +757,148 @@ async fn set_online(socket: &Path, site: &str, online: bool, confirm: bool) -> R
         entry.online = online;
         Ok(format!("{site} is {word}"))
     })
+    .await
+}
+
+/// A setting of this site (`wanderlan settings <name> <value>`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum SettingName {
+    /// Time to confirm a change on this site (10s to 1h).
+    CommitTimeout,
+    /// How often this site measures the path MTU (at least 10s).
+    MtuCheck,
+    /// A fixed TCP MSS on this site's tunnels (536-1460).
+    Mss,
+    /// UDP and TCP port of this site's daemon.
+    ControlPort,
+    /// UDP port of this site's tunnels.
+    TunnelPort,
+}
+
+/// `wanderlan settings`: shows the settings of this site or changes one,
+/// always of this site (local.toml, or its own ports in the network).
+async fn settings(
+    socket: &Path,
+    setting: Option<SettingName>,
+    value: Option<&str>,
+    confirm: bool,
+) -> Result<ExitCode> {
+    let client = connect(socket).await?;
+    settle(&client).await?;
+    let running: ConfigTexts = client.call(Request::GetConfig).await?;
+    if !running.configured {
+        bail!("this site is not part of a network");
+    }
+    let mut network = config::parse_network(&running.network)
+        .ok()
+        .and_then(|p| p.network)
+        .context("cannot read the running configuration")?;
+    let mut local = config::parse_local(&running.local)
+        .map_err(|_| anyhow!("cannot read the running local.toml"))?
+        .local;
+    let me = local.self_name.clone().context("this site has no name")?;
+    let Some(setting) = setting else {
+        let own = |own: bool| if own { "" } else { "  (network default)" };
+        let ports = network.site(&me).map(|s| s.ports).unwrap_or_default();
+        println!(
+            "commit-timeout  {}{}",
+            humantime::format_duration(local.commit_timeout.unwrap_or(network.commit_timeout)),
+            own(local.commit_timeout.is_some())
+        );
+        println!(
+            "mtu-check       every {}{}",
+            humantime::format_duration(
+                local
+                    .mtu_probe_interval
+                    .unwrap_or(network.mtu_probe_interval)
+            ),
+            own(local.mtu_probe_interval.is_some())
+        );
+        match local.mss.or(network.mss) {
+            Some(mss) => println!("mss             fixed {mss}{}", own(local.mss.is_some())),
+            None => println!("mss             from the path MTU"),
+        }
+        println!(
+            "control-port    {} (UDP, TCP){}",
+            network.control_port_of(&me),
+            own(ports.control.is_some())
+        );
+        println!(
+            "tunnel-port     {} (UDP){}",
+            network.tunnel_port_of(&me),
+            if ports.tunnel.is_some() {
+                ""
+            } else {
+                "  (control port + 1)"
+            }
+        );
+        return Ok(ExitCode::SUCCESS);
+    };
+    let value = value.context("give a value, or \"default\" for the network's")?;
+    let default = value.trim() == "default";
+    let duration = || -> Result<Option<Duration>> {
+        if default {
+            return Ok(None);
+        }
+        humantime::parse_duration(value.trim())
+            .map(Some)
+            .map_err(|_| anyhow!("\"{value}\" is not a duration like 60s or 5m"))
+    };
+    let number = |max: u16| -> Result<Option<u16>> {
+        if default {
+            return Ok(None);
+        }
+        match value.trim().parse::<u16>() {
+            Ok(v) if (1..=max).contains(&v) => Ok(Some(v)),
+            _ => bail!("\"{value}\" is no number between 1 and {max}"),
+        }
+    };
+    let shown = if default {
+        "the network's default".to_string()
+    } else {
+        value.trim().to_string()
+    };
+    let done = match setting {
+        SettingName::CommitTimeout => {
+            local.commit_timeout = duration()?;
+            format!("The commit timeout of this site is {shown}")
+        }
+        SettingName::MtuCheck => {
+            local.mtu_probe_interval = duration()?;
+            format!("This site checks the path MTU every {shown}")
+        }
+        SettingName::Mss => {
+            local.mss = number(u16::MAX)?;
+            format!("The TCP MSS of this site is {shown}")
+        }
+        SettingName::ControlPort | SettingName::TunnelPort => {
+            let port = number(if setting == SettingName::TunnelPort {
+                u16::MAX - 1
+            } else {
+                u16::MAX
+            })?;
+            let site = network
+                .sites
+                .iter_mut()
+                .find(|s| s.name == me)
+                .context("this site is not in its network")?;
+            if setting == SettingName::ControlPort {
+                site.ports.control = port;
+                format!("The control port of this site is {shown}")
+            } else {
+                site.ports.tunnel = port;
+                format!("The tunnel port of this site is {shown}")
+            }
+        }
+    };
+    send_edit(
+        &client,
+        &network,
+        config::render_local(&local),
+        running.revision,
+        confirm,
+        &done,
+    )
     .await
 }
 

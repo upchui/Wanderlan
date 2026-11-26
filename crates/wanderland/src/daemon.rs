@@ -852,7 +852,7 @@ impl Controller {
     /// measurements, so that a restart does not remove and re-add them.
     async fn seed_measurements(&mut self) {
         let Some(cfg) = &self.config else { return };
-        if cfg.network.mss.is_some() {
+        if cfg.mss().is_some() {
             return;
         }
         let Ok(Some(rules)) = self.sys.nft_state().await.map(|s| s.map(|s| s.mss)) else {
@@ -1180,7 +1180,7 @@ impl Controller {
                 } else {
                     s.address
                 };
-                SocketAddrV4::new(ip, cfg.network.control_port)
+                SocketAddrV4::new(ip, cfg.control_port())
             })
         });
         // The clients with a key are never contacted first: they come.
@@ -1237,21 +1237,20 @@ impl Controller {
             }
         };
         self.expected = expected;
-        let mtu_interval = self.config.as_ref().and_then(|c| {
-            c.network
-                .mss
-                .is_none()
-                .then_some(c.network.mtu_probe_interval)
-        });
+        let mtu_interval = self
+            .config
+            .as_ref()
+            .and_then(|c| c.mss().is_none().then_some(c.mtu_probe_interval()));
         // The test whether a client tunnel can run direct: the VNIs of the
         // clients (for the test frames), the tunnel to the uplink.
-        let vnis = self
-            .runtime
-            .vnis
-            .iter()
-            .filter(|(peer, _)| passive.contains(*peer))
-            .map(|(peer, vni)| (peer.clone(), *vni))
-            .collect();
+        let tests = self.config.as_ref().map_or_else(BTreeMap::new, |cfg| {
+            self.runtime
+                .vnis
+                .iter()
+                .filter(|(peer, _)| passive.contains(*peer))
+                .map(|(peer, vni)| (peer.clone(), (*vni, cfg.network.tunnel_port_of(peer))))
+                .collect()
+        });
         let uplink = self
             .config
             .as_ref()
@@ -1262,10 +1261,20 @@ impl Controller {
                 peer,
                 direct: self.runtime.uplink_direct,
             });
-        let tunnel_port = self.config.as_ref().map_or(0, |c| c.network.tunnel_port());
+        let probe_peers = self.config.as_ref().map_or_else(BTreeMap::new, |cfg| {
+            peers
+                .iter()
+                .map(|(name, addr)| {
+                    (
+                        name.clone(),
+                        SocketAddrV4::new(*addr, cfg.network.control_port_of(name)),
+                    )
+                })
+                .collect()
+        });
         self.probe_config.send_replace(ProbeConfig {
             bind,
-            peers,
+            peers: probe_peers,
             responders,
             generation: self.generation,
             mtu_interval,
@@ -1274,8 +1283,7 @@ impl Controller {
             me: self.identity.clone().map(Me),
             keys: self.peer_keys.clone(),
             passive,
-            tunnel_port,
-            vnis,
+            tests,
             direct: self.runtime.direct.clone(),
             uplink,
         });
@@ -1469,7 +1477,7 @@ impl Controller {
     /// reaches the client at `at`) or through NAT.
     async fn tunnel_direct(&mut self, peer: &str, at: Option<Ipv4Addr>) {
         let Some(cfg) = &self.config else { return };
-        let port = cfg.network.tunnel_port();
+        let (port, own_port) = (cfg.network.tunnel_port_of(peer), cfg.tunnel_port());
         let kind = topology::tunnels_for(&cfg.network, cfg.self_name())
             .into_iter()
             .find(|t| t.peer.name == peer)
@@ -1494,7 +1502,7 @@ impl Controller {
                 "The tunnel to client \"{peer}\" runs direct now: it is reachable at {ip}:{port}"
             ),
             (_, Some(_)) => format!(
-                "The tunnel to \"{peer}\" runs direct now: it reaches this site at UDP {port}"
+                "The tunnel to \"{peer}\" runs direct now: it reaches this site at UDP {own_port}"
             ),
             (_, None) => format!(
                 "The tunnel to \"{peer}\" runs through NAT now (the client opens the flows)"
@@ -1652,7 +1660,6 @@ impl Controller {
             Some(v) => v,
             None => Version::of(&confirmed.network),
         };
-        let port = confirmed.network.control_port;
         let tunnels: Vec<(String, TunnelKind)> = topology::tunnels_for(&confirmed.network, &me)
             .into_iter()
             .map(|t| (t.peer.name.clone(), t.kind))
@@ -1779,9 +1786,9 @@ impl Controller {
         let Some((peer, version, mode)) = chosen else {
             return;
         };
-        let peers = self.direct_peers();
-        let Some(addr) = peers.get(&peer) else { return };
-        let target = SocketAddrV4::new(*addr, port);
+        let Some(target) = self.control_target(&peer) else {
+            return;
+        };
         match (&mode, version) {
             (FetchMode::Merge, Some(v)) => self.events.emit(
                 Level::Info,
@@ -1820,16 +1827,30 @@ impl Controller {
         });
     }
 
+    /// Where the daemon of `peer` listens: where its authenticated probes
+    /// come from (it may just have moved to another port, which this site
+    /// learns only with its network), else its control port in the network.
+    fn control_target(&self, peer: &str) -> Option<SocketAddrV4> {
+        let cfg = self.confirmed.as_ref()?;
+        let addr = *self.direct_peers().get(peer)?;
+        let seen = self
+            .probes
+            .read()
+            .ok()
+            .and_then(|t| t.get(peer).and_then(|p| p.control_at))
+            .filter(|at| *at.ip() == addr);
+        Some(seen.unwrap_or_else(|| SocketAddrV4::new(addr, cfg.network.control_port_of(peer))))
+    }
+
     /// Sends this site's network to its uplink (`SYNC` with a body).
     fn push_to(&mut self, peer: &str, fingerprint: &str) {
-        let Some(cfg) = &self.confirmed else { return };
-        let Some(addr) = self.direct_peers().get(peer).copied() else {
+        let Some(target) = self.control_target(peer) else {
             return;
         };
+        let Some(cfg) = &self.confirmed else { return };
         let (Some(me), Some(k)) = (self.own_id(), self.peer_keys.get(peer).cloned()) else {
             return;
         };
-        let target = SocketAddrV4::new(addr, cfg.network.control_port);
         let text = render_network_wire(&cfg.network);
         self.pushing = true;
         self.pushed = Some(fingerprint.to_string());
@@ -2221,7 +2242,7 @@ impl Controller {
         let command = self
             .confirmed
             .as_ref()
-            .and_then(|c| c.self_site().map(|s| (s.address, c.network.control_port)))
+            .and_then(|c| c.self_site().map(|s| (s.address, c.control_port())))
             .map(|(address, port)| {
                 if port == config::DEFAULT_CONTROL_PORT {
                     format!("wanderlan join {address} {}", invite.code)
@@ -2735,7 +2756,7 @@ impl Controller {
         // Within the range of commit_timeout: a huge value from the API
         // would never roll back (or overflow the deadline).
         let timeout = timeout
-            .unwrap_or(cfg.network.commit_timeout)
+            .unwrap_or(cfg.commit_timeout())
             .clamp(MIN_TIMEOUT, config::COMMIT_TIMEOUT_RANGE.1);
         let fingerprint = config::fingerprint(&cfg.network);
         let previous = self.config.clone();
@@ -3509,7 +3530,12 @@ impl Controller {
                         t,
                         &self.runtime,
                         probe.and_then(|p| p.direct_test),
-                        desired.tunnel_port,
+                        // A client is tested at its port, this site at its own.
+                        if t.kind == TunnelKind::Client {
+                            cfg.network.tunnel_port_of(&t.peer.name)
+                        } else {
+                            desired.tunnel_port
+                        },
                     ),
                     vni,
                     endpoint: self

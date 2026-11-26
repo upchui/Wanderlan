@@ -2104,7 +2104,10 @@ impl App {
             network: draft.network_text(),
             local: draft.local_text(),
             base_revision: draft.base_revision,
-            commit_timeout: draft.network.commit_timeout,
+            commit_timeout: draft
+                .local
+                .commit_timeout
+                .unwrap_or(draft.network.commit_timeout),
             lines: draft.diff(self.running.as_ref()),
             problems: draft.diagnostics.clone(),
             scroll: 0,
@@ -2908,7 +2911,7 @@ impl App {
     }
 
     fn on_settings_key(&mut self, key: &KeyEvent, fx: &mut Vec<Effect>) {
-        use super::ui::settings::{ROWS, Setting, settings};
+        use super::ui::settings::{ROWS, Scope, Setting, settings};
         let all = settings(self.draft.as_ref());
         if let Some(n) = nav(
             key.code,
@@ -2932,14 +2935,11 @@ impl App {
                             self.open_ports(PortTarget::Default, fx);
                             return;
                         }
-                        if row.key == "vlans" && !self.may_change_network_vlans() {
-                            return;
-                        }
                         let Some(draft) = &self.draft else { return };
-                        let mut form = if row.local {
-                            Form::local(draft)
-                        } else {
-                            Form::network(draft)
+                        // This host only: local.toml or its own ports.
+                        let mut form = match row.scope {
+                            Scope::Local => Form::local(draft),
+                            Scope::OwnSite => Form::own_ports(draft),
                         };
                         form.focus_on(row.key);
                         self.modal = Some(Modal::Form(form));
@@ -3051,7 +3051,14 @@ impl App {
             KeyCode::Char('N') if selected < count => {
                 self.modal = Some(Modal::Form(Form::rename(draft, selected)));
             }
-            KeyCode::Char('m') => self.modal = Some(Modal::Form(Form::network(draft))),
+            // The VLANs of the network (each site sets its own settings).
+            KeyCode::Char('m') => {
+                if self.may_change_network_vlans()
+                    && let Some(draft) = &self.draft
+                {
+                    self.modal = Some(Modal::Form(Form::vlans(draft)));
+                }
+            }
             KeyCode::Char('i') => self.invite(),
             KeyCode::Char('I') => self.show_invites(fx),
             KeyCode::Char('o') if selected < count => self.toggle_online(),

@@ -228,6 +228,7 @@ mod tests {
             self_name: Some("haus2".into()),
             trunk: vec!["ens19".into()],
             tunnel_trunks: [("heim".to_string(), vec!["ens20".to_string()])].into(),
+            ..Local::default()
         };
         // A peer renamed: the trunk of the tunnel to it follows.
         let mut received = previous.clone();

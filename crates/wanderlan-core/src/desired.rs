@@ -248,7 +248,9 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
     let default_trunk = cfg.trunk();
 
     let self_online = cfg.self_site().is_none_or(|s| s.online);
-    let tunnel_port = network.tunnel_port();
+    // This site listens (and through NAT sends) on its own tunnel port; it
+    // sends to the one of each peer.
+    let tunnel_port = cfg.tunnel_port();
     let passing = forwarding::forwarding(network, me);
     let mut has_clients = false;
     let mut unbuilt = BTreeMap::new();
@@ -306,8 +308,11 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
             (TunnelKind::Client, TunnelMode::Direct) => runtime
                 .direct
                 .get(&t.peer.name)
-                .map(|ip| SocketAddrV4::new(*ip, tunnel_port)),
-            _ => Some(SocketAddrV4::new(t.peer.address, tunnel_port)),
+                .map(|ip| SocketAddrV4::new(*ip, network.tunnel_port_of(&t.peer.name))),
+            _ => Some(SocketAddrV4::new(
+                t.peer.address,
+                network.tunnel_port_of(&t.peer.name),
+            )),
         };
         let down_reason = down_reason.or_else(|| {
             remote.is_none().then(|| {
@@ -694,8 +699,7 @@ fn mss_rules(cfg: &Config, tunnels: &[TunnelSpec], runtime: &Runtime) -> BTreeSe
             (a, b) => a.or(b),
         };
         let mss = cfg
-            .network
-            .mss
+            .mss()
             .or_else(|| measured.get(t.name.as_str()).map(|p| mtu::mss_for_pmtu(*p)))
             .or(preliminary);
         let Some(mss) = mss else { continue };
@@ -834,6 +838,25 @@ mod tests {
         assert_eq!(d.trunk().vlans.len(), 41);
         assert!(d.trunk().vlans.values().all(|f| *f == VlanFlags::TAGGED));
         assert!(!d.trunk().vlans.contains_key(&1));
+    }
+
+    #[test]
+    fn each_site_listens_on_its_own_tunnel_port_and_sends_to_the_peers() {
+        let mut cfg = config("heim");
+        for site in &mut cfg.network.sites {
+            match site.name.as_str() {
+                "heim" => site.ports.control = Some(52821),
+                "buero" => site.ports.tunnel = Some(52833),
+                _ => {}
+            }
+        }
+        let d = derive(&cfg, &Runtime::default());
+        assert_eq!(d.tunnel_port, 52822, "the one after its own control port");
+        let t = d.tunnels.iter().find(|t| t.peer == "buero").unwrap();
+        assert_eq!(t.params.port, 52822);
+        assert_eq!(t.remote.map(|r| r.port()), Some(52833));
+        let other = d.tunnels.iter().find(|t| t.peer == "haus3").unwrap();
+        assert_eq!(other.remote.map(|r| r.port()), Some(51822));
     }
 
     #[test]

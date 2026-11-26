@@ -53,3 +53,27 @@ expect_ping c-site5 10.30.0.1 "mapped VLAN 130 at site5 reaches VLAN 30 at site1
 sed 's/^vlans = .*/vlans = "10-50"/' "$RUN_DIR/network-map.toml" | put site1 /tmp/network-50.toml
 x site1 "wanderlan apply --network /tmp/network-50.toml >/dev/null && wanderlan confirm >/dev/null"
 wait_eq 90 "site5 is back at VLANs 10-50" "10-19,20:pu,21-50" vlan_summary site5 trunk0
+
+begin "Settings: every site sets its own, nobody those of another"
+
+client_vlan c-site3 20 10.20.0.11/24
+client_vlan c-site4 20 10.20.0.12/24
+site4_entry() { x site1 "sed -n '/^\[site.site4\]/,/^\[/p' /etc/wanderlan/network.toml"; }
+check "site4 moves its control port" x site4 "wanderlan settings control-port 52821 --confirm"
+check "and its tunnel port" x site4 "wanderlan settings tunnel-port 52833 --confirm"
+wait_for 90 "site1 learned the ports of site4 (from site4, at its new port)" \
+  eval 'site4_entry | grep -q "^control_port = 52821" && site4_entry | grep -q "^tunnel_port = 52833"'
+wait_for 30 "site1 sends to the new tunnel port of site4" \
+  x site1 "bridge fdb show dev vx-site4 | grep -q 'port 52833'"
+expect_ping c-site3 10.20.0.12 "VLAN 20: site3 reaches site4 at its new ports"
+x site1 "sed 's/^control_port = 52821/control_port = 52999/' /etc/wanderlan/network.toml > /tmp/ports.toml"
+check "site1 cannot change the ports of site4" \
+  x site1 "! wanderlan apply --network /tmp/ports.toml 2>/tmp/ports.err && grep -q 'only \"site4\" itself' /tmp/ports.err"
+check "site4 sets its own commit timeout" x site4 "wanderlan settings commit-timeout 2m --confirm"
+check "site4 keeps it in its local.toml" x site4 "grep -q '^commit_timeout = \"2m\"' /etc/wanderlan/local.toml"
+check "site1 keeps its own" x site1 "wanderlan settings | grep -q '^commit-timeout  1m  (network default)'"
+for s in commit-timeout tunnel-port control-port; do
+  x site4 "wanderlan settings $s default --confirm" >/dev/null
+done
+wait_for 90 "site1 has the default ports of site4 again" eval '! site4_entry | grep -q "_port ="'
+expect_ping c-site3 10.20.0.12 "VLAN 20: site3 reaches site4 at the default ports again"

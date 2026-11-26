@@ -31,8 +31,8 @@ pub enum FormKind {
     Site(Option<String>),
     /// A VLAN mapping (as it was); `None` adds a new one.
     Map(Option<VlanMap>),
-    /// The `[network]` settings.
-    Network,
+    /// The ports of this site (its own entry in the network).
+    OwnPorts(String),
     /// Only the shared VLANs.
     Vlans,
     /// `local.toml`.
@@ -165,7 +165,7 @@ pub struct Form {
     pub notes: Vec<Diagnostic>,
     /// The user tried to save at least once.
     pub submitted: bool,
-    candidate: Option<Draft>,
+    candidate: Option<Box<Draft>>,
 }
 
 impl Form {
@@ -434,48 +434,30 @@ impl Form {
         Self::new(FormKind::Breakout(existing), title, fields, draft)
     }
 
-    /// Form for the `[network]` settings.
-    pub fn network(draft: &Draft) -> Self {
-        let m = &draft.network;
+    /// Form for the ports of this site (its own entry: the other sites
+    /// connect there). Empty: the default of the network.
+    pub fn own_ports(draft: &Draft) -> Self {
+        let me = draft.local.self_name.clone().unwrap_or_default();
+        let ports = draft.network.site(&me).map(|s| s.ports).unwrap_or_default();
+        let shown = |p: Option<u16>| p.map(|p| p.to_string()).unwrap_or_default();
         let fields = vec![
-            vlans_field(&m.vlans),
             Field::text(
                 "control_port",
                 "Control port",
-                "UDP/TCP port of the daemons on the site addresses",
-                m.control_port.to_string(),
+                format!(
+                    "UDP/TCP port of this site's daemon; empty: the network's ({})",
+                    draft.network.control_port
+                ),
+                shown(ports.control),
             ),
             Field::text(
                 "tunnel_port",
                 "Tunnel port",
-                "UDP port of the VXLAN tunnels (NAT also the one above); empty: control port + 1",
-                m.tunnel_port.map(|p| p.to_string()).unwrap_or_default(),
-            ),
-            Field::text(
-                "mtu_probe_interval",
-                "MTU probe every",
-                "how often the path MTU is measured, e.g. 5m",
-                format::duration(m.mtu_probe_interval),
-            ),
-            Field::text(
-                "commit_timeout",
-                "Commit timeout",
-                "time to confirm a change before it is rolled back, e.g. 60s",
-                format::duration(m.commit_timeout),
-            ),
-            Field::text(
-                "mss",
-                "Fixed MSS",
-                "empty: derive from the measured path MTU; or 536-1460",
-                m.mss.map(|v| v.to_string()).unwrap_or_default(),
+                "UDP port of this site's tunnels (NAT also the one above); empty: control port + 1",
+                shown(ports.tunnel),
             ),
         ];
-        Self::new(
-            FormKind::Network,
-            "Network settings (all sites)",
-            fields,
-            draft,
-        )
+        Self::new(FormKind::OwnPorts(me), "Ports of this site", fields, draft)
     }
 
     /// Form for the own VLANs of the site `site` (index in the network).
@@ -551,14 +533,44 @@ impl Form {
     pub fn local(draft: &Draft) -> Self {
         let sites: Vec<String> = draft.network.sites.iter().map(|s| s.name.clone()).collect();
         let own = draft.local.self_name.clone().unwrap_or_default();
-        let fields = vec![Field::choice(
-            "self",
-            "This site",
-            "which site of the network this host is",
-            sites,
-            &own,
-        )];
-        Self::new(FormKind::Local, "This site (local.toml)", fields, draft)
+        let l = &draft.local;
+        let n = &draft.network;
+        let fields = vec![
+            Field::choice(
+                "self",
+                "This site",
+                "which site of the network this host is",
+                sites,
+                &own,
+            ),
+            Field::text(
+                "commit_timeout",
+                "Commit timeout",
+                format!(
+                    "time to confirm a change here, e.g. 60s; empty: the network's ({})",
+                    format::duration(n.commit_timeout)
+                ),
+                l.commit_timeout.map(format::duration).unwrap_or_default(),
+            ),
+            Field::text(
+                "mtu_probe_interval",
+                "MTU probe every",
+                format!(
+                    "how often this site measures the path MTU, e.g. 5m; empty: the network's ({})",
+                    format::duration(n.mtu_probe_interval)
+                ),
+                l.mtu_probe_interval
+                    .map(format::duration)
+                    .unwrap_or_default(),
+            ),
+            Field::text(
+                "mss",
+                "Fixed MSS",
+                "empty: derive from the measured path MTU; or 536-1460",
+                l.mss.map(|v| v.to_string()).unwrap_or_default(),
+            ),
+        ];
+        Self::new(FormKind::Local, "This host (local.toml)", fields, draft)
     }
 
     /// Looks up a field by key.
@@ -658,7 +670,7 @@ impl Form {
             f.warning = None;
         }
         self.notes.clear();
-        self.candidate = self.build(draft);
+        self.candidate = self.build(draft).map(Box::new);
         let Some(candidate) = self.candidate.take() else {
             return;
         };
@@ -701,7 +713,7 @@ impl Form {
         self.submitted = true;
         self.revalidate(draft);
         if self.is_valid() {
-            self.candidate.take()
+            self.candidate.take().map(|d| *d)
         } else {
             if let Some(i) = self
                 .fields
@@ -723,9 +735,10 @@ impl Form {
     fn index(&self, draft: &Draft) -> Option<usize> {
         match &self.kind {
             FormKind::Site(None) | FormKind::Invite => Some(draft.network.sites.len()),
-            FormKind::Site(Some(name)) | FormKind::OwnVlans(name) | FormKind::Rename(name) => {
-                Self::site_index(draft, name)
-            }
+            FormKind::Site(Some(name))
+            | FormKind::OwnVlans(name)
+            | FormKind::Rename(name)
+            | FormKind::OwnPorts(name) => Self::site_index(draft, name),
             FormKind::Breakout(_) => Self::site_index(draft, &self.breakout_site()),
             FormKind::Map(None) => Some(draft.network.maps.len()),
             FormKind::Map(Some(map)) => draft.network.maps.iter().position(|m| m == map),
@@ -740,20 +753,22 @@ impl Form {
                         .unwrap_or(draft.network.tunnels.len()),
                 )
             }
-            FormKind::Network | FormKind::Vlans | FormKind::Local => None,
+            FormKind::Vlans | FormKind::Local => None,
         }
     }
 
     fn entity_path(&self, draft: &Draft) -> Option<FieldPath> {
         let i = self.index(draft)?;
         match &self.kind {
-            FormKind::Site(_) | FormKind::Invite | FormKind::OwnVlans(_) | FormKind::Rename(_) => {
-                Some(FieldPath::site(i))
-            }
+            FormKind::Site(_)
+            | FormKind::Invite
+            | FormKind::OwnVlans(_)
+            | FormKind::Rename(_)
+            | FormKind::OwnPorts(_) => Some(FieldPath::site(i)),
             FormKind::Map(_) => Some(FieldPath::map(i)),
             FormKind::TunnelVlans(..) => Some(FieldPath::tunnel(i)),
             FormKind::Breakout(_) => Some(FieldPath::site_field(i, "breakout")),
-            FormKind::Network | FormKind::Vlans | FormKind::Local => None,
+            FormKind::Vlans | FormKind::Local => None,
         }
     }
 
@@ -761,9 +776,11 @@ impl Form {
     fn path_of(&self, key: &str, draft: &Draft) -> FieldPath {
         let i = self.index(draft).unwrap_or_default();
         match &self.kind {
-            FormKind::Site(_) | FormKind::Invite | FormKind::OwnVlans(_) | FormKind::Rename(_) => {
-                FieldPath::site_field(i, key)
-            }
+            FormKind::Site(_)
+            | FormKind::Invite
+            | FormKind::OwnVlans(_)
+            | FormKind::Rename(_)
+            | FormKind::OwnPorts(_) => FieldPath::site_field(i, key),
             FormKind::Map(_) => FieldPath::map_field(i, key),
             FormKind::TunnelVlans(..) => FieldPath::tunnel_field(i, key),
             FormKind::Breakout(_) => {
@@ -774,7 +791,7 @@ impl Form {
                     _ => FieldPath::site_field(i, &format!("breakout.{vid}.{key}")),
                 }
             }
-            FormKind::Network | FormKind::Vlans => FieldPath::network(key),
+            FormKind::Vlans => FieldPath::network(key),
             FormKind::Local => FieldPath::local(key),
         }
     }
@@ -868,21 +885,15 @@ impl Form {
                     None => candidate.network.maps.push(map),
                 }
             }
-            FormKind::Network => {
-                let vlans = self.parse_vlans();
-                let port = self.parse_port();
-                let tunnel_port = self.parse_tunnel_port();
-                let interval = self.parse_duration("mtu_probe_interval");
-                let timeout = self.parse_duration("commit_timeout");
-                let mss = self.parse_mss();
-                let vlans = vlans.and_then(|v| self.guard_network_vlans(draft, v));
-                let network = &mut candidate.network;
-                network.vlans = vlans?;
-                network.control_port = port?;
-                network.tunnel_port = tunnel_port?;
-                network.mtu_probe_interval = interval?;
-                network.commit_timeout = timeout?;
-                network.mss = mss?;
+            FormKind::OwnPorts(name) => {
+                let Some(i) = Self::site_index(draft, &name) else {
+                    return self.gone(&format!("Site {name}"));
+                };
+                let control = self.parse_opt_port("control_port", u16::MAX);
+                let tunnel = self.parse_opt_port("tunnel_port", u16::MAX - 1);
+                let ports = &mut candidate.network.sites.get_mut(i)?.ports;
+                ports.control = control?;
+                ports.tunnel = tunnel?;
             }
             FormKind::Vlans => {
                 let vlans = self.parse_vlans()?;
@@ -940,7 +951,14 @@ impl Form {
             }
             FormKind::Local => {
                 let own = self.value("self");
-                candidate.local.self_name = (!own.is_empty()).then_some(own);
+                let timeout = self.parse_opt_duration("commit_timeout");
+                let interval = self.parse_opt_duration("mtu_probe_interval");
+                let mss = self.parse_mss();
+                let local = &mut candidate.local;
+                local.self_name = (!own.is_empty()).then_some(own);
+                local.commit_timeout = timeout?;
+                local.mtu_probe_interval = interval?;
+                local.mss = mss?;
             }
             FormKind::Breakout(old) => {
                 if let Some((site, vid)) = &old {
@@ -1090,6 +1108,7 @@ impl Form {
             managed_by: candidate.local.self_name.clone(),
             uplink: candidate.local.self_name.clone(),
             breakout: Default::default(),
+            ports: Default::default(),
             self_managed: false,
         });
         if let Some(shared) = native {
@@ -1156,6 +1175,7 @@ impl Form {
             self_managed: false,
             uplink: None,
             breakout: Default::default(),
+            ports: Default::default(),
         })
     }
 
@@ -1241,35 +1261,29 @@ impl Form {
         }
     }
 
-    fn parse_port(&mut self) -> Option<u16> {
-        match self.value("control_port").parse::<u16>() {
-            Ok(p) if p > 0 => Some(p),
-            _ => {
-                self.set_error("control_port", "a port number between 1 and 65535");
-                None
-            }
-        }
-    }
-
-    /// Empty: `None` (it follows the control port).
-    fn parse_tunnel_port(&mut self) -> Option<Option<u16>> {
-        let text = self.value("tunnel_port");
-        if text.trim().is_empty() {
+    /// Empty: `None` (the network's default).
+    fn parse_opt_port(&mut self, key: &str, max: u16) -> Option<Option<u16>> {
+        let text = self.value(key);
+        if text.is_empty() {
             return Some(None);
         }
-        match text.trim().parse::<u16>() {
-            Ok(p) if (1..u16::MAX).contains(&p) => Some(Some(p)),
+        match text.parse::<u16>() {
+            Ok(p) if (1..=max).contains(&p) => Some(Some(p)),
             _ => {
-                self.set_error("tunnel_port", "empty or a port number between 1 and 65534");
+                self.set_error(key, format!("empty or a port number between 1 and {max}"));
                 None
             }
         }
     }
 
-    fn parse_duration(&mut self, key: &str) -> Option<Duration> {
+    /// Empty: `None` (the network's default).
+    fn parse_opt_duration(&mut self, key: &str) -> Option<Option<Duration>> {
         let text = self.value(key);
+        if text.is_empty() {
+            return Some(None);
+        }
         match humantime::parse_duration(&text) {
-            Ok(d) => Some(d),
+            Ok(d) => Some(Some(d)),
             Err(_) => {
                 self.set_error(key, format!("\"{text}\" is not a duration like 60s or 5m"));
                 None
@@ -1591,9 +1605,9 @@ mod tests {
     }
 
     #[test]
-    fn network_settings_parse_and_validate() {
+    fn the_settings_of_this_host_parse_and_validate() {
         let d = draft();
-        let mut form = Form::network(&d);
+        let mut form = Form::local(&d);
         form.focus = form.fields.iter().position(|f| f.key == "mss").unwrap();
         type_text(&mut form, &d, "100");
         let mss = form.field("mss").unwrap();
@@ -1608,7 +1622,15 @@ mod tests {
         press(&mut form, &d, KeyCode::Backspace);
         type_text(&mut form, &d, "1300");
         let new = form.submit(&d).expect("valid");
-        assert_eq!(new.network.mss, Some(1300));
+        assert_eq!(new.local.mss, Some(1300));
+        assert_eq!(new.network, d.network, "nothing of the other sites");
+        // The ports: only the own entry.
+        let mut form = Form::own_ports(&d);
+        type_text(&mut form, &d, "52821");
+        let new = form.submit(&d).expect("valid");
+        let me = d.local.self_name.clone().unwrap();
+        assert_eq!(new.network.control_port_of(&me), 52821);
+        assert_eq!(new.network.control_port, d.network.control_port);
     }
 
     #[test]
@@ -1629,10 +1651,14 @@ mod tests {
     }
 
     #[test]
-    fn the_local_form_only_chooses_the_site() {
+    fn the_local_form_chooses_the_site_and_this_host_s_settings() {
         let d = draft();
         let mut form = Form::local(&d);
-        assert_eq!(form.fields.len(), 1, "the trunk has a window of its own");
+        assert_eq!(
+            form.fields.iter().map(|f| f.key).collect::<Vec<_>>(),
+            ["self", "commit_timeout", "mtu_probe_interval", "mss"],
+            "the trunk has a window of its own"
+        );
         assert_eq!(form.value("self"), "heim");
         form.handle_key(&KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         let saved = form.submit(&d).expect("valid");

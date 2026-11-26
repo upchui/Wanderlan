@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use super::model::{Breakouts, Local, LocalVid, Network};
+use super::model::{Breakouts, Local, LocalVid, Network, SitePorts};
 
 const NETWORK_HEADER: &str = "\
 # wanderlan network configuration, shared by all sites.
@@ -131,6 +131,7 @@ pub fn render_network(network: &Network) -> String {
             if let Some(line) = breakout_line(&site.breakout) {
                 out.push_str(&line);
             }
+            out.push_str(&ports_lines(site.ports));
         }
         let maps: Vec<String> = network
             .maps
@@ -237,6 +238,8 @@ fn render_network_inner(network: &Network, with_revision: bool) -> String {
         if let Some(line) = breakout_line(&site.breakout) {
             out.push_str(&line);
         }
+        // Only where set: older sites know the form without them.
+        out.push_str(&ports_lines(site.ports));
         match &site.uplink {
             Some(up) => {
                 let _ = writeln!(out, "uplink = {}", quote(up));
@@ -309,6 +312,15 @@ pub fn render_local(local: &Local) -> String {
     if !local.trunk.is_empty() {
         let _ = writeln!(out, "trunk = {}", ports(&local.trunk));
     }
+    if let Some(t) = local.commit_timeout {
+        let _ = writeln!(out, "commit_timeout = {}", duration(t));
+    }
+    if let Some(t) = local.mtu_probe_interval {
+        let _ = writeln!(out, "mtu_probe_interval = {}", duration(t));
+    }
+    if let Some(mss) = local.mss {
+        let _ = writeln!(out, "mss = {mss}");
+    }
     for (site, trunk) in &local.tunnel_trunks {
         let key = key(site);
         // The comment is one line, whatever the name holds.
@@ -321,6 +333,18 @@ pub fn render_local(local: &Local) -> String {
             "\n# The tunnel to \"{shown}\" has its own trunk (a segment of its own).\n[tunnels.{key}]\ntrunk = {}\n",
             ports(trunk)
         );
+    }
+    out
+}
+
+/// The own ports of a site (nothing for the default ones).
+fn ports_lines(ports: SitePorts) -> String {
+    let mut out = String::new();
+    if let Some(port) = ports.control {
+        let _ = writeln!(out, "control_port = {port}");
+    }
+    if let Some(port) = ports.tunnel {
+        let _ = writeln!(out, "tunnel_port = {port}");
     }
     out
 }

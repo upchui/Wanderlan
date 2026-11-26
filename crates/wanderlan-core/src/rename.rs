@@ -114,6 +114,7 @@ mod tests {
             self_managed: false,
             uplink: uplink.map(Into::into),
             breakout: Default::default(),
+            ports: Default::default(),
         }
     }
 
@@ -211,6 +212,7 @@ mod tests {
             self_name: Some("c".into()),
             trunk: vec!["ens19".into()],
             tunnel_trunks: [("hq".to_string(), vec!["ens20".to_string()])].into(),
+            ..Local::default()
         };
         let renamed = follow_renames(&old, &new, &mut local);
         assert_eq!(renamed.len(), 2);

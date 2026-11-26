@@ -364,6 +364,7 @@ pub fn add_site(
         // Plugged into the inviting site: its only tunnel leads there.
         uplink: Some(inviter.to_string()),
         breakout: Default::default(),
+        ports: Default::default(),
     });
     if let Some(shared) = rules.native {
         new.maps.push(VlanMap {
@@ -529,6 +530,7 @@ mod tests {
             self_managed: false,
             uplink: None,
             breakout: Default::default(),
+            ports: Default::default(),
         });
         network
     }
@@ -648,6 +650,7 @@ mod tests {
             self_managed: false,
             uplink: None,
             breakout: Default::default(),
+            ports: Default::default(),
         });
         let moved = join(&base, "site3", "site2", false, NEW, &none()).unwrap();
         assert!(!moved.added && moved.changed);
@@ -686,6 +689,7 @@ mod tests {
             self_managed: false,
             uplink: Some("site2".into()),
             breakout: Default::default(),
+            ports: Default::default(),
         });
         let no_loop = join(&chain, "site4", "site2", false, NEW, &none()).unwrap();
         assert!(!no_loop.changed);

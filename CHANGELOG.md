@@ -31,6 +31,21 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 - Update all sites before using it: older ones do not read a network with
   a breakout (networks without one stay as they were).
 
+### Settings of a site only on that site
+
+- Every setting of the Settings view (`7`) changes this site only, in the
+  TUI and with `wanderlan settings [<setting> <value|default>]`: the commit
+  timeout, the path MTU check and a fixed MSS go into `local.toml`; the
+  control port and the tunnel port into the site's own entry of the network
+  (`site.<name>.control_port` / `tunnel_port`), which only the site itself
+  may change; the other sites learn them with the network and connect
+  there (also right after a change: they fetch from where its probes come
+  from).
+- The values of `[network]` (ports, commit timeout, MTU check, MSS) are only
+  the defaults of the sites without their own and cannot be changed any
+  more; the network VLANs stay where they were (VLANs `3` → `v`, Sites `2` →
+  `m`), with the rights of before.
+
 ### Tunnel mode found out by itself; fixes
 
 - No `tunnel_mode` setting and no `wanderlan tunnel-mode` any more: a client

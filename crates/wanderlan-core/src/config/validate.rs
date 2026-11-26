@@ -214,6 +214,26 @@ impl Validator {
                 );
             }
 
+            // Its own ports: the tunnel port and the one above it (NAT)
+            // apart from the control port.
+            if site.ports != super::model::SitePorts::default() {
+                let control = network.control_port_of(name);
+                let tunnel = network.tunnel_port_of(name);
+                if tunnel == control || tunnel.checked_add(1) == Some(control) {
+                    self.error(
+                        FieldPath::site_field(i, "tunnel_port"),
+                        format!(
+                            "site \"{name}\": its tunnel port {tunnel} and the port above it must differ from its control port {control}"
+                        ),
+                    );
+                } else if tunnel == u16::MAX {
+                    self.error(
+                        FieldPath::site_field(i, "tunnel_port"),
+                        format!("site \"{name}\": its tunnel port must be at most 65534"),
+                    );
+                }
+            }
+
             if site
                 .vlans
                 .as_ref()
@@ -520,6 +540,38 @@ impl Validator {
                     "self = \"{name}\" is not a site in network.toml (known sites: {})",
                     known.join(", ")
                 ),
+            );
+        }
+        // The settings of this site alone, in the ranges of the network's.
+        if let Some(t) = local.mtu_probe_interval
+            && !(PROBE_INTERVAL_MIN..=PROBE_INTERVAL_MAX).contains(&t)
+        {
+            push(
+                "mtu_probe_interval",
+                format!(
+                    "mtu_probe_interval must be between {} and {}",
+                    humantime::format_duration(PROBE_INTERVAL_MIN),
+                    humantime::format_duration(PROBE_INTERVAL_MAX)
+                ),
+            );
+        }
+        let (min, max) = COMMIT_TIMEOUT_RANGE;
+        if let Some(t) = local.commit_timeout
+            && !(min..=max).contains(&t)
+        {
+            push(
+                "commit_timeout",
+                format!(
+                    "commit_timeout must be between {} and {}",
+                    humantime::format_duration(min),
+                    humantime::format_duration(max)
+                ),
+            );
+        }
+        if let Some(mss) = local.mss.filter(|m| !(MSS_MIN..=MSS_MAX).contains(m)) {
+            push(
+                "mss",
+                format!("mss must be between {MSS_MIN} and {MSS_MAX}, got {mss}"),
             );
         }
         if local.trunk.is_empty() {

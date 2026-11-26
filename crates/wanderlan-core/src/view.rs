@@ -266,6 +266,7 @@ mod tests {
             self_managed: true,
             uplink: uplink.map(Into::into),
             breakout: Default::default(),
+            ports: Default::default(),
         }
     }
 
@@ -374,12 +375,21 @@ mod tests {
             .network;
         assert_eq!(same, network);
 
-        // The network settings come with the view, the tunnel port too.
+        // Its own ports come with the view; the settings of the network
+        // (the defaults of every site) it does not change.
+        let mut view = view_for(&network, "site2");
+        view.sites
+            .iter_mut()
+            .find(|s| s.name == "site2")
+            .unwrap()
+            .ports
+            .tunnel = Some(51900);
+        let merged = merge(&network, &view, "site2").unwrap().network;
+        assert_eq!(merged.tunnel_port_of("site2"), 51900);
+        assert!(merged.revision > network.revision);
         let mut view = view_for(&network, "site2");
         view.tunnel_port = Some(51900);
-        let merged = merge(&network, &view, "site2").unwrap().network;
-        assert_eq!(merged.tunnel_port, Some(51900));
-        assert!(merged.revision > network.revision);
+        assert!(merge(&network, &view, "site2").is_err());
         // A revision far ahead would end the revisions of the network.
         let mut view = view_for(&network, "site2");
         view.revision = crate::config::MAX_REVISION;

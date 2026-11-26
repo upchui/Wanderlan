@@ -465,7 +465,7 @@ created on any site; the new site becomes a client of that site.
 
 **Choose the VLANs of a site.** Sites, `Enter` on the site, field "VLANs"
 (empty: the VLANs of the network). The VLANs of the network: VLANs (`3`),
-`v`, or Settings (`7`).
+`v`, or Sites (`2`), `m`.
 
 **Give a site VLANs of its own.** VLANs (`3`), `o`: VLANs on this site's
 trunk and towards its own clients, never to its server; possible even when
@@ -619,14 +619,22 @@ sites with older and newer versions keep working together.
 
 ### Settings
 
+Every site sets its own settings, each on itself (`wanderlan settings`, or
+Settings `7` in the terminal UI): the commit timeout, the path MTU check
+and a fixed MSS in its `local.toml`, its ports in its own entry of the
+network (the other sites connect there; only the site itself may change
+them). The values of `[network]` are only the defaults of the sites
+without their own; they cannot be changed any more (they would change the
+other sites).
+
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `network.vlans` | all | VLANs of every site without its own list. Missing, empty or `"all"`: every VLAN and the untagged traffic. Otherwise e.g. `"native,10-50"`, `"10,20,30-40"` or `[10, "20-30"]`. |
-| `network.commit_timeout` | `60s` | Time to confirm a change (10 s to 1 h). |
-| `network.mtu_probe_interval` | `5m` | Interval of the path MTU measurement (at least 10 s). |
-| `network.mss` | unset | Fixed TCP MSS (536 to 1460) instead of the measured value. |
-| `network.control_port` | `51821` | UDP and TCP port of the daemons on the site addresses. |
-| `network.tunnel_port` | control port + 1 (`51822`) | UDP port of the tunnels (VXLAN). |
+| `network.commit_timeout` | `60s` | Default time to confirm a change (10 s to 1 h). |
+| `network.mtu_probe_interval` | `5m` | Default interval of the path MTU measurement (at least 10 s). |
+| `network.mss` | unset | Default fixed TCP MSS (536 to 1460) instead of the measured value. |
+| `network.control_port` | `51821` | Default UDP and TCP port of the daemons. |
+| `network.tunnel_port` | control port + 1 (`51822`) | Default UDP port of the tunnels (VXLAN). |
 | `network.revision` | `0` | Revision counter of the sync; raised by the daemon. |
 | `[site.<name>]` | | One table per site. The name is unique; `a-z`, `0-9` and `-`, at most 12 characters (it is part of the interface name `vx-<name>`). |
 | `site.<name>.address` | | Unique IPv4 address of the site in the transport network. |
@@ -638,10 +646,15 @@ sites with older and newer versions keep working together.
 | `site.<name>.own_vlans` | none | The site's own VLANs: on its trunk and towards its own clients, never towards its server. The site itself may always change them. |
 | `site.<name>.map` | none | VLAN mappings: `{ <source VLAN> = <mapped VLAN> }`. The source VLAN is the VLAN in the network (one of the VLANs of the site, not 1), the mapped VLAN its ID on the site's trunk or `"native"` (untagged), e.g. `{ 30 = "native", 40 = 140 }`. |
 | `site.<name>.tunnel_vlans` | none | The most the tunnel to another site carries (on top of the VLANs of both sites), e.g. `{ dc = "30-40" }`; `"none"`: no VLAN at all. At one of the two sites. |
+| `site.<name>.control_port` | `network.control_port` | UDP and TCP port of this site's daemon. Only the site itself changes it (`wanderlan settings control-port`). |
+| `site.<name>.tunnel_port` | its control port + 1 | UDP port of this site's tunnels; a tunnel through NAT also sends from the one above. Only the site itself changes it. |
 | `site.<name>.breakout` | none | [Local breakout](#local-breakout) per VLAN of the site (its ID in the network; untagged: 1): `{ <VLAN> = { uplink = "<interface>", except = [<networks>] } }`, both optional, e.g. `{ 10 = {}, 20 = { uplink = "ens20", except = ["203.0.113.0/24"] } }`. Older sites do not read a network with it: update all sites first. |
 | `self` (local) | | Which site of `network.toml` this host is. |
 | `trunk` (local) | | The interface carrying the VLANs, or several (`["ens19", "ens22"]`, bridged like switch ports, the first is the main port). |
 | `tunnels.<site>.trunk` (local) | `trunk` | A trunk of its own for the tunnel to `<site>`: one interface or several. A port belongs to one segment. |
+| `commit_timeout` (local) | `network.commit_timeout` | Time to confirm a change on this site (10 s to 1 h). |
+| `mtu_probe_interval` (local) | `network.mtu_probe_interval` | How often this site measures the path MTU (at least 10 s). |
+| `mss` (local) | `network.mss` | Fixed TCP MSS (536 to 1460) on this site's tunnels instead of the measured value. |
 
 Every file is checked when it is loaded or applied; problems are reported
 with file and line:
@@ -825,7 +838,7 @@ clicked.
 | `4` | MAC addresses: filter (`/`; `vlan:20` for one VLAN), sort (`s`, `o`). |
 | `5` | Log: live events in local time (`t`: UTC), filter by level (`l`), site (`p`) and text (`/`). |
 | `6` | Setup: new network or join; on a configured site invite (`i`) and reset (`R`). |
-| `7` | Settings: every setting with an explanation, the trunk of every tunnel, and the role and rights of this site. `Enter` on a trunk lists the interfaces of the host to choose from (`Space`, `m`: main port). |
+| `7` | Settings of this host only (this site, trunk, commit timeout, path MTU check, MSS, its ports), each with an explanation, the trunk of every tunnel, and the role and rights of this site. `Enter` on a trunk lists the interfaces of the host to choose from (`Space`, `m`: main port). |
 | `8` | Breakout: the [local breakouts](#local-breakout) of all sites, per VLAN, with uplink and exceptions; for this site where IPv4 and IPv6 leave now (or why they go through the tunnel) and the traffic, above it the uplinks of this box. New (`n`), edit (`Enter`), remove (`d`). |
 
 Changes are collected in a draft; the status line says how many it holds,
@@ -854,6 +867,7 @@ its last log lines and keeps trying.
 | `wanderlan manage <site> [--by S] [--self-managed yes\|no]` | Who may change (and rename) a site |
 | `wanderlan rename <site> <new-name>` | Rename a site: this site always, a site it manages too |
 | `wanderlan role <site> server\|client <server>` | Make a site a server or a client |
+| `wanderlan settings [<setting> <value\|default>]` | The settings of this site (`commit-timeout`, `mtu-check`, `mss`, `control-port`, `tunnel-port`): shown, or one changed. Only this site's: every site sets its own |
 | `wanderlan trunk <site> <interfaces\|default>` | Trunk ports of the tunnel to a site, or (this site's name) of the default trunk; several separated by commas |
 | `wanderlan own-vlans <site> <vlans\|none>` | Own VLANs of a site (trunk and its own clients only) |
 | `wanderlan tunnel-vlans <site> <site> <vlans\|all\|none>` | The most the tunnel between two sites carries |

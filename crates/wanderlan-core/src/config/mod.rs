@@ -42,6 +42,35 @@ impl Config {
         self.network.site(self.self_name())
     }
 
+    /// Time to confirm a change here: this site's, or the network's.
+    pub fn commit_timeout(&self) -> std::time::Duration {
+        self.local
+            .commit_timeout
+            .unwrap_or(self.network.commit_timeout)
+    }
+
+    /// How often this site measures the path MTU.
+    pub fn mtu_probe_interval(&self) -> std::time::Duration {
+        self.local
+            .mtu_probe_interval
+            .unwrap_or(self.network.mtu_probe_interval)
+    }
+
+    /// The fixed TCP MSS of this site, if any.
+    pub fn mss(&self) -> Option<u16> {
+        self.local.mss.or(self.network.mss)
+    }
+
+    /// The control port of this site.
+    pub fn control_port(&self) -> u16 {
+        self.network.control_port_of(self.self_name())
+    }
+
+    /// The tunnel port of this site.
+    pub fn tunnel_port(&self) -> u16 {
+        self.network.tunnel_port_of(self.self_name())
+    }
+
     /// Name of the main trunk port.
     pub fn trunk(&self) -> &str {
         self.local.main_trunk().unwrap_or_default()

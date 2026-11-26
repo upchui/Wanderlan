@@ -263,6 +263,33 @@ fn check_changes(old: &Network, new: &Network, editor: &str) -> Result<(), Strin
     if old.vlans != new.vlans && !may_change_network_vlans(old, editor) {
         return Err(why_not_network(old, editor));
     }
+    // The settings of `[network]` would change those of every other site
+    // (where it has none of its own): each site sets its own.
+    let settings = |n: &Network| {
+        (
+            n.control_port,
+            n.tunnel_port,
+            n.commit_timeout,
+            n.mtu_probe_interval,
+            n.mss,
+        )
+    };
+    if settings(old) != settings(new) {
+        return Err(
+            "the ports, the commit timeout, the path MTU check and the MSS are set per site, each on itself (`wanderlan settings`, or Settings in the terminal UI); the values of [network] are only the defaults"
+                .to_string(),
+        );
+    }
+    // The ports of a site: only the site itself.
+    for site in &new.sites {
+        let before = old.site(&site.name).map(|s| s.ports).unwrap_or_default();
+        if site.ports != before && editor != site.name {
+            return Err(format!(
+                "only \"{}\" itself may change its ports (`wanderlan settings` there)",
+                site.name
+            ));
+        }
+    }
     for site in &old.sites {
         // A released site changes its VLANs, mappings and online state; who
         // manages it, where it is plugged in and its address stay the
@@ -376,6 +403,7 @@ mod tests {
             self_managed,
             uplink: None,
             breakout: Default::default(),
+            ports: Default::default(),
         }
     }
 
@@ -400,6 +428,22 @@ mod tests {
         assert!(err.contains("may not change site \"c\""), "{err}");
         assert!(err.contains("only \"a\""), "{err}");
         assert!(check_edit(&old, &new, "c").is_err(), "not self-managed");
+    }
+
+    #[test]
+    fn a_site_sets_its_own_ports_and_no_one_the_network_settings() {
+        let old = network();
+        let mut new = old.clone();
+        new.sites[1].ports.control = Some(52821);
+        assert!(check_edit(&old, &new, "b").is_ok());
+        let err = check_edit(&old, &new, "a").unwrap_err();
+        assert!(err.contains("only \"b\" itself"), "{err}");
+        let mut new = old.clone();
+        new.control_port = 52821;
+        assert!(check_edit(&old, &new, "a").is_err());
+        let mut new = old.clone();
+        new.mss = Some(1300);
+        assert!(check_edit(&old, &new, "a").is_err());
     }
 
     #[test]
@@ -454,7 +498,6 @@ mod tests {
         let old = network();
         let mut new = old.clone();
         new.sites[1].vlans = Some(VlanSet::from_range(30, 30));
-        new.commit_timeout = std::time::Duration::from_secs(120);
         new.vlans = VlanSet::from_range(10, 50);
         assert!(check_edit(&old, &new, "a").is_ok());
         assert!(check_edit(&old, &new, "b").is_ok());
@@ -497,9 +540,9 @@ mod tests {
             shared: 20,
         });
         assert!(check_edit(&old, &new, "c").is_err());
-        // Technical settings stay open.
+        // Its own ports are its own business.
         let mut new = old.clone();
-        new.commit_timeout = std::time::Duration::from_secs(300);
+        new.sites[2].ports.tunnel = Some(52833);
         assert!(check_edit(&old, &new, "c").is_ok());
     }
 

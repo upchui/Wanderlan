@@ -15,90 +15,111 @@ use crate::tui::app::App;
 use crate::tui::draft::Draft;
 use crate::tui::{format, theme};
 
+/// Where a setting of this host is kept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    /// `local.toml`: this host alone, never synchronised.
+    Local,
+    /// The own entry of this site in the network: synchronised (the other
+    /// sites connect there), changed only by this site.
+    OwnSite,
+}
+
 /// One row of the settings list.
 pub struct SettingRow {
     /// Key of the field in its form.
     pub key: &'static str,
     /// Label.
     pub label: &'static str,
-    /// True for `local.toml` (this host), false for the network.
-    pub local: bool,
+    /// Where it is kept.
+    pub scope: Scope,
     /// What it does.
     pub help: &'static str,
 }
 
-/// The settings, in display order.
-pub const ROWS: [SettingRow; 8] = [
-    SettingRow {
-        key: "vlans",
-        label: "VLANs",
-        local: false,
-        help: "VLANs of every site that does not list its own. Empty: all VLANs and the untagged traffic (native), like a trunk between two switches; or e.g. native,10-50.",
-    },
-    SettingRow {
-        key: "commit_timeout",
-        label: "Commit timeout",
-        local: false,
-        help: "Every change must be confirmed (c) within this time, otherwise it is rolled back, so nobody locks themselves out. 10 s to 1 h.",
-    },
-    SettingRow {
-        key: "mtu_probe_interval",
-        label: "Path MTU check",
-        local: false,
-        help: "How often the path MTU to every peer is measured (at least 10 s); it determines the TCP MSS. Also measured at start and when a peer comes back.",
-    },
-    SettingRow {
-        key: "mss",
-        label: "TCP MSS",
-        local: false,
-        help: "Empty: clamp TCP to the MSS that fits the measured path MTU (path MTU - 94). A fixed value (536-1460) replaces the measurement, e.g. if probes are filtered.",
-    },
-    SettingRow {
-        key: "control_port",
-        label: "Control port",
-        local: false,
-        help: "UDP and TCP port of the daemons on the site addresses: probes, configuration sync and joining. Must be reachable between all sites. The tunnel port follows it unless set.",
-    },
-    SettingRow {
-        key: "tunnel_port",
-        label: "Tunnel port",
-        local: false,
-        help: "UDP port of the VXLAN tunnels (a tunnel through NAT also sends from the one above). Empty: control port + 1. Must be reachable towards the servers; a client that its server reaches there runs its tunnel direct.",
-    },
+/// The settings of this host, in display order. Every one changes this
+/// host only: what other sites do they decide themselves.
+pub const ROWS: [SettingRow; 7] = [
     SettingRow {
         key: "self",
         label: "This site",
-        local: true,
+        scope: Scope::Local,
         help: "Which site of the network this host is (local.toml, never synchronised).",
     },
     SettingRow {
         key: "trunk",
         label: "Trunk",
-        local: true,
+        scope: Scope::Local,
         help: "The interfaces that carry the VLANs to the switch or hypervisor (ports of br0; Enter lists those of this host). Several act like switch ports, the first is the main port. The one the tunnels run over is marked.",
+    },
+    SettingRow {
+        key: "commit_timeout",
+        label: "Commit timeout",
+        scope: Scope::Local,
+        help: "Every change on this site must be confirmed (c) within this time, otherwise it is rolled back, so nobody locks themselves out. 10 s to 1 h; empty: the network's default.",
+    },
+    SettingRow {
+        key: "mtu_probe_interval",
+        label: "Path MTU check",
+        scope: Scope::Local,
+        help: "How often this site measures the path MTU to its peers (at least 10 s); it determines the TCP MSS. Also measured at start and when a peer comes back. Empty: the network's default.",
+    },
+    SettingRow {
+        key: "mss",
+        label: "TCP MSS",
+        scope: Scope::Local,
+        help: "Empty: clamp TCP on this site's tunnels to the MSS that fits the measured path MTU (path MTU - 94). A fixed value (536-1460) replaces the measurement, e.g. if probes are filtered.",
+    },
+    SettingRow {
+        key: "control_port",
+        label: "Control port",
+        scope: Scope::OwnSite,
+        help: "UDP and TCP port of this site's daemon: probes, configuration sync and joining. The other sites learn it with the network and connect there. The tunnel port follows it unless set.",
+    },
+    SettingRow {
+        key: "tunnel_port",
+        label: "Tunnel port",
+        scope: Scope::OwnSite,
+        help: "UDP port of this site's VXLAN tunnels (a tunnel through NAT also sends from the one above). Empty: control port + 1. The other sites send there; open it towards them.",
     },
 ];
 
 fn value(draft: &Draft, key: &str) -> String {
     let m = &draft.network;
+    let l = &draft.local;
+    let me = l.self_name.as_deref().unwrap_or_default();
+    let ports = m.site(me).map(|s| s.ports).unwrap_or_default();
+    // Its own value, or the default of the network.
+    let from = |own: bool| if own { "" } else { "  (network default)" };
     match key {
-        "vlans" => {
-            if m.vlans.is_all() {
-                "all (every VLAN and untagged)".into()
-            } else {
-                format!("{} ({} VLANs)", m.vlans, m.vlans.len())
-            }
-        }
-        "commit_timeout" => format::duration(m.commit_timeout),
-        "mtu_probe_interval" => format!("every {}", format::duration(m.mtu_probe_interval)),
-        "mss" => m
-            .mss
-            .map_or_else(|| "from the path MTU".into(), |v| format!("fixed {v}")),
-        "control_port" => m.control_port.to_string(),
-        "tunnel_port" => match m.tunnel_port {
-            Some(p) => format!("{p} (UDP, fixed)"),
-            None => format!("{} (UDP, control port + 1)", m.tunnel_port()),
+        "commit_timeout" => format!(
+            "{}{}",
+            format::duration(l.commit_timeout.unwrap_or(m.commit_timeout)),
+            from(l.commit_timeout.is_some())
+        ),
+        "mtu_probe_interval" => format!(
+            "every {}{}",
+            format::duration(l.mtu_probe_interval.unwrap_or(m.mtu_probe_interval)),
+            from(l.mtu_probe_interval.is_some())
+        ),
+        "mss" => match l.mss.or(m.mss) {
+            Some(v) => format!("fixed {v}{}", from(l.mss.is_some())),
+            None => "from the path MTU".into(),
         },
+        "control_port" => format!(
+            "{} (UDP, TCP){}",
+            m.control_port_of(me),
+            from(ports.control.is_some())
+        ),
+        "tunnel_port" => format!(
+            "{} (UDP){}",
+            m.tunnel_port_of(me),
+            if ports.tunnel.is_some() {
+                ""
+            } else {
+                "  (control port + 1)"
+            }
+        ),
         "self" => draft.local.self_name.clone().unwrap_or_else(|| "-".into()),
         "trunk" if draft.local.trunk.is_empty() => "-".into(),
         "trunk" => draft.local.trunk.join(", "),
@@ -223,25 +244,24 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     let [table, help] = Layout::vertical([Constraint::Min(8), Constraint::Length(5)]).areas(area);
     let selectable = settings(Some(draft));
     let selected = selectable.get(app.settings_selected).copied();
-    let mut rows = vec![Row::new(vec![Cell::from(Span::styled(
-        "Network (all sites)",
-        theme::header(),
-    ))])];
+    // Only this host: what other sites do they decide themselves.
+    let mut rows = vec![Row::new(vec![
+        Cell::from(Span::styled("This host", theme::header())),
+        Cell::from(Span::styled(
+            "every setting here changes this site only",
+            theme::dim(),
+        )),
+    ])];
     let mut selected_row = 0;
+    let me = draft.local.self_name.as_deref().unwrap_or_default();
+    let own = draft.network.sites.iter().position(|s| s.name == me);
     for (i, row) in ROWS.iter().enumerate() {
-        if row.local && !ROWS[..i].iter().any(|r| r.local) {
-            rows.push(Row::new(vec![Cell::from(Span::styled(
-                "This host",
-                theme::header(),
-            ))]));
-        }
         if selected == Some(Setting::Fixed(i)) {
             selected_row = rows.len();
         }
-        let path = if row.local {
-            FieldPath::local(row.key)
-        } else {
-            FieldPath::network(row.key)
+        let path = match (row.scope, own) {
+            (Scope::OwnSite, Some(own)) => FieldPath::site_field(own, row.key),
+            _ => FieldPath::local(row.key),
         };
         rows.push(
             Row::new(vec![

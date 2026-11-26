@@ -109,8 +109,9 @@ impl Eq for Me {}
 pub struct ProbeConfig {
     /// Local address and port to bind.
     pub bind: Option<SocketAddrV4>,
-    /// Direct peers by name.
-    pub peers: BTreeMap<String, Ipv4Addr>,
+    /// Direct peers by name: where their daemon listens (each site has its
+    /// own control port).
+    pub peers: BTreeMap<String, SocketAddrV4>,
     /// Further sites whose probes are answered but which are not probed
     /// (peers removed recently, so they can still fetch the new network).
     pub responders: BTreeMap<String, Ipv4Addr>,
@@ -132,10 +133,9 @@ pub struct ProbeConfig {
     /// key, maybe behind NAT): probed only where their authenticated probes
     /// come from, once that place answered a challenge.
     pub passive: BTreeSet<String>,
-    /// The UDP port of the tunnels: where the test frames go.
-    pub tunnel_port: u16,
-    /// The VNIs of the tunnels to the passive peers (for their test frames).
-    pub vnis: BTreeMap<String, u32>,
+    /// The VNIs and tunnel ports of the passive peers: where their test
+    /// frames go.
+    pub tests: BTreeMap<String, (u32, u16)>,
     /// The passive peers whose tunnels run direct, at this address.
     pub direct: BTreeMap<String, Ipv4Addr>,
     /// For a client: its uplink, tested through the tunnel to it.
@@ -163,7 +163,7 @@ impl ProbeConfig {
     fn peer_at(&self, ip: Ipv4Addr) -> Option<(String, bool)> {
         self.peers
             .iter()
-            .find(|(_, a)| **a == ip)
+            .find(|(_, a)| *a.ip() == ip)
             .map(|(n, _)| (n.clone(), true))
             .or_else(|| {
                 self.responders
@@ -212,6 +212,11 @@ pub struct PeerProbe {
     /// directly (see the module doc).
     #[serde(skip)]
     pub direct_test: Option<DirectTest>,
+    /// Where the authenticated probes of the peer come from: its daemon (its
+    /// socket is bound to its control port), also right after it moved to
+    /// another port.
+    #[serde(skip)]
+    pub control_at: Option<SocketAddrV4>,
     #[serde(skip)]
     lost: u32,
     /// Recent probes: round trip in ms, or `None` if unanswered.
@@ -456,7 +461,7 @@ async fn bind_socket(bind: SocketAddrV4) -> anyhow::Result<UdpSocket> {
 }
 
 /// What a probe task is for: the peer's address and identity.
-type Target = (Ipv4Addr, Option<SiteId>);
+type Target = (SocketAddrV4, Option<SiteId>);
 
 /// Starts and stops the per-peer tasks to match the configured peers. A
 /// peer with another address or identity gets a new task and starts over.
@@ -600,6 +605,9 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
                     if direct && verified {
                         note_announce(&table, &events, &peer, request.announce);
                         note_nonce(&shared, &events, &peer, request.nonce);
+                        if !passive && let Ok(mut t) = table.write() {
+                            t.entry(peer.clone()).or_default().control_at = Some(from);
+                        }
                     }
                     // A client asks from where its NAT sends: the place to
                     // probe it, once it answers a challenge there.
@@ -690,14 +698,11 @@ async fn serve_direct(
     request: &wire2::Request,
     keys: &PairKeys,
 ) -> bool {
-    let (vni, port, running) = {
+    let (test, running) = {
         let cfg = shared.config.borrow();
-        (
-            cfg.vnis.get(peer).copied(),
-            cfg.tunnel_port,
-            cfg.direct.get(peer).copied(),
-        )
+        (cfg.tests.get(peer).copied(), cfg.direct.get(peer).copied())
     };
+    let (vni, port) = (test.map(|(v, _)| v), test.map_or(0, |(_, p)| p));
     let now = Instant::now();
     let (packet, tested) = {
         let Ok(mut tests) = shared.tests.lock() else {
@@ -936,17 +941,12 @@ impl Drop for PendingGuard<'_> {
 async fn probe_peer(
     shared: Arc<Shared>,
     name: String,
-    addr: Ipv4Addr,
+    to: SocketAddrV4,
     table: ProbeTable,
     events: mpsc::Sender<ProbeEvent>,
 ) {
-    let (port, passive) = {
-        let cfg = shared.config.borrow();
-        (
-            cfg.bind.map_or(0, |b| b.port()),
-            cfg.passive.contains(&name),
-        )
-    };
+    let addr = *to.ip();
+    let passive = shared.config.borrow().passive.contains(&name);
     // A passive peer is probed only where it was confirmed.
     let mut place = if passive {
         shared
@@ -955,7 +955,7 @@ async fn probe_peer(
             .ok()
             .and_then(|e| e.get(&name).copied())
     } else {
-        Some(SocketAddrV4::new(addr, port))
+        Some(to)
     };
     let mut next_mtu: Option<Instant> = Some(Instant::now());
     let mut last_pmtu: Option<u16> = None;
@@ -1395,7 +1395,11 @@ mod tests {
         }
         let config = ProbeConfig {
             bind: Some(bind),
-            peers: [("other".to_string(), Ipv4Addr::LOCALHOST)].into(),
+            peers: [(
+                "other".to_string(),
+                SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+            )]
+            .into(),
             me: Some(Me(me.clone())),
             keys,
             ..ProbeConfig::default()

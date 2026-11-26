@@ -470,6 +470,7 @@ impl Wizard {
             self_managed: false,
             uplink: None,
             breakout: Default::default(),
+            ports: Default::default(),
         });
         let local = Local {
             self_name: Some(name),

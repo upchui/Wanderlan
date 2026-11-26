@@ -1227,3 +1227,45 @@ breakout = { 10 = {}, 20 = { uplink = "ens20", except = ["203.0.113.9/24", "2001
         "{err}"
     );
 }
+
+#[test]
+fn a_site_has_its_own_ports_and_settings() {
+    let base = parse_network(EXAMPLE_NETWORK).unwrap().network.unwrap();
+    let text = edit(
+        EXAMPLE_NETWORK_2,
+        "[site.haus2]\naddress = \"10.8.0.11\"\n",
+        "[site.haus2]\naddress = \"10.8.0.11\"\ncontrol_port = 52821\n",
+    );
+    let local =
+        format!("{LOCAL}commit_timeout = \"2m\"\nmtu_probe_interval = \"1m\"\nmss = 1300\n");
+    let Loaded::Configured(cfg) = load(&text, &local).unwrap().loaded else {
+        panic!("configured");
+    };
+    assert_eq!(cfg.control_port(), 52821);
+    assert_eq!(cfg.tunnel_port(), 52822, "the one after its control port");
+    assert_eq!(
+        cfg.network.control_port_of("heim"),
+        51821,
+        "the others keep theirs"
+    );
+    assert_eq!(cfg.commit_timeout(), std::time::Duration::from_secs(120));
+    assert_eq!(cfg.mtu_probe_interval(), std::time::Duration::from_secs(60));
+    assert_eq!(cfg.mss(), Some(1300));
+    assert!(render_network(&cfg.network).contains("control_port = 52821"));
+    let rendered = render_local(&cfg.local);
+    assert!(rendered.contains("commit_timeout = \"2m\"") && rendered.contains("mss = 1300"));
+    // Without own ports the network keeps its form and fingerprint.
+    assert!(!render_network(&base).contains("\ntunnel_port ="));
+    // Its tunnel port must stay off its control port.
+    let clash = edit(
+        &text,
+        "control_port = 52821\n",
+        "control_port = 52821\ntunnel_port = 52820\n",
+    );
+    assert!(
+        errors(&clash, LOCAL)
+            .iter()
+            .any(|e| e.message.contains("must differ from its control port"))
+    );
+    assert!(!errors(EXAMPLE_NETWORK, &format!("{LOCAL}mss = 100\n")).is_empty());
+}
