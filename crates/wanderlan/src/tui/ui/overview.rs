@@ -85,7 +85,9 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
                 .sites
                 .iter()
                 .find(|s| s.is_self)
-                .map_or_else(String::new, |s| format::role(s.uplink.as_deref()));
+                .map_or_else(String::new, |s| {
+                    format::role(s.uplink.as_deref(), format::serves(&status.sites, &s.name))
+                });
             lines.push(Line::from(vec![
                 Span::styled(format!(" {site}"), theme::bold()),
                 Span::styled(format!("  {role}"), theme::title()),
@@ -380,7 +382,10 @@ fn draw_sites(frame: &mut Frame, app: &App, status: &Status, area: Rect) {
                     topology::tree_name(&site.name, depth),
                     site.address.clone(),
                     site.vlans.clone(),
-                    format::role(site.uplink.as_deref()),
+                    format::role(
+                        site.uplink.as_deref(),
+                        format::serves(&status.sites, &site.name),
+                    ),
                     link,
                 ],
                 style,
@@ -393,7 +398,7 @@ fn draw_sites(frame: &mut Frame, app: &App, status: &Status, area: Rect) {
         area.width.saturating_sub(3),
         &headers,
         &texts,
-        &[16, 15, 40, 22, 16],
+        &[16, 15, 40, 30, 16],
         2,
     );
     let rows: Vec<Row> = entries
@@ -456,6 +461,19 @@ mod tests {
         far.via = Some("buero".into());
         status.sites.push(far.clone());
         assert_eq!(link(&status, &far).0, "via buero");
-        assert_eq!(format::role(far.uplink.as_deref()), "client of buero");
+        assert_eq!(
+            format::role(far.uplink.as_deref(), false),
+            "client of buero"
+        );
+        // A client with clients of its own is a server for them.
+        let mut below = far.clone();
+        below.name = "below".into();
+        below.uplink = Some("far".into());
+        status.sites.push(below);
+        assert!(format::serves(&status.sites, "far"));
+        assert_eq!(
+            format::role(far.uplink.as_deref(), true),
+            "client of buero + server"
+        );
     }
 }

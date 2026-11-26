@@ -104,7 +104,10 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
                 topology::tree_name(&site.name, depth),
                 site.address.to_string(),
                 vlans,
-                format::role(site.uplink.as_deref()),
+                format::role(
+                    site.uplink.as_deref(),
+                    topology::has_clients(&draft.network, &site.name),
+                ),
                 policy::managed_label(&draft.network, site),
                 tunnel,
             ];
@@ -127,7 +130,7 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         area.width.saturating_sub(3),
         &headers,
         &texts,
-        &[1, 16, 15, 40, 22, 20, 12],
+        &[1, 16, 15, 40, 30, 20, 12],
         3,
     );
     let rows: Vec<Row> = entries
@@ -215,7 +218,10 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
         let text = format!(
             " {}: {}; VLANs {vlans}{own}; managed by {}{keys}",
             site.name,
-            format::role(site.uplink.as_deref()),
+            format::role(
+                site.uplink.as_deref(),
+                topology::has_clients(&draft.network, &site.name)
+            ),
             policy::managed_label(&draft.network, site)
         );
         lines.push(Line::styled(text, theme::dim()));

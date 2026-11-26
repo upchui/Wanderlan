@@ -161,3 +161,45 @@ check "site1 says that a new box took over site5" \
 wait_for 30 "site5's tunnel to site1 is up again" \
   x site5 "wanderlan status --json | jq -e '.peers[] | select(.name == \"site1\") | .identity_state == \"confirmed\" and .port_state == \"up\"'"
 expect_ping c-site5 10.20.0.1 "VLAN 20: site5 reaches site1's client again"
+
+begin "Client + server: site5 (a client of site1) has a client of its own"
+
+only_tunnel() { x "$1" "[ \"\$(ip -j link show master br0 | jq -r '[.[].ifname | select(startswith(\"vx-\"))] | join(\" \")')\" = vx-$2 ]"; }
+check "site1 makes site4 a client of site5" x site1 "wanderlan role site4 client site5 --confirm"
+wait_for 60 "site4's only tunnel leads to site5" only_tunnel site4 site5
+wait_for 30 "site5 has a tunnel to its client site4" x site5 "ip link show vx-site4"
+keyed site4 site5
+check "site1 shows site5 as client + server" \
+  x site1 "wanderlan status | grep -q 'site5 .*client of site1 + server'"
+wait_eq 30 "site4 knows only site5 (its server) and itself" "site4 site5" \
+  jqs site4 '[.sites[].name] | sort | join(" ")'
+expect_ping c-site4 10.20.0.1 "VLAN 20: site4's client reaches site1's client (through site5)"
+# A change only site4 itself may make reaches site1 through site5.
+check "site4 moves its control port" x site4 "wanderlan settings control-port 52841 --confirm"
+wait_for 90 "site1 learned it through site5" eval 'entry_of site1 site4 | grep -q "^control_port = 52841"'
+expect_ping c-site4 10.20.0.1 "VLAN 20: site4's client still reaches site1's client"
+check "site4 takes the default port again" x site4 "wanderlan settings control-port default --confirm"
+wait_for 90 "site1 has the default port of site4 again" eval '! entry_of site1 site4 | grep -q "_port ="'
+# Away from a client + server only when that one knows where it went.
+out=$(x site1 "wanderlan role site4 server --confirm" 2>&1)
+if grep -q 'hangs off "site5", a client' <<<"$out"; then
+  pass "site4 is not moved away from under site5 (site5 would lose it)"
+else
+  fail "unexpected role output: $out"
+fi
+# site5 is managed by site2 (it invited it first). site2 changes it once it
+# has the latest network (a change on an older one would lose against it).
+uplink_at() { jqs "$1" ".sites[] | select(.name == \"$2\") | .uplink"; }
+wait_eq 30 "site2 has the network of site1" "$(jqs site1 .revision)" jqs site2 .revision
+check "site2 makes site5 a server" x site2 "wanderlan role site5 server --confirm"
+wait_for 60 "site5 has its tunnels to the servers" x site5 "ip link show vx-site2 && ip link show vx-site3"
+wait_eq 30 "site1 knows site5 as a server" null uplink_at site1 site5
+check "then site4 a server" x site1 "wanderlan role site4 server --confirm"
+wait_for 60 "site4 has its tunnels to the servers again" \
+  x site4 "ip link show vx-site1 && ip link show vx-site2 && ip link show vx-site3"
+wait_eq 30 "site2 knows site4 as a server" null uplink_at site2 site4
+check "and site5 a client of site1 again" x site2 "wanderlan role site5 client site1 --confirm"
+wait_for 60 "site5's only tunnel leads to site1 again" only_tunnel site5 site1
+keyed site4 site5
+expect_ping c-site4 10.20.0.1 "VLAN 20: site4's client reaches site1's client directly again"
+expect_ping c-site5 10.20.0.1 "VLAN 20: site5 reaches site1's client again"

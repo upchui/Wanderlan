@@ -2974,7 +2974,10 @@ impl App {
                 d.network.sites.get(*i).is_some_and(|s| {
                     let vlans = d.network.vlans_of(s).to_string();
                     let address = s.address.to_string();
-                    let role = format::role(s.uplink.as_deref());
+                    let role = format::role(
+                        s.uplink.as_deref(),
+                        topology::has_clients(&d.network, &s.name),
+                    );
                     let managed = policy::managed_label(&d.network, s);
                     self.sites_filter
                         .matches(&[&s.name, &address, &vlans, &role, &managed])

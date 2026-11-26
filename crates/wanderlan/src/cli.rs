@@ -541,14 +541,14 @@ pub async fn run(args: Args) -> Result<ExitCode> {
                     return Err(format!(
                         "{} is already a {}.",
                         entry.name,
-                        role_text(uplink.as_deref())
+                        role_text(uplink.as_deref(), false)
                     ));
                 }
                 entry.uplink.clone_from(&uplink);
                 Ok(format!(
                     "{} is a {}",
                     entry.name,
-                    role_text(uplink.as_deref())
+                    role_text(uplink.as_deref(), false)
                 ))
             })
             .await
@@ -1328,7 +1328,7 @@ async fn site_command(socket: &Path, action: SiteAction) -> Result<ExitCode> {
                 if let Some(up) = uplink.as_deref().filter(|u| network.site(u).is_none()) {
                     bail!("there is no site \"{up}\" to be a client of");
                 }
-                let role = role_text(uplink.as_deref());
+                let role = role_text(uplink.as_deref(), false);
                 network.sites.push(config::Site {
                     name: name.clone(),
                     address,
@@ -1859,15 +1859,16 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
         println!("{}", serde_json::to_string_pretty(&st)?);
         return Ok(ExitCode::SUCCESS);
     }
-    let own_uplink = st
-        .sites
-        .iter()
-        .find(|s| s.is_self)
-        .and_then(|s| s.uplink.as_deref());
+    // A site with clients of its own is their server.
+    let serves = |name: &str| st.sites.iter().any(|s| s.uplink.as_deref() == Some(name));
+    let own_role = st.sites.iter().find(|s| s.is_self).map_or_else(
+        || role_text(None, false),
+        |s| role_text(s.uplink.as_deref(), serves(&s.name)),
+    );
     match &st.site {
         Some(site) => println!(
             "Site {site} ({}){}, address {}, trunk {}, VLANs {}",
-            role_text(own_uplink),
+            own_role,
             if st.online { "" } else { " (OFFLINE)" },
             st.address.as_deref().unwrap_or("?"),
             if st.trunk_ports.is_empty() {
@@ -1913,7 +1914,7 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
     }
     if !st.sites.is_empty() {
         println!(
-            "\n{:<12} {:<15} {:<9} {:<18} LINK",
+            "\n{:<12} {:<15} {:<9} {:<26} LINK",
             "SITE", "ADDRESS", "ID", "ROLE"
         );
         // Servers, each with its clients below.
@@ -1934,11 +1935,11 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
                 "-".to_string()
             };
             println!(
-                "{:<12} {:<15} {:<9} {:<18} {link}",
+                "{:<12} {:<15} {:<9} {:<26} {link}",
                 wanderlan_core::topology::tree_name(&s.name, depth),
                 s.address,
                 s.id.as_deref().unwrap_or("-"),
-                role_text(s.uplink.as_deref())
+                role_text(s.uplink.as_deref(), serves(&s.name))
             );
         }
     }
@@ -1987,9 +1988,10 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `server`, or `client of <uplink>`.
-fn role_text(uplink: Option<&str>) -> String {
-    uplink.map_or_else(|| "server".to_string(), |u| format!("client of {u}"))
+/// `server`, `client of <uplink>`, or `client of <uplink> + server` for a
+/// client with clients of its own.
+fn role_text(uplink: Option<&str>, has_clients: bool) -> String {
+    wanderlan_core::topology::role(uplink, has_clients)
 }
 
 fn short(fingerprint: &str) -> &str {

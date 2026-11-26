@@ -233,9 +233,20 @@ a client only has to reach its server in the transport network. Servers are
 connected with each other (every server with every other server), so servers
 must reach each other.
 
-A client can invite sites too; they become its own clients. A site can be
-made a server or the client of another site later. Every view shows the role
-(`server`, `client of hq`).
+A client can invite sites too; they become its own clients. It is then
+**client + server**: a client in its tunnel to its server, the server in the
+tunnels to its clients. For them it works like any server: it invites them,
+takes over their changes and passes them on, and their clients can have
+clients again. A site can be made a server or the client of another site
+later. Every view shows the role (`server`, `client of hq`, `client of hq +
+server`).
+
+A site below a client + server stays below it: only its server tells a site
+where it went, and moved elsewhere that client would no longer know it (a
+server knows the whole network, so moving sites away from a server is fine).
+To move one out, make the client + server a server first, or let the site
+join again through its new server (`wanderlan reset` there, then `wanderlan
+join`).
 
 ### Clients behind NAT
 
@@ -365,9 +376,12 @@ like for the VLANs of a site (Breakout (`7`), or `wanderlan breakout`).
 ### Who knows what
 
 Servers know the whole network. A client knows only itself, its server and
-its own clients: it never learns about the clients of other servers, neither
-in the terminal UI nor in its configuration files. Changes made on a client
-(to itself and to its own clients) reach the network through its server.
+the sites below it (its clients, their clients, ...): it never learns about
+the clients of other sites, neither in the terminal UI nor in its
+configuration files. Changes made on a client (to itself and to the sites
+below it) reach the network through its server; a client + server passes the
+changes of its clients on the same way, so they travel up through every site
+on the way, and each checks them.
 
 ### Who may change what
 
@@ -383,7 +397,7 @@ The site that created an invitation **manages** the site that joined with it.
 A site that joined and was not released is **restricted**: it cannot change
 the VLANs its server gave it, only those of sites it invited itself. Its own
 VLANs (see above) are always its own business. A client may in any case only
-change itself and its own clients, never its server. The daemons enforce
+change itself and the sites below it, never its server. The daemons enforce
 these rules among themselves (someone with root on a site could bypass
 them); which box is behind a site, however, is protected by its key (see
 [Identities and keys](#identities-and-keys)).
@@ -566,7 +580,7 @@ as `*.rejected`.
 Two files in `/etc/wanderlan/`, both maintained by the daemon:
 
 * `network.toml`: the network. A server holds the whole network; a client only
-  its part of it (itself, its server, its own clients). The daemons keep the
+  its part of it (itself, its server, the sites below it). The daemons keep the
   files in sync.
 * `local.toml`: this host only, never synchronised.
 
@@ -771,7 +785,8 @@ should have: servers and the uplink the whole configuration of this site, a
 client only its own part. A site that sees a newer version fetches it over
 TCP and applies it; a server that sees changes of one of its clients fetches
 the client's part and takes over what the client is responsible for (itself,
-its own clients, the network settings), checked against its rights. Changes
+the sites below it, the network settings), checked against the rights of the
+client and of the sites below it (their changes come through it). Changes
 received this way are confirmed automatically as soon as a neighbour answers
 with them in effect. A newer revision with the same content (a change
 elsewhere in the network that does not concern this site) is taken over
@@ -1002,7 +1017,8 @@ or `WANDERLAN_SOCKET`.
   with split horizon. There are no tunnels between clients; the VLANs decide
   who meets whom.
 * **Clients only know their part.** A client's configuration contains its
-  server and its own clients only; servers merge the changes of their clients.
+  server and the sites below it only; servers merge the changes of their
+  clients, a client + server passes those of its clients on.
 * **Who may change a site**: its manager (the inviting site), the site itself
   only if released. The daemons enforce this among themselves; someone with
   root on a site could bypass it.

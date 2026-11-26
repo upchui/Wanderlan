@@ -16,17 +16,24 @@
 //! manager that left the network can no longer decide: its sites are open
 //! again and no longer restricted.
 //!
+//! A client changes only itself and the sites below it (its clients, their
+//! clients, ...): for them it is the server. It never changes its own
+//! server or sites beside it.
+//!
 //! A site may always rename itself. Another site may rename it only if it
 //! is its manager (`managed_by`) and may change it; a client never renames
 //! its server.
 //!
 //! Every wanderland checks this when a change is made on it (TUI, CLI,
-//! edited files). It is an agreement between the daemons, not a
-//! cryptographic protection.
+//! edited files), and a server again when it takes over the changes of a
+//! client: those of the client and of the sites below it, which come
+//! through it. It is an agreement between the daemons, not a cryptographic
+//! protection.
 
 use std::collections::BTreeSet;
 
 use crate::config::{Breakouts, Network, Site, VlanMap};
+use crate::topology;
 
 /// The parts of a site that only its managers may change.
 #[derive(Debug, PartialEq, Eq)]
@@ -78,11 +85,9 @@ pub fn restricted_by<'a>(network: &'a Network, editor: &str) -> Option<&'a str> 
 
 /// True if `editor` may change the rules of `site` in `network`.
 pub fn may_change(network: &Network, site: &Site, editor: &str) -> bool {
-    // A client only changes itself and its own clients, never its server.
-    if client_of(network, editor).is_some()
-        && site.name != editor
-        && site.uplink.as_deref() != Some(editor)
-    {
+    // A client only changes itself and the sites below it, never its
+    // server.
+    if client_of(network, editor).is_some() && !itself_or_below(network, &site.name, editor) {
         return false;
     }
     match manager(network, site) {
@@ -129,6 +134,11 @@ pub fn why_not_tunnel(network: &Network, a: &str, b: &str, editor: &str) -> Stri
     )
 }
 
+/// True if `site` is `editor` or hangs (indirectly) off it.
+fn itself_or_below(network: &Network, site: &str, editor: &str) -> bool {
+    site == editor || topology::is_below(network, site, editor)
+}
+
 /// The site `editor` is a client of, if it is a client.
 pub fn client_of<'a>(network: &'a Network, editor: &str) -> Option<&'a str> {
     network.site(editor)?.uplink.as_deref()
@@ -163,11 +173,10 @@ pub fn managed_label(network: &Network, site: &Site) -> String {
 pub fn why_not(network: &Network, site: &Site, editor: &str, what: &str) -> String {
     let name = &site.name;
     if let Some(up) = client_of(network, editor)
-        && site.name != editor
-        && site.uplink.as_deref() != Some(editor)
+        && !itself_or_below(network, name, editor)
     {
         return format!(
-            "this site (\"{editor}\") is a client of \"{up}\": it may only change itself and its own clients, not {what} site \"{name}\""
+            "this site (\"{editor}\") is a client of \"{up}\": it may only change itself and the sites below it, not {what} site \"{name}\""
         );
     }
     if let Some(m) = restricted_by(network, editor)
@@ -225,12 +234,11 @@ pub fn why_not_rename(network: &Network, site: &str, editor: &str) -> String {
         |s| renamers(network, s),
     );
     if let Some(up) = client_of(network, editor)
-        && network
-            .site(site)
-            .is_some_and(|s| s.uplink.as_deref() != Some(editor))
+        && network.site(site).is_some()
+        && !itself_or_below(network, site, editor)
     {
         return format!(
-            "this site (\"{editor}\") is a client of \"{up}\": it may only rename itself and its own clients, not site \"{site}\" ({who} may)"
+            "this site (\"{editor}\") is a client of \"{up}\": it may only rename itself and the sites below it, not site \"{site}\" ({who} may)"
         );
     }
     format!("this site (\"{editor}\") may not rename site \"{site}\": {who} may")
@@ -240,10 +248,38 @@ pub fn why_not_rename(network: &Network, site: &str, editor: &str) -> String {
 /// same address under a new name), the network's VLANs, and every site of
 /// `old` whose rules differ in `new` (or that is gone).
 pub fn check_edit(old: &Network, new: &Network, editor: &str) -> Result<(), String> {
+    check_by(old, new, &[editor])
+}
+
+/// [`check_edit`] for the changes a client passes on to its uplink: they
+/// were made by the client `from` itself or by a site below it, so a change
+/// passes if one of them may make it. A client only changes itself and the
+/// sites below it, so this never reaches beyond them; each site on the way
+/// already checked the changes of the sites below it.
+pub fn check_relayed(old: &Network, new: &Network, from: &str) -> Result<(), String> {
+    let mut editors = vec![from];
+    editors.extend(topology::below(old, from));
+    check_by(old, new, &editors)
+}
+
+/// The editor an error about `site` is told for: the site itself if it is
+/// one of them, otherwise the first (the site that made or passed on the
+/// change).
+fn speaker<'a>(editors: &[&'a str], site: &str) -> &'a str {
+    editors
+        .iter()
+        .find(|e| **e == site)
+        .or_else(|| editors.first())
+        .copied()
+        .unwrap_or_default()
+}
+
+/// [`check_edit`] for changes made by one of `editors`.
+fn check_by(old: &Network, new: &Network, editors: &[&str]) -> Result<(), String> {
     let renamed = crate::rename::renames(old, new);
     for (from, _) in &renamed {
-        if !may_rename(old, from, editor) {
-            return Err(why_not_rename(old, from, editor));
+        if !editors.iter().any(|e| may_rename(old, from, e)) {
+            return Err(why_not_rename(old, from, speaker(editors, from)));
         }
     }
     // The rest compares the network as renamed: the changed references to a
@@ -252,17 +288,58 @@ pub fn check_edit(old: &Network, new: &Network, editor: &str) -> Result<(), Stri
     for (from, to) in &renamed {
         base.rename_site(from, to);
     }
-    let editor = renamed
+    let editors: Vec<&str> = editors
         .iter()
-        .find(|(from, _)| from == editor)
-        .map_or(editor, |(_, to)| to.as_str());
-    check_changes(&base, new, editor)
+        .map(|e| {
+            renamed
+                .iter()
+                .find(|(from, _)| from == e)
+                .map_or(*e, |(_, to)| to.as_str())
+        })
+        .collect();
+    check_changes(&base, new, &editors)
+}
+
+/// What `editor` may not do to `site` (as it is in `old`) in `new`, if
+/// anything.
+fn check_site(old: &Network, new: &Network, site: &Site, editor: &str) -> Result<(), String> {
+    let now = new.site(&site.name);
+    // A released site changes its VLANs, mappings and online state; who
+    // manages it, where it is plugged in and its address stay the decision
+    // of its manager.
+    if editor == site.name
+        && site.self_managed
+        && let Some(m) = manager(old, site).filter(|m| *m != editor)
+        && let Some(now) = now
+    {
+        let fixed = |s: &Site| (s.address, s.managed_by.clone(), s.uplink.clone());
+        if fixed(now) != fixed(site) {
+            return Err(format!(
+                "this site (\"{editor}\") may not change who manages it, its server or its address: that is for \"{m}\""
+            ));
+        }
+    }
+    if may_change(old, site, editor) {
+        return Ok(());
+    }
+    match now {
+        None => Err(why_not(old, site, editor, "remove")),
+        Some(now) if rules(new, now) != rules(old, site) => {
+            Err(why_not(old, site, editor, "change"))
+        }
+        // Its own VLANs: the site itself, or whoever may change it.
+        Some(now) if now.own_vlans != site.own_vlans && editor != site.name => {
+            Err(why_not(old, site, editor, "change the own VLANs of"))
+        }
+        Some(_) => Ok(()),
+    }
 }
 
 /// [`check_edit`] for two networks with the same names.
-fn check_changes(old: &Network, new: &Network, editor: &str) -> Result<(), String> {
-    if old.vlans != new.vlans && !may_change_network_vlans(old, editor) {
-        return Err(why_not_network(old, editor));
+fn check_changes(old: &Network, new: &Network, editors: &[&str]) -> Result<(), String> {
+    let first = editors.first().copied().unwrap_or_default();
+    if old.vlans != new.vlans && !editors.iter().any(|e| may_change_network_vlans(old, e)) {
+        return Err(why_not_network(old, first));
     }
     // The settings of `[network]` would change those of every other site
     // (where it has none of its own): each site sets its own.
@@ -284,7 +361,7 @@ fn check_changes(old: &Network, new: &Network, editor: &str) -> Result<(), Strin
     // The ports of a site: only the site itself.
     for site in &new.sites {
         let before = old.site(&site.name).map(|s| s.ports).unwrap_or_default();
-        if site.ports != before && editor != site.name {
+        if site.ports != before && !editors.contains(&site.name.as_str()) {
             return Err(format!(
                 "only \"{}\" itself may change its ports (`wanderlan settings` there)",
                 site.name
@@ -292,39 +369,11 @@ fn check_changes(old: &Network, new: &Network, editor: &str) -> Result<(), Strin
         }
     }
     for site in &old.sites {
-        // A released site changes its VLANs, mappings and online state; who
-        // manages it, where it is plugged in and its address stay the
-        // decision of its manager.
-        if editor == site.name
-            && site.self_managed
-            && let Some(m) = manager(old, site).filter(|m| *m != editor)
-            && let Some(now) = new.site(&site.name)
+        if !editors
+            .iter()
+            .any(|e| check_site(old, new, site, e).is_ok())
         {
-            let fixed = |s: &Site| (s.address, s.managed_by.clone(), s.uplink.clone());
-            if fixed(now) != fixed(site) {
-                return Err(format!(
-                    "this site (\"{editor}\") may not change who manages it, its server or its address: that is for \"{m}\""
-                ));
-            }
-        }
-        if may_change(old, site, editor) {
-            continue;
-        }
-        let what = match new.site(&site.name) {
-            None => "remove",
-            Some(now) if rules(new, now) != rules(old, site) => "change",
-            Some(_) => continue,
-        };
-        return Err(why_not(old, site, editor, what));
-    }
-    // Its own VLANs: the site itself, or whoever may change it.
-    for site in &old.sites {
-        if let Some(now) = new.site(&site.name)
-            && now.own_vlans != site.own_vlans
-            && editor != site.name
-            && !may_change(old, site, editor)
-        {
-            return Err(why_not(old, site, editor, "change the own VLANs of"));
+            return check_site(old, new, site, speaker(editors, &site.name));
         }
     }
     // The VLANs of a tunnel: whoever may change one of its two sites.
@@ -335,23 +384,31 @@ fn check_changes(old: &Network, new: &Network, editor: &str) -> Result<(), Strin
         .map(|t| &t.sites)
         .collect();
     for [a, b] in pairs {
-        if old.tunnel_limit(a, b) != new.tunnel_limit(a, b) && !may_change_tunnel(old, a, b, editor)
+        if old.tunnel_limit(a, b) != new.tunnel_limit(a, b)
+            && !editors.iter().any(|e| may_change_tunnel(old, a, b, e))
         {
-            return Err(why_not_tunnel(old, a, b, editor));
+            return Err(why_not_tunnel(old, a, b, first));
         }
     }
-    check_ids(old, new, editor)?;
-    // A client only adds clients of its own.
-    if let Some(up) = client_of(old, editor)
-        && let Some(added) = new
-            .sites
-            .iter()
-            .find(|s| old.site(&s.name).is_none() && s.uplink.as_deref() != Some(editor))
-    {
+    check_ids(old, new, editors)?;
+    // A site below a client stays below it: only that client tells it where
+    // it went, and it would no longer know it.
+    if let Some((site, up)) = topology::stranded(old, new) {
         return Err(format!(
-            "this site (\"{editor}\") is a client of \"{up}\": it may only add clients of its own, not \"{}\"",
-            added.name
+            "site \"{site}\" hangs off \"{up}\", a client: elsewhere \"{up}\" would no longer know it and could not tell it where it went. Move it below \"{up}\", make \"{up}\" a server first, or let \"{site}\" join again through its new server (`wanderlan reset` there, then `wanderlan join` with an invitation of that site)"
         ));
+    }
+    // A client only adds sites below it (its clients, theirs, ...).
+    for added in new.sites.iter().filter(|s| old.site(&s.name).is_none()) {
+        let fits = editors
+            .iter()
+            .any(|e| client_of(old, e).is_none() || topology::is_below(new, &added.name, e));
+        if !fits && let Some(up) = client_of(old, first) {
+            return Err(format!(
+                "this site (\"{first}\") is a client of \"{up}\": it may only add clients below it (its own and theirs), not \"{}\"",
+                added.name
+            ));
+        }
     }
     Ok(())
 }
@@ -361,7 +418,7 @@ fn check_changes(old: &Network, new: &Network, editor: &str) -> Result<(), Strin
 /// on. Another identity for a known site comes only with a join, decided by
 /// the site that invited it; when that is a client, its server gets the
 /// change from it. Nobody removes an identity.
-fn check_ids(old: &Network, new: &Network, editor: &str) -> Result<(), String> {
+fn check_ids(old: &Network, new: &Network, editors: &[&str]) -> Result<(), String> {
     for site in &old.sites {
         let Some(now) = new.site(&site.name) else {
             continue;
@@ -369,15 +426,19 @@ fn check_ids(old: &Network, new: &Network, editor: &str) -> Result<(), String> {
         if now.id == site.id {
             continue;
         }
-        let its_server = site.uplink.as_deref() == Some(editor);
+        let its_server = site
+            .uplink
+            .as_deref()
+            .is_some_and(|up| editors.contains(&up));
         let allowed = match (site.id, now.id) {
-            (None, Some(_)) => editor == site.name || its_server,
+            (None, Some(_)) => editors.contains(&site.name.as_str()) || its_server,
             (Some(_), Some(_)) => its_server,
             (_, None) => false,
         };
         if !allowed {
             return Err(format!(
-                "this site (\"{editor}\") may not change the identity of site \"{}\": it changes only when that box joins again with an invitation (`wanderlan reset` there, then `wanderlan join`)",
+                "this site (\"{}\") may not change the identity of site \"{}\": it changes only when that box joins again with an invitation (`wanderlan reset` there, then `wanderlan join`)",
+                speaker(editors, &site.name),
                 site.name
             ));
         }
@@ -573,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn a_client_changes_only_itself_and_its_own_clients() {
+    fn a_client_changes_only_itself_and_the_sites_below_it() {
         let mut old = network();
         // d is a client of a (released, so its VLANs are its own), e a client of d.
         old.sites[3].uplink = Some("a".into());
@@ -586,6 +647,31 @@ mod tests {
         new.sites[3].online = false;
         new.sites[4].online = false;
         assert!(check_edit(&old, &new, "d").is_ok(), "itself and its client");
+        // g hangs off e: d is a server for it too (and manages it).
+        let mut deep = old.clone();
+        deep.sites.push(Site {
+            uplink: Some("e".into()),
+            managed_by: Some("d".into()),
+            ..site("g", 7, None, false)
+        });
+        let mut changed = deep.clone();
+        changed.sites[5].online = false;
+        assert!(check_edit(&deep, &changed, "d").is_ok(), "a site below it");
+        changed.sites[5].managed_by = Some("e".into());
+        let mut by_e = changed.clone();
+        by_e.sites[5].online = true;
+        assert!(check_edit(&changed, &by_e, "d").is_err(), "managed by e");
+        // Up from e to d: e would no longer know it.
+        let mut moved = deep.clone();
+        moved.sites[5].uplink = Some("d".into());
+        let err = check_edit(&deep, &moved, "d").unwrap_err();
+        assert!(err.contains("hangs off \"e\", a client"), "{err}");
+        // With e a server, e knows where g went, but d would lose e; with
+        // d a server too, nobody is lost.
+        moved.sites[4].uplink = None;
+        assert_eq!(topology::stranded(&deep, &moved), Some(("e", "d")));
+        moved.sites[3].uplink = None;
+        assert_eq!(topology::stranded(&deep, &moved), None);
         let mut server = old.clone();
         server.sites[1].online = false;
         let err = check_edit(&old, &server, "d").unwrap_err();
@@ -599,6 +685,8 @@ mod tests {
         );
         added.sites[5].uplink = Some("d".into());
         assert!(check_edit(&old, &added, "d").is_ok());
+        added.sites[5].uplink = Some("e".into());
+        assert!(check_edit(&old, &added, "d").is_ok(), "below its client");
     }
 
     #[test]

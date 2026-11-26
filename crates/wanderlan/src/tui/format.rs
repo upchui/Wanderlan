@@ -129,8 +129,13 @@ pub fn site_with_kind(site: &wanderlan_core::config::Site) -> String {
 }
 
 /// The role of a site: `server`, or `client of <uplink>`.
-pub fn role(uplink: Option<&str>) -> String {
-    uplink.map_or_else(|| "server".to_string(), |u| format!("client of {u}"))
+pub fn role(uplink: Option<&str>, has_clients: bool) -> String {
+    wanderlan_core::topology::role(uplink, has_clients)
+}
+
+/// True if a site of the status has clients of its own.
+pub fn serves(sites: &[wanderlan_core::api::SiteSummary], name: &str) -> bool {
+    sites.iter().any(|s| s.uplink.as_deref() == Some(name))
 }
 
 #[cfg(test)]

@@ -2,26 +2,28 @@
 //!
 //! Servers (sites without uplink) know the whole network. A client knows
 //! only itself, the site it is plugged into (its uplink, which it sees as a
-//! server) and its own clients; never the clients of other servers. Its
-//! `network.toml` contains exactly that.
+//! server) and the sites below it (its clients, their clients, ...); never
+//! the clients of other sites. Its `network.toml` contains exactly that.
 //!
 //! A client's changes reach the network through its uplink: the uplink
 //! fetches the client's view and merges what the client is responsible for
-//! (itself, its own clients and the network settings) into its own network.
+//! (itself, the sites below it and the network settings) into its own
+//! network. A client with clients of its own passes their changes on the
+//! same way, so they travel up through every site on the way.
 
 use std::collections::BTreeSet;
 
 use crate::config::{
     MAX_REVISION, Network, Site, TunnelVlans, VlanMap, fingerprint, next_revision, validate,
 };
-use crate::policy;
+use crate::{policy, topology};
 
 /// How far a client's view may count the revision on past its uplink's.
 const MAX_REVISION_STEP: u64 = 1 << 20;
 
 /// The part of `network` the site `site` knows: everything for a server; for a
-/// client itself, its uplink (without the uplink's own uplink) and its own
-/// clients. An unknown site knows no sites at all.
+/// client itself, its uplink (without the uplink's own uplink) and the sites
+/// below it. An unknown site knows no sites at all.
 pub fn view_for(network: &Network, site: &str) -> Network {
     let Some(me) = network.site(site) else {
         return Network {
@@ -37,7 +39,9 @@ pub fn view_for(network: &Network, site: &str) -> Network {
     let sites: Vec<Site> = network
         .sites
         .iter()
-        .filter(|s| s.name == site || s.name == uplink || s.uplink.as_deref() == Some(site))
+        .filter(|s| {
+            s.name == site || s.name == uplink || topology::is_below(network, &s.name, site)
+        })
         .map(|s| {
             let mut s = s.clone();
             if s.name == uplink {
@@ -87,12 +91,13 @@ pub struct Merged {
 }
 
 /// Merges the view of the client `from` into `full` (the network of its
-/// uplink): its own entry, the entries of its own clients (new ones too,
+/// uplink): its own entry, the entries of the sites below it (new ones too,
 /// removed ones go), their mappings and the network settings. Anything else
 /// in the view must be as `from` received it. A site of the view at the
 /// address of a site under another name is that site renamed (the client
 /// itself, too); the rename reaches the whole network. The result is checked
-/// against the rights of `from` and validated.
+/// against the rights of `from` and of the sites below it (their changes come
+/// through it) and validated.
 pub fn merge(full: &Network, view: &Network, from: &str) -> Result<Merged, String> {
     let renamed = crate::rename::renames(&view_for(full, from), view);
     let mut base = full.clone();
@@ -121,7 +126,7 @@ pub fn merge(full: &Network, view: &Network, from: &str) -> Result<Merged, Strin
         view.revision.max(next_revision(full.revision))
     }
     .min(MAX_REVISION);
-    policy::check_edit(full, &merged, from)?;
+    policy::check_relayed(full, &merged, from)?;
     if let Some(error) = validate(&merged, None).into_iter().find(|d| d.is_error()) {
         return Err(error.message);
     }
@@ -138,11 +143,14 @@ fn merge_named(full: &Network, view: &Network, from: &str) -> Result<Network, St
             "the configuration of \"{from}\" does not contain \"{from}\" itself"
         ));
     }
-    let owned = |s: &Site| s.name == from || s.uplink.as_deref() == Some(from);
+    // `from` and the sites below it, each in the network it belongs to.
+    let owned_in = |n: &Network, s: &Site| s.name == from || topology::is_below(n, &s.name, from);
+    let owned_view = |s: &Site| owned_in(view, s);
+    let owned_full = |s: &Site| owned_in(full, s);
     let expected = view_for(full, from);
     for site in &view.sites {
-        if owned(site) {
-            if full.site(&site.name).is_some_and(|f| !owned(f)) {
+        if owned_view(site) {
+            if full.site(&site.name).is_some_and(|f| !owned_full(f)) {
                 return Err(format!(
                     "the name \"{}\" is already used in the network",
                     site.name
@@ -154,7 +162,7 @@ fn merge_named(full: &Network, view: &Network, from: &str) -> Result<Network, St
             && maps_of(view, &site.name) == maps_of(&expected, &site.name);
         if !same {
             return Err(format!(
-                "\"{from}\" may only change itself and its own clients, not \"{}\"",
+                "\"{from}\" may only change itself and the sites below it, not \"{}\"",
                 site.name
             ));
         }
@@ -162,10 +170,10 @@ fn merge_named(full: &Network, view: &Network, from: &str) -> Result<Network, St
     if let Some(missing) = expected
         .sites
         .iter()
-        .find(|s| !owned(s) && view.site(&s.name).is_none())
+        .find(|s| !owned_full(s) && view.site(&s.name).is_none())
     {
         return Err(format!(
-            "\"{from}\" may only change itself and its own clients, not remove \"{}\"",
+            "\"{from}\" may only change itself and the sites below it, not remove \"{}\"",
             missing.name
         ));
     }
@@ -182,8 +190,8 @@ fn merge_named(full: &Network, view: &Network, from: &str) -> Result<Network, St
         .sites
         .iter()
         .filter_map(|s| {
-            if owned(s) {
-                view.site(&s.name).filter(|v| owned(v)).cloned()
+            if owned_full(s) {
+                view.site(&s.name).filter(|v| owned_view(v)).cloned()
             } else {
                 Some(s.clone())
             }
@@ -192,22 +200,22 @@ fn merge_named(full: &Network, view: &Network, from: &str) -> Result<Network, St
     for site in view
         .sites
         .iter()
-        .filter(|s| owned(s) && full.site(&s.name).is_none())
+        .filter(|s| owned_view(s) && full.site(&s.name).is_none())
     {
         merged.sites.push(site.clone());
     }
     let names: BTreeSet<&str> = full
         .sites
         .iter()
-        .chain(view.sites.iter())
-        .filter(|s| owned(s))
+        .filter(|s| owned_full(s))
+        .chain(view.sites.iter().filter(|s| owned_view(s)))
         .map(|s| s.name.as_str())
         .collect();
     // Its own mappings as in the view; unchanged ones keep their place.
     let own_maps: Vec<&VlanMap> = view
         .maps
         .iter()
-        .filter(|m| names.contains(m.site.as_str()) && view.site(&m.site).is_some_and(owned))
+        .filter(|m| names.contains(m.site.as_str()) && view.site(&m.site).is_some_and(owned_view))
         .collect();
     merged
         .maps
@@ -271,7 +279,8 @@ mod tests {
     }
 
     /// alex and dc are servers; marcel and site2 are clients of alex, x is a
-    /// client of marcel, y a client of dc.
+    /// client of marcel, y a client of dc, w a client of x (so marcel and x
+    /// are client + server).
     fn full() -> Network {
         let mut network = Network::new(VlanSet::from_range(10, 50));
         network.revision = 7;
@@ -282,6 +291,7 @@ mod tests {
             site("site2", 4, Some("alex")),
             site("x", 5, Some("marcel")),
             site("y", 6, Some("dc")),
+            site("w", 7, Some("x")),
         ];
         network.maps = vec![
             VlanMap {
@@ -303,7 +313,7 @@ mod tests {
     }
 
     #[test]
-    fn a_client_knows_its_server_and_its_own_clients_only() {
+    fn a_client_knows_its_server_and_the_sites_below_it_only() {
         let network = full();
         assert_eq!(
             names(&view_for(&network, "alex")),
@@ -315,9 +325,9 @@ mod tests {
         assert_eq!(site2.maps.len(), 1, "only its own mapping");
         assert_eq!(site2.revision, 7);
         let marcel = view_for(&network, "marcel");
-        assert_eq!(names(&marcel), ["alex", "marcel", "x"]);
+        assert_eq!(names(&marcel), ["alex", "marcel", "x", "w"]);
         let x = view_for(&network, "x");
-        assert_eq!(names(&x), ["marcel", "x"]);
+        assert_eq!(names(&x), ["marcel", "x", "w"]);
         assert_eq!(
             x.site("marcel").unwrap().uplink,
             None,
@@ -325,7 +335,7 @@ mod tests {
         );
         assert!(view_for(&network, "nobody").sites.is_empty());
         // Every view is a valid configuration of its own.
-        for s in ["site2", "marcel", "x", "y"] {
+        for s in ["site2", "marcel", "x", "y", "w"] {
             let v = view_for(&network, s);
             assert!(!validate(&v, None).iter().any(|d| d.is_error()), "{s}");
         }
@@ -397,6 +407,48 @@ mod tests {
     }
 
     #[test]
+    fn changes_travel_up_through_every_site_on_the_way() {
+        let network = full();
+        // x (a client of marcel) invites z and sets its own ports.
+        let mut at_x = view_for(&network, "x");
+        at_x.revision = 8;
+        at_x.sites.push(site("z", 9, Some("x")));
+        at_x.sites
+            .iter_mut()
+            .find(|s| s.name == "x")
+            .unwrap()
+            .ports
+            .control = Some(52000);
+        // marcel takes it over from x, alex from marcel.
+        let at_marcel = merge(&view_for(&network, "marcel"), &at_x, "x")
+            .unwrap()
+            .network;
+        assert!(at_marcel.site("z").is_some());
+        let at_alex = merge(&network, &at_marcel, "marcel").unwrap().network;
+        assert_eq!(at_alex.site("z").unwrap().uplink.as_deref(), Some("x"));
+        assert_eq!(at_alex.control_port_of("x"), 52000);
+        // And down again: x knows z.
+        assert_eq!(names(&view_for(&at_alex, "x")), ["marcel", "x", "w", "z"]);
+        // marcel may not set the ports of x itself, nor change its server.
+        let mut own = view_for(&network, "marcel");
+        own.sites
+            .iter_mut()
+            .find(|s| s.name == "x")
+            .unwrap()
+            .ports
+            .control = Some(52000);
+        let err = policy::check_edit(&view_for(&network, "marcel"), &own, "marcel").unwrap_err();
+        assert!(err.contains("only \"x\" itself"), "{err}");
+        let mut up = view_for(&network, "x");
+        up.sites
+            .iter_mut()
+            .find(|s| s.name == "marcel")
+            .unwrap()
+            .online = false;
+        assert!(merge(&view_for(&network, "marcel"), &up, "x").is_err());
+    }
+
+    #[test]
     fn a_client_cannot_change_its_server_or_take_other_names() {
         let network = full();
         let mut view = view_for(&network, "site2");
@@ -408,7 +460,7 @@ mod tests {
             .online = false;
         let err = merge(&network, &view, "site2").unwrap_err();
         assert!(
-            err.contains("may only change itself and its own clients"),
+            err.contains("may only change itself and the sites below it"),
             "{err}"
         );
 
@@ -542,14 +594,16 @@ mod tests {
         view.revision += 1;
         let merged = merge(&network, &view, "marcel").unwrap();
         assert!(merged.network.site("x2").is_some());
-        // Managed by another site: not by marcel.
+        // Managed by another site: marcel itself may not (its daemon says
+        // so); x renamed itself, its change comes through marcel.
         let mut other = network.clone();
         other.sites[4].managed_by = Some("alex".into());
         let mut view = view_for(&other, "marcel");
         view.rename_site("x", "x2");
         view.revision += 1;
-        let err = merge(&other, &view, "marcel").unwrap_err();
+        let err = policy::check_edit(&view_for(&other, "marcel"), &view, "marcel").unwrap_err();
         assert!(err.contains("may not rename site \"x\""), "{err}");
+        assert!(merge(&other, &view, "marcel").is_ok());
     }
 
     #[test]

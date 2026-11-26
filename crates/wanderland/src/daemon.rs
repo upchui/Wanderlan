@@ -300,6 +300,10 @@ struct Controller {
     fetching: bool,
     fetch_backoff: BTreeMap<String, Instant>,
     grace: BTreeMap<String, (Ipv4Addr, Instant)>,
+    /// The keys of the peers in `grace`: with them they still fetch the new
+    /// network (authenticated), e.g. a server that became a client of
+    /// another site learns so from its old peers.
+    grace_keys: BTreeMap<String, PeerKeys>,
     generation: u64,
     invites: Invites,
     join_failures: BTreeMap<Ipv4Addr, VecDeque<Instant>>,
@@ -409,6 +413,7 @@ pub async fn run(args: Args) -> Result<()> {
         fetching: false,
         fetch_backoff: BTreeMap::new(),
         grace: BTreeMap::new(),
+        grace_keys: BTreeMap::new(),
         generation: 0,
         invites,
         join_failures: BTreeMap::new(),
@@ -1035,6 +1040,10 @@ impl Controller {
             // A renamed peer is still there under its new name: its old name
             // must not answer for its address.
             if !new_peers.contains_key(&name) && !new_peers.values().any(|a| *a == addr) {
+                // The keys are still those of the old peers here.
+                if let Some(k) = self.peer_keys.get(&name) {
+                    self.grace_keys.insert(name.clone(), k.clone());
+                }
                 self.grace.insert(name, (addr, now + GRACE));
             }
         }
@@ -1042,6 +1051,8 @@ impl Controller {
             self.grace.remove(name);
         }
         self.grace.retain(|_, (_, until)| *until > now);
+        let grace = &self.grace;
+        self.grace_keys.retain(|name, _| grace.contains_key(name));
         self.runtime
             .pmtu
             .retain(|peer, _| new_peers.contains_key(peer));
@@ -1141,6 +1152,7 @@ impl Controller {
             move_key(&mut self.peer_keys, old, new);
             move_key(&mut self.control_endpoints, old, new);
             self.grace.remove(old);
+            self.grace_keys.remove(old);
             if self.runtime.blocked.remove(&topology::tunnel_name(old)) {
                 self.runtime.blocked.insert(topology::tunnel_name(new));
             }
@@ -1197,8 +1209,9 @@ impl Controller {
             revision: m.revision,
             fingerprint: fingerprint_bytes(&config::fingerprint(m)),
         };
-        // Servers and the uplink get what this site knows; a client of this
-        // site (and a removed site) only its own view of the network.
+        // Servers and the uplink get what this site knows; a client (of
+        // this site, or one in grace that became a client elsewhere) and a
+        // removed site only its own view of the network.
         let mut announce_to = BTreeMap::new();
         let mut views = BTreeMap::new();
         let mut texts: BTreeMap<String, String> = BTreeMap::new();
@@ -1208,11 +1221,12 @@ impl Controller {
             Some(c) => {
                 // Peers get the network in the form every version reads.
                 let own = render_network_wire(&c.network);
+                let uplink = c.self_site().and_then(|s| s.uplink.as_deref());
                 for (name, addr) in peers.iter().chain(responders.iter()) {
                     let client = c
                         .network
                         .site(name)
-                        .is_none_or(|s| s.uplink.as_deref() == Some(c.self_name()));
+                        .is_none_or(|s| s.uplink.is_some() && Some(name.as_str()) != uplink);
                     if client {
                         let v = view::view_for(&c.network, name);
                         announce_to.insert(name.clone(), version(&v));
@@ -1274,8 +1288,12 @@ impl Controller {
         });
         self.probe_config.send_replace(ProbeConfig {
             bind,
+            tunnel_port: self
+                .config
+                .as_ref()
+                .map(|cfg| cfg.network.tunnel_port_of(cfg.self_name())),
             peers: probe_peers,
-            responders,
+            responders: responders.clone(),
             generation: self.generation,
             mtu_interval,
             announce,
@@ -1311,6 +1329,21 @@ impl Controller {
                     },
                 ))
             })
+            // Former peers (in grace) fetch what they get with their key,
+            // from where they are now (a former client behind NAT).
+            .chain(responders.iter().filter_map(|(name, address)| {
+                let k = self.grace_keys.get(name)?;
+                Some((
+                    k.id,
+                    sync_net::Keyed {
+                        name: name.clone(),
+                        address: *address,
+                        client: true,
+                        view: Arc::from(texts.get(name)?.as_str()),
+                        keys: k.keys.clone(),
+                    },
+                ))
+            }))
             .collect();
         self.offer.send_replace(Offer {
             bind,
@@ -2582,6 +2615,7 @@ impl Controller {
         self.rejected.clear();
         self.fetch_backoff.clear();
         self.grace.clear();
+        self.grace_keys.clear();
         self.flushes.clear();
         self.invites.clear();
         self.join_failures.clear();

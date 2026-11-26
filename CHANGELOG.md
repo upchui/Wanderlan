@@ -7,6 +7,25 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
+### Client + server: clients with clients of their own
+
+- A client with clients of its own is their server in every respect: it
+  knows all sites below it (also the clients of its clients), may change
+  them like a server, and its server takes over the changes it passes on
+  with the rights of the site that made them. Before, a change only a client
+  of a client may make (its own ports) was refused by the server on top, and
+  a third level of clients was lost again.
+- The role shows it: `client of hq + server` (TUI, `wanderlan status`).
+- A site is no longer moved away from under a client + server (it would
+  never learn where it went): the change is refused and says how to do it.
+- A server made a client of a client + server learns it from its old peers:
+  they refused its fetch ("unknown identity"), as they no longer kept the
+  keys of a peer in its grace time, and now give it its own view.
+- The daemon's socket for the tests of the client tunnels could get the
+  tunnel port of its own site by chance (a free port is picked at random);
+  that site's tunnels then did not come up ("Address in use") until a
+  restart. It now never takes the ports of its site.
+
 ### TUI: fixes and easier to use; sites and mappings on the command line
 
 - Editing a site in the TUI kept neither its own ports nor its breakouts (a

@@ -109,6 +109,10 @@ impl Eq for Me {}
 pub struct ProbeConfig {
     /// Local address and port to bind.
     pub bind: Option<SocketAddrV4>,
+    /// This site's tunnel port: the kernel takes it (and the one above, the
+    /// source of a tunnel through NAT) when a tunnel comes up, so the
+    /// socket for the tests of the client tunnels never does.
+    pub tunnel_port: Option<u16>,
     /// Direct peers by name: where their daemon listens (each site has its
     /// own control port).
     pub peers: BTreeMap<String, SocketAddrV4>,
@@ -154,6 +158,16 @@ pub struct UplinkTunnel {
 }
 
 impl ProbeConfig {
+    /// The ports of this site no other socket of this daemon may take.
+    fn own_ports(&self) -> Vec<u16> {
+        let mut ports: Vec<u16> = self.bind.map(|b| b.port()).into_iter().collect();
+        if let Some(tunnel) = self.tunnel_port {
+            ports.push(tunnel);
+            ports.push(tunnel.saturating_add(1));
+        }
+        ports
+    }
+
     /// What to announce to `peer`.
     fn announce_of(&self, peer: &str) -> wire::Announce {
         self.announce_to.get(peer).copied().unwrap_or(self.announce)
@@ -397,13 +411,18 @@ async fn run(
             warn!("{e:#}; the probes of this run use a fixed nonce");
             [0; wire2::NONCE_LEN]
         });
-        let test_socket = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await {
+        let avoid = config.borrow().own_ports();
+        let test_socket = match test_socket(&avoid).await {
             Ok(s) => Some(s),
             Err(e) => {
                 warn!("Cannot open the socket for the tests of the client tunnels: {e}");
                 None
             }
         };
+        let test_port = test_socket
+            .as_ref()
+            .and_then(|s| s.local_addr().ok())
+            .map(|a| a.port());
         let shared = Arc::new(Shared {
             socket,
             pending: Mutex::new(HashMap::new()),
@@ -423,7 +442,10 @@ async fn run(
         let mut gone = false;
         loop {
             let current = config.borrow_and_update().clone();
-            if current.bind != Some(bind) {
+            // A new address, or a tunnel port that the test socket has.
+            if current.bind != Some(bind)
+                || test_port.is_some_and(|p| current.own_ports().contains(&p))
+            {
                 break;
             }
             sync_probers(&mut prober, &current, &shared, &table, &events);
@@ -451,6 +473,25 @@ async fn run(
             t.clear();
         }
     }
+}
+
+/// A socket on a free port, never on one of `avoid`: port 0 may well get
+/// this site's tunnel port (both lie in the range of free ports), and a
+/// tunnel could then not come up ("Address in use").
+async fn test_socket(avoid: &[u16]) -> std::io::Result<UdpSocket> {
+    // The rejected ones stay open until the end, so the next is another.
+    let mut rejected = Vec::new();
+    for _ in 0..8 {
+        let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await?;
+        if !avoid.contains(&socket.local_addr()?.port()) {
+            return Ok(socket);
+        }
+        rejected.push(socket);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AddrInUse,
+        "no free port besides those of this site",
+    ))
 }
 
 async fn bind_socket(bind: SocketAddrV4) -> anyhow::Result<UdpSocket> {

@@ -40,6 +40,9 @@ x() {
 # Same, but without output.
 xq() { x "$@" >/dev/null 2>&1; }
 
+# entry_of <site> <name>: the entry of site <name> in the network.toml of <site>.
+entry_of() { x "$1" "sed -n '/^\[site.$2\]/,/^\[/p' /etc/wanderlan/network.toml"; }
+
 # Writes stdin to a file in a container.
 put() {
   local svc="$1" path="$2"

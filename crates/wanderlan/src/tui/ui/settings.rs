@@ -138,9 +138,22 @@ fn permissions(draft: &Draft) -> [(&'static str, String); 4] {
     let site = network.site(me);
     let role = site.map_or_else(
         || "-".to_string(),
-        |s| match s.uplink.as_deref() {
-            Some(up) => format!("client of {up} (its only tunnel leads there)"),
-            None => "server (connected with the other servers)".to_string(),
+        |s| {
+            let clients: Vec<&str> = network
+                .sites
+                .iter()
+                .filter(|c| c.uplink.as_deref() == Some(me))
+                .map(|c| c.name.as_str())
+                .collect();
+            match s.uplink.as_deref() {
+                // A client in the tunnel up, the server in those down.
+                Some(up) if !clients.is_empty() => format!(
+                    "client of {up} (tunnel up) + server of its clients ({})",
+                    clients.join(", ")
+                ),
+                Some(up) => format!("client of {up} (its only tunnel leads there)"),
+                None => "server (connected with the other servers)".to_string(),
+            }
         },
     );
     let managed = match (site, policy::restricted_by(network, me)) {

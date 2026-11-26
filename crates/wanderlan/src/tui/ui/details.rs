@@ -429,7 +429,10 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, scroll: u16, area: Rect) {
     let mut lines = vec![
         Line::from(vec![
             label("Role"),
-            Span::raw(format::role(site.uplink.as_deref())),
+            Span::raw(format::role(
+                site.uplink.as_deref(),
+                topology::has_clients(network, &site.name),
+            )),
             if site.name == me {
                 dim("   this site")
             } else {

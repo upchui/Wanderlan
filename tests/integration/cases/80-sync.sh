@@ -73,7 +73,6 @@ check "site4 sets its own commit timeout" x site4 "wanderlan settings commit-tim
 check "site4 keeps it in its local.toml" x site4 "grep -q '^commit_timeout = \"2m\"' /etc/wanderlan/local.toml"
 check "site1 keeps its own" x site1 "wanderlan settings | grep -q '^commit-timeout  1m  (network default)'"
 # Its ports are its own, its VLANs not: they change elsewhere, the ports stay.
-entry_of() { x "$1" "sed -n '/^\[site.$2\]/,/^\[/p' /etc/wanderlan/network.toml"; }
 check "site1 changes the VLANs of site4, which has ports of its own" \
   x site1 "wanderlan site vlans site4 10-40 --confirm"
 wait_for 90 "site4 has the VLANs 10-40 and kept its ports" \

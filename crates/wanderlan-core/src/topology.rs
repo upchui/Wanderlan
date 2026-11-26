@@ -165,6 +165,59 @@ fn ancestors<'a>(network: &'a Network, site: &'a str) -> Vec<&'a str> {
     chain
 }
 
+/// True if `site` hangs (directly or indirectly) off `root`: its chain of
+/// servers leads there. A site is not below itself.
+pub fn is_below(network: &Network, site: &str, root: &str) -> bool {
+    site != root && ancestors(network, site).contains(&root)
+}
+
+/// The sites below `root`: its clients, their clients, ... in the order of
+/// the network.
+pub fn below<'a>(network: &'a Network, root: &str) -> Vec<&'a str> {
+    network
+        .sites
+        .iter()
+        .map(|s| s.name.as_str())
+        .filter(|s| is_below(network, s, root))
+        .collect()
+}
+
+/// A site that `new` moves away from under the client it hangs off in `old`,
+/// to a place outside that client's sites, as (site, that client). Only its
+/// server tells a site where it went, and that client would no longer know
+/// it (a server knows the whole network, so moving a site away from a server
+/// is fine).
+pub fn stranded<'a>(old: &'a Network, new: &Network) -> Option<(&'a str, &'a str)> {
+    old.sites.iter().find_map(|site| {
+        let up = site.uplink.as_deref()?;
+        let up_was_client = old.site(up)?.uplink.is_some();
+        new.site(&site.name)?;
+        let known = new
+            .site(up)
+            .is_some_and(|u| u.uplink.is_none() || is_below(new, &site.name, up));
+        (up_was_client && !known).then_some((site.name.as_str(), up))
+    })
+}
+
+/// True if a site has clients of its own.
+pub fn has_clients(network: &Network, site: &str) -> bool {
+    network
+        .sites
+        .iter()
+        .any(|s| s.uplink.as_deref() == Some(site))
+}
+
+/// The role of a site for displays: `server`, `client of hq`, or
+/// `client of hq + server` for a client with clients of its own (a client in
+/// its tunnel to its server, the server in the tunnels to its clients).
+pub fn role(uplink: Option<&str>, has_clients: bool) -> String {
+    match uplink {
+        None => "server".to_string(),
+        Some(up) if has_clients => format!("client of {up} + server"),
+        Some(up) => format!("client of {up}"),
+    }
+}
+
 /// The neighbour through which `from` reaches `to`, if `to` is neither
 /// `from` itself nor a direct neighbour: shown as "via …".
 pub fn via<'a>(network: &'a Network, from: &str, to: &str) -> Option<&'a str> {
