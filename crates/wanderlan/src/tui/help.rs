@@ -24,7 +24,7 @@ pub const SECTIONS: &[Section] = &[
     Section {
         title: "Everywhere",
         keys: &[
-            ("1-7, Tab", "switch view (Shift-Tab: previous)"),
+            ("1-8, Tab", "switch view (Shift-Tab: previous)"),
             ("a", "review the draft (diff) and apply it"),
             ("x", "discard the draft"),
             ("c", "confirm a pending change"),
@@ -136,6 +136,21 @@ pub const SECTIONS: &[Section] = &[
         keys: &[("Up/Down", "choose a setting"), ("Enter", "change it")],
         text: "Every setting of the network and of this host, with an explanation. \
                Trunk and the trunk per tunnel open a list of the interfaces of this host.",
+    },
+    Section {
+        title: "8 Breakout",
+        keys: &[
+            ("n", "a VLAN of a site uses its own uplink to the internet"),
+            (
+                "e, Enter",
+                "edit: uplink (empty: default route), exceptions",
+            ),
+            ("d, Del", "the VLAN goes through the tunnel again"),
+        ],
+        text: "Public IPv4 and IPv6 destinations of the VLAN leave through the uplink of \
+               that site (masqueraded); its devices keep their gateway and DHCP. Private \
+               destinations and the exceptions still go through the tunnel. Its manager \
+               decides, like for its VLANs.",
     },
     Section {
         title: "Trunk ports",
@@ -321,7 +336,7 @@ pub fn bar(app: &App) -> Vec<Binding> {
     }
     let common: [Binding; 2] = [("?", "help"), ("q", "quit")];
     let mut keys: Vec<Binding> = if !matches!(app.conn, Conn::Connected) {
-        vec![("1-7", "views")]
+        vec![("1-8", "views")]
     } else {
         match app.view {
             View::Overview => vec![
@@ -344,6 +359,12 @@ pub fn bar(app: &App) -> Vec<Binding> {
                 ("/", "search"),
             ],
             View::Settings => vec![("Enter", "change"), ("Up/Down", "choose")],
+            View::Breakout => vec![
+                ("n", "new"),
+                ("Enter", "edit"),
+                ("d", "remove"),
+                ("Up/Down", "choose"),
+            ],
             View::Vlans if app.vlans_tunnels => vec![
                 ("Enter", "limit"),
                 ("d", "no limit"),
@@ -411,7 +432,7 @@ pub fn bar(app: &App) -> Vec<Binding> {
             keys.push(("a", "apply"));
             keys.push(("x", "discard"));
         } else {
-            keys.push(("1-7", "views"));
+            keys.push(("1-8", "views"));
         }
     }
     keys.dedup();

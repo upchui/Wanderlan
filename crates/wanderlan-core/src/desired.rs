@@ -8,6 +8,7 @@ use crate::config::{Config, LocalVid, NATIVE_VID, TunnelMode};
 use crate::forwarding;
 use crate::identity::PeerIdentity;
 use crate::mtu;
+use crate::sys::breakout::{BreakoutSpec, Egress, Uplinks, conf};
 use crate::sys::nft::{MssRule, PortDir, SplitRule};
 use crate::sys::nft_ip::LearnRule;
 use crate::sys::tc::{Direction, TcAction, TcRule};
@@ -108,6 +109,9 @@ pub struct Desired {
     /// The tunnels through NAT (by VNI): their packets get the tunnel port
     /// as source port (see [`crate::sys::nft_ip`]).
     pub fixed: BTreeSet<u32>,
+    /// The local breakouts (see [`crate::breakout`]), one per segment with
+    /// a tunnel and VLAN with a breakout.
+    pub breakout: Vec<BreakoutSpec>,
 }
 
 impl Desired {
@@ -123,6 +127,16 @@ impl Desired {
     /// The default trunk.
     pub fn default_trunk(&self) -> Option<&TrunkSpec> {
         self.trunks.first()
+    }
+
+    /// The sysctls the breakouts set (to read before comparing).
+    pub fn breakout_sysctls(&self) -> Vec<String> {
+        let paths: BTreeSet<&String> = self
+            .breakout
+            .iter()
+            .flat_map(|b| b.sysctls.keys())
+            .collect();
+        paths.into_iter().cloned().collect()
     }
 }
 
@@ -174,6 +188,13 @@ pub struct Runtime {
     pub uplink_direct: bool,
     /// Connection tracking is loaded (it would cost every tunnel packet).
     pub conntrack: bool,
+    /// The interfaces the breakouts can leave by.
+    pub uplinks: Uplinks,
+    /// The current values of the sysctls the breakouts depend on (path
+    /// below `/proc/sys/net`, see [`breakout_sysctl_paths`]).
+    pub sysctls: BTreeMap<String, String>,
+    /// The sysctls can be written (not in a container).
+    pub sysctl_writable: bool,
 }
 
 impl Runtime {
@@ -348,6 +369,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
     // The packets of the client tunnels skip connection tracking on their
     // server (a client may need it: its firewall lets the answers in).
     let notrack = runtime.conntrack && has_clients;
+    let breakout = breakouts(cfg, runtime, &trunks, &tunnels, &trunk_vlans);
     let fixed = tunnels
         .iter()
         .filter(|t| t.params.source_port.is_some())
@@ -372,7 +394,254 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
             .collect(),
         tunnels,
         local_address,
+        breakout,
     }
+}
+
+/// The local breakouts of this site: for every segment with a tunnel and
+/// every VLAN of the site with a breakout.
+fn breakouts(
+    cfg: &Config,
+    runtime: &Runtime,
+    trunks: &[TrunkSpec],
+    tunnels: &[TunnelSpec],
+    trunk_vlans: &PortVlans,
+) -> Vec<BreakoutSpec> {
+    let Some(site) = cfg.self_site() else {
+        return Vec::new();
+    };
+    if site.breakout.is_empty() {
+        return Vec::new();
+    }
+    // The segments in the order of the trunks (the default one first).
+    let mut segments: Vec<(&str, Vec<String>)> = Vec::new();
+    for t in trunks {
+        match segments.iter_mut().find(|(b, _)| *b == t.bridge) {
+            Some((_, ports)) => ports.push(t.name.clone()),
+            None => segments.push((t.bridge.as_str(), vec![t.name.clone()])),
+        }
+    }
+    let trunk_ports: BTreeSet<&str> = trunks.iter().map(|t| t.name.as_str()).collect();
+    let mut out = Vec::new();
+    for (segment, (bridge, ports)) in segments.iter().enumerate() {
+        if !tunnels.iter().any(|t| t.bridge == *bridge) {
+            continue;
+        }
+        for (vid, b) in &site.breakout {
+            if !trunk_vlans.contains_key(vid) {
+                continue;
+            }
+            let Some(id) = crate::breakout::id(segment, *vid) else {
+                continue;
+            };
+            let (router, port) = crate::breakout::names(segment, *vid);
+            let uplink = b.uplink.as_deref();
+            let check = |v6| -> Result<Egress, String> {
+                if let Some(dev) = uplink
+                    && (trunk_ports.contains(dev) || is_own_interface(dev))
+                {
+                    return Err(format!(
+                        "{dev} is a trunk port or an interface of wanderlan, not an uplink"
+                    ));
+                }
+                let egress = egress(v6, uplink, &runtime.uplinks)?;
+                forwarding(v6, egress.dev(), &router, runtime)?;
+                Ok(egress)
+            };
+            let v4 = check(false);
+            let v6 = check(true);
+            let sysctls = breakout_sysctls(&v4, &v6, &router, &port, runtime);
+            out.push(BreakoutSpec {
+                bridge: (*bridge).to_string(),
+                vid: *vid,
+                id,
+                mac: crate::breakout::mac(segment, *vid),
+                router,
+                port,
+                trunks: ports.clone(),
+                except: b.except.clone(),
+                v4,
+                v6,
+                sysctls,
+            });
+        }
+    }
+    out
+}
+
+/// True for the interfaces wanderlan makes itself.
+fn is_own_interface(name: &str) -> bool {
+    name == BRIDGE_NAME
+        || name.starts_with(SEGMENT_PREFIX)
+        || topology::is_tunnel_name(name)
+        || crate::breakout::is_breakout_name(name)
+}
+
+/// How one family leaves: by the default route (`uplink` `None`) or out of
+/// the chosen interface, or why it cannot.
+fn egress(v6: bool, uplink: Option<&str>, uplinks: &Uplinks) -> Result<Egress, String> {
+    let family = if v6 { "IPv6" } else { "IPv4" };
+    let auto = if v6 { &uplinks.auto6 } else { &uplinks.auto4 };
+    let dev = match uplink {
+        Some(dev) => dev.to_string(),
+        None => auto
+            .clone()
+            .ok_or_else(|| format!("this box has no {family} default route"))?,
+    };
+    let Some(info) = uplinks.by_name.get(&dev) else {
+        return Err(format!("the uplink {dev} does not exist"));
+    };
+    if !info.up {
+        return Err(format!("the uplink {dev} is down"));
+    }
+    let addressed = if v6 {
+        !info.v6.is_empty()
+    } else {
+        !info.v4.is_empty()
+    };
+    if !addressed {
+        return Err(format!(
+            "{dev} has no {}{family} address",
+            if v6 { "global " } else { "" }
+        ));
+    }
+    if uplink.is_none() {
+        return Ok(Egress::Main { dev });
+    }
+    let default = if v6 {
+        info.default6.map(|g| g.map(std::net::IpAddr::V6))
+    } else {
+        info.default4.map(|g| g.map(std::net::IpAddr::V4))
+    };
+    match default {
+        Some(gateway) => Ok(Egress::Fixed { dev, gateway }),
+        None if info.pointopoint => Ok(Egress::Fixed { dev, gateway: None }),
+        None => Err(format!(
+            "{dev} has no {family} default route (an uplink needs one of its own, with any metric)"
+        )),
+    }
+}
+
+/// Whether the box can forward a family for the router `router` leaving by
+/// `dev`: it is on already, or the sysctls can be written.
+fn forwarding(v6: bool, dev: &str, router: &str, runtime: &Runtime) -> Result<(), String> {
+    if runtime.sysctl_writable {
+        return Ok(());
+    }
+    let value = |path: &str| runtime.sysctls.get(path).map(String::as_str);
+    // A new router takes the default of new interfaces.
+    let own_or_default = |key: &str, v6: bool| {
+        value(&conf(v6, router, key)).or_else(|| value(&conf(v6, "default", key)))
+    };
+    if v6 {
+        if value(&conf(true, "all", "forwarding")) != Some("1") {
+            return Err(
+                "IPv6 forwarding is off and the sysctls cannot be written (net.ipv6.conf.all.forwarding = 1 is needed)"
+                    .into(),
+            );
+        }
+        if own_or_default("disable_ipv6", true) == Some("1") {
+            return Err(
+                "IPv6 is disabled on new interfaces and the sysctls cannot be written (net.ipv6.conf.default.disable_ipv6 = 0 is needed)"
+                    .into(),
+            );
+        }
+    } else {
+        if value(&conf(false, dev, "forwarding")) != Some("1")
+            || own_or_default("forwarding", false) != Some("1")
+        {
+            return Err(format!(
+                "IPv4 forwarding is off and the sysctls cannot be written (net.ipv4.conf.{dev}.forwarding = 1 and net.ipv4.conf.default.forwarding = 1 are needed)"
+            ));
+        }
+        // The kernel takes the stricter of `all` and the interface: strict
+        // source checks drop what the devices send (their addresses are
+        // reached through the router, not by a route of the box).
+        let level = |v: Option<&str>| v.and_then(|v| v.parse::<u8>().ok()).unwrap_or(0);
+        let all = level(value(&conf(false, "all", "rp_filter")));
+        let router_rp = all.max(level(own_or_default("rp_filter", false)));
+        if router_rp == 1 {
+            return Err(
+                "strict reverse path filtering is on and the sysctls cannot be written (net.ipv4.conf.all.rp_filter and .default.rp_filter = 2 are needed)"
+                    .into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The sysctls of a breakout: forwarding on the router and the uplink,
+/// IPv6 forwarding; where the sysctls can be written also what keeps the
+/// router quiet and the uplink taking its IPv6 router advertisements.
+fn breakout_sysctls(
+    v4: &Result<Egress, String>,
+    v6: &Result<Egress, String>,
+    router: &str,
+    port: &str,
+    runtime: &Runtime,
+) -> BTreeMap<String, String> {
+    let writable = runtime.sysctl_writable;
+    let value = |path: &str| runtime.sysctls.get(path).map(String::as_str);
+    let mut out = BTreeMap::new();
+    let mut set = |path: String, v: &str| {
+        out.insert(path, v.to_string());
+    };
+    if let Ok(egress) = v4 {
+        let dev = egress.dev();
+        set(conf(false, dev, "forwarding"), "1");
+        set(conf(false, router, "forwarding"), "1");
+        if writable {
+            // Loose source checks: the devices are reached through the
+            // router, the internet through the uplink.
+            set(conf(false, router, "rp_filter"), "2");
+            // The router answers no ARP request (it asks only).
+            set(conf(false, router, "arp_ignore"), "8");
+            set(conf(false, router, "arp_announce"), "2");
+            let strict = |d: &str| value(&conf(false, d, "rp_filter")) == Some("1");
+            let all = value(&conf(false, "all", "rp_filter"))
+                .and_then(|v| v.parse::<u8>().ok())
+                .unwrap_or(0);
+            if matches!(egress, Egress::Fixed { .. }) && (strict(dev) || all == 1) {
+                // The answers of a second uplink come in where the main
+                // table does not lead.
+                set(conf(false, dev, "rp_filter"), "2");
+            }
+        }
+    }
+    if let Ok(egress) = v6 {
+        let dev = egress.dev();
+        set(conf(true, "all", "forwarding"), "1");
+        set(conf(true, router, "disable_ipv6"), "0");
+        if writable {
+            set(conf(true, router, "accept_ra"), "0");
+            set(conf(true, router, "autoconf"), "0");
+            // Forwarding on: router advertisements count only with 2.
+            if value(&conf(true, dev, "accept_ra")) == Some("1") {
+                set(conf(true, dev, "accept_ra"), "2");
+            }
+        }
+    }
+    if writable && (v4.is_ok() || v6.is_ok()) {
+        // The port end has no address of its own.
+        set(conf(true, port, "disable_ipv6"), "1");
+    }
+    out
+}
+
+/// The sysctls the breakouts depend on, for the given interfaces (the
+/// uplinks and the routers there are): what the daemon reads into
+/// [`Runtime::sysctls`].
+pub fn breakout_sysctl_paths<'a>(devs: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for dev in devs.into_iter().chain(["all", "default"]) {
+        for key in ["forwarding", "rp_filter"] {
+            out.insert(conf(false, dev, key));
+        }
+        for key in ["forwarding", "accept_ra", "disable_ipv6"] {
+            out.insert(conf(true, dev, key));
+        }
+    }
+    out.into_iter().collect()
 }
 
 /// Why a tunnel with a key is down: its peer has not proven its identity.

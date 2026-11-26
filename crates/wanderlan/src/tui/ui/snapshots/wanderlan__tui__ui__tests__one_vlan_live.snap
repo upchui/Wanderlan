@@ -1,9 +1,8 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 610
 expression: render(&app)
 ---
-" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+" 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings  8 Breakout   "
 "┌ VLAN 20 live   Up/Down: other VLAN  m: MACs  Esc: back ──────────────────────┐"
 "│ Here        on the trunk, tagged                                             │"
 "│ Tunnels     buero, haus2, haus3, haus5, haus6                                │"

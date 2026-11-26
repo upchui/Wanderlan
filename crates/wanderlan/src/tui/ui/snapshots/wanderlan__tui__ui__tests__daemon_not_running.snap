@@ -1,9 +1,8 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 158
 expression: render(&app)
 ---
-" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+" 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings  8 Breakout   "
 "                                                                                "
 "                                                                                "
 "                                                                                "
@@ -26,4 +25,4 @@ expression: render(&app)
 "                                                                                "
 "                                                                                "
 "                                                                        offline "
-" 1-7  views   ?  help   q  quit                                                 "
+" 1-8  views   ?  help   q  quit                                                 "

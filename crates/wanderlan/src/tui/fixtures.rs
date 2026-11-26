@@ -159,6 +159,8 @@ pub fn status() -> Status {
         trunk_ports: Vec::new(),
         missing_ports: Vec::new(),
         site_id: Some("hEiM1x2y3z4w5v6u7t8s9r0qPoNmLkJiHgFeDcBa0Q8=".into()),
+        breakout: Vec::new(),
+        uplinks: Vec::new(),
         peers: vec![
             PeerStatus {
                 macs: 12,
@@ -237,6 +239,8 @@ pub fn unconfigured_status() -> Status {
         trunk_ports: Vec::new(),
         missing_ports: Vec::new(),
         site_id: None,
+        breakout: Vec::new(),
+        uplinks: Vec::new(),
         peers: Vec::new(),
         sites: Vec::new(),
         blocked: Vec::new(),

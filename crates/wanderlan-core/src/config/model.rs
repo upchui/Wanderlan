@@ -10,9 +10,12 @@
 //! sites together act as one virtual switch: every site has a tunnel to
 //! every other site.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::Ipv4Addr;
 use std::time::Duration;
+
+use ipnet::IpNet;
 
 use super::vlan::VlanSet;
 use crate::identity::SiteId;
@@ -194,6 +197,25 @@ pub struct Site {
     /// The site this one is plugged into (a client of it): its only tunnel
     /// leads there. `None`: a server, connected with all other servers.
     pub uplink: Option<String>,
+    /// Local internet breakout per VLAN (the VLAN ID in the network): the
+    /// public destinations of these VLANs leave through this site's own
+    /// uplink instead of the tunnel. Only its managers change it.
+    pub breakout: Breakouts,
+}
+
+/// The VLANs of a site with a local breakout, by VLAN ID in the network.
+pub type Breakouts = BTreeMap<u16, Breakout>;
+
+/// The local internet breakout of one VLAN at a site: frames of the VLAN
+/// that arrive at the site's trunk with a public IPv4 or IPv6 destination
+/// leave through the box's own uplink (masqueraded) instead of the tunnel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct Breakout {
+    /// The interface of the box they leave through; `None`: the one of the
+    /// default route.
+    pub uplink: Option<String>,
+    /// Public destinations that still go through the tunnel.
+    pub except: BTreeSet<IpNet>,
 }
 
 /// How a tunnel runs. Both are VXLAN on the tunnel port; they differ in who
@@ -541,6 +563,7 @@ mod tests {
             managed_by: None,
             self_managed: false,
             uplink: None,
+            breakout: Breakouts::new(),
         });
         network.sites.push(Site {
             name: "b".into(),
@@ -552,6 +575,7 @@ mod tests {
             managed_by: None,
             self_managed: false,
             uplink: None,
+            breakout: Breakouts::new(),
         });
         assert!(network.site("c").is_none());
         let a = network.site("a").unwrap();

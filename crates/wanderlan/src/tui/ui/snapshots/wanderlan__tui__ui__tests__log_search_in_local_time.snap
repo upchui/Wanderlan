@@ -2,7 +2,7 @@
 source: crates/wanderlan/src/tui/ui/tests.rs
 expression: render(&app)
 ---
-" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+" 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings  8 Breakout   "
 " Level all  Peer all  following  1 of 6 events                                  "
 " Filter loop                            1 of 6  / changes it                    "
 "┌ Events (local time, CET; t: UTC) ────────────────────────────────────────────┐"
@@ -25,4 +25,4 @@ expression: render(&app)
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "                                  1 blocked (see 1)  draft: no changes  heim r7 "
-" l  level   p  peer   End  follow   /  search   1-7  views   ?  help   q  quit  "
+" l  level   p  peer   End  follow   /  search   1-8  views   ?  help   q  quit  "

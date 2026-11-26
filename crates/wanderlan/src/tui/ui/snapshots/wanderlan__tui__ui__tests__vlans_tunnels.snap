@@ -2,7 +2,7 @@
 source: crates/wanderlan/src/tui/ui/tests.rs
 expression: render(&app)
 ---
-" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+" 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings  8 Breakout   "
 "┌ VLANs of the network (v) ────────────────────────────────────────────────────┐"
 "│ 10-50  (41 VLANs)                                                            │"
 "│ Default of every site (native = untagged); limit a site in Sites (2).        │"

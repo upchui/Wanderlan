@@ -53,7 +53,7 @@ const REQUEST_TIMEOUT_TICKS: u64 = 5;
 /// Seconds left at which the countdown banner turns red.
 pub const URGENT_SECS: u64 = 10;
 
-/// The views, reachable with the digit keys 1-7.
+/// The views, reachable with the digit keys 1-8.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     /// Sites and live peer status.
@@ -70,11 +70,13 @@ pub enum View {
     Setup,
     /// All settings of the network and of this host.
     Settings,
+    /// The local internet breakouts of the sites, per VLAN.
+    Breakout,
 }
 
 impl View {
     /// All views in tab order.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Overview,
         Self::Sites,
         Self::Vlans,
@@ -82,6 +84,7 @@ impl View {
         Self::Log,
         Self::Setup,
         Self::Settings,
+        Self::Breakout,
     ];
 
     /// Tab title.
@@ -94,6 +97,7 @@ impl View {
             Self::Log => "Log",
             Self::Setup => "Setup",
             Self::Settings => "Settings",
+            Self::Breakout => "Breakout",
         }
     }
 
@@ -115,18 +119,28 @@ impl View {
 /// Text in front of the tabs.
 pub const BRAND: &str = " wanderlan ";
 
-/// The tab labels with their first and one-past-last column in the tab bar.
-pub fn tab_layout() -> Vec<(View, String, u16, u16)> {
-    let mut x = u16::try_from(BRAND.len()).unwrap_or_default();
-    View::ALL
+/// One tab: its view, label, first and one-past-last column.
+pub type Tab = (View, String, u16, u16);
+
+/// The tabs of a tab bar `width` columns wide, and the brand in front of
+/// them where it fits.
+pub fn tab_layout(width: u16) -> (Option<&'static str>, Vec<Tab>) {
+    let labels: Vec<(View, String)> = View::ALL
         .iter()
-        .map(|&view| {
-            let label = format!(" {} {} ", view.index() + 1, view.title());
+        .map(|&view| (view, format!(" {} {} ", view.index() + 1, view.title())))
+        .collect();
+    let total: usize = labels.iter().map(|(_, l)| l.len()).sum();
+    let brand = (BRAND.len() + total <= usize::from(width)).then_some(BRAND);
+    let mut x = u16::try_from(brand.map_or(0, str::len)).unwrap_or_default();
+    let tabs = labels
+        .into_iter()
+        .map(|(view, label)| {
             let start = x;
             x += u16::try_from(label.len()).unwrap_or_default();
             (view, label, start, x)
         })
-        .collect()
+        .collect();
+    (brand, tabs)
 }
 
 /// Connection to the daemon.
@@ -194,6 +208,8 @@ pub enum AskAction {
     DeleteSite(String),
     /// Remove a VLAN mapping from the draft (by its content).
     DeleteMap(wanderlan_core::config::VlanMap),
+    /// Remove the breakout of a VLAN of a site from the draft.
+    DeleteBreakout(String, u16),
     /// Re-enable a port blocked by the loop guard.
     Unblock(String),
     /// Remove everything wanderlan set up on this site.
@@ -480,6 +496,8 @@ pub struct Scrolls {
     pub peer_vlans: list::Scroll,
     /// The ports in the VLAN window.
     pub vlan_ports: list::Scroll,
+    /// The breakouts.
+    pub breakouts: list::Scroll,
     /// Largest scroll offset of the help screen at its last size.
     pub help_max: std::cell::Cell<u16>,
     /// Largest scroll offset of the site details at their last size.
@@ -488,6 +506,8 @@ pub struct Scrolls {
     pub bar: std::cell::RefCell<Vec<(u16, u16, &'static str)>>,
     /// Screen row of the help bar.
     pub bar_row: std::cell::Cell<u16>,
+    /// Width of the tab bar as drawn.
+    pub tabs_width: std::cell::Cell<u16>,
 }
 
 /// A list the mouse can point at.
@@ -502,10 +522,11 @@ enum ListId {
     Invites,
     Ports,
     PeerVlans,
+    Breakouts,
 }
 
 /// The key a label of the help bar stands for; `None` for labels that
-/// name several keys (Up/Down, 1-7, ...).
+/// name several keys (Up/Down, 1-8, ...).
 fn bar_key(label: &str) -> Option<KeyCode> {
     let first = label.split('/').next().unwrap_or(label);
     match first {
@@ -576,6 +597,8 @@ pub struct App {
     pub sites_selected: usize,
     /// Selected mapping in the VLAN view.
     pub maps_selected: usize,
+    /// Selected row in the breakout view.
+    pub breakouts_selected: usize,
     /// The VLAN view shows the tunnels instead of the mappings (`t`).
     pub vlans_tunnels: bool,
     /// Search in the Sites view.
@@ -653,6 +676,7 @@ impl App {
             overview_selected: 0,
             sites_selected: 0,
             maps_selected: 0,
+            breakouts_selected: 0,
             vlans_tunnels: false,
             sites_filter: Filter::default(),
             maps_filter: Filter::default(),
@@ -1602,6 +1626,9 @@ impl App {
         self.tunnels_selected = self
             .tunnels_selected
             .min(self.visible_tunnels().len().saturating_sub(1));
+        self.breakouts_selected = self
+            .breakouts_selected
+            .min(self.breakout_rows().len().saturating_sub(1));
         let settings = super::ui::settings::settings(self.draft.as_ref()).len();
         self.settings_selected = self.settings_selected.min(settings.saturating_sub(1));
     }
@@ -1687,6 +1714,7 @@ impl App {
             View::Log => self.on_log_key(key),
             View::Setup => self.on_setup_key(key, fx),
             View::Settings => self.on_settings_key(key, fx),
+            View::Breakout => self.on_breakout_key(key),
         }
     }
 
@@ -1700,7 +1728,8 @@ impl App {
         };
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) if row == 0 && self.modal.is_none() => {
-                if let Some((view, ..)) = tab_layout()
+                if let Some((view, ..)) = tab_layout(self.scrolls.tabs_width.get())
+                    .1
                     .into_iter()
                     .find(|(_, _, start, end)| (*start..*end).contains(&column))
                 {
@@ -1790,6 +1819,7 @@ impl App {
             }
             (None, View::Vlans) => vec![(ListId::Maps, &self.scrolls.maps)],
             (None, View::Macs) => vec![(ListId::Macs, &self.scrolls.macs)],
+            (None, View::Breakout) => vec![(ListId::Breakouts, &self.scrolls.breakouts)],
             (None, _) => Vec::new(),
         }
     }
@@ -1846,6 +1876,11 @@ impl App {
                 self.tunnels_selected = index;
                 again
             }
+            ListId::Breakouts => {
+                let again = self.breakouts_selected == index;
+                self.breakouts_selected = index;
+                again
+            }
             ListId::Macs => {
                 self.macs.selected = index;
                 false
@@ -1897,7 +1932,7 @@ impl App {
         match key.code {
             KeyCode::Tab => self.set_view(self.view.offset(1), fx),
             KeyCode::BackTab => self.set_view(self.view.offset(-1), fx),
-            KeyCode::Char(c @ '1'..='7') => {
+            KeyCode::Char(c @ '1'..='8') => {
                 let index = c.to_digit(10).map_or(0, |d| d as usize - 1);
                 if let Some(&view) = View::ALL.get(index) {
                     self.set_view(view, fx);
@@ -2567,6 +2602,21 @@ impl App {
                 }
                 self.clamp_selection();
             }
+            AskAction::DeleteBreakout(site, vid) => {
+                if let Some(draft) = &mut self.draft
+                    && let Some(entry) = draft.network.sites.iter_mut().find(|s| s.name == site)
+                    && entry.breakout.remove(&vid).is_some()
+                {
+                    draft.revalidate();
+                    self.say(
+                        MessageKind::Info,
+                        format!(
+                            "{site}: VLAN {vid} goes through the tunnel again (in the draft; a applies)."
+                        ),
+                    );
+                }
+                self.clamp_selection();
+            }
             AskAction::Unblock(port) => {
                 fx.push(Effect::Request(Request::Unblock(UnblockParams { port })));
             }
@@ -3158,6 +3208,120 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// The rows of the breakout view: every VLAN of every site with a
+    /// breakout, in the order of the sites.
+    pub fn breakout_rows(&self) -> Vec<(String, u16)> {
+        let Some(d) = &self.draft else {
+            return Vec::new();
+        };
+        d.network
+            .sites
+            .iter()
+            .flat_map(|s| s.breakout.keys().map(|vid| (s.name.clone(), *vid)))
+            .collect()
+    }
+
+    /// Keys of the breakout view.
+    fn on_breakout_key(&mut self, key: &KeyEvent) {
+        let rows = self.breakout_rows();
+        if let Some(n) = nav(
+            key.code,
+            self.breakouts_selected,
+            rows.len(),
+            self.scrolls.breakouts.page(),
+        ) {
+            self.breakouts_selected = n;
+            return;
+        }
+        let selected = rows.get(self.breakouts_selected).cloned();
+        let edits = matches!(
+            key.code,
+            KeyCode::Enter | KeyCode::Char('e' | 'd') | KeyCode::Delete
+        );
+        if edits && selected.is_none() {
+            self.say(MessageKind::Info, "No VLAN breaks out yet: n chooses one.");
+            return;
+        }
+        if edits
+            && let Some((site, _)) = &selected
+            && !self.may_change(site)
+        {
+            return;
+        }
+        let Some(draft) = &self.draft else {
+            self.not_configured();
+            return;
+        };
+        match key.code {
+            KeyCode::Char('n') => {
+                let site = selected
+                    .as_ref()
+                    .map(|(s, _)| s.clone())
+                    .or_else(|| draft.local.self_name.clone());
+                let uplinks = self.uplink_hint();
+                if let Some(draft) = &self.draft {
+                    self.modal = Some(Modal::Form(Form::breakout(
+                        draft,
+                        None,
+                        site.as_deref(),
+                        &uplinks,
+                    )));
+                }
+            }
+            KeyCode::Enter | KeyCode::Char('e') => {
+                let uplinks = self.uplink_hint();
+                if let (Some(draft), Some(selected)) = (&self.draft, selected) {
+                    self.modal = Some(Modal::Form(Form::breakout(
+                        draft,
+                        Some(selected),
+                        None,
+                        &uplinks,
+                    )));
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Delete => {
+                if let Some((site, vid)) = selected {
+                    self.modal = Some(Modal::Ask(Ask {
+                        title: "Remove breakout".into(),
+                        text: format!(
+                            "VLAN {vid} of {site} goes through the tunnel again, also to the internet?"
+                        ),
+                        action: AskAction::DeleteBreakout(site, vid),
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The uplinks of this box, for the hint of the uplink field.
+    fn uplink_hint(&self) -> String {
+        let Some(status) = &self.status else {
+            return String::new();
+        };
+        let mut names: Vec<String> = status
+            .uplinks
+            .iter()
+            .filter(|u| u.gateway4.is_some() || u.gateway6.is_some())
+            .map(|u| {
+                if u.default4 || u.default6 {
+                    format!("{} (default)", u.name)
+                } else {
+                    u.name.clone()
+                }
+            })
+            .collect();
+        if names.is_empty() {
+            names = self
+                .interfaces
+                .iter()
+                .filter(|i| i.is_listed() && i.master.is_none() && i.kind != "bridge")
+                .map(|i| i.name.clone())
+                .collect();
+        }
+        names.join(", ")
     }
 
     /// Keys of the tunnel table in the VLAN view.

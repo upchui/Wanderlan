@@ -637,6 +637,72 @@ pub struct Status {
     /// The identity of this box (its public key), once it has one.
     #[serde(default)]
     pub site_id: Option<String>,
+    /// The local breakouts of this site, by segment and VLAN.
+    #[serde(default)]
+    pub breakout: Vec<BreakoutStatus>,
+    /// The interfaces of this box that can be an uplink (only looked at
+    /// while this site has a breakout).
+    #[serde(default)]
+    pub uplinks: Vec<UplinkStatus>,
+}
+
+/// The local breakout of one VLAN in one segment of this site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BreakoutStatus {
+    /// The VLAN (in the network).
+    pub vid: u16,
+    /// The bridge of the segment.
+    pub bridge: String,
+    /// The router end (`wlbo<vid>`).
+    pub router: String,
+    /// The configured uplink; `None`: the default route.
+    pub uplink: Option<String>,
+    /// The exceptions (through the tunnel).
+    pub except: Vec<String>,
+    /// How IPv4 leaves.
+    pub ipv4: BreakoutFamily,
+    /// How IPv6 leaves.
+    pub ipv6: BreakoutFamily,
+    /// The veth pair is in place (up, in its bridge and VLAN).
+    pub ready: bool,
+    /// Receive rate of the router in bit/s (from the devices, out to the
+    /// internet).
+    pub rx_bps: u64,
+    /// Transmit rate in bit/s (answers to the devices).
+    pub tx_bps: u64,
+    /// The counters of the router.
+    pub traffic: Traffic,
+}
+
+/// One family of a breakout: the interface it leaves by, or why it goes
+/// through the tunnel.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BreakoutFamily {
+    /// The interface it leaves by.
+    pub dev: Option<String>,
+    /// The next hop of a fixed uplink.
+    pub gateway: Option<String>,
+    /// Why it does not break out (it goes through the tunnel).
+    pub reason: Option<String>,
+}
+
+/// An interface of this box as an uplink.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UplinkStatus {
+    /// Interface name.
+    pub name: String,
+    /// Operationally up.
+    pub up: bool,
+    /// Its addresses.
+    pub addresses: Vec<String>,
+    /// The gateway of its IPv4 default route (`"direct"` without one).
+    pub gateway4: Option<String>,
+    /// The same for IPv6.
+    pub gateway6: Option<String>,
+    /// The box's own traffic leaves by it (IPv4, IPv6).
+    pub default4: bool,
+    /// The same for IPv6.
+    pub default6: bool,
 }
 
 fn online_default() -> bool {

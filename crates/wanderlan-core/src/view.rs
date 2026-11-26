@@ -265,6 +265,7 @@ mod tests {
             managed_by: uplink.map(Into::into),
             self_managed: true,
             uplink: uplink.map(Into::into),
+            breakout: Default::default(),
         }
     }
 

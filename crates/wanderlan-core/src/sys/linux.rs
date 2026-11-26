@@ -23,6 +23,8 @@ pub struct LinuxSystem {
     pub nft: CachedNft<NftCli>,
     /// Where the clients are (table `ip wanderlan`).
     pub learn: LearnCli,
+    /// The sysctls of the local breakout.
+    pub sysctls: super::breakout::Sysctls,
 }
 
 impl LinuxSystem {
@@ -32,6 +34,7 @@ impl LinuxSystem {
             net: Netlink::connect()?,
             nft: CachedNft::new(NftCli, NFT_CACHE_TTL),
             learn: LearnCli::default(),
+            sysctls: super::breakout::Sysctls::default(),
         })
     }
 }
@@ -76,6 +79,9 @@ impl NetOps for LinuxSystem {
         self.net
             .set_tunnel_remote(index, name, own_port, remote)
             .await
+    }
+    async fn create_veth(&self, name: &str, peer: &str, mac: [u8; 6]) -> SysResult<()> {
+        self.net.create_veth(name, peer, mac).await
     }
     async fn delete_link(&self, index: u32) -> SysResult<()> {
         self.net.delete_link(index).await

@@ -187,6 +187,34 @@ expect_output "alpha takes beta online right after the join" 'beta is online' "$
 wait_for 30 "VLAN 20: the clients reach each other again" ping_ok
 healthy
 
+begin "Local breakout under the hardened unit: sysctls written and put back"
+uplink=$(x beta "ip -o -4 addr show | awk '/ 10\\.8\\.0\\.2\\// {print \$2}'")
+forwarding() { x beta "cat /proc/sys/net/ipv4/conf/$uplink/forwarding"; }
+x beta "ip route replace default via 10.8.0.254; sysctl -qw net.ipv4.conf.$uplink.forwarding=0"
+out=$(x beta "wanderlan breakout beta 20 on --confirm" 2>&1)
+expect_output "beta (restricted) may not break out by itself" 'may not' "$out"
+check "alpha (its manager) lets beta break out VLAN 20" \
+  x alpha "wanderlan breakout beta 20 on --confirm"
+wait_for 30 "beta: the breakout of VLAN 20 is in place, out of $uplink" \
+  x beta "wanderlan status --json | jq -e '.breakout[0].ready and .breakout[0].ipv4.dev == \"$uplink\"'"
+check "beta: the daemon turned on forwarding on $uplink (ProtectKernelTunables, ReadWritePaths)" \
+  test "$(forwarding)" = 1
+check "beta: and wrote down the value before" x beta "grep -q 'ipv4/conf/$uplink/forwarding' /var/lib/wanderlan/breakout-sysctl"
+check "beta: the nftables tables are there (the NAT modules load)" \
+  x beta "nft list table inet wanderlan-breakout >/dev/null && nft list table bridge wanderlan-breakout >/dev/null"
+x beta "systemctl stop wanderland"
+check "beta: after a stop forwarding on $uplink is off again" test "$(forwarding)" = 0
+check "beta: no breakout interface, table or rule is left" \
+  x beta "! ip link show wlbo20 2>/dev/null && ! nft list table inet wanderlan-breakout 2>/dev/null && ! ip rule show | grep -q 'proto 87' && [ ! -e /var/lib/wanderlan/breakout-sysctl ]"
+x beta "systemctl start wanderland"
+wait_for 30 "beta: the breakout is back after the start" \
+  x beta "wanderlan status --json | jq -e '.breakout[0].ready'"
+check "alpha takes the breakout of beta back" x alpha "wanderlan breakout beta 20 off --confirm"
+wait_for 30 "beta: forwarding on $uplink is off again" eval '[ "$(forwarding)" = 0 ]'
+x beta "ip route del default via 10.8.0.254"
+wait_for 30 "VLAN 20: the clients still reach each other" ping_ok
+healthy
+
 begin "A crash: the cleanup removes what is left, the restart builds it anew"
 before=$(br0_index)
 cursor=$(journal_cursor alpha)

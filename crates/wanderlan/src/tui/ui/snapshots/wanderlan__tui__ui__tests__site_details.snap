@@ -2,7 +2,7 @@
 source: crates/wanderlan/src/tui/ui/tests.rs
 expression: render(&app)
 ---
-" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+" 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings  8 Breakout   "
 "┌ heim   Up/Down: next site   PgUp/PgDn: scroll   e: edit   Esc: close ────────┐"
 "│ Role         server   this site                                              │"
 "│ Address      10.8.0.1   online                                               │"

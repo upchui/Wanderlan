@@ -253,6 +253,54 @@ impl Validator {
                     );
                 }
             }
+            self.breakout(network, i, site);
+        }
+    }
+
+    /// The local breakout of a site: VLANs of the site, usable uplink
+    /// names, not too many exceptions.
+    fn breakout(&mut self, network: &Network, i: usize, site: &super::model::Site) {
+        let name = &site.name;
+        let vlans: super::vlan::VlanSet = network
+            .effective_vlans(site)
+            .iter()
+            .chain(network.own_vlans(site).iter())
+            .collect();
+        for (vid, b) in &site.breakout {
+            let path = FieldPath::site_field(i, &format!("breakout.{vid}"));
+            if !vlans.contains(*vid) {
+                self.error(
+                    path.clone(),
+                    format!(
+                        "site \"{name}\": breakout: VLAN {vid} is not one of the VLANs of the site ({vlans})"
+                    ),
+                );
+            }
+            if let Some(uplink) = &b.uplink {
+                let path = FieldPath::site_field(i, &format!("breakout.{vid}.uplink"));
+                if let Some(msg) = ifname_error(uplink) {
+                    self.error(
+                        path,
+                        format!("site \"{name}\": breakout {vid}: uplink: {msg}"),
+                    );
+                } else if is_managed_name(uplink) {
+                    self.error(
+                        path,
+                        format!(
+                            "site \"{name}\": breakout {vid}: uplink \"{uplink}\" is an interface of wanderlan"
+                        ),
+                    );
+                }
+            }
+            if b.except.len() > crate::breakout::MAX_EXCEPT {
+                self.error(
+                    FieldPath::site_field(i, &format!("breakout.{vid}.except")),
+                    format!(
+                        "site \"{name}\": breakout {vid}: at most {} exceptions",
+                        crate::breakout::MAX_EXCEPT
+                    ),
+                );
+            }
         }
     }
 
@@ -550,6 +598,30 @@ impl Validator {
             }
         }
         let me = local.self_name.as_deref();
+        // The uplink of a breakout is never a trunk port.
+        if let Some((i, site)) = network
+            .sites
+            .iter()
+            .enumerate()
+            .find(|(_, s)| Some(s.name.as_str()) == me)
+        {
+            let trunks: BTreeSet<&String> = local
+                .trunk
+                .iter()
+                .chain(local.tunnel_trunks.values().flatten())
+                .collect();
+            for (vid, b) in &site.breakout {
+                if let Some(uplink) = b.uplink.as_ref().filter(|u| trunks.contains(u)) {
+                    self.error(
+                        FieldPath::site_field(i, &format!("breakout.{vid}.uplink")),
+                        format!(
+                            "site \"{}\": breakout {vid}: uplink \"{uplink}\" is a trunk port of this site, not an uplink",
+                            site.name
+                        ),
+                    );
+                }
+            }
+        }
         let mut unused = Vec::new();
         for (site, ports) in &local.tunnel_trunks {
             let path = format!("tunnels.{site}.trunk");
@@ -586,6 +658,7 @@ fn is_managed_name(name: &str) -> bool {
     crate::topology::is_tunnel_name(name)
         || name == crate::BRIDGE_NAME
         || name.starts_with(crate::desired::SEGMENT_PREFIX)
+        || crate::breakout::is_breakout_name(name)
 }
 
 /// True if two sites may have the same address: both have an identity and

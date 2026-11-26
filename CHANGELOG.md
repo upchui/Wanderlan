@@ -7,6 +7,30 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
+### Local internet breakout per VLAN
+
+- A VLAN of a site can reach the internet through that site's own uplink
+  instead of the tunnel (`breakout = { <VLAN> = { uplink, except } }` in
+  `[site.<name>]`), completely transparently: the devices keep their
+  gateway, DHCP and DNS; frames from the trunk to public IPv4 and IPv6
+  destinations leave through the uplink, masqueraded, private destinations
+  and the exceptions of the VLAN go through the tunnel as before. The
+  uplink is the interface of the default route or one chosen per VLAN (a
+  second line with a default route of its own). Nothing of a breakout
+  reaches a tunnel; a family that cannot break out stays on the tunnel and
+  the status says why.
+- In the kernel: a veth pair per VLAN and segment (`wlbo<vid>` in the IP
+  stack, `wlbp<vid>` in the bridge), the nftables tables `bridge
+  wanderlan-breakout` and `inet wanderlan-breakout`, routing rules of
+  protocol 87 for the answers, forwarding where it is needed (put back
+  afterwards, written down in `/var/lib/wanderlan/breakout-sysctl`). The
+  unit may write `/proc/sys/net/ipv{4,6}/conf` and loads `veth`.
+- Its manager decides, like for the VLANs of a site. TUI: new view Breakout
+  (`8`); CLI: `wanderlan breakout`; `wanderlan status` shows it. With eight
+  views the brand in the tab bar shows from 90 columns on.
+- Update all sites before using it: older ones do not read a network with
+  a breakout (networks without one stay as they were).
+
 ### Tunnel mode found out by itself; fixes
 
 - No `tunnel_mode` setting and no `wanderlan tunnel-mode` any more: a client

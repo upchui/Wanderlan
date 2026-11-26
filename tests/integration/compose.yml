@@ -17,6 +17,8 @@ x-common: &common
     net.ipv6.conf.default.disable_ipv6: "1"
 
 services:
+  # Also "the internet" of the local breakout: 203.0.113.1 and
+  # 2001:db8:ffff::1 on a dummy interface.
   router:
     <<: *common
     hostname: router
@@ -24,12 +26,13 @@ services:
       ROLE: router
     sysctls:
       net.ipv4.ip_forward: "1"
-      net.ipv6.conf.all.disable_ipv6: "1"
-      net.ipv6.conf.default.disable_ipv6: "1"
+      net.ipv6.conf.all.disable_ipv6: "0"
+      net.ipv6.conf.default.disable_ipv6: "0"
     networks:
       ul-site1: { ipv4_address: 10.100.1.254 }
       ul-site2: { ipv4_address: 10.100.2.254 }
-      ul-site3: { ipv4_address: 10.100.11.254 }
+      ul-site3: { ipv4_address: 10.100.11.254, ipv6_address: "2001:db8:11::254" }
+      wan2-site3: { ipv4_address: 10.100.111.254 }
       ul-site4: { ipv4_address: 10.100.12.254 }
       ul-site5: { ipv4_address: 10.100.13.254 }
       ul-nat: { ipv4_address: 10.100.20.254 }
@@ -120,15 +123,23 @@ services:
       ul-site2: { ipv4_address: 10.100.2.10 }
       tr-site2: { ipv4_address: 10.200.2.10 }
 
+  # The gateway of VLAN 44 for the breakout case ("the central site").
   c-site2:
     <<: *common
     hostname: c-site2
     environment:
       ROLE: client
       TRUNK_NET: "10.200.2."
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "0"
+      net.ipv6.conf.default.disable_ipv6: "0"
     networks:
       tr-site2: { ipv4_address: 10.200.2.20 }
 
+  # Breaks out VLAN 44 to "the internet": by its default route (IPv4 and
+  # IPv6) or a second uplink with a default route of its own (metric 500).
+  # /proc/sys is read-only in a container: forwarding is on and the source
+  # checks are loose from the start.
   site3:
     <<: *common
     hostname: site3
@@ -136,9 +147,19 @@ services:
       ROLE: site
       TRUNK_NET: "10.200.11."
       GATEWAY: 10.100.11.254
+      GATEWAY6: "2001:db8:11::254"
+      GATEWAY2: 10.100.111.254
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.rp_filter: "2"
+      net.ipv4.conf.default.rp_filter: "2"
+      net.ipv6.conf.all.forwarding: "1"
+      net.ipv6.conf.all.disable_ipv6: "0"
+      net.ipv6.conf.default.disable_ipv6: "0"
     networks:
-      ul-site3: { ipv4_address: 10.100.11.10 }
+      ul-site3: { ipv4_address: 10.100.11.10, ipv6_address: "2001:db8:11::10" }
       tr-site3: { ipv4_address: 10.200.11.10 }
+      wan2-site3: { ipv4_address: 10.100.111.10 }
 
   c-site3:
     <<: *common
@@ -146,6 +167,9 @@ services:
     environment:
       ROLE: client
       TRUNK_NET: "10.200.11."
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "0"
+      net.ipv6.conf.default.disable_ipv6: "0"
     networks:
       tr-site3: { ipv4_address: 10.200.11.20 }
 
@@ -200,8 +224,13 @@ networks:
       config: [{ subnet: 10.100.2.0/24 }]
   ul-site3:
     internal: true
+    enable_ipv6: true
     ipam:
-      config: [{ subnet: 10.100.11.0/24 }]
+      config: [{ subnet: 10.100.11.0/24 }, { subnet: "2001:db8:11::/64" }]
+  wan2-site3:
+    internal: true
+    ipam:
+      config: [{ subnet: 10.100.111.0/24 }]
   ul-site4:
     internal: true
     ipam:

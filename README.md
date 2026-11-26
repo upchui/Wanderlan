@@ -47,7 +47,8 @@ What that means:
   routes, no NAT, no DHCP server of its own: plug in the box, done.
 * **Like a cable to the first site.** The devices at the second site go to
   the internet through the firewall of the first site, and its rules apply
-  to them too.
+  to them too. Or, VLAN by VLAN, through the second site's own internet
+  (local breakout), without them noticing.
 * **VLANs come along.** If the network has VLANs (staff, guests, phones), all
   of them reach the other site, or only the ones you choose per site; a VLAN
   can also arrive untagged or with another ID there.
@@ -102,9 +103,10 @@ UI (`wanderlan`) to set it up and watch it; see [Concepts](#concepts) and
   * **Clients** only need to reach their server, outgoing: TCP and UDP to
     its control port, UDP to its tunnel port. A client may sit behind NAT,
     several behind the same one (see [Clients behind NAT](#clients-behind-nat)).
-* The kernel modules `bridge`, `vxlan`, `sch_ingress`, `cls_flower`,
+* The kernel modules `bridge`, `vxlan`, `veth`, `sch_ingress`, `cls_flower`,
   `act_vlan`, `act_gact` and `nf_tables` (standard kernels have them; the
-  service loads them when it starts).
+  service loads them when it starts); for a local breakout also the NAT
+  modules of nftables, which the kernel loads by itself.
 
 ## Installation
 
@@ -219,7 +221,8 @@ belongs to and which VLAN IDs are translated.
 each other and do not even know about each other; whether traffic flows
 between two sites is decided by the VLANs alone. Gateways and DHCP servers
 of the network stay where they are; wanderlan does not route or hand out
-addresses.
+addresses (only a [local breakout](#local-breakout) routes, and only the
+public destinations of its VLANs).
 
 ### Servers and clients
 
@@ -330,6 +333,35 @@ The VLAN mapping views (Site, Source VLAN, Mapped VLAN) show next to each
 site whether it is a server or a client. In `network.toml` a mapping keeps
 its keys: `shared` is the source VLAN, `local` the mapped VLAN.
 
+### Local breakout
+
+Normally the devices of a site reach the internet like everything else:
+through the tunnel and the gateway (and firewall) of the network. A **local
+breakout** lets one VLAN of one site use that site's own internet instead,
+completely transparently: its devices keep their gateway, DHCP and DNS, but
+every frame they send to a **public IPv4 or IPv6 address** leaves through
+the uplink of the box at their site, masqueraded to its address, and the
+answers come back to them. Everything else keeps going through the tunnel:
+
+* private destinations (10/8, 172.16/12, 192.168/16, 100.64/10, link-local,
+  ULA `fc00::/7`, multicast, the NAT64 prefixes), so the NAS, the printers
+  and the other VLANs are reached as before;
+* the **exceptions** of the VLAN, e.g. a service that only lets in the
+  public address of the central site (`except = ["203.0.113.0/24"]`).
+
+The **uplink** is the interface of the box's default route, or one chosen
+per VLAN (`uplink = "ens20"`, e.g. a second line; it needs a default route
+of its own, with any metric, or a point-to-point link such as WireGuard).
+Only frames from the trunk of the site break out, never what comes from a
+tunnel, and nothing of a breakout ever reaches a tunnel: the central site
+does not see it at all. If a family cannot break out (no IPv6 uplink, no
+default route on the chosen interface, forwarding cannot be switched on), it
+goes through the tunnel as before, and the status says why.
+
+A breakout bypasses the firewall of the network, so **its manager decides**,
+like for the VLANs of a site (Breakout (`8`), or `wanderlan breakout`).
+
+
 ### Who knows what
 
 Servers know the whole network. A client knows only itself, its server and
@@ -343,7 +375,7 @@ The site that created an invitation **manages** the site that joined with it.
 
 | Change | Who |
 |--------|-----|
-| VLANs, mappings, online state of a managed site, removing it | its manager; the site itself too if it was released ("may change its own VLANs") |
+| VLANs, mappings, local breakout, online state of a managed site, removing it | its manager; the site itself too if it was released ("may change its own VLANs") |
 | The same for a site without a manager (the first site) and the VLANs of the network | every site that is not *restricted* |
 | Timeouts, MTU check, MSS, control port, invitations | every site |
 | The name of a site | the site itself, always; its manager only if the site allows it |
@@ -443,6 +475,14 @@ the server manages everything else. CLI: `wanderlan own-vlans <site> 50,60`
 **Put untagged traffic into a VLAN, translate a VLAN.** VLANs (`3`), `n`:
 site, source VLAN (e.g. `30`), mapped VLAN `native` (or the VLAN ID on that
 site's trunk, e.g. `130`).
+
+**Let a VLAN use the internet of its own site.** Breakout (`8`), `n`: site,
+VLAN, uplink (empty: the default route; the window names the interfaces of
+this box) and exceptions; `Enter` changes one, `d` removes it. The view
+shows for this site where IPv4 and IPv6 leave now and the traffic. CLI:
+`wanderlan breakout office 10,20 on`, `wanderlan breakout office 20 on
+--uplink ens20 --except 203.0.113.0/24`, `wanderlan breakout office 20 off`;
+`wanderlan breakout` shows the breakouts of this site.
 
 **Let a site change its own VLANs, move it.** Sites, `Enter` on the site:
 "Changes" (only its manager, or the manager and the site itself). A site
@@ -563,6 +603,8 @@ managed_by = "hq"
 online = false                # joined, not taken online yet
 map = { 30 = "native" }       # source VLAN 30 = untagged at lab
 tunnel_vlans = { hq = "30-40" }  # the tunnel to hq carries at most 30-40
+# VLAN 30 reaches the internet through lab's own uplink, except 203.0.113.0/24
+breakout = { 30 = { except = ["203.0.113.0/24"] } }
 ```
 
 `map` reads like the VLAN mapping view: `source VLAN = VLAN on the trunk of
@@ -596,6 +638,7 @@ sites with older and newer versions keep working together.
 | `site.<name>.own_vlans` | none | The site's own VLANs: on its trunk and towards its own clients, never towards its server. The site itself may always change them. |
 | `site.<name>.map` | none | VLAN mappings: `{ <source VLAN> = <mapped VLAN> }`. The source VLAN is the VLAN in the network (one of the VLANs of the site, not 1), the mapped VLAN its ID on the site's trunk or `"native"` (untagged), e.g. `{ 30 = "native", 40 = 140 }`. |
 | `site.<name>.tunnel_vlans` | none | The most the tunnel to another site carries (on top of the VLANs of both sites), e.g. `{ dc = "30-40" }`; `"none"`: no VLAN at all. At one of the two sites. |
+| `site.<name>.breakout` | none | [Local breakout](#local-breakout) per VLAN of the site (its ID in the network; untagged: 1): `{ <VLAN> = { uplink = "<interface>", except = [<networks>] } }`, both optional, e.g. `{ 10 = {}, 20 = { uplink = "ens20", except = ["203.0.113.0/24"] } }`. Older sites do not read a network with it: update all sites first. |
 | `self` (local) | | Which site of `network.toml` this host is. |
 | `trunk` (local) | | The interface carrying the VLANs, or several (`["ens19", "ens22"]`, bridged like switch ports, the first is the main port). |
 | `tunnels.<site>.trunk` (local) | `trunk` | A trunk of its own for the tunnel to `<site>`: one interface or several. A port belongs to one segment. |
@@ -652,6 +695,28 @@ once more before every start in case that could not run):
 * the nftables table `bridge wanderlan` for MSS clamping: every bridged
   frame of the host passes one rule there, only TCP SYNs go on to the MSS
   rules (chain `wl-mss`);
+* with a [local breakout](#local-breakout), per VLAN and segment a veth
+  pair: `wlbp<vid>` is a port of the bridge (only in that VLAN, untagged,
+  with a static forwarding entry), `wlbo<vid>` its other end in the IP stack
+  of the box (MAC `02:77:6c:…`, address `192.0.0.8/32`, the IPv4 dummy
+  address of RFC 7600, as the sender of its ARP requests, so no real
+  address gets into the caches of the devices). The table `bridge
+  wanderlan-breakout` rewrites the destination MAC of the frames from the
+  trunk with a public destination to that of `wlbo<vid>`, so the bridge
+  delivers them there instead of to the tunnel, and keeps everything of the
+  breakout away from the tunnels; the table `inet wanderlan-breakout` marks
+  their connections, clamps the MSS and masquerades them. The answers find
+  `wlbo<vid>` by their mark (routing rules and tables of protocol 87, so the
+  box never needs to know the addresses of the VLAN; a chosen uplink gets a
+  table with its default route). Forwarding is switched on where it is
+  needed (IPv4 on `wlbo*` and the uplinks, IPv6 for the whole box: the
+  kernel has no switch per interface; `accept_ra = 2` on the uplinks, so
+  they keep their router advertisements); what was changed is written down
+  first (`/var/lib/wanderlan/breakout-sysctl`) and put back when the
+  breakout ends or the service stops. The unit may write
+  `/proc/sys/net/ipv{4,6}/conf` for that, the rest of `/proc/sys` stays
+  read-only. All of it runs in the kernel; only the breakout traffic is
+  connection-tracked;
 * with client tunnels: the nftables table `ip wanderlan`. In `nat` mode both ends
   send from the tunnel port: the VXLAN interface sends from it or the port
   above (Linux includes the upper end of a port range since March 2026), and
@@ -761,6 +826,7 @@ clicked.
 | `5` | Log: live events in local time (`t`: UTC), filter by level (`l`), site (`p`) and text (`/`). |
 | `6` | Setup: new network or join; on a configured site invite (`i`) and reset (`R`). |
 | `7` | Settings: every setting with an explanation, the trunk of every tunnel, and the role and rights of this site. `Enter` on a trunk lists the interfaces of the host to choose from (`Space`, `m`: main port). |
+| `8` | Breakout: the [local breakouts](#local-breakout) of all sites, per VLAN, with uplink and exceptions; for this site where IPv4 and IPv6 leave now (or why they go through the tunnel) and the traffic, above it the uplinks of this box. New (`n`), edit (`Enter`), remove (`d`). |
 
 Changes are collected in a draft; the status line says how many it holds,
 and new or changed rows are marked `+` or `*`. `a` shows the difference to
@@ -791,6 +857,7 @@ its last log lines and keeps trying.
 | `wanderlan trunk <site> <interfaces\|default>` | Trunk ports of the tunnel to a site, or (this site's name) of the default trunk; several separated by commas |
 | `wanderlan own-vlans <site> <vlans\|none>` | Own VLANs of a site (trunk and its own clients only) |
 | `wanderlan tunnel-vlans <site> <site> <vlans\|all\|none>` | The most the tunnel between two sites carries |
+| `wanderlan breakout [<site> <vlans> on\|off [--uplink IF\|auto] [--except NETS\|none]]` | Local breakout of VLANs of a site; without arguments the breakouts of this site and its uplinks |
 | `wanderlan apply [--network F] [--local F] [--timeout 60s]` | Apply files (default: those in `/etc/wanderlan`) |
 | `wanderlan confirm` / `wanderlan rollback` | Confirm or revert the pending change |
 | `wanderlan validate <network.toml> [--local <local.toml>]` | Check files without applying them |
@@ -799,7 +866,7 @@ its last log lines and keeps trying.
 | `wanderlan reset [--yes]` | Remove everything wanderlan set up on this site |
 
 Commands that change the configuration (`online`, `offline`, `manage`,
-`role`, `trunk`, `own-vlans`, `tunnel-vlans`) take `--confirm` to confirm right away; without it, run
+`role`, `trunk`, `own-vlans`, `tunnel-vlans`, `breakout`) take `--confirm` to confirm right away; without it, run
 `wanderlan confirm` within the commit timeout. They wait for a change that is
 still being synchronised. The daemon's socket can be chosen with `--socket`
 or `WANDERLAN_SOCKET`.
@@ -848,6 +915,14 @@ or `WANDERLAN_SOCKET`.
 * **"another box joined as …"** on a site: its entry now belongs to another
   box (a reset copy, a cloned machine). Reset this box and join again, or
   remove the other one.
+* **A breakout VLAN does not reach the internet**: `wanderlan breakout` says
+  where IPv4 and IPv6 leave, or why they go through the tunnel. A firewall
+  on the box that drops forwarded traffic (ufw's default, Docker's `FORWARD`
+  policy) must let the traffic from `wlbo*` out to the uplink. Where
+  `/proc/sys` is read-only (a container), forwarding must be on already and
+  the source checks loose (`net.ipv4.conf.all.rp_filter = 2`). A VLAN with
+  public addresses of its own (a DMZ) needs its network as an exception.
+  Two segments of one box with a breakout must not use the same addresses.
 * **Large transfers stall**: compare the path MTU in `wanderlan status` with
   the MTU of the VPN; set `mss` if probes are filtered.
 * **A port is BLOCKED**: the loop guard found a loop through another layer-2
@@ -915,8 +990,16 @@ or `WANDERLAN_SOCKET`.
   use rtnetlink; nftables is driven through its JSON interface (the
   `nftables` crate, hence the dependency on the `nftables` package; a test
   guards a workaround for swapped `<`/`>` in its 0.6.3 release).
-* **Fixed interface names** `br0`, `wl-<interface>` and `vx-<site>`; site
-  names have at most 12 characters so that `vx-<site>` fits.
+* **Fixed interface names** `br0`, `wl-<interface>`, `vx-<site>` and
+  `wlbo<vid>`/`wlbp<vid>`; site names have at most 12 characters so that
+  `vx-<site>` fits.
+* **Local breakout by destination, not by gateway.** The devices keep their
+  gateway; the box takes the frames to public destinations out of the
+  bridge before they reach the tunnel, and masquerades them (IPv6 too, so
+  dual-stack devices do not keep using the tunnel). The answers return by a
+  connection mark, so the box needs no address in the VLAN; a family that
+  cannot break out stays on the tunnel. The manager of a site decides about
+  it, like about its VLANs.
 
 Open questions are collected in [docs/OPEN-QUESTIONS.md](docs/OPEN-QUESTIONS.md).
 

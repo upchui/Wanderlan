@@ -224,7 +224,7 @@ pub fn learn_script(
 const NFT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Runs `nft -f -` with `script`.
-async fn apply_script(what: &str, script: &str) -> SysResult<()> {
+pub(crate) async fn apply_script(what: &str, script: &str) -> SysResult<()> {
     let run = async {
         let mut child = tokio::process::Command::new(helper::DEFAULT_NFT.unwrap_or("nft"))
             .args(["-f", "-"])

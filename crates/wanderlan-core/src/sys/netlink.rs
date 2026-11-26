@@ -17,7 +17,9 @@ use rtnetlink::packet_route::neighbour::{
     NeighbourAddress, NeighbourAttribute, NeighbourFlags, NeighbourMessage, NeighbourState,
 };
 use rtnetlink::packet_route::{AddressFamily, RouteNetlinkMessage};
-use rtnetlink::{Handle, LinkBridge, LinkBridgePort, LinkBridgeVlan, LinkUnspec, LinkVxlan};
+use rtnetlink::{
+    Handle, LinkBridge, LinkBridgePort, LinkBridgeVlan, LinkUnspec, LinkVeth, LinkVxlan,
+};
 
 use super::{
     BridgeOptions, LinkKind, LinkState, LinkUpdate, NetOps, PortVlans, SysError, SysResult,
@@ -606,6 +608,16 @@ impl NetOps for Netlink {
             .map_err(fail)?;
         }
         Ok(())
+    }
+
+    async fn create_veth(&self, name: &str, peer: &str, mac: [u8; 6]) -> SysResult<()> {
+        // Down at first: the reconciliation sets it up once it is in place.
+        self.handle
+            .link()
+            .add(LinkVeth::new(name, peer).address(mac.to_vec()).build())
+            .execute()
+            .await
+            .map_err(|e| SysError::new(format!("create veth pair {name} / {peer}"), e))
     }
 
     async fn delete_link(&self, index: u32) -> SysResult<()> {

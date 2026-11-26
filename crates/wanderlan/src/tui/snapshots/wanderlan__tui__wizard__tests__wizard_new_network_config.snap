@@ -8,7 +8,9 @@ expression: render_network(&network)
 #
 # [site.<name>]: `server` is the site it is a client of (none: a server);
 # map = { <source VLAN> = <VLAN on its trunk, or "native"> };
-# tunnel_vlans = { <other site> = <the most that tunnel carries> }.
+# tunnel_vlans = { <other site> = <the most that tunnel carries> };
+# breakout = { <VLAN> = { uplink = <interface>, except = [<networks>] } }:
+# the public destinations of the VLAN leave through the site's own uplink.
 
 [network]
 revision = 0

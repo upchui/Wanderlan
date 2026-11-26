@@ -28,6 +28,11 @@ make_trunk() {
 
 case "${ROLE:-site}" in
   router)
+    # "The internet" of the local breakout.
+    ip link add inet0 type dummy
+    ip link set inet0 up
+    ip addr add 203.0.113.1/32 dev inet0
+    ip -6 addr add 2001:db8:ffff::1/128 dev inet0 2>/dev/null || true
     ;;
   nat)
     wan=$(find_if "$WAN_NET")
@@ -53,6 +58,13 @@ NFT
     make_trunk "$TRUNK_NET"
     if [ -n "${GATEWAY:-}" ]; then
       ip route replace default via "$GATEWAY"
+    fi
+    if [ -n "${GATEWAY6:-}" ]; then
+      ip -6 route replace default via "$GATEWAY6"
+    fi
+    # A second uplink: a default route of its own, with a higher metric.
+    if [ -n "${GATEWAY2:-}" ]; then
+      ip route add default via "$GATEWAY2" metric 500
     fi
     # Start the daemon like systemd would, if this site was configured before
     # (e.g. after a container restart).

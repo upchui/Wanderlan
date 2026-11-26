@@ -21,8 +21,8 @@ use serde_spanned::Spanned;
 
 use super::diag::{ConfigFile, Diagnostic, FieldPath, SpanMap};
 use super::model::{
-    DEFAULT_COMMIT_TIMEOUT, DEFAULT_CONTROL_PORT, DEFAULT_MTU_PROBE_INTERVAL, Local, LocalVid,
-    Network, Site, TunnelVlans, VlanMap, site_pair,
+    Breakout, Breakouts, DEFAULT_COMMIT_TIMEOUT, DEFAULT_CONTROL_PORT, DEFAULT_MTU_PROBE_INTERVAL,
+    Local, LocalVid, Network, Site, TunnelVlans, VlanMap, site_pair,
 };
 use super::vlan::{VID_MAX, VID_MIN, VlanSet};
 use crate::identity::SiteId;
@@ -81,6 +81,8 @@ struct RawSite {
     rename_by_manager: Option<Spanned<bool>>,
     uplink: Option<Spanned<String>>,
     tunnel_mode: Option<Spanned<String>>,
+    /// VLAN ID (key) = its local breakout.
+    breakout: Option<Spanned<Ordered<Spanned<RawBreakout>>>>,
     /// Since 0.2 there are no roles; read and ignored with a warning.
     role: Option<Spanned<String>>,
     /// Since 0.2 there are no hubs; read and ignored with a warning.
@@ -93,6 +95,14 @@ struct RawMap {
     site: Option<Spanned<String>>,
     local: Option<Spanned<RawLocalVid>>,
     shared: Option<Spanned<i64>>,
+}
+
+/// One VLAN of `breakout = { <VLAN> = { uplink = "ens20", except = [..] } }`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBreakout {
+    uplink: Option<Spanned<String>>,
+    except: Option<Spanned<Vec<Spanned<String>>>>,
 }
 
 /// `[[tunnel]]`: the VLANs one tunnel carries at most.
@@ -168,6 +178,8 @@ struct RawSite2 {
     map: Option<Spanned<Ordered<Spanned<RawLocalVid>>>>,
     /// Other site (key) = the most the tunnel to it carries.
     tunnel_vlans: Option<Spanned<Ordered<Spanned<RawVlans>>>>,
+    /// VLAN ID (key) = its local breakout.
+    breakout: Option<Spanned<Ordered<Spanned<RawBreakout>>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -481,6 +493,7 @@ fn parse_network_2(text: &str) -> Result<ParsedNetwork, Vec<Diagnostic>> {
             rename_by_manager: raw_site.rename_by_manager,
             uplink: raw_site.server,
             tunnel_mode: raw_site.tunnel_mode,
+            breakout: raw_site.breakout,
             role: None,
             hub: None,
         };
@@ -727,6 +740,7 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
     let vlans = lw.take(&vlans_path, s.vlans);
     let own_path = FieldPath::site_field(i, "own_vlans");
     let own_vlans = lw.take(&own_path, s.own_vlans);
+    let breakout = lw.take(&FieldPath::site_field(i, "breakout"), s.breakout);
     let online = lw
         .take(&FieldPath::site_field(i, "online"), s.online)
         .unwrap_or(true);
@@ -818,6 +832,7 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
             None
         }
     });
+    let breakout = breakout.map_or_else(Breakouts::new, |b| lower_breakout(lw, i, &label, b));
     Some((
         Site {
             name: name?,
@@ -829,9 +844,75 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, bool)> {
             managed_by,
             self_managed,
             uplink,
+            breakout,
         },
         uplink_given,
     ))
+}
+
+/// `breakout = { <VLAN> = { uplink = "<interface>", except = [<networks>] } }`.
+fn lower_breakout(
+    lw: &mut Lowering,
+    i: usize,
+    label: &str,
+    raw: Ordered<Spanned<RawBreakout>>,
+) -> Breakouts {
+    let mut breakouts = Breakouts::new();
+    for (key, entry) in raw.0 {
+        let key_span = key.span();
+        let key = key.into_inner();
+        let vid = match key.trim().parse::<u16>() {
+            Ok(v) if (VID_MIN..=VID_MAX).contains(&v) => v,
+            _ => {
+                let path = FieldPath::site_field(i, "breakout");
+                lw.span(&path, key_span);
+                lw.error(
+                    path,
+                    format!(
+                        "{label}: breakout: \"{key}\" is not a VLAN ID ({VID_MIN}-{VID_MAX}); write breakout = {{ <VLAN> = {{}} }}, e.g. {{ 10 = {{}} }} (untagged traffic: 1)"
+                    ),
+                );
+                continue;
+            }
+        };
+        let path = FieldPath::site_field(i, &format!("breakout.{vid}"));
+        lw.span(&path, entry.span());
+        if breakouts.contains_key(&vid) {
+            lw.error(
+                path,
+                format!("{label}: breakout: VLAN {vid} is listed twice"),
+            );
+            continue;
+        }
+        let entry = entry.into_inner();
+        let uplink_path = FieldPath::site_field(i, &format!("breakout.{vid}.uplink"));
+        let uplink = lw
+            .take(&uplink_path, entry.uplink)
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty() && u != "auto");
+        let except_path = FieldPath::site_field(i, &format!("breakout.{vid}.except"));
+        let mut except = std::collections::BTreeSet::new();
+        for item in lw.take(&except_path, entry.except).unwrap_or_default() {
+            let span = item.span();
+            let text = item.into_inner();
+            match crate::breakout::parse_net(&text) {
+                Some(net) => {
+                    except.insert(net);
+                }
+                None => {
+                    lw.span(&except_path, span);
+                    lw.error(
+                        except_path.clone(),
+                        format!(
+                            "{label}: breakout {vid}: except \"{text}\" is not an address or a network like 203.0.113.0/24 or 2001:db8::/32"
+                        ),
+                    );
+                }
+            }
+        }
+        breakouts.insert(vid, Breakout { uplink, except });
+    }
+    breakouts
 }
 
 fn lower_map(lw: &mut Lowering, i: usize, m: RawMap) -> Option<VlanMap> {

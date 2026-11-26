@@ -2,7 +2,7 @@
 source: crates/wanderlan/src/tui/ui/tests.rs
 expression: render(&app)
 ---
-" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+" 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings  8 Breakout   "
 "┌ buero (10.8.0.2) via vx-buero   Left/Right: other peer  Esc: close ──────────┐"
 "│ Tunnel       up   reachable   config revision 7, same as here                │"
 "│ Round trip   12ms  min 11ms avg 13ms max 16ms  jitter 0.7ms                  │"

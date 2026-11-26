@@ -53,6 +53,15 @@ pub struct FakeState {
     pub learn: Option<super::nft_ip::LearnState>,
     /// What its sets hold.
     pub learned: BTreeMap<String, Vec<super::nft_ip::Learned>>,
+    /// The other end of each veth, by index.
+    pub peers: BTreeMap<u32, u32>,
+    /// The kernel parts of the local breakout (sysctls: the values of the
+    /// sysctls there are, by path).
+    pub breakout: super::breakout::BreakoutState,
+    /// What [`super::breakout::BreakoutOps::uplinks`] reports.
+    pub uplinks: super::breakout::Uplinks,
+    /// Writing a sysctl fails (read-only, like in a container).
+    pub sysctl_read_only: bool,
     /// A bridge asked for counters came without them.
     vlan_stats_missed: bool,
     next_index: u32,
@@ -139,6 +148,24 @@ impl FakeNet {
     /// Behaves like a kernel without per-VLAN counters per port.
     pub fn without_vlan_stats(&self) {
         self.lock().no_vlan_stats = true;
+    }
+
+    /// Sets what [`super::breakout::BreakoutOps::uplinks`] reports.
+    pub fn set_uplinks(&self, uplinks: super::breakout::Uplinks) {
+        self.lock().uplinks = uplinks;
+    }
+
+    /// Sets a sysctl (`ipv4/conf/ens18/forwarding`).
+    pub fn set_sysctl(&self, path: &str, value: &str) {
+        self.lock()
+            .breakout
+            .sysctls
+            .insert(path.to_string(), value.to_string());
+    }
+
+    /// The value of a sysctl.
+    pub fn sysctl(&self, path: &str) -> Option<String> {
+        self.lock().breakout.sysctls.get(path).cloned()
     }
 
     /// Returns a copy of the current state.
@@ -367,12 +394,49 @@ impl NetOps for FakeNet {
         Ok(())
     }
 
+    async fn create_veth(&self, name: &str, peer: &str, _mac: [u8; 6]) -> SysResult<()> {
+        let mut s = self.lock();
+        s.calls.push(format!("create_veth {name} {peer}"));
+        if s.name_taken(name) || s.name_taken(peer) {
+            return Err(err("create veth", "File exists"));
+        }
+        let mut ends = Vec::new();
+        for n in [name, peer] {
+            let index = s.alloc();
+            s.links.insert(
+                index,
+                LinkState {
+                    index,
+                    name: n.to_string(),
+                    kind: LinkKind::Other("veth".into()),
+                    alias: None,
+                    master: None,
+                    admin_up: false,
+                    oper_up: false,
+                    mtu: 1500,
+                    isolated: None,
+                    traffic: crate::api::Traffic::default(),
+                },
+            );
+            ends.push(index);
+        }
+        s.peers.insert(ends[0], ends[1]);
+        s.peers.insert(ends[1], ends[0]);
+        Ok(())
+    }
+
     async fn delete_link(&self, index: u32) -> SysResult<()> {
         let mut s = self.lock();
         let Some(link) = s.links.remove(&index) else {
             return Err(err("delete link", "No such device"));
         };
         s.calls.push(format!("delete_link {}", link.name));
+        // Like the kernel: a veth goes with its peer.
+        if let Some(peer) = s.peers.remove(&index) {
+            s.peers.remove(&peer);
+            s.links.remove(&peer);
+            s.vlans.remove(&peer);
+        }
         s.vlans.remove(&index);
         s.tc.remove(&index);
         s.remotes.remove(&index);
@@ -692,5 +756,104 @@ impl ObserveOps for FakeNet {
         Ok(s.routes
             .get(&dst)
             .and_then(|name| s.links.values().find(|l| l.name == *name).map(|l| l.index)))
+    }
+}
+
+impl super::breakout::BreakoutOps for FakeNet {
+    async fn uplinks(&self) -> SysResult<super::breakout::Uplinks> {
+        Ok(self.lock().uplinks.clone())
+    }
+
+    async fn breakout_state(
+        &self,
+        sysctls: &[String],
+    ) -> SysResult<super::breakout::BreakoutState> {
+        let s = self.lock();
+        let exists = |name: &str| s.name_taken(name);
+        let b = &s.breakout;
+        Ok(super::breakout::BreakoutState {
+            nft: b.nft.clone(),
+            rules: b.rules.clone(),
+            routes: b
+                .routes
+                .iter()
+                .filter(|r| exists(&r.dev))
+                .cloned()
+                .collect(),
+            addresses: b.addresses.iter().filter(|a| exists(a)).cloned().collect(),
+            fdb: b.fdb.iter().filter(|f| exists(&f.port)).cloned().collect(),
+            sysctls: sysctls
+                .iter()
+                .filter_map(|p| b.sysctls.get(p).map(|v| (p.clone(), v.clone())))
+                .collect(),
+            changed: b.changed.clone(),
+        })
+    }
+
+    async fn set_breakout(&self, specs: &[super::breakout::BreakoutSpec]) -> SysResult<()> {
+        let mut s = self.lock();
+        s.calls.push(format!("set_breakout {}", specs.len()));
+        let want = super::breakout::wanted(specs);
+        for (path, changed) in std::mem::take(&mut s.breakout.changed) {
+            if want.sysctls.contains_key(&path) {
+                s.breakout.changed.insert(path, changed);
+            } else if s.breakout.sysctls.get(&path) == Some(&changed.set) {
+                s.breakout.sysctls.insert(path, changed.original);
+            }
+        }
+        for (path, value) in &want.sysctls {
+            let current = s.breakout.sysctls.get(path).cloned();
+            if current.as_deref() == Some(value.as_str()) {
+                continue;
+            }
+            if s.sysctl_read_only {
+                s.breakout.nft = None;
+                return Err(err(&format!("set sysctl {path}"), "Read-only file system"));
+            }
+            let own = path
+                .split('/')
+                .nth(2)
+                .is_some_and(crate::breakout::is_breakout_name);
+            if !own && !s.breakout.changed.contains_key(path) {
+                s.breakout.changed.insert(
+                    path.clone(),
+                    super::breakout::Changed {
+                        original: current.unwrap_or_default(),
+                        set: value.clone(),
+                    },
+                );
+            }
+            s.breakout.sysctls.insert(path.clone(), value.clone());
+        }
+        for name in specs.iter().flat_map(|spec| [&spec.router, &spec.port]) {
+            if !s.name_taken(name) {
+                return Err(err(
+                    "set up the breakout",
+                    &format!("interface {name} vanished"),
+                ));
+            }
+        }
+        s.breakout.nft = want.nft;
+        s.breakout.rules = want.rules;
+        s.breakout.routes = want.routes;
+        s.breakout.addresses = want.addresses;
+        s.breakout.fdb = want.fdb;
+        Ok(())
+    }
+
+    async fn delete_breakout(&self) -> SysResult<()> {
+        let mut s = self.lock();
+        s.calls.push("delete_breakout".into());
+        s.breakout.nft = None;
+        s.breakout.rules.clear();
+        s.breakout.routes.clear();
+        s.breakout.addresses.clear();
+        s.breakout.fdb.clear();
+        for (path, changed) in std::mem::take(&mut s.breakout.changed) {
+            if s.breakout.sysctls.get(&path) == Some(&changed.set) {
+                s.breakout.sysctls.insert(path, changed.original);
+            }
+        }
+        Ok(())
     }
 }

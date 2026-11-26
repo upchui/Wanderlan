@@ -18,10 +18,10 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{debug, info, warn};
 use wanderlan_core::api::{
-    ApiError, Applied, ChangeSource, ConfigInput, ConfigTexts, Confirmed, Done, Interface,
-    Invitation, JoinParams, Joined, Level, MacEntry, PeerStatus, PendingChange, PortState,
-    PortTraffic, Request, ResetReport, SiteState, SiteSummary, Status, Validation, VlanPortTraffic,
-    VlanTraffic,
+    ApiError, Applied, BreakoutFamily, BreakoutStatus, ChangeSource, ConfigInput, ConfigTexts,
+    Confirmed, Done, Interface, Invitation, JoinParams, Joined, Level, MacEntry, PeerStatus,
+    PendingChange, PortState, PortTraffic, Request, ResetReport, SiteState, SiteSummary, Status,
+    UplinkStatus, Validation, VlanPortTraffic, VlanTraffic,
 };
 use wanderlan_core::config::{
     self, Config, ConfigFile, Diagnostic, Loaded, Network, render_local, render_network,
@@ -35,6 +35,7 @@ use wanderlan_core::mtu::wire::Announce;
 use wanderlan_core::policy;
 use wanderlan_core::reconcile::{self, Change};
 use wanderlan_core::sync::{self, Version};
+use wanderlan_core::sys::breakout::{BreakoutOps as _, Egress};
 use wanderlan_core::sys::linux::LinuxSystem;
 use wanderlan_core::sys::nft::NftOps as _;
 use wanderlan_core::sys::nft::PortDir;
@@ -2986,6 +2987,7 @@ impl Controller {
             return Ok(Vec::new());
         };
         self.runtime.underlay_mtu = self.underlay_mtus(&cfg).await;
+        self.refresh_breakout(&cfg).await;
         let desired = desired::derive(&cfg, &self.runtime);
         for (peer, reason) in &desired.unbuilt {
             self.error_once(format!("No tunnel to site \"{peer}\": {reason}"));
@@ -3041,6 +3043,49 @@ impl Controller {
         }
         self.update_port_map().await;
         Ok(changes)
+    }
+
+    /// What the local breakouts depend on besides the configuration: the
+    /// uplinks and the sysctls (looked at only while this site has one).
+    async fn refresh_breakout(&mut self, cfg: &config::Config) {
+        if cfg.self_site().is_none_or(|s| s.breakout.is_empty()) {
+            self.runtime.uplinks = Default::default();
+            self.runtime.sysctls.clear();
+            return;
+        }
+        match self.sys.uplinks().await {
+            Ok(uplinks) => self.runtime.uplinks = uplinks,
+            Err(e) => warn!("{e}"),
+        }
+        let uplinks = &self.runtime.uplinks;
+        let mut devs: BTreeSet<String> = BTreeSet::new();
+        devs.extend(uplinks.auto4.clone());
+        devs.extend(uplinks.auto6.clone());
+        devs.extend(
+            cfg.self_site()
+                .into_iter()
+                .flat_map(|s| s.breakout.values().filter_map(|b| b.uplink.clone())),
+        );
+        devs.extend(
+            uplinks
+                .by_name
+                .keys()
+                .filter(|n| wanderlan_core::breakout::is_breakout_name(n))
+                .cloned(),
+        );
+        let sysctls = &self.sys.sysctls;
+        let mut values: BTreeMap<String, String> =
+            desired::breakout_sysctl_paths(devs.iter().map(String::as_str))
+                .into_iter()
+                .filter_map(|p| sysctls.read(&p).map(|v| (p, v)))
+                .collect();
+        // What wanderlan changed counts with its value before: the wish
+        // stays the same once it is fulfilled.
+        for (path, changed) in sysctls.changed() {
+            values.insert(path, changed.original);
+        }
+        self.runtime.sysctls = values;
+        self.runtime.sysctl_writable = sysctls.writable();
     }
 
     /// Forgets the learned MAC addresses of all of wanderlan's bridges.
@@ -3357,6 +3402,8 @@ impl Controller {
                 missing_ports: Vec::new(),
                 sync_problem: None,
                 site_id: self.own_id().map(|id| id.to_string()),
+                breakout: Vec::new(),
+                uplinks: Vec::new(),
             };
         };
         let desired = derived
@@ -3512,6 +3559,79 @@ impl Controller {
                 }
             })
             .collect();
+        let family = |r: &Result<Egress, String>| match r {
+            Ok(egress) => BreakoutFamily {
+                dev: Some(egress.dev().to_string()),
+                gateway: match egress {
+                    Egress::Fixed {
+                        gateway: Some(g), ..
+                    } => Some(g.to_string()),
+                    Egress::Fixed { gateway: None, .. } => Some("direct".into()),
+                    Egress::Main { .. } => None,
+                },
+                reason: None,
+            },
+            Err(why) => BreakoutFamily {
+                reason: Some(why.clone()),
+                ..BreakoutFamily::default()
+            },
+        };
+        let breakout = desired
+            .breakout
+            .iter()
+            .map(|b| {
+                let router = links.iter().find(|l| l.name == b.router);
+                let port = links.iter().find(|l| l.name == b.port);
+                let (rx_bps, tx_bps) = rates.get(&b.router).copied().unwrap_or_default();
+                BreakoutStatus {
+                    vid: b.vid,
+                    bridge: b.bridge.clone(),
+                    router: b.router.clone(),
+                    uplink: me
+                        .and_then(|s| s.breakout.get(&b.vid))
+                        .and_then(|c| c.uplink.clone()),
+                    except: b.except.iter().map(ToString::to_string).collect(),
+                    ipv4: family(&b.v4),
+                    ipv6: family(&b.v6),
+                    ready: router.is_some_and(|l| l.admin_up)
+                        && port.is_some_and(|l| l.admin_up && l.master.is_some()),
+                    rx_bps,
+                    tx_bps,
+                    traffic: router.map(|l| l.traffic).unwrap_or_default(),
+                }
+            })
+            .collect();
+        let trunk_names: BTreeSet<&str> = desired.trunks.iter().map(|t| t.name.as_str()).collect();
+        let uplinks = &self.runtime.uplinks;
+        let uplinks: Vec<UplinkStatus> = uplinks
+            .by_name
+            .iter()
+            .filter(|(name, _)| {
+                name.as_str() != "lo"
+                    && !trunk_names.contains(name.as_str())
+                    && !links
+                        .iter()
+                        .any(|l| l.name == **name && reconcile::is_owned(l))
+            })
+            .map(|(name, u)| UplinkStatus {
+                name: name.clone(),
+                up: u.up,
+                addresses: u
+                    .v4
+                    .iter()
+                    .map(ToString::to_string)
+                    .chain(u.v6.iter().map(ToString::to_string))
+                    .collect(),
+                gateway4: u
+                    .default4
+                    .map(|g| g.map_or_else(|| "direct".to_string(), |g| g.to_string())),
+                gateway6: u
+                    .default6
+                    .map(|g| g.map_or_else(|| "direct".to_string(), |g| g.to_string())),
+                default4: uplinks.auto4.as_deref() == Some(name.as_str()),
+                default6: uplinks.auto6.as_deref() == Some(name.as_str()),
+            })
+            .collect();
         Status {
             version: wanderlan_core::version_line().into(),
             state: if self.last_error.is_some() {
@@ -3543,6 +3663,8 @@ impl Controller {
                 .map(|t| t.name.clone())
                 .collect(),
             site_id: self.own_id().map(|id| id.to_string()),
+            breakout,
+            uplinks,
         }
     }
 }

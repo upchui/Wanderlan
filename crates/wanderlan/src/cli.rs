@@ -194,6 +194,35 @@ pub enum Command {
         #[arg(long)]
         confirm: bool,
     },
+    /// The local internet breakout of VLANs of a site: their public IPv4
+    /// and IPv6 destinations leave through that site's own uplink
+    /// (masqueraded) instead of the tunnel; private destinations and the
+    /// exceptions still go through the tunnel. "off": all through the
+    /// tunnel again. Without arguments: the breakouts of this site.
+    ///
+    /// Examples: `wanderlan breakout office 10,20 on`,
+    /// `wanderlan breakout office 20 on --uplink ens20 --except 203.0.113.0/24`,
+    /// `wanderlan breakout office 20 off`.
+    Breakout {
+        /// The site (none: show the breakouts of this site).
+        site: Option<String>,
+        /// VLANs (in the network), e.g. 10,20 or 10-20.
+        vlans: Option<String>,
+        /// "on" or "off".
+        #[arg(value_parser = ["on", "off"])]
+        state: Option<String>,
+        /// The interface of that site the VLANs leave by; "auto": the one
+        /// of its default route.
+        #[arg(long)]
+        uplink: Option<String>,
+        /// Destinations that still go through the tunnel, e.g.
+        /// 203.0.113.0/24,2001:db8::/32; "none": no exceptions.
+        #[arg(long)]
+        except: Option<String>,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Limit the VLANs of the tunnel between two sites (on top of the VLANs
     /// both take part in), or lift the limit ("all"). "none": the tunnel
     /// carries no VLAN.
@@ -441,6 +470,53 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             vlans,
             confirm,
         }) => set_tunnel_vlans(&socket, &site, &other, &vlans, confirm).await,
+        Some(Command::Breakout {
+            site,
+            vlans,
+            state,
+            uplink,
+            except,
+            confirm,
+        }) => {
+            let (Some(site), Some(vlans), Some(state)) = (site, vlans, state) else {
+                return show_breakout(&socket).await;
+            };
+            let vlans: config::VlanSet = vlans.parse().map_err(|e| anyhow!("{vlans}: {e}"))?;
+            let except = except.map(|text| parse_except(&text)).transpose()?;
+            let uplink = uplink.map(|u| {
+                let u = u.trim().to_string();
+                (!u.is_empty() && u != "auto").then_some(u)
+            });
+            edit_site(&socket, &site, confirm, |entry, _| {
+                let before = entry.breakout.clone();
+                for vid in vlans.iter() {
+                    if state == "off" {
+                        entry.breakout.remove(&vid);
+                        continue;
+                    }
+                    let b = entry.breakout.entry(vid).or_default();
+                    if let Some(uplink) = &uplink {
+                        b.uplink.clone_from(uplink);
+                    }
+                    if let Some(except) = &except {
+                        b.except.clone_from(except);
+                    }
+                }
+                if entry.breakout == before {
+                    return Err(format!("Nothing to change for {}.", entry.name));
+                }
+                Ok(if entry.breakout.is_empty() {
+                    format!("{} has no local breakout", entry.name)
+                } else {
+                    let list: config::VlanSet = entry.breakout.keys().copied().collect();
+                    format!(
+                        "{} breaks out VLANs {list} to the internet through its own uplink",
+                        entry.name
+                    )
+                })
+            })
+            .await
+        }
         Some(Command::Rename {
             site,
             new_name,
@@ -1160,6 +1236,122 @@ async fn apply(
     }
 }
 
+/// `--except`: networks or addresses separated by commas, or "none".
+fn parse_except(text: &str) -> Result<std::collections::BTreeSet<wanderlan_core::breakout::IpNet>> {
+    if matches!(text.trim(), "" | "none") {
+        return Ok(std::collections::BTreeSet::new());
+    }
+    text.split(',')
+        .map(|part| {
+            wanderlan_core::breakout::parse_net(part).ok_or_else(|| {
+                anyhow!(
+                    "\"{}\" is not an address or a network like 203.0.113.0/24",
+                    part.trim()
+                )
+            })
+        })
+        .collect()
+}
+
+/// One family of a breakout in words.
+fn breakout_family(f: &api::BreakoutFamily) -> String {
+    match (&f.dev, &f.reason) {
+        (Some(dev), _) => match &f.gateway {
+            Some(g) if g != "direct" => format!("out of {dev} via {g}"),
+            _ => format!("out of {dev}"),
+        },
+        (None, Some(why)) => format!("through the tunnel ({why})"),
+        (None, None) => "through the tunnel".into(),
+    }
+}
+
+/// The breakout lines of `wanderlan status` and `wanderlan breakout`.
+fn print_breakouts(st: &Status) {
+    for b in &st.breakout {
+        let segment = if b.bridge == wanderlan_core::BRIDGE_NAME {
+            String::new()
+        } else {
+            format!(" ({})", b.bridge)
+        };
+        println!(
+            "  VLAN {}{segment}: IPv4 {}, IPv6 {}{}",
+            b.vid,
+            breakout_family(&b.ipv4),
+            breakout_family(&b.ipv6),
+            if b.except.is_empty() {
+                String::new()
+            } else {
+                format!(", except {}", b.except.join(", "))
+            }
+        );
+        if b.ready {
+            println!(
+                "    {}: {} out, {} back",
+                b.router,
+                format_rate(b.rx_bps),
+                format_rate(b.tx_bps)
+            );
+        } else {
+            println!("    {}: being set up", b.router);
+        }
+    }
+}
+
+/// A rate in bit/s, short.
+fn format_rate(bps: u64) -> String {
+    #[allow(clippy::cast_precision_loss)]
+    let v = bps as f64;
+    if v >= 1e9 {
+        format!("{:.1} Gbit/s", v / 1e9)
+    } else if v >= 1e6 {
+        format!("{:.1} Mbit/s", v / 1e6)
+    } else if v >= 1e3 {
+        format!("{:.0} kbit/s", v / 1e3)
+    } else {
+        format!("{bps} bit/s")
+    }
+}
+
+/// `wanderlan breakout` without arguments.
+async fn show_breakout(socket: &Path) -> Result<ExitCode> {
+    let client = connect(socket).await?;
+    let st: Status = client.call(Request::Status).await?;
+    if st.breakout.is_empty() {
+        println!(
+            "This site has no local breakout. Example: wanderlan breakout {} 10 on",
+            st.site.as_deref().unwrap_or("<site>")
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!(
+        "Local breakout of {}:",
+        st.site.as_deref().unwrap_or("this site")
+    );
+    print_breakouts(&st);
+    if !st.uplinks.is_empty() {
+        println!("\nUplinks of this box:");
+        for u in st
+            .uplinks
+            .iter()
+            .filter(|u| u.gateway4.is_some() || u.gateway6.is_some())
+        {
+            let mark = match (u.default4, u.default6) {
+                (true, true) => " (default route)",
+                (true, false) => " (IPv4 default route)",
+                (false, true) => " (IPv6 default route)",
+                (false, false) => "",
+            };
+            println!(
+                "  {}{mark}: {}{}",
+                u.name,
+                u.addresses.join(", "),
+                if u.up { "" } else { " (down)" }
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
     let client = connect(socket).await?;
     let st: Status = client.call(Request::Status).await?;
@@ -1214,6 +1406,10 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
             "{} open invitation(s) (`wanderlan invite list`)",
             st.invites
         );
+    }
+    if !st.breakout.is_empty() {
+        println!("Local breakout (`wanderlan breakout`):");
+        print_breakouts(&st);
     }
     if !st.sites.is_empty() {
         println!(

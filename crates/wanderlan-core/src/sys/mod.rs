@@ -5,9 +5,11 @@
 //! in-memory model of the kernel so that the reconciliation logic can be
 //! tested without root privileges.
 
+pub mod breakout;
 pub mod fake;
 pub mod linux;
 pub mod netlink;
+mod netlink_breakout;
 mod netlink_observe;
 mod netlink_tc;
 pub mod nft;
@@ -235,6 +237,14 @@ pub trait NetOps: Send + Sync {
         remote: Option<SocketAddrV4>,
     ) -> impl Future<Output = SysResult<()>> + Send;
 
+    /// Creates a veth pair: `name` with the MAC address `mac`, and its peer.
+    fn create_veth(
+        &self,
+        name: &str,
+        peer: &str,
+        mac: [u8; 6],
+    ) -> impl Future<Output = SysResult<()>> + Send;
+
     /// Deletes a link.
     fn delete_link(&self, index: u32) -> impl Future<Output = SysResult<()>> + Send;
 
@@ -275,12 +285,17 @@ pub trait NetOps: Send + Sync {
 
 /// Everything the daemon needs from the system.
 pub trait System:
-    NetOps + tc::TcOps + nft::NftOps + observe::ObserveOps + nft_ip::LearnOps
+    NetOps + tc::TcOps + nft::NftOps + observe::ObserveOps + nft_ip::LearnOps + breakout::BreakoutOps
 {
 }
 
 impl<T> System for T where
-    T: NetOps + tc::TcOps + nft::NftOps + observe::ObserveOps + nft_ip::LearnOps
+    T: NetOps
+        + tc::TcOps
+        + nft::NftOps
+        + observe::ObserveOps
+        + nft_ip::LearnOps
+        + breakout::BreakoutOps
 {
 }
 

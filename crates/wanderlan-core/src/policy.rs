@@ -26,7 +26,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::{Network, Site, VlanMap};
+use crate::config::{Breakouts, Network, Site, VlanMap};
 
 /// The parts of a site that only its managers may change.
 #[derive(Debug, PartialEq, Eq)]
@@ -38,6 +38,9 @@ struct Rules<'a> {
     self_managed: bool,
     uplink: Option<&'a str>,
     maps: Vec<&'a VlanMap>,
+    /// The local breakout bypasses the central firewall: its manager
+    /// decides.
+    breakout: &'a Breakouts,
 }
 
 fn rules<'a>(network: &'a Network, site: &'a Site) -> Rules<'a> {
@@ -51,6 +54,7 @@ fn rules<'a>(network: &'a Network, site: &'a Site) -> Rules<'a> {
         self_managed: site.self_managed,
         uplink: site.uplink.as_deref(),
         maps,
+        breakout: &site.breakout,
     }
 }
 
@@ -371,6 +375,7 @@ mod tests {
             managed_by: managed_by.map(Into::into),
             self_managed,
             uplink: None,
+            breakout: Default::default(),
         }
     }
 

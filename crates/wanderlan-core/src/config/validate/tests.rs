@@ -1169,3 +1169,61 @@ fn the_tunnel_port_follows_the_control_port_unless_set() {
     network.tunnel_port = Some(65535);
     assert!(!errors(&render_network(&network), LOCAL).is_empty());
 }
+
+#[test]
+fn breakouts_are_read_written_and_checked() {
+    let text = r#"
+[network]
+vlans = "native,10-20"
+
+[site.alex]
+address = "10.13.0.103"
+
+[site.site2]
+address = "10.13.0.104"
+server = "alex"
+breakout = { 10 = {}, 20 = { uplink = "ens20", except = ["203.0.113.9/24", "2001:db8::1"] } }
+"#;
+    let network = parse_network(text).unwrap().network.unwrap();
+    let site2 = network.site("site2").unwrap();
+    assert_eq!(site2.breakout.len(), 2);
+    let twenty = &site2.breakout[&20];
+    assert_eq!(twenty.uplink.as_deref(), Some("ens20"));
+    let except: Vec<String> = twenty.except.iter().map(ToString::to_string).collect();
+    assert_eq!(except, ["203.0.113.0/24", "2001:db8::1/128"]);
+    // Both forms carry it, and read back the same.
+    let line = "breakout = { 10 = {}, 20 = { uplink = \"ens20\", except = [\"203.0.113.0/24\", \"2001:db8::1/128\"] } }";
+    for form in [
+        render_network(&network),
+        crate::config::render_network_wire(&network),
+    ] {
+        assert!(form.contains(line), "{form}");
+        assert_eq!(
+            parse_network(&form).unwrap().network.unwrap().sites,
+            network.sites
+        );
+    }
+    // Only the VLANs of the site.
+    let local = "self = \"site2\"\ntrunk = \"ens19\"\n";
+    let wrong = text.replace("20 = { uplink", "30 = { uplink");
+    let err = single_error(&wrong, local);
+    assert!(
+        err.message
+            .contains("breakout: VLAN 30 is not one of the VLANs of the site"),
+        "{err}"
+    );
+    assert_eq!(err.line, Some(line_of(&wrong, "[site.site2]", "breakout")));
+    // A trunk port is no uplink.
+    let err = single_error(text, "self = \"site2\"\ntrunk = \"ens20\"\n");
+    assert!(
+        err.message.contains("is a trunk port of this site"),
+        "{err}"
+    );
+    // Not an address.
+    let bad = text.replace("2001:db8::1", "example.com");
+    let err = single_error(&bad, local);
+    assert!(
+        err.message.contains("\"example.com\" is not an address"),
+        "{err}"
+    );
+}

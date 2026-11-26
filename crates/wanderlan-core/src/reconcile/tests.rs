@@ -1126,3 +1126,127 @@ async fn the_gretap_tunnels_of_an_older_version_are_removed() {
     assert!(net.link("gt-buero").is_none());
     assert!(net.link("vx-buero").is_some());
 }
+
+/// haus2 breaks out VLAN 20 by its default route and VLAN 30 out of eth1.
+fn breakout_runtime() -> Runtime {
+    use crate::sys::breakout::{Uplink, Uplinks};
+    let uplink = |last: u8| Uplink {
+        up: true,
+        v4: vec![Ipv4Addr::new(192, 0, 2, last)],
+        default4: Some(Some(Ipv4Addr::new(192, 0, 2, 1))),
+        ..Uplink::default()
+    };
+    Runtime {
+        sysctl_writable: true,
+        uplinks: Uplinks {
+            by_name: [("eth0".into(), uplink(2)), ("eth1".into(), uplink(3))].into(),
+            auto4: Some("eth0".into()),
+            auto6: None,
+        },
+        ..Runtime::default()
+    }
+}
+
+#[tokio::test]
+async fn a_breakout_builds_its_pair_and_goes_again() {
+    let network = NETWORK.replace(
+        "vlans = \"20,30\"               # haus2 only takes part in VLANs 20 and 30",
+        "vlans = \"20,30\"\nbreakout = { 20 = {}, 30 = { uplink = \"eth1\" } }",
+    );
+    let net = fresh();
+    net.add_physical("eth1");
+    net.set_sysctl("ipv4/conf/eth1/forwarding", "0");
+    let runtime = breakout_runtime();
+    let d = derive(&config_from(&network, "haus2"), &runtime);
+    assert_eq!(d.breakout.len(), 2);
+    assert!(d.breakout[0].v6.is_err(), "no IPv6 uplink");
+    run(&net, &d).await;
+
+    let br = net.link("br0").unwrap();
+    let port = net.link("wlbp20").unwrap();
+    assert_eq!(port.master, Some(br.index));
+    assert_eq!(port.alias.as_deref(), Some(OWNER_ALIAS));
+    assert_eq!(net.vlans("wlbp20"), [(20, VlanFlags::NATIVE)].into());
+    assert!(net.link("wlbo20").unwrap().admin_up);
+    let state = net.state().breakout;
+    assert!(state.nft.is_some());
+    // Two ways back, one way out of eth1.
+    assert_eq!(state.rules.len(), 3, "{:?}", state.rules);
+    assert_eq!(
+        net.sysctl("ipv4/conf/eth1/forwarding").as_deref(),
+        Some("1")
+    );
+    assert_eq!(
+        net.sysctl("ipv4/conf/wlbo20/forwarding").as_deref(),
+        Some("1")
+    );
+    assert!(run(&net, &d).await.is_empty(), "nothing left to do");
+
+    // No breakout any more: the pairs and the rest go, eth1 is as before.
+    let plain = derive(&config_from(NETWORK, "haus2"), &runtime);
+    let changes = run(&net, &plain).await;
+    assert!(matches!(changes[0], Change::SetBreakout { ref specs } if specs.is_empty()));
+    assert!(net.link("wlbo20").is_none() && net.link("wlbp30").is_none());
+    assert!(net.state().breakout.is_empty());
+    assert_eq!(
+        net.sysctl("ipv4/conf/eth1/forwarding").as_deref(),
+        Some("0")
+    );
+
+    // The teardown takes it all, the diversion first.
+    run(&net, &d).await;
+    net.take_calls();
+    teardown(&net, |_| {}).await.unwrap();
+    let calls = net.take_calls();
+    assert_eq!(calls[0], "delete_breakout", "{calls:?}");
+    assert!(net.state().links.values().all(|l| !is_owned(l)));
+    assert_eq!(
+        net.sysctl("ipv4/conf/eth1/forwarding").as_deref(),
+        Some("0")
+    );
+}
+
+#[tokio::test]
+async fn without_writable_sysctls_a_family_breaks_out_only_if_forwarding_is_on() {
+    let network = NETWORK.replace(
+        "vlans = \"20,30\"               # haus2 only takes part in VLANs 20 and 30",
+        "vlans = \"20,30\"\nbreakout = { 20 = {} }",
+    );
+    let mut runtime = breakout_runtime();
+    runtime.sysctl_writable = false;
+    let cfg = config_from(&network, "haus2");
+    let off = derive(&cfg, &runtime);
+    assert!(
+        off.breakout[0]
+            .v4
+            .as_ref()
+            .is_err_and(|why| why.contains("net.ipv4.conf.eth0.forwarding")),
+        "{:?}",
+        off.breakout[0].v4
+    );
+    runtime.sysctls = [
+        ("ipv4/conf/eth0/forwarding".to_string(), "1".to_string()),
+        ("ipv4/conf/default/forwarding".to_string(), "1".to_string()),
+    ]
+    .into();
+    let on = derive(&cfg, &runtime);
+    assert!(on.breakout[0].v4.is_ok());
+    // Strict source checks would drop what the devices send.
+    let mut strict = runtime.clone();
+    strict
+        .sysctls
+        .insert("ipv4/conf/all/rp_filter".into(), "1".into());
+    assert!(
+        derive(&cfg, &strict).breakout[0]
+            .v4
+            .as_ref()
+            .is_err_and(|why| why.contains("rp_filter"))
+    );
+    // Nothing optional is set where nothing can be written.
+    assert_eq!(
+        on.breakout[0].sysctls.len(),
+        2,
+        "{:?}",
+        on.breakout[0].sysctls
+    );
+}

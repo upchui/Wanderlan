@@ -469,6 +469,7 @@ impl Wizard {
             managed_by: None,
             self_managed: false,
             uplink: None,
+            breakout: Default::default(),
         });
         let local = Local {
             self_name: Some(name),

@@ -11,8 +11,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::net::SocketAddrV4;
 
+use crate::breakout::{PORT_PREFIX, ROUTER_PREFIX, is_breakout_name, is_port_name};
 use crate::config::VlanSet;
 use crate::desired::{Desired, OWNER_ALIAS, TUNNEL_MTU};
+use crate::sys::breakout::{BreakoutSpec, BreakoutState};
 use crate::sys::nft::{MssRule, NftState, SplitRule};
 use crate::sys::nft_ip::{LearnRule, LearnState};
 use crate::sys::tc::{IfTc, TcRule};
@@ -46,11 +48,26 @@ pub struct Actual {
     pub learn: Option<LearnState>,
     /// Why the table `ip wanderlan` could not be read.
     pub nat_error: Option<String>,
+    /// The kernel parts of the breakouts (without their veth pairs).
+    pub breakout: BreakoutState,
+    /// Why they could not be read.
+    pub breakout_error: Option<String>,
 }
 
 impl Actual {
     /// Reads the current state from the system.
     pub async fn observe<N: System>(net: &N) -> Result<Self, SysError> {
+        Self::observe_with(net, None).await
+    }
+
+    /// Reads the current state. The kernel parts of the breakouts are read
+    /// with `breakout` (the sysctls they set, see
+    /// [`Desired::breakout_sysctls`]) or while interfaces of a breakout are
+    /// left; a site without one never pays for them.
+    pub async fn observe_with<N: System>(
+        net: &N,
+        breakout: Option<&[String]>,
+    ) -> Result<Self, SysError> {
         let links: BTreeMap<String, LinkState> = net
             .links()
             .await?
@@ -83,6 +100,18 @@ impl Actual {
             Ok(learn) => (learn, None),
             Err(e) => (None, Some(e.to_string())),
         };
+        let left = links
+            .values()
+            .any(|l| is_owned(l) && is_breakout_name(&l.name));
+        let (breakout, breakout_error) = match breakout {
+            Some(sysctls) => net.breakout_state(sysctls).await,
+            None if left => net.breakout_state(&[]).await,
+            None => Ok(BreakoutState::default()),
+        }
+        .map_or_else(
+            |e| (BreakoutState::default(), Some(e.to_string())),
+            |state| (state, None),
+        );
         Ok(Self {
             links,
             vlans,
@@ -93,6 +122,8 @@ impl Actual {
             remotes,
             learn,
             nat_error,
+            breakout,
+            breakout_error,
         })
     }
 
@@ -145,6 +176,17 @@ pub enum Change {
     },
     /// Delete the table `ip wanderlan`.
     DeleteLearn,
+    /// Create the veth pair of a breakout.
+    CreateVeth {
+        router: String,
+        port: String,
+        mac: [u8; 6],
+    },
+    /// Put the breakouts whose veth pairs are in place in the kernel (and
+    /// remove the rest).
+    SetBreakout { specs: Vec<BreakoutSpec> },
+    /// Remove everything of the breakouts but their veth pairs.
+    DeleteBreakout,
     /// Delete a link created by wanderlan.
     DeleteLink { name: String, reason: String },
     /// Set the MTU of a link.
@@ -330,8 +372,39 @@ impl fmt::Display for Change {
                 }
             }
             Self::DeleteLearn => write!(f, "Deleting nftables table ip wanderlan"),
+            Self::CreateVeth { router, port, .. } => write!(
+                f,
+                "Creating the breakout interfaces {router} (to the uplink) and {port} (bridge port)"
+            ),
+            Self::SetBreakout { specs } if specs.is_empty() => {
+                write!(f, "Removing the local breakout")
+            }
+            Self::SetBreakout { specs } => {
+                let parts: Vec<String> = specs.iter().map(describe_breakout).collect();
+                write!(f, "Local breakout: {}", parts.join("; "))
+            }
+            Self::DeleteBreakout => write!(
+                f,
+                "Removing the local breakout (nftables tables {}, routing rules, sysctls)",
+                crate::sys::breakout::TABLE
+            ),
         }
     }
+}
+
+/// One breakout for the log: VLAN, where each family leaves.
+fn describe_breakout(spec: &BreakoutSpec) -> String {
+    let family = |r: &Result<crate::sys::breakout::Egress, String>| match r {
+        Ok(e) => format!("out of {}", e.dev()),
+        Err(why) => format!("through the tunnel ({why})"),
+    };
+    format!(
+        "VLAN {} on {}: IPv4 {}, IPv6 {}",
+        spec.vid,
+        spec.bridge,
+        family(&spec.v4),
+        family(&spec.v6)
+    )
 }
 
 fn on_off(v: bool) -> &'static str {
@@ -494,6 +567,36 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
             }),
         }
     }
+    // The veth pairs of the breakouts: a router end per breakout, and its
+    // bridge port. Others of ours go (one end takes the other with it).
+    let wanted_breakouts: BTreeSet<&str> = desired
+        .breakout
+        .iter()
+        .flat_map(|b| [b.router.as_str(), b.port.as_str()])
+        .collect();
+    for link in actual.links.values() {
+        if !is_owned(link) || !is_breakout_name(&link.name) {
+            continue;
+        }
+        let peer = peer_name(&link.name);
+        let peer_there = actual.links.contains_key(&peer);
+        if !wanted_breakouts.contains(link.name.as_str()) {
+            // The router end takes its port along; a port alone goes too.
+            if !is_port_name(&link.name) || !peer_there {
+                deletes.push(Change::DeleteLink {
+                    name: link.name.clone(),
+                    reason: "its VLAN no longer breaks out here".into(),
+                });
+            }
+        } else if (link.kind != LinkKind::Other("veth".into()) || !peer_there)
+            && (!is_port_name(&link.name) || !peer_there)
+        {
+            deletes.push(Change::DeleteLink {
+                name: link.name.clone(),
+                reason: "it is not the veth pair of a breakout".into(),
+            });
+        }
+    }
     let deleted: BTreeSet<String> = deletes
         .iter()
         .filter_map(|c| match c {
@@ -586,6 +689,78 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
         }
     }
 
+    // Breakouts: the veth pair, the port in its VLAN, both ends up. The
+    // rest follows for the pairs that are in place.
+    let mut ready: Vec<BreakoutSpec> = Vec::new();
+    for spec in &desired.breakout {
+        let router = actual.links.get(&spec.router);
+        let port = actual.links.get(&spec.port);
+        for link in [router, port].into_iter().flatten() {
+            if !is_owned(link) {
+                return Err(PlanError::Foreign(link.name.clone()));
+            }
+        }
+        let (Some(router), Some(port)) = (router, port) else {
+            if router.is_none() && port.is_none() {
+                creates.push(Change::CreateVeth {
+                    router: spec.router.clone(),
+                    port: spec.port.clone(),
+                    mac: spec.mac,
+                });
+            }
+            continue;
+        };
+        if deleted.contains(&router.name) || deleted.contains(&port.name) {
+            continue;
+        }
+        let vlans: PortVlans = [(spec.vid, VlanFlags::NATIVE)].into();
+        port_changes(
+            PortWanted {
+                name: &spec.port,
+                mtu: None,
+                isolated: false,
+                up: true,
+                up_reason: None,
+                vlans: &vlans,
+            },
+            port,
+            bridge_index.get(spec.bridge.as_str()).copied(),
+            &spec.bridge,
+            actual,
+            &mut settings,
+            &mut vlan_dels,
+            &mut vlan_adds,
+            &mut ups,
+        );
+        if !router.admin_up {
+            ups.push(Change::SetUp {
+                name: router.name.clone(),
+                up: true,
+                reason: None,
+            });
+        }
+        let attached = bridge_index
+            .get(spec.bridge.as_str())
+            .is_some_and(|b| port.master == Some(*b));
+        if attached
+            && router.admin_up
+            && port.admin_up
+            && actual.vlans_of(port).get(&spec.vid) == Some(&VlanFlags::NATIVE)
+        {
+            ready.push(spec.clone());
+        }
+    }
+    let breakout_changes = if actual.breakout_error.is_some() {
+        Vec::new()
+    } else {
+        let want = crate::sys::breakout::wanted(&ready);
+        if actual.breakout.satisfies(&want) {
+            Vec::new()
+        } else {
+            vec![Change::SetBreakout { specs: ready }]
+        }
+    };
+
     // The bridge devices themselves carry no VLANs (they have no address).
     for link in bridge_index.values().filter_map(|i| actual.by_index(*i)) {
         let current = actual.vlans_of(link);
@@ -660,7 +835,9 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
         }
     };
 
-    let mut out = deletes;
+    // The breakouts first: a frame goes to a router only while it is there.
+    let mut out = breakout_changes;
+    out.extend(deletes);
     out.extend(tunnel_changes);
     out.extend(bridge_changes);
     out.extend(creates);
@@ -866,10 +1043,25 @@ pub fn plan_teardown(actual: &Actual) -> Vec<Change> {
     // The tunnels first (while the split horizon still holds), then the
     // nftables table and the tc rules, the bridges last (that detaches the
     // trunk).
+    // A veth goes with its peer: the port end only without its router.
+    let links: Vec<Change> = links
+        .into_iter()
+        .filter(|c| match c {
+            Change::DeleteLink { name, .. } if is_port_name(name) => {
+                !actual.links.contains_key(&peer_name(name))
+            }
+            _ => true,
+        })
+        .collect();
     let (tunnels, bridges): (Vec<Change>, Vec<Change>) = links
         .into_iter()
         .partition(|c| matches!(c, Change::DeleteLink { name, .. } if is_tunnel_name(name)));
-    let mut out = tunnels;
+    // No frame goes to a router any more before anything else.
+    let mut out = Vec::new();
+    if !actual.breakout.is_empty() {
+        out.push(Change::DeleteBreakout);
+    }
+    out.extend(tunnels);
     if actual.nft.is_some() {
         out.push(Change::DeleteNftTable);
     }
@@ -989,8 +1181,22 @@ pub async fn apply<N: System>(net: &N, actual: &Actual, change: &Change) -> Resu
             fixed,
         } => net.set_learn(*port, rules, *notrack, fixed).await?,
         Change::DeleteLearn => net.delete_learn().await?,
+        Change::CreateVeth { router, port, mac } => net.create_veth(router, port, *mac).await?,
+        Change::SetBreakout { specs } => net.set_breakout(specs).await?,
+        Change::DeleteBreakout => net.delete_breakout().await?,
     }
     Ok(())
+}
+
+/// The other end of a breakout interface (router ↔ port).
+fn peer_name(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix(ROUTER_PREFIX) {
+        format!("{PORT_PREFIX}{rest}")
+    } else if let Some(rest) = name.strip_prefix(PORT_PREFIX) {
+        format!("{ROUTER_PREFIX}{rest}")
+    } else {
+        String::new()
+    }
 }
 
 /// Returns true if the change creates or deletes a link, which invalidates
@@ -998,7 +1204,10 @@ pub async fn apply<N: System>(net: &N, actual: &Actual, change: &Change) -> Resu
 fn changes_links(change: &Change) -> bool {
     matches!(
         change,
-        Change::CreateBridge { .. } | Change::CreateTunnel { .. } | Change::DeleteLink { .. }
+        Change::CreateBridge { .. }
+            | Change::CreateTunnel { .. }
+            | Change::CreateVeth { .. }
+            | Change::DeleteLink { .. }
     )
 }
 
@@ -1018,8 +1227,14 @@ pub async fn reconcile<N: System>(
     // rest goes on without it.
     let is_nat = |c: &Change| matches!(c, Change::SetLearn { .. } | Change::DeleteLearn);
     let mut nat_failed: Option<SysError> = None;
+    // The breakout only concerns the internet of its VLANs: the rest goes
+    // on without it (and its VLANs go through the tunnel).
+    let is_breakout = |c: &Change| matches!(c, Change::SetBreakout { .. } | Change::DeleteBreakout);
+    let mut breakout_failed: Option<SysError> = None;
+    let sysctls = desired.breakout_sysctls();
+    let breakout = (!desired.breakout.is_empty()).then_some(sysctls.as_slice());
     for _ in 0..MAX_ROUNDS {
-        let mut actual = Actual::observe(net).await?;
+        let mut actual = Actual::observe_with(net, breakout).await?;
         let mut changes = plan(desired, &actual)?;
         if nft_failed.is_some() {
             changes.retain(|c| !is_nft(c));
@@ -1027,13 +1242,24 @@ pub async fn reconcile<N: System>(
         if nat_failed.is_some() {
             changes.retain(|c| !is_nat(c));
         }
+        if breakout_failed.is_some() {
+            changes.retain(|c| !is_breakout(c));
+        }
         if changes.is_empty() {
-            return match (nft_failed, actual.nft_error, nat_failed) {
-                (Some(e), _, _) | (None, None, Some(e)) => Err(e.into()),
-                (None, Some(e), _) => {
+            let breakout_error = breakout_failed.or_else(|| {
+                (!desired.breakout.is_empty())
+                    .then_some(())
+                    .and(actual.breakout_error.clone())
+                    .map(|e| SysError::new("read the local breakout", e))
+            });
+            return match (nft_failed, actual.nft_error, nat_failed, breakout_error) {
+                (Some(e), _, _, _) | (None, None, Some(e), _) | (None, None, None, Some(e)) => {
+                    Err(e.into())
+                }
+                (None, Some(e), _, _) => {
                     Err(SysError::new("read nftables table bridge wanderlan", e).into())
                 }
-                (None, None, None) => Ok(applied),
+                (None, None, None, None) => Ok(applied),
             };
         }
         for change in changes {
@@ -1048,20 +1274,29 @@ pub async fn reconcile<N: System>(
                     nat_failed = Some(e);
                     continue;
                 }
+                Err(e) if is_breakout(&change) => {
+                    breakout_failed = Some(e);
+                    continue;
+                }
                 Err(e) => return Err(e.into()),
             }
             if changes_links(&change) {
-                if let Change::CreateBridge { name, .. } | Change::CreateTunnel { name, .. } =
-                    &change
-                {
-                    mark_owned(net, name).await?;
+                match &change {
+                    Change::CreateBridge { name, .. } | Change::CreateTunnel { name, .. } => {
+                        mark_owned(net, name).await?;
+                    }
+                    Change::CreateVeth { router, port, .. } => {
+                        mark_owned(net, router).await?;
+                        mark_owned(net, port).await?;
+                    }
+                    _ => {}
                 }
-                actual = Actual::observe(net).await?;
+                actual = Actual::observe_with(net, breakout).await?;
             }
             applied.push(change);
         }
     }
-    let pending = plan(desired, &Actual::observe(net).await?)?;
+    let pending = plan(desired, &Actual::observe_with(net, breakout).await?)?;
     if pending.is_empty() {
         Ok(applied)
     } else {
@@ -1191,6 +1426,13 @@ async fn observe_for_teardown<N: System>(net: &N) -> Result<(Actual, Vec<String>
     if let Some(e) = &nat_error {
         problems.push(e.clone());
     }
+    let (breakout, breakout_error) = match net.breakout_state(&[]).await {
+        Ok(state) => (state, None),
+        Err(e) => (BreakoutState::default(), Some(e.to_string())),
+    };
+    if let Some(e) = &breakout_error {
+        problems.push(e.clone());
+    }
     let actual = Actual {
         links,
         vlans: BTreeMap::new(),
@@ -1201,6 +1443,8 @@ async fn observe_for_teardown<N: System>(net: &N) -> Result<(Actual, Vec<String>
         remotes: BTreeMap::new(),
         learn,
         nat_error,
+        breakout,
+        breakout_error,
     };
     Ok((actual, problems))
 }

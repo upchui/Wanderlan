@@ -14,7 +14,7 @@ Type=simple
 ExecStartPre=-+/usr/bin/wanderland --cleanup
 # The kernel modules only while wanderlan runs ("+": with full rights, the
 # daemon itself may not load modules; "-": not possible in a container).
-ExecStartPre=-+/sbin/modprobe -a bridge vxlan sch_ingress cls_flower act_vlan act_gact nf_tables
+ExecStartPre=-+/sbin/modprobe -a bridge vxlan veth sch_ingress cls_flower act_vlan act_gact nf_tables
 ExecStart=/usr/bin/wanderland
 ExecReload=/bin/kill -HUP $MAINPID
 # After every end of the service (stop, restart, update, crash, kill):
@@ -42,7 +42,10 @@ RuntimeDirectoryMode=0750
 StateDirectory=wanderlan
 StateDirectoryMode=0750
 ProtectSystem=strict
-ReadWritePaths=/etc/wanderlan
+# The local breakout turns on forwarding (on its interfaces and uplinks, and
+# for IPv6) while it is configured, and puts it back afterwards; the rest of
+# /proc/sys stays read-only (ProtectKernelTunables).
+ReadWritePaths=/etc/wanderlan /proc/sys/net/ipv4/conf /proc/sys/net/ipv6/conf
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

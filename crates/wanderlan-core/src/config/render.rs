@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use super::model::{Local, LocalVid, Network};
+use super::model::{Breakouts, Local, LocalVid, Network};
 
 const NETWORK_HEADER: &str = "\
 # wanderlan network configuration, shared by all sites.
@@ -29,7 +29,9 @@ const NETWORK_HEADER_2: &str = "\
 #
 # [site.<name>]: `server` is the site it is a client of (none: a server);
 # map = { <source VLAN> = <VLAN on its trunk, or \"native\"> };
-# tunnel_vlans = { <other site> = <the most that tunnel carries> }.
+# tunnel_vlans = { <other site> = <the most that tunnel carries> };
+# breakout = { <VLAN> = { uplink = <interface>, except = [<networks>] } }:
+# the public destinations of the VLAN leave through the site's own uplink.
 ";
 
 const LOCAL_HEADER: &str = "\
@@ -125,6 +127,9 @@ pub fn render_network(network: &Network) -> String {
             }
             if let Some(own) = site.own_vlans.as_ref().filter(|v| !v.is_empty()) {
                 let _ = writeln!(out, "own_vlans = {}", quote(&own.to_string()));
+            }
+            if let Some(line) = breakout_line(&site.breakout) {
+                out.push_str(&line);
             }
         }
         let maps: Vec<String> = network
@@ -227,6 +232,11 @@ fn render_network_inner(network: &Network, with_revision: bool) -> String {
         if site.self_managed {
             out.push_str("self_managed = true\n");
         }
+        // Only where it is set: networks without a breakout keep the form
+        // (and the fingerprint) older sites know.
+        if let Some(line) = breakout_line(&site.breakout) {
+            out.push_str(&line);
+        }
         match &site.uplink {
             Some(up) => {
                 let _ = writeln!(out, "uplink = {}", quote(up));
@@ -260,6 +270,33 @@ fn render_network_inner(network: &Network, with_revision: bool) -> String {
         let _ = writeln!(out, "vlans = {}", quote(&vlans));
     }
     out
+}
+
+/// `breakout = { 10 = {}, 20 = { uplink = "ens20", except = [..] } }`, or
+/// nothing without a breakout.
+fn breakout_line(breakouts: &Breakouts) -> Option<String> {
+    if breakouts.is_empty() {
+        return None;
+    }
+    let entries: Vec<String> = breakouts
+        .iter()
+        .map(|(vid, b)| {
+            let mut fields = Vec::new();
+            if let Some(uplink) = &b.uplink {
+                fields.push(format!("uplink = {}", quote(uplink)));
+            }
+            if !b.except.is_empty() {
+                let nets: Vec<String> = b.except.iter().map(|n| quote(&n.to_string())).collect();
+                fields.push(format!("except = [{}]", nets.join(", ")));
+            }
+            if fields.is_empty() {
+                format!("{vid} = {{}}")
+            } else {
+                format!("{vid} = {{ {} }}", fields.join(", "))
+            }
+        })
+        .collect();
+    Some(format!("breakout = {{ {} }}\n", entries.join(", ")))
 }
 
 /// Renders `local.toml` in canonical form.

@@ -4,6 +4,7 @@
 //! Screen layout (80×24 and up): tab bar, countdown banner (only while a
 //! change waits for confirmation), the view, a status line and the help bar.
 
+mod breakout;
 mod details;
 pub mod list;
 mod log;
@@ -26,9 +27,7 @@ use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use wanderlan_core::api::{PeerStatus, PortState, SiteState};
 use wanderlan_core::config::{Diagnostic, Severity};
 
-use super::app::{
-    App, BRAND, Busy, Conn, MessageKind, Modal, URGENT_SECS, View, banner_text, tab_layout,
-};
+use super::app::{App, Busy, Conn, MessageKind, Modal, URGENT_SECS, View, banner_text, tab_layout};
 use super::{format, help, theme};
 use overview::{Health, health};
 
@@ -88,8 +87,13 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn draw_tabs(frame: &mut Frame, app: &App, area: Rect) {
-    let mut spans = vec![Span::styled(BRAND, theme::bold())];
-    for (view, label, _, _) in tab_layout() {
+    app.scrolls.tabs_width.set(area.width);
+    let (brand, tabs) = tab_layout(area.width);
+    let mut spans: Vec<Span> = brand
+        .map(|b| Span::styled(b, theme::bold()))
+        .into_iter()
+        .collect();
+    for (view, label, _, _) in tabs {
         let style = if view == app.view {
             theme::active_tab()
         } else {
@@ -123,6 +127,7 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
         View::Log => log::draw(frame, &app.log, area),
         View::Setup => wizard::draw(frame, app, area),
         View::Settings => settings::draw(frame, app, area),
+        View::Breakout => breakout::draw(frame, app, area),
     }
 }
 

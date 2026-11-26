@@ -2,7 +2,7 @@
 source: crates/wanderlan/src/tui/ui/tests.rs
 expression: render(&app)
 ---
-" wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings    "
+" 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Settings  8 Breakout   "
 "┌ Settings (Enter: change, Up/Down: more) ─────────────────────────────────────┐"
 "│  TCP MSS              from the path MTU                                      ║"
 "│  Control port         51821                                                  ║"

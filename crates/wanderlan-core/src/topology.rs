@@ -289,6 +289,7 @@ mod tests {
             managed_by: None,
             self_managed: false,
             uplink: None,
+            breakout: Default::default(),
         }
     }
 

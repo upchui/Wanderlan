@@ -5,8 +5,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 MODULES=(bridge 8021q vxlan sch_ingress cls_flower act_vlan act_gact nf_tables veth)
-# For the NAT router of the integration tests; built in on some kernels.
-NAT_MODULES=(nf_conntrack nf_nat nft_masq nft_chain_nat nft_ct)
+# For the NAT router and the local breakout of the integration tests; built in
+# on some kernels.
+NAT_MODULES=(nf_conntrack nf_nat nft_masq nft_chain_nat nft_ct nft_meta_bridge)
 
 modprobe_host() { # modprobe_host <modprobe arguments...>
   if [ "${GITHUB_ACTIONS:-}" = true ]; then

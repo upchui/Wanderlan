@@ -6,6 +6,7 @@
 //! traits so that all logic can be tested without root privileges.
 
 pub mod api;
+pub mod breakout;
 pub mod config;
 pub mod desired;
 pub mod forwarding;

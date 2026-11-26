@@ -673,3 +673,109 @@ fn no_traffic_per_vlan_without_counters() {
     reply(&mut app, Request::VlanTraffic, Reply::VlanTraffic(traffic));
     assert!(render(&app).contains("No traffic per VLAN"));
 }
+
+/// heim breaks out VLAN 10 by its default route and VLAN 20 out of ens20
+/// (IPv6 there has no uplink); buero breaks out VLAN 30.
+fn with_breakouts() -> App {
+    use wanderlan_core::api::{BreakoutFamily, BreakoutStatus, Traffic, UplinkStatus};
+    let mut app = connected();
+    let mut texts = fixtures::config_texts();
+    let mut network = parse_network(&texts.network).unwrap().network.unwrap();
+    let breakout = |uplink: Option<&str>, except: &[&str]| wanderlan_core::config::Breakout {
+        uplink: uplink.map(Into::into),
+        except: except
+            .iter()
+            .filter_map(|e| wanderlan_core::breakout::parse_net(e))
+            .collect(),
+    };
+    for site in &mut network.sites {
+        match site.name.as_str() {
+            "heim" => {
+                site.breakout.insert(10, breakout(None, &[]));
+                site.breakout
+                    .insert(20, breakout(Some("ens20"), &["203.0.113.0/24"]));
+            }
+            "buero" => {
+                site.breakout.insert(30, breakout(None, &[]));
+            }
+            _ => {}
+        }
+    }
+    texts.network = render_network(&network);
+    reply(&mut app, Request::GetConfig, Reply::Config(texts));
+    let out = |dev: &str| BreakoutFamily {
+        dev: Some(dev.into()),
+        ..BreakoutFamily::default()
+    };
+    let mut status = fixtures::status();
+    status.breakout = vec![
+        BreakoutStatus {
+            vid: 10,
+            bridge: "br0".into(),
+            router: "wlbo10".into(),
+            uplink: None,
+            except: Vec::new(),
+            ipv4: out("ens18"),
+            ipv6: out("ens18"),
+            ready: true,
+            rx_bps: 12_400_000,
+            tx_bps: 98_000_000,
+            traffic: Traffic::default(),
+        },
+        BreakoutStatus {
+            vid: 20,
+            bridge: "br0".into(),
+            router: "wlbo20".into(),
+            uplink: Some("ens20".into()),
+            except: vec!["203.0.113.0/24".into()],
+            ipv4: BreakoutFamily {
+                gateway: Some("192.0.2.1".into()),
+                ..out("ens20")
+            },
+            ipv6: BreakoutFamily {
+                reason: Some("ens20 has no global IPv6 address".into()),
+                ..BreakoutFamily::default()
+            },
+            ready: true,
+            rx_bps: 0,
+            tx_bps: 0,
+            traffic: Traffic::default(),
+        },
+    ];
+    status.uplinks = vec![
+        UplinkStatus {
+            name: "ens18".into(),
+            up: true,
+            addresses: vec!["192.168.1.50".into(), "2001:db8:51::2".into()],
+            gateway4: Some("192.168.1.1".into()),
+            gateway6: Some("fe80::1".into()),
+            default4: true,
+            default6: true,
+        },
+        UplinkStatus {
+            name: "ens20".into(),
+            up: true,
+            addresses: vec!["192.0.2.2".into()],
+            gateway4: Some("192.0.2.1".into()),
+            ..UplinkStatus::default()
+        },
+    ];
+    reply(&mut app, Request::Status, Reply::Status(Box::new(status)));
+    app
+}
+
+#[test]
+fn breakout_view() {
+    let mut app = with_breakouts();
+    key(&mut app, KeyCode::Char('8'));
+    key(&mut app, KeyCode::Down);
+    insta::assert_snapshot!(render(&app));
+}
+
+#[test]
+fn breakout_form() {
+    let mut app = with_breakouts();
+    key(&mut app, KeyCode::Char('8'));
+    key(&mut app, KeyCode::Char('n'));
+    insta::assert_snapshot!(render(&app));
+}

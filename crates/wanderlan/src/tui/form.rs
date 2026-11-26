@@ -46,6 +46,9 @@ pub enum FormKind {
     TunnelVlans(String, String),
     /// A new name for a site; everything that names it follows.
     Rename(String),
+    /// The local breakout of a VLAN of a site (as it was: site and VLAN);
+    /// `None` adds one.
+    Breakout(Option<(String, u16)>),
 }
 
 /// The editable value of a field.
@@ -359,6 +362,78 @@ impl Form {
         Self::new(FormKind::Map(existing.cloned()), title, fields, draft)
     }
 
+    /// Form for the local breakout of a VLAN of a site (`existing`), or a
+    /// new one (at `site_hint`). `uplinks` names the uplinks of this box.
+    pub fn breakout(
+        draft: &Draft,
+        existing: Option<(String, u16)>,
+        site_hint: Option<&str>,
+        uplinks: &str,
+    ) -> Self {
+        let sites: Vec<String> = draft
+            .network
+            .sites
+            .iter()
+            .map(format::site_with_kind)
+            .collect();
+        let site = existing
+            .as_ref()
+            .map(|(s, _)| s.clone())
+            .or_else(|| site_hint.map(str::to_string))
+            .or_else(|| draft.local.self_name.clone())
+            .unwrap_or_default();
+        let entry = existing.as_ref().and_then(|(s, vid)| {
+            draft
+                .network
+                .site(s)
+                .and_then(|site| site.breakout.get(vid))
+        });
+        let shown = draft
+            .network
+            .site(&site)
+            .map_or(site.clone(), format::site_with_kind);
+        let vid = existing
+            .as_ref()
+            .map(|(_, v)| v.to_string())
+            .unwrap_or_default();
+        let uplink = entry.and_then(|b| b.uplink.clone()).unwrap_or_default();
+        let except: Vec<String> = entry
+            .map(|b| b.except.iter().map(ToString::to_string).collect())
+            .unwrap_or_default();
+        let uplink_hint = if uplinks.is_empty() {
+            "empty: the interface of the site's default route; or e.g. ens20".to_string()
+        } else {
+            format!("empty: the default route; at this box: {uplinks}")
+        };
+        let title = match &existing {
+            Some((s, v)) => format!("Breakout of VLAN {v} at {s}"),
+            None => "New local breakout".to_string(),
+        };
+        let fields = vec![
+            Field::choice(
+                "site",
+                "Site",
+                "the site whose devices go to the internet through its own uplink",
+                sites,
+                &shown,
+            ),
+            Field::text(
+                "vlan",
+                "VLAN",
+                "the VLAN in the network (untagged traffic: 1, or its mapped source VLAN)",
+                vid,
+            ),
+            Field::text("uplink", "Uplink", uplink_hint, uplink),
+            Field::text(
+                "except",
+                "Except",
+                "public destinations that still go through the tunnel, e.g. 203.0.113.0/24, 2001:db8::/32",
+                except.join(", "),
+            ),
+        ];
+        Self::new(FormKind::Breakout(existing), title, fields, draft)
+    }
+
     /// Form for the `[network]` settings.
     pub fn network(draft: &Draft) -> Self {
         let m = &draft.network;
@@ -651,6 +726,7 @@ impl Form {
             FormKind::Site(Some(name)) | FormKind::OwnVlans(name) | FormKind::Rename(name) => {
                 Self::site_index(draft, name)
             }
+            FormKind::Breakout(_) => Self::site_index(draft, &self.breakout_site()),
             FormKind::Map(None) => Some(draft.network.maps.len()),
             FormKind::Map(Some(map)) => draft.network.maps.iter().position(|m| m == map),
             FormKind::TunnelVlans(a, b) => {
@@ -676,6 +752,7 @@ impl Form {
             }
             FormKind::Map(_) => Some(FieldPath::map(i)),
             FormKind::TunnelVlans(..) => Some(FieldPath::tunnel(i)),
+            FormKind::Breakout(_) => Some(FieldPath::site_field(i, "breakout")),
             FormKind::Network | FormKind::Vlans | FormKind::Local => None,
         }
     }
@@ -689,6 +766,14 @@ impl Form {
             }
             FormKind::Map(_) => FieldPath::map_field(i, key),
             FormKind::TunnelVlans(..) => FieldPath::tunnel_field(i, key),
+            FormKind::Breakout(_) => {
+                let vid = self.value("vlan").trim().to_string();
+                match key {
+                    "vlan" => FieldPath::site_field(i, &format!("breakout.{vid}")),
+                    "site" => FieldPath::site_field(i, "name"),
+                    _ => FieldPath::site_field(i, &format!("breakout.{vid}.{key}")),
+                }
+            }
             FormKind::Network | FormKind::Vlans => FieldPath::network(key),
             FormKind::Local => FieldPath::local(key),
         }
@@ -857,9 +942,83 @@ impl Form {
                 let own = self.value("self");
                 candidate.local.self_name = (!own.is_empty()).then_some(own);
             }
+            FormKind::Breakout(old) => {
+                if let Some((site, vid)) = &old {
+                    let still = draft
+                        .network
+                        .site(site)
+                        .is_some_and(|s| s.breakout.contains_key(vid));
+                    if !still {
+                        return self.gone(&format!("The breakout of VLAN {vid} at {site}"));
+                    }
+                }
+                let site = self.breakout_site();
+                let vid = match parse_vid(&self.value("vlan")) {
+                    Ok(v) => Some(v),
+                    Err(msg) => {
+                        self.set_error("vlan", msg);
+                        None
+                    }
+                };
+                let uplink = self.value("uplink").trim().to_string();
+                let uplink = (!uplink.is_empty() && uplink != "auto").then_some(uplink);
+                let mut except = std::collections::BTreeSet::new();
+                let text = self.value("except");
+                for part in text.split([',', ' ']).filter(|p| !p.trim().is_empty()) {
+                    match wanderlan_core::breakout::parse_net(part) {
+                        Some(net) => {
+                            except.insert(net);
+                        }
+                        None => {
+                            self.set_error(
+                                "except",
+                                format!(
+                                    "\"{}\" is not an address or a network like 203.0.113.0/24",
+                                    part.trim()
+                                ),
+                            );
+                            return None;
+                        }
+                    }
+                }
+                let vid = vid?;
+                if let Some((old_site, old_vid)) = &old
+                    && let Some(entry) = candidate
+                        .network
+                        .sites
+                        .iter_mut()
+                        .find(|s| s.name == *old_site)
+                {
+                    entry.breakout.remove(old_vid);
+                }
+                let Some(entry) = candidate.network.sites.iter_mut().find(|s| s.name == site)
+                else {
+                    self.set_error("site", "the network has no sites");
+                    return None;
+                };
+                if old.as_ref() != Some(&(site.clone(), vid)) && entry.breakout.contains_key(&vid) {
+                    self.set_error(
+                        "vlan",
+                        format!("VLAN {vid} of {site} breaks out already (Enter on it edits it)"),
+                    );
+                    return None;
+                }
+                entry
+                    .breakout
+                    .insert(vid, wanderlan_core::config::Breakout { uplink, except });
+            }
         }
         candidate.revalidate();
         Some(candidate)
+    }
+
+    /// The site chosen in a breakout form ("marcel (client)" → "marcel").
+    fn breakout_site(&self) -> String {
+        self.value("site")
+            .split(" (")
+            .next()
+            .unwrap_or_default()
+            .to_string()
     }
 
     /// The network as it would be with the invited site (at an address no
@@ -930,6 +1089,7 @@ impl Form {
             online: false,
             managed_by: candidate.local.self_name.clone(),
             uplink: candidate.local.self_name.clone(),
+            breakout: Default::default(),
             self_managed: false,
         });
         if let Some(shared) = native {
@@ -995,6 +1155,7 @@ impl Form {
             managed_by: None,
             self_managed: false,
             uplink: None,
+            breakout: Default::default(),
         })
     }
 

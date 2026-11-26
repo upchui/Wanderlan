@@ -14,6 +14,8 @@ for s in site1 site2 site3 site4 site5 natc1 natc2; do
     x "$s" "! nft list table bridge wanderlan 2>/dev/null"
   check "$s: no nftables table ip wanderlan" \
     x "$s" "! nft list table ip wanderlan 2>/dev/null"
+  check "$s: no breakout interfaces, tables or routing rules" \
+    x "$s" "[ -z \"\$(ip -o link show | grep -E ' wlb[op][0-9]')\" ] && ! nft list table inet wanderlan-breakout 2>/dev/null && ! ip rule show | grep -q 'proto 87'"
   check "$s: no tc filters on trunk0" \
     x "$s" "[ -z \"\$(tc filter show dev trunk0 ingress 2>/dev/null)\" ] && [ -z \"\$(tc filter show dev trunk0 egress 2>/dev/null)\" ]"
 done
