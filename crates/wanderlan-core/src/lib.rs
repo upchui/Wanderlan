@@ -13,6 +13,7 @@ pub mod forwarding;
 pub mod identity;
 pub mod join;
 pub mod loopguard;
+pub mod merge;
 pub mod mtu;
 pub mod nat;
 pub mod policy;

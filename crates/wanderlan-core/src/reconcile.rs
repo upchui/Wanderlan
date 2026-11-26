@@ -16,7 +16,7 @@ use crate::config::VlanSet;
 use crate::desired::{Desired, OWNER_ALIAS, TUNNEL_MTU};
 use crate::sys::breakout::{BreakoutSpec, BreakoutState};
 use crate::sys::nft::{MssRule, NftState, SplitRule};
-use crate::sys::nft_ip::{LearnRule, LearnState};
+use crate::sys::nft_ip::{LearnState, LearnTable};
 use crate::sys::tc::{IfTc, TcRule};
 use crate::sys::{
     BridgeOptions, LinkKind, LinkState, LinkUpdate, PortVlans, SysError, System, VlanFlags,
@@ -172,12 +172,7 @@ pub enum Change {
         remote: Option<SocketAddrV4>,
     },
     /// Write the rules that learn where the clients are.
-    SetLearn {
-        port: u16,
-        rules: BTreeSet<LearnRule>,
-        notrack: bool,
-        fixed: BTreeSet<u32>,
-    },
+    SetLearn { table: LearnTable },
     /// Delete the table `ip wanderlan`.
     DeleteLearn,
     /// Create the veth pair of a breakout.
@@ -355,10 +350,21 @@ impl fmt::Display for Change {
                 }
             }
             Self::DeleteNftTable => write!(f, "Deleting nftables table bridge wanderlan"),
-            Self::SetLearn {
-                port, rules, fixed, ..
-            } => {
-                let clients: Vec<&str> = rules.iter().map(|r| r.client.as_str()).collect();
+            Self::SetLearn { table } => {
+                let clients: Vec<&str> = table.rules.iter().map(|r| r.client.as_str()).collect();
+                let ports: BTreeSet<u16> = table
+                    .rules
+                    .iter()
+                    .map(|r| r.port)
+                    .chain(table.notrack.iter().copied())
+                    .chain(table.fixed.iter().map(|f| f.port))
+                    .collect();
+                let port = ports
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let fixed = &table.fixed;
                 if clients.is_empty() && fixed.is_empty() {
                     write!(
                         f,
@@ -826,30 +832,14 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
     });
 
     // The table `ip wanderlan` follows the client tunnels.
-    let unwanted = desired.learn.is_empty() && desired.fixed.is_empty() && !desired.notrack;
+    let unwanted = desired.learn.is_empty();
     let learn_changes = match &actual.learn {
         Some(_) if unwanted => vec![Change::DeleteLearn],
         _ if unwanted => Vec::new(),
-        have => {
-            let port = desired.tunnel_port;
-            let same = have.as_ref().is_some_and(|l| {
-                l.port == (!desired.learn.is_empty()).then_some(port)
-                    && l.fixed_port == (!desired.fixed.is_empty()).then_some(port)
-                    && l.rules == desired.learn
-                    && l.notrack == desired.notrack
-                    && l.fixed == desired.fixed
-            });
-            if same {
-                Vec::new()
-            } else {
-                vec![Change::SetLearn {
-                    port,
-                    rules: desired.learn.clone(),
-                    notrack: desired.notrack,
-                    fixed: desired.fixed.clone(),
-                }]
-            }
-        }
+        Some(have) if have.holds(&desired.learn) => Vec::new(),
+        _ => vec![Change::SetLearn {
+            table: desired.learn.clone(),
+        }],
     };
 
     // The breakouts first: a frame goes to a router only while it is there.
@@ -1198,12 +1188,7 @@ pub async fn apply<N: System>(net: &N, actual: &Actual, change: &Change) -> Resu
         Change::DelTcRule { dev, rule } => net.del_tc_rule(index_of(dev)?, rule).await?,
         Change::SetNft { mss, split } => net.set_nft_rules(mss, split).await?,
         Change::DeleteNftTable => net.delete_table().await?,
-        Change::SetLearn {
-            port,
-            rules,
-            notrack,
-            fixed,
-        } => net.set_learn(*port, rules, *notrack, fixed).await?,
+        Change::SetLearn { table } => net.set_learn(table).await?,
         Change::DeleteLearn => net.delete_learn().await?,
         Change::CreateVeth { router, port, mac } => net.create_veth(router, port, *mac).await?,
         Change::SetBreakout { specs } => net.set_breakout(specs).await?,

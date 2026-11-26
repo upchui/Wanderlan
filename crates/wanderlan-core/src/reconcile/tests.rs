@@ -1019,7 +1019,7 @@ async fn a_client_behind_nat_is_reached_where_its_packets_come_from() {
         .identity
         .insert("heim".into(), PeerIdentity::Confirmed);
     let client = derive(&config_from(&network, "haus3"), &runtime);
-    assert!(client.learn.is_empty(), "a client learns nothing");
+    assert!(client.learn.rules.is_empty(), "a client learns nothing");
     let net = fresh();
     run(&net, &client).await;
     let LinkKind::Vxlan(p) = net.link("vx-heim").unwrap().kind else {
@@ -1066,7 +1066,7 @@ async fn a_client_behind_nat_is_reached_where_its_packets_come_from() {
         "{:?}",
         tunnel.down_reason
     );
-    assert_eq!(server.learn.len(), 1);
+    assert_eq!(server.learn.rules.len(), 1);
     let net = fresh();
     run(&net, &server).await;
     assert!(net.state().calls.iter().any(|c| c == "set_learn 51822 1"));

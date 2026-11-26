@@ -46,9 +46,10 @@ const CHAIN: &str = "pre";
 const LEARN_CHAIN: &str = "wl-learn";
 /// The base chain of the packets this site sends (output), for `notrack`.
 const OUT_CHAIN: &str = "out";
-/// Comment of the rules that exempt the tunnel packets from tracking.
-/// Tunnel packets to the box itself skip connection tracking (forwarded
-/// ones, of a local breakout, keep it: they are masqueraded).
+/// Comment of the rules that exempt the tunnel packets from tracking, and
+/// the tunnel port. Tunnel packets to the box itself skip connection
+/// tracking (forwarded ones, of a local breakout, keep it: they are
+/// masqueraded).
 const NOTRACK: &str = "wl notrack local";
 /// Comment prefix of the rules that set the source port: port and VNI.
 const FIXED_PREFIX: &str = "wl fixed ";
@@ -69,18 +70,22 @@ const OFFSET_FLAGS: u32 = 64;
 const OFFSET_VNI: u32 = 96;
 const OFFSET_ETHERTYPE: u32 = 224;
 
-/// One client whose endpoint is learned: by the VNI of its tunnel.
+/// One client whose endpoint is learned: by the VNI of its tunnel, on the
+/// tunnel port of its network.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct LearnRule {
-    /// The client site.
+    /// The client's tunnel interface (names its set).
     pub client: String,
     /// The VNI of its tunnel.
     pub vni: u32,
+    /// The tunnel port its packets arrive at (0: a rule of a version
+    /// without the port, rewritten).
+    pub port: u16,
 }
 
 impl LearnRule {
     fn comment(&self) -> String {
-        format!("wl learn {} {}", self.client, self.vni)
+        format!("wl learn {} {} {}", self.client, self.vni, self.port)
     }
 
     fn from_comment(comment: &str) -> Option<Self> {
@@ -90,7 +95,11 @@ impl LearnRule {
         }
         let client = parts.next()?.to_string();
         let vni = parts.next()?.parse().ok()?;
-        parts.next().is_none().then_some(Self { client, vni })
+        let port = match parts.next() {
+            Some(p) => p.parse().ok()?,
+            None => 0,
+        };
+        parts.next().is_none().then_some(Self { client, vni, port })
     }
 
     fn set(&self) -> String {
@@ -98,21 +107,68 @@ impl LearnRule {
     }
 }
 
+/// A tunnel through NAT whose packets get the tunnel port as source port.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FixedRule {
+    /// The tunnel port.
+    pub port: u16,
+    /// The VNI of the tunnel.
+    pub vni: u32,
+}
+
+/// What the table holds besides the sets: per tunnel port (one per
+/// network on the box).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LearnTable {
+    /// The clients whose endpoints are learned.
+    pub rules: BTreeSet<LearnRule>,
+    /// The tunnel ports whose packets skip connection tracking (0: a rule
+    /// of a version without the port, rewritten).
+    pub notrack: BTreeSet<u16>,
+    /// The tunnels through NAT.
+    pub fixed: BTreeSet<FixedRule>,
+}
+
+impl LearnTable {
+    /// Nothing to hold: no table.
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty() && self.notrack.is_empty() && self.fixed.is_empty()
+    }
+
+    /// The ports that need a gate: those of the learned clients.
+    pub fn gates(&self) -> BTreeSet<u16> {
+        self.rules.iter().map(|r| r.port).collect()
+    }
+
+    /// The sets of the learned clients.
+    pub fn sets(&self) -> BTreeSet<String> {
+        self.rules.iter().map(LearnRule::set).collect()
+    }
+
+    /// Takes over the rules of `other` (another network).
+    pub fn extend(&mut self, other: &LearnTable) {
+        self.rules.extend(other.rules.iter().cloned());
+        self.notrack.extend(other.notrack.iter().copied());
+        self.fixed.extend(other.fixed.iter().copied());
+    }
+}
+
 /// What the table holds.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LearnState {
-    /// The UDP port the gate watches, if there is a gate.
-    pub port: Option<u16>,
-    /// The learn rules.
-    pub rules: BTreeSet<LearnRule>,
+    /// The rules.
+    pub table: LearnTable,
+    /// The UDP ports the gates watch.
+    pub gates: BTreeSet<u16>,
     /// The sets by client.
     pub sets: BTreeSet<String>,
-    /// The tunnel packets skip connection tracking.
-    pub notrack: bool,
-    /// The tunnels (by VNI) whose packets get the tunnel port as source.
-    pub fixed: BTreeSet<u32>,
-    /// The tunnel port of these rules.
-    pub fixed_port: Option<u16>,
+}
+
+impl LearnState {
+    /// The table holds what `want` says, with the gates it needs.
+    pub fn holds(&self, want: &LearnTable) -> bool {
+        self.table == *want && self.gates == want.gates()
+    }
 }
 
 /// One learned endpoint.
@@ -129,17 +185,11 @@ pub trait LearnOps: Send + Sync {
     /// What the table holds, or `None` without it.
     fn learn_state(&self) -> impl Future<Output = SysResult<Option<LearnState>>> + Send;
 
-    /// Writes the gate for `port` and the rules (the sets of other clients
-    /// go, the others keep their entries); with `notrack`, the tunnel
-    /// packets to and from `port` skip connection tracking; the packets of
-    /// the tunnels in `fixed` (VNIs) get `port` as source port.
-    fn set_learn(
-        &self,
-        port: u16,
-        rules: &BTreeSet<LearnRule>,
-        notrack: bool,
-        fixed: &BTreeSet<u32>,
-    ) -> impl Future<Output = SysResult<()>> + Send;
+    /// Writes the gates and the rules of `table` (the sets of other clients
+    /// go, the others keep their entries): the tunnel packets to and from
+    /// the ports in `notrack` skip connection tracking, those of the
+    /// tunnels in `fixed` get their tunnel port as source port.
+    fn set_learn(&self, table: &LearnTable) -> impl Future<Output = SysResult<()>> + Send;
 
     /// Deletes the table.
     fn delete_learn(&self) -> impl Future<Output = SysResult<()>> + Send;
@@ -152,13 +202,7 @@ pub trait LearnOps: Send + Sync {
 /// and the sets are created if missing (`add` keeps what exists), the
 /// chains are flushed and filled, the sets of clients no longer listed
 /// deleted.
-pub fn learn_script(
-    port: u16,
-    rules: &BTreeSet<LearnRule>,
-    notrack: bool,
-    fixed: &BTreeSet<u32>,
-    stale_sets: &BTreeSet<String>,
-) -> String {
+pub fn learn_script(table: &LearnTable, stale_sets: &BTreeSet<String>) -> String {
     let t = format!("ip {TABLE}");
     let mut out = String::new();
     let _ = writeln!(out, "add table {t}");
@@ -178,42 +222,44 @@ pub fn learn_script(
     for set in stale_sets {
         let _ = writeln!(out, "delete set {t} {set}");
     }
-    for rule in rules {
+    for rule in &table.rules {
         let _ = writeln!(
             out,
             "add set {t} {} {{ type ipv4_addr . inet_service; flags dynamic,timeout; timeout {ENDPOINT_TIMEOUT_SECS}s; size {SET_SIZE}; }}",
             rule.set()
         );
     }
-    if notrack {
+    for port in table.notrack.iter().filter(|p| **p != 0) {
         let _ = writeln!(
             out,
-            "add rule {t} {CHAIN} udp dport {port} fib daddr type local notrack comment \"{NOTRACK}\""
+            "add rule {t} {CHAIN} udp dport {port} fib daddr type local notrack comment \"{NOTRACK} {port}\""
         );
         let _ = writeln!(
             out,
-            "add rule {t} {OUT_CHAIN} udp sport {port} notrack comment \"{NOTRACK}\""
+            "add rule {t} {OUT_CHAIN} udp sport {port} notrack comment \"{NOTRACK} {port}\""
         );
     }
     // The source port of the tunnels through NAT (see the module doc).
-    let upper = port.saturating_add(1);
-    for vni in fixed {
+    for FixedRule { port, vni } in &table.fixed {
+        let upper = port.saturating_add(1);
         let _ = writeln!(
             out,
             "add rule {t} {OUT_CHAIN} udp sport {upper} @th,{OFFSET_FLAGS},8 {VXLAN_FLAGS:#04x} @th,{OFFSET_VNI},24 {vni} udp sport set {port} comment \"{FIXED_PREFIX}{port} {vni}\""
         );
     }
-    // The gate: tunnel packets to the port whose inner frame is a keepalive.
-    if !rules.is_empty() {
+    // The gates: tunnel packets to a port whose inner frame is a keepalive.
+    for port in table.gates() {
         let _ = writeln!(
             out,
             "add rule {t} {CHAIN} udp dport {port} @th,{OFFSET_ETHERTYPE},16 {KEEPALIVE_ETHERTYPE:#06x} jump {LEARN_CHAIN} comment \"wl learn gate {port}\""
         );
     }
-    for rule in rules {
+    // The same VNI may come again on the port of another network.
+    for rule in &table.rules {
         let _ = writeln!(
             out,
-            "add rule {t} {LEARN_CHAIN} @th,{OFFSET_FLAGS},8 {VXLAN_FLAGS:#04x} @th,{OFFSET_VNI},24 {} update @{} {{ ip saddr . udp sport }} comment \"{}\"",
+            "add rule {t} {LEARN_CHAIN} udp dport {} @th,{OFFSET_FLAGS},8 {VXLAN_FLAGS:#04x} @th,{OFFSET_VNI},24 {} update @{} {{ ip saddr . udp sport }} comment \"{}\"",
+            rule.port,
             rule.vni,
             rule.set(),
             rule.comment()
@@ -267,20 +313,20 @@ pub fn parse_state(json: &str) -> Option<LearnState> {
         if let Some(rule) = object.get("rule") {
             let comment = rule.get("comment").and_then(|c| c.as_str()).unwrap_or("");
             if let Some(port) = comment.strip_prefix("wl learn gate ") {
-                state.port = port.trim().parse().ok();
-            } else if comment == NOTRACK {
-                state.notrack = true;
+                state.gates.extend(port.trim().parse::<u16>().ok());
+            } else if let Some(rest) = comment.strip_prefix(NOTRACK) {
+                // Without a port: written by a version before networks.
+                state.table.notrack.insert(rest.trim().parse().unwrap_or(0));
             } else if let Some(rest) = comment.strip_prefix(FIXED_PREFIX) {
                 let mut parts = rest.split_whitespace();
                 if let (Some(port), Some(vni)) = (
                     parts.next().and_then(|p| p.parse().ok()),
                     parts.next().and_then(|v| v.parse().ok()),
                 ) {
-                    state.fixed_port = Some(port);
-                    state.fixed.insert(vni);
+                    state.table.fixed.insert(FixedRule { port, vni });
                 }
             } else if let Some(rule) = LearnRule::from_comment(comment) {
-                state.rules.insert(rule);
+                state.table.rules.insert(rule);
             }
         } else if let Some(set) = object.get("set")
             && let Some(name) = set.get("name").and_then(|n| n.as_str())
@@ -403,30 +449,21 @@ impl LearnOps for LearnCli {
         Ok(state)
     }
 
-    async fn set_learn(
-        &self,
-        port: u16,
-        rules: &BTreeSet<LearnRule>,
-        notrack: bool,
-        fixed: &BTreeSet<u32>,
-    ) -> SysResult<()> {
+    async fn set_learn(&self, table: &LearnTable) -> SysResult<()> {
         let current = list()
             .await?
             .as_deref()
             .and_then(parse_state)
             .unwrap_or_default();
-        let wanted: BTreeSet<String> = rules.iter().map(LearnRule::set).collect();
+        let wanted = table.sets();
         let stale: BTreeSet<String> = current.sets.difference(&wanted).cloned().collect();
-        let script = learn_script(port, rules, notrack, fixed, &stale);
+        let script = learn_script(table, &stale);
         let result = apply_script("apply nftables table ip wanderlan", &script).await;
         self.store(result.is_ok().then(|| {
             Some(LearnState {
-                port: (!rules.is_empty()).then_some(port),
-                rules: rules.clone(),
+                table: table.clone(),
+                gates: table.gates(),
                 sets: wanted,
-                notrack,
-                fixed: fixed.clone(),
-                fixed_port: (!fixed.is_empty()).then_some(port),
             })
         }));
         result
@@ -459,20 +496,26 @@ mod tests {
         [LearnRule {
             client: "lab".into(),
             vni: 0x12_3456,
+            port: 51822,
         }]
         .into()
     }
 
+    fn table() -> LearnTable {
+        LearnTable {
+            rules: rules(),
+            notrack: [51822].into(),
+            fixed: [FixedRule {
+                port: 51822,
+                vni: 0x12_3456,
+            }]
+            .into(),
+        }
+    }
+
     #[test]
     fn the_script_matches_the_keepalives_of_each_client() {
-        let fixed: BTreeSet<u32> = [0x12_3456].into();
-        let script = learn_script(
-            51822,
-            &rules(),
-            true,
-            &fixed,
-            &["ep-old".to_string()].into(),
-        );
+        let script = learn_script(&table(), &["ep-old".to_string()].into());
         // Prerouting at the raw priority, notrack both ways, the gate on the
         // port and the inner ethertype, the VNI at its offset, the update.
         for needle in [
@@ -481,10 +524,10 @@ mod tests {
             "flush chain ip wanderlan pre",
             "delete set ip wanderlan ep-old",
             "add set ip wanderlan ep-lab { type ipv4_addr . inet_service; flags dynamic,timeout; timeout 90s; size 8; }",
-            "add rule ip wanderlan pre udp dport 51822 fib daddr type local notrack comment \"wl notrack local\"",
-            "add rule ip wanderlan out udp sport 51822 notrack comment \"wl notrack local\"",
+            "add rule ip wanderlan pre udp dport 51822 fib daddr type local notrack comment \"wl notrack local 51822\"",
+            "add rule ip wanderlan out udp sport 51822 notrack comment \"wl notrack local 51822\"",
             "add rule ip wanderlan pre udp dport 51822 @th,224,16 0x88b5 jump wl-learn comment \"wl learn gate 51822\"",
-            "add rule ip wanderlan wl-learn @th,64,8 0x08 @th,96,24 1193046 update @ep-lab { ip saddr . udp sport } comment \"wl learn lab 1193046\"",
+            "add rule ip wanderlan wl-learn udp dport 51822 @th,64,8 0x08 @th,96,24 1193046 update @ep-lab { ip saddr . udp sport } comment \"wl learn lab 1193046 51822\"",
             // The tunnel port as source port again.
             "add rule ip wanderlan out udp sport 51823 @th,64,8 0x08 @th,96,24 1193046 udp sport set 51822 comment \"wl fixed 51822 1193046\"",
         ] {
@@ -493,12 +536,40 @@ mod tests {
         // The sets keep their entries: they are only added, never flushed.
         assert!(!script.contains("flush set"), "{script}");
         assert!(!script.contains("flush table"), "{script}");
-        let (no_vnis, no_sets) = (BTreeSet::new(), BTreeSet::new());
-        assert!(!learn_script(51822, &rules(), false, &no_vnis, &no_sets).contains("notrack"));
+        let no_sets = BTreeSet::new();
+        let tracked = LearnTable {
+            notrack: BTreeSet::new(),
+            ..table()
+        };
+        assert!(!learn_script(&tracked, &no_sets).contains("notrack"));
         // A client: only its source port, no gate.
-        let client = learn_script(51822, &BTreeSet::new(), false, &fixed, &no_sets);
+        let client = LearnTable {
+            rules: BTreeSet::new(),
+            ..tracked
+        };
+        let client = learn_script(&client, &no_sets);
         assert!(client.contains("udp sport set 51822"), "{client}");
         assert!(!client.contains("learn gate"), "{client}");
+        // Two networks: a gate per port, the same VNI told apart by it.
+        let mut both = table();
+        both.extend(&LearnTable {
+            rules: [LearnRule {
+                client: "vaother".into(),
+                vni: 0x12_3456,
+                port: 51900,
+            }]
+            .into(),
+            ..LearnTable::default()
+        });
+        let both = learn_script(&both, &no_sets);
+        assert!(both.contains("comment \"wl learn gate 51822\""), "{both}");
+        assert!(both.contains("comment \"wl learn gate 51900\""), "{both}");
+        assert!(
+            both.contains(
+                "wl-learn udp dport 51900 @th,64,8 0x08 @th,96,24 1193046 update @ep-vaother"
+            ),
+            "{both}"
+        );
     }
 
     #[test]
@@ -512,16 +583,12 @@ mod tests {
                        {"elem": {"val": {"concat": ["203.0.113.7", 40500]}, "timeout": 90, "expires": 87}}]}},
             {"set": {"family": "ip", "name": "ep-lab2", "table": "wanderlan", "type": ["ipv4_addr", "inet_service"], "handle": 4}},
             {"rule": {"family": "ip", "table": "wanderlan", "chain": "pre", "handle": 5, "comment": "wl learn gate 51822", "expr": []}},
-            {"rule": {"family": "ip", "table": "wanderlan", "chain": "wl-learn", "handle": 6, "comment": "wl learn lab 1193046", "expr": []}},
-            {"rule": {"family": "ip", "table": "wanderlan", "chain": "pre", "handle": 7, "comment": "wl notrack local", "expr": []}},
+            {"rule": {"family": "ip", "table": "wanderlan", "chain": "wl-learn", "handle": 6, "comment": "wl learn lab 1193046 51822", "expr": []}},
+            {"rule": {"family": "ip", "table": "wanderlan", "chain": "pre", "handle": 7, "comment": "wl notrack local 51822", "expr": []}},
             {"rule": {"family": "ip", "table": "wanderlan", "chain": "out", "handle": 8, "comment": "wl fixed 51822 1193046", "expr": []}}
         ]}"#;
         let state = parse_state(json).unwrap();
-        assert_eq!(state.port, Some(51822));
-        assert_eq!(state.fixed_port, Some(51822));
-        assert_eq!(state.fixed, [0x12_3456].into());
-        assert_eq!(state.rules, rules());
-        assert!(state.notrack);
+        assert!(state.holds(&table()), "{state:?}");
         assert_eq!(
             state.sets,
             ["ep-lab".to_string(), "ep-lab2".to_string()].into()
@@ -533,5 +600,12 @@ mod tests {
         assert_eq!(lab[1].expires, 87);
         assert!(!learned.contains_key("lab2"));
         assert!(parse_learned("not json").is_empty());
+        // Rules of a version before networks (no ports) are rewritten.
+        let old = json
+            .replace("wl learn lab 1193046 51822", "wl learn lab 1193046")
+            .replace("wl notrack local 51822", "wl notrack local");
+        let old = parse_state(&old).unwrap();
+        assert!(!old.holds(&table()), "{old:?}");
+        assert!(old.table.notrack.contains(&0));
     }
 }

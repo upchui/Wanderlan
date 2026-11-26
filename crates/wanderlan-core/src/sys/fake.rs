@@ -692,28 +692,30 @@ impl super::nft_ip::LearnOps for FakeNet {
         Ok(self.lock().learn.clone())
     }
 
-    async fn set_learn(
-        &self,
-        port: u16,
-        rules: &BTreeSet<super::nft_ip::LearnRule>,
-        notrack: bool,
-        fixed: &BTreeSet<u32>,
-    ) -> SysResult<()> {
+    async fn set_learn(&self, table: &super::nft_ip::LearnTable) -> SysResult<()> {
         let mut s = self.lock();
-        s.calls.push(format!("set_learn {port} {}", rules.len()));
-        let sets = rules
+        let ports: Vec<String> = table
+            .rules
             .iter()
-            .map(|r| format!("ep-{}", r.client))
-            .collect::<BTreeSet<_>>();
+            .map(|r| r.port)
+            .chain(table.notrack.iter().copied())
+            .chain(table.fixed.iter().map(|f| f.port))
+            .collect::<BTreeSet<_>>()
+            .iter()
+            .map(u16::to_string)
+            .collect();
+        s.calls.push(format!(
+            "set_learn {} {}",
+            ports.join(","),
+            table.rules.len()
+        ));
+        let sets = table.sets();
         s.learned
             .retain(|client, _| sets.contains(&format!("ep-{client}")));
         s.learn = Some(super::nft_ip::LearnState {
-            port: (!rules.is_empty()).then_some(port),
-            rules: rules.clone(),
+            table: table.clone(),
+            gates: table.gates(),
             sets,
-            notrack,
-            fixed: fixed.clone(),
-            fixed_port: (!fixed.is_empty()).then_some(port),
         });
         Ok(())
     }

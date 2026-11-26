@@ -5,7 +5,7 @@ use std::net::SocketAddrV4;
 
 use super::netlink::Netlink;
 use super::nft::{CachedNft, MssRule, NftCli, NftOps, NftState, SplitRule};
-use super::nft_ip::{LearnCli, LearnOps, LearnRule, LearnState, Learned};
+use super::nft_ip::{LearnCli, LearnOps, LearnState, LearnTable, Learned};
 
 /// How long the MSS rules read from nftables are trusted.
 const NFT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(120);
@@ -146,14 +146,8 @@ impl LearnOps for LinuxSystem {
     async fn learn_state(&self) -> SysResult<Option<LearnState>> {
         self.learn.learn_state().await
     }
-    async fn set_learn(
-        &self,
-        port: u16,
-        rules: &BTreeSet<LearnRule>,
-        notrack: bool,
-        fixed: &BTreeSet<u32>,
-    ) -> SysResult<()> {
-        self.learn.set_learn(port, rules, notrack, fixed).await
+    async fn set_learn(&self, table: &LearnTable) -> SysResult<()> {
+        self.learn.set_learn(table).await
     }
     async fn delete_learn(&self) -> SysResult<()> {
         self.learn.delete_learn().await

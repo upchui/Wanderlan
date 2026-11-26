@@ -1647,8 +1647,8 @@ impl Controller {
         let Some(desired) = self.derived().desired else {
             return;
         };
-        if desired.learn.is_empty() || Instant::now() < self.learn_next {
-            if desired.learn.is_empty() && !self.runtime.endpoints.is_empty() {
+        if desired.learn.rules.is_empty() || Instant::now() < self.learn_next {
+            if desired.learn.rules.is_empty() && !self.runtime.endpoints.is_empty() {
                 self.runtime.endpoints.clear();
             }
             return;
@@ -1669,6 +1669,7 @@ impl Controller {
         // The sets are named by the tunnels of the clients.
         let clients: Vec<(SiteId, &str)> = desired
             .learn
+            .rules
             .iter()
             .filter_map(|r| {
                 Some((

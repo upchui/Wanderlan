@@ -10,7 +10,7 @@ use crate::identity::{PeerIdentity, SiteId};
 use crate::mtu;
 use crate::sys::breakout::{BreakoutSpec, Egress, Uplinks, conf};
 use crate::sys::nft::{MssRule, PortDir, SplitRule};
-use crate::sys::nft_ip::LearnRule;
+use crate::sys::nft_ip::{FixedRule, LearnRule, LearnTable};
 use crate::sys::tc::{Direction, TcAction, TcRule};
 use crate::sys::{BridgeOptions, PortVlans, VlanFlags, VxlanParams};
 use crate::topology::{self, TunnelKind};
@@ -125,14 +125,11 @@ pub struct Desired {
     pub tunnel_port: u16,
     /// Tunnels that cannot be built, by peer, with the reason.
     pub unbuilt: BTreeMap<SiteId, String>,
-    /// The clients whose endpoints are learned (table `ip wanderlan`).
-    pub learn: BTreeSet<LearnRule>,
-    /// The tunnel packets of the clients skip connection tracking (only
-    /// where it is loaded).
-    pub notrack: bool,
-    /// The tunnels through NAT (by VNI): their packets get the tunnel port
-    /// as source port (see [`crate::sys::nft_ip`]).
-    pub fixed: BTreeSet<u32>,
+    /// The table `ip wanderlan` (see [`crate::sys::nft_ip`]): the clients
+    /// whose endpoints are learned, the tunnel packets of the clients that
+    /// skip connection tracking (only where it is loaded), the tunnels
+    /// through NAT (their packets get the tunnel port as source port).
+    pub learn: LearnTable,
     /// The local breakouts (see [`crate::breakout`]), one per segment with
     /// a tunnel and VLAN with a breakout.
     pub breakout: Vec<BreakoutSpec>,
@@ -332,6 +329,7 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
                 learn.insert(LearnRule {
                     client: name.clone(),
                     vni,
+                    port: tunnel_port,
                 });
                 runtime.endpoints.get(&peer).copied()
             }
@@ -404,19 +402,27 @@ pub fn derive(cfg: &Config, runtime: &Runtime) -> Desired {
 
     // The packets of the client tunnels skip connection tracking on their
     // server (a client may need it: its firewall lets the answers in).
-    let notrack = runtime.conntrack && has_clients;
+    let notrack = (runtime.conntrack && has_clients)
+        .then_some(tunnel_port)
+        .into_iter()
+        .collect();
     let breakout = breakouts(cfg, runtime, &trunks, &tunnels, &trunk_vlans);
     let fixed = tunnels
         .iter()
         .filter(|t| t.params.source_port.is_some())
-        .map(|t| t.params.vni)
+        .map(|t| FixedRule {
+            port: tunnel_port,
+            vni: t.params.vni,
+        })
         .collect();
     Desired {
         tunnel_port,
         unbuilt,
-        notrack,
-        fixed,
-        learn,
+        learn: LearnTable {
+            rules: learn,
+            notrack,
+            fixed,
+        },
         bridge_options: BRIDGE_OPTIONS,
         trunks,
         mss: mss_rules(cfg, &tunnels, runtime),
@@ -969,6 +975,7 @@ mod tests {
         assert_eq!(
             server
                 .learn
+                .rules
                 .iter()
                 .map(|r| (r.client.as_str(), r.vni))
                 .collect::<Vec<_>>(),
@@ -994,15 +1001,22 @@ mod tests {
             Some(SocketAddrV4::new(Ipv4Addr::new(10, 8, 0, 1), 51822))
         );
         assert_eq!(up.params.vni, nat.params.vni, "the same VNI at both ends");
-        assert!(client.learn.is_empty());
-        assert_eq!(client.fixed, [up.params.vni].into());
+        assert!(client.learn.rules.is_empty());
+        assert_eq!(
+            client.learn.fixed,
+            [FixedRule {
+                port: 51822,
+                vni: up.params.vni
+            }]
+            .into()
+        );
         let reached = Runtime {
             uplink_direct: true,
             ..Runtime::default()
         };
         let lan_side = derive(&cfg("lan"), &reached);
         assert_eq!(tunnel(&lan_side, "heim").params.source_port, None);
-        assert!(lan_side.fixed.is_empty());
+        assert!(lan_side.learn.fixed.is_empty());
     }
 
     #[test]
