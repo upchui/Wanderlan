@@ -360,11 +360,11 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
         .count();
     let title = if errors > 0 {
         format!(
-            " VLAN mappings: {} ({errors} with conflicts) ",
+            " VLAN mappings: {} ({errors} with conflicts) - t: tunnels ",
             draft.network.maps.len()
         )
     } else {
-        format!(" VLAN mappings: {} ", draft.network.maps.len())
+        format!(" VLAN mappings: {} - t: tunnels ", draft.network.maps.len())
     };
     let total = rows.len();
     let table = Table::new(rows, widths)

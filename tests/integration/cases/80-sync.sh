@@ -72,8 +72,35 @@ check "site1 cannot change the ports of site4" \
 check "site4 sets its own commit timeout" x site4 "wanderlan settings commit-timeout 2m --confirm"
 check "site4 keeps it in its local.toml" x site4 "grep -q '^commit_timeout = \"2m\"' /etc/wanderlan/local.toml"
 check "site1 keeps its own" x site1 "wanderlan settings | grep -q '^commit-timeout  1m  (network default)'"
+# Its ports are its own, its VLANs not: they change elsewhere, the ports stay.
+entry_of() { x "$1" "sed -n '/^\[site.$2\]/,/^\[/p' /etc/wanderlan/network.toml"; }
+check "site1 changes the VLANs of site4, which has ports of its own" \
+  x site1 "wanderlan site vlans site4 10-40 --confirm"
+wait_for 90 "site4 has the VLANs 10-40 and kept its ports" \
+  eval 'entry_of site4 site4 | grep -q "^vlans = \"10-40\"" && entry_of site4 site4 | grep -q "^control_port = 52821"'
+check "and gives it those of the network again" x site1 "wanderlan site vlans site4 default --confirm"
+wait_for 90 "site4 has the VLANs of the network again" eval '! entry_of site4 site4 | grep -q "^vlans ="'
 for s in commit-timeout tunnel-port control-port; do
   x site4 "wanderlan settings $s default --confirm" >/dev/null
 done
 wait_for 90 "site1 has the default ports of site4 again" eval '! site4_entry | grep -q "_port ="'
 expect_ping c-site3 10.20.0.12 "VLAN 20: site3 reaches site4 at the default ports again"
+
+begin "CLI: sites, VLANs and mappings by hand"
+
+check "site1 adds the site lab (a client of site1)" \
+  x site1 "wanderlan site add lab 10.100.1.99 --vlans 10,20 --confirm"
+wait_for 90 "site3 knows lab (synced)" eval 'entry_of site3 lab | grep -q "^server = \"site1\""'
+check "lab cannot be added twice" \
+  x site1 "! wanderlan site add lab 10.100.1.98 2>/tmp/add.err && grep -q 'already a site' /tmp/add.err"
+check "site1 maps source VLAN 20 to VLAN 120 at lab" x site1 "wanderlan map add lab 20 120 --confirm"
+wait_for 90 "site3 has the mapping" eval 'entry_of site3 lab | grep -q "^map = { 20 = 120 }"'
+check "site1 deletes it" x site1 "wanderlan map del lab 20 --confirm"
+check "the mapping is gone" eval '! entry_of site1 lab | grep -q "^map"'
+check "site1 removes lab" x site1 "wanderlan site remove lab --confirm"
+wait_for 90 "site3 no longer knows lab" eval '! entry_of site3 lab | grep -q lab'
+check "the network VLANs: nothing to change" x site1 "wanderlan vlans 10-50 | grep -q 'already'"
+check "site1 sets the VLANs of the network" x site1 "wanderlan vlans 10-51 --confirm"
+wait_for 90 "site3 has the VLANs 10-51" x site3 "grep -q '^vlans = \"10-51\"' /etc/wanderlan/network.toml"
+x site1 "wanderlan vlans 10-50 --confirm" >/dev/null
+wait_eq 90 "site5 is back at VLANs 10-50" "10-19,20:pu,21-50" vlan_summary site5 trunk0

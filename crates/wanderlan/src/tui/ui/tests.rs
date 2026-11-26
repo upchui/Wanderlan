@@ -779,3 +779,49 @@ fn breakout_form() {
     key(&mut app, KeyCode::Char('n'));
     insta::assert_snapshot!(render(&app));
 }
+
+/// Every key the help bar offers in a view is explained in the section of
+/// that view (or in "Everywhere"), and `?` opens the help there.
+#[test]
+fn help_bar_keys_are_explained() {
+    use crate::tui::app::View;
+    use crate::tui::help;
+    let mut app = connected();
+    let views = [
+        View::Overview,
+        View::Sites,
+        View::Vlans,
+        View::Macs,
+        View::Log,
+        View::Breakout,
+        View::Settings,
+    ];
+    for (view, tunnels) in views
+        .iter()
+        .map(|v| (*v, false))
+        .chain(std::iter::once((View::Vlans, true)))
+    {
+        app.view = view;
+        app.vlans_tunnels = tunnels;
+        let number = format!("{} ", view.index() + 1);
+        let explained: Vec<&str> = help::SECTIONS
+            .iter()
+            .filter(|s| s.title.starts_with(&number) || s.title == "Everywhere")
+            .flat_map(|s| s.keys.iter())
+            .flat_map(|(k, _)| k.split([',', ' ']).chain(std::iter::once(*k)))
+            .collect();
+        for (key, _) in help::bar(&app) {
+            assert!(
+                key == "1-8" || explained.contains(&key),
+                "{view:?}: the bar offers {key}, the help does not explain it"
+            );
+        }
+        key(&mut app, KeyCode::Char('?'));
+        let line = usize::from(help::section_line(view));
+        assert!(
+            matches!(&help::lines()[line], help::HelpLine::Title(t) if t.starts_with(&number)),
+            "{view:?}"
+        );
+        key(&mut app, KeyCode::Esc);
+    }
+}

@@ -3,7 +3,7 @@ source: crates/wanderlan/src/tui/ui/tests.rs
 expression: render(&app)
 ---
 " 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Breakout  8 Settings   "
-"┌ Sites (draft): 6 ────────────────────────────────────────────────────────────┐"
+"┌                                                                              ┐"
 "│ ┌ New site ────────────────────────────────────────────────────────────────┐ │"
 "│ │ Name                                                                     │ │"
 "│ │                  a-z, 0-9 and '-', at most 12 characters                 │ │"
@@ -20,9 +20,9 @@ expression: render(&app)
 "│ │                  online state                                            │ │"
 "│ │ Own VLANs                                                                │ │"
 "│ │                  its trunk and its own clients only, never its server;   │ │"
-"└─│                  empty: none                                             │─┘"
-" h│                                                                          │  "
+"└ │                  empty: none                                             │ ┘"
+"  │                                                                          │  "
 "  └──────────────────────────────────────────────────────────────────────────┘  "
 "                                                                                "
-"                                  1 blocked (see 1)  draft: no changes  heim r7 "
+"                          1 blocked, 1 down (see 1)  draft: no changes  heim r7 "
 " Tab  next field   Left/Right  choose   Enter  save to draft   Esc  cancel      "

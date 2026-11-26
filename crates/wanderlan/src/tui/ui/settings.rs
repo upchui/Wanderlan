@@ -277,7 +277,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
     rows.push(Row::new(vec![
         Cell::from(Span::styled("Role and rights", theme::header())),
         Cell::from(Span::styled(
-            "who may change VLANs: Sites (2), e, Changes",
+            "read only here; Sites (2), e on a site changes them",
             theme::dim(),
         )),
     ]));

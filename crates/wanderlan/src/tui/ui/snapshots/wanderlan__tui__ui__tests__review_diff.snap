@@ -24,5 +24,5 @@ expression: render(&app)
 "│Enter applies the change. Then confirm it with c within 1m; otherwise it is   │"
 "│rolled back automatically.                                                    │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-"                                    1 blocked (see 1)  draft: 1 change  heim r7 "
+"                            1 blocked, 1 down (see 1)  draft: 1 change  heim r7 "
 " Enter  apply   Up/Down  scroll   Esc  back                                     "

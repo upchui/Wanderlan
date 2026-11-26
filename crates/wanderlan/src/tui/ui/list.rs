@@ -115,3 +115,60 @@ pub fn scrollbar(
         &mut state,
     );
 }
+
+/// Column widths for a table whose rows are `width` columns wide: every
+/// column as wide as its header and its widest cell, at most its `max`;
+/// column `flex` gets what is left (at least its header). Columns are one
+/// apart.
+pub fn fit_widths(
+    width: u16,
+    headers: &[&str],
+    rows: &[Vec<String>],
+    max: &[usize],
+    flex: usize,
+) -> Vec<u16> {
+    let natural: Vec<usize> = headers
+        .iter()
+        .enumerate()
+        .map(|(c, h)| {
+            rows.iter()
+                .filter_map(|r| r.get(c))
+                .map(|t| t.chars().count())
+                .chain(std::iter::once(h.chars().count()))
+                .max()
+                .unwrap_or_default()
+                .min(max.get(c).copied().unwrap_or(usize::MAX))
+        })
+        .collect();
+    let spacing = headers.len().saturating_sub(1);
+    let others: usize = natural
+        .iter()
+        .enumerate()
+        .filter(|(c, _)| *c != flex)
+        .map(|(_, w)| *w)
+        .sum();
+    let rest = usize::from(width).saturating_sub(others + spacing);
+    natural
+        .iter()
+        .enumerate()
+        .map(|(c, w)| {
+            let w = if c == flex {
+                rest.max(headers.get(c).map_or(0, |h| h.chars().count()))
+            } else {
+                *w
+            };
+            u16::try_from(w).unwrap_or(u16::MAX)
+        })
+        .collect()
+}
+
+/// `text` in at most `width` characters, with `…` where it is cut.
+pub fn fit(text: &str, width: u16) -> String {
+    let width = usize::from(width);
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}

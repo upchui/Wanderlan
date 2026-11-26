@@ -299,14 +299,14 @@ impl Form {
             ),
             Field::text(
                 "native",
-                "Untagged",
-                "empty: none; or the source VLAN for untagged traffic",
+                "Native",
+                "empty: none; or the source VLAN that is untagged (native) on its trunk",
                 "",
             ),
             Field::text(
                 "translations",
-                "Translations",
-                "mapped:source, e.g. 130:30, 140:40",
+                "Mappings",
+                "mapped:source, e.g. 130:30, 140:40 (source VLAN 30 is VLAN 130 on its trunk)",
                 "",
             ),
             Field::choice(
@@ -589,21 +589,25 @@ impl Form {
         Self::new(FormKind::Vlans, "VLANs of the network", fields, draft)
     }
 
-    /// Form for `local.toml`: which site this host is. The trunk ports
-    /// have a window of their own (`ports.rs`).
-    pub fn local(draft: &Draft) -> Self {
-        let sites: Vec<String> = draft.network.sites.iter().map(|s| s.name.clone()).collect();
-        let own = draft.local.self_name.clone().unwrap_or_default();
-        let l = &draft.local;
-        let n = &draft.network;
-        let fields = vec![
-            Field::choice(
+    /// Form for `local.toml` opened on the setting `key`: which site this
+    /// host is (a form of its own: it changes the identity), or the timings
+    /// of this host. The trunk ports have a window of their own (`ports.rs`).
+    pub fn local(draft: &Draft, key: &str) -> Self {
+        if key == "self" {
+            let sites: Vec<String> = draft.network.sites.iter().map(|s| s.name.clone()).collect();
+            let own = draft.local.self_name.clone().unwrap_or_default();
+            let fields = vec![Field::choice(
                 "self",
                 "This site",
                 "which site of the network this host is",
                 sites,
                 &own,
-            ),
+            )];
+            return Self::new(FormKind::Local, "This site (local.toml)", fields, draft);
+        }
+        let l = &draft.local;
+        let n = &draft.network;
+        let fields = vec![
             Field::text(
                 "commit_timeout",
                 "Commit timeout",
@@ -615,7 +619,7 @@ impl Form {
             ),
             Field::text(
                 "mtu_probe_interval",
-                "MTU probe every",
+                "Path MTU check",
                 format!(
                     "how often this site measures the path MTU, e.g. 5m; empty: the network's ({})",
                     format::duration(n.mtu_probe_interval)
@@ -626,7 +630,7 @@ impl Form {
             ),
             Field::text(
                 "mss",
-                "Fixed MSS",
+                "TCP MSS",
                 "empty: derive from the measured path MTU; or 536-1460",
                 l.mss.map(|v| v.to_string()).unwrap_or_default(),
             ),
@@ -943,8 +947,8 @@ impl Form {
                         Some(i) => Some(i),
                         None => {
                             return self.gone(&format!(
-                                "The mapping {} {} = shared {}",
-                                m.site, m.local, m.shared
+                                "The mapping of {} (source VLAN {} = mapped VLAN {})",
+                                m.site, m.shared, m.local
                             ));
                         }
                     },
@@ -1020,13 +1024,16 @@ impl Form {
                 };
                 candidate.network.set_tunnel_limit(&a, &b, limit);
             }
-            FormKind::Local => {
+            // Only the fields of the form (see `Form::local`).
+            FormKind::Local if self.field("self").is_some() => {
                 let own = self.value("self");
+                candidate.local.self_name = (!own.is_empty()).then_some(own);
+            }
+            FormKind::Local => {
                 let timeout = self.parse_opt_duration("commit_timeout");
                 let interval = self.parse_opt_duration("mtu_probe_interval");
                 let mss = self.parse_mss();
                 let local = &mut candidate.local;
-                local.self_name = (!own.is_empty()).then_some(own);
                 local.commit_timeout = timeout?;
                 local.mtu_probe_interval = interval?;
                 local.mss = mss?;
@@ -1442,10 +1449,8 @@ fn own_vlans_field(site: Option<&Site>) -> Field {
     )
 }
 
-/// Choices of the "Changes" field of a site: only its manager, or the
-/// manager and the site itself.
 /// The "Changes" choice of a site that no site manages.
-const ANYONE: &str = "anyone (not managed)";
+const ANYONE: &str = "nobody (every server may change it)";
 /// The "Server" choice of a server.
 const NO_SERVER: &str = "none (a server)";
 
@@ -1716,7 +1721,7 @@ mod tests {
     #[test]
     fn the_settings_of_this_host_parse_and_validate() {
         let d = draft();
-        let mut form = Form::local(&d);
+        let mut form = Form::local(&d, "mss");
         form.focus = form.fields.iter().position(|f| f.key == "mss").unwrap();
         type_text(&mut form, &d, "100");
         let mss = form.field("mss").unwrap();
@@ -1762,16 +1767,21 @@ mod tests {
     #[test]
     fn the_local_form_chooses_the_site_and_this_host_s_settings() {
         let d = draft();
-        let mut form = Form::local(&d);
+        let mut form = Form::local(&d, "self");
         assert_eq!(
             form.fields.iter().map(|f| f.key).collect::<Vec<_>>(),
-            ["self", "commit_timeout", "mtu_probe_interval", "mss"],
-            "the trunk has a window of its own"
+            ["self"],
+            "the identity has a form of its own, the trunk a window"
         );
         assert_eq!(form.value("self"), "heim");
         form.handle_key(&KeyEvent::new(KeyCode::Right, KeyModifiers::NONE));
         let saved = form.submit(&d).expect("valid");
         assert_ne!(saved.local.self_name.as_deref(), Some("heim"));
         assert_eq!(saved.local.trunk, d.local.trunk, "the trunk is kept");
+        let form = Form::local(&d, "commit_timeout");
+        assert_eq!(
+            form.fields.iter().map(|f| f.key).collect::<Vec<_>>(),
+            ["commit_timeout", "mtu_probe_interval", "mss"]
+        );
     }
 }

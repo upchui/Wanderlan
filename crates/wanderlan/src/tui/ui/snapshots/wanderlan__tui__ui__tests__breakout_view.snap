@@ -24,5 +24,5 @@ expression: render(&app)
 " IPv4: public destinations leave out of ens20 via 192.0.2.1, masqueraded        "
 " IPv6 goes through the tunnel: ens20 has no global IPv6 address                 "
 " Through the tunnel also: 203.0.113.0/24                                        "
-"                                  1 blocked (see 1)  draft: no changes  heim r7 "
+"                          1 blocked, 1 down (see 1)  draft: no changes  heim r7 "
 " n  new   Enter  edit   d  remove   Up/Down  choose   ?  help   q  quit         "

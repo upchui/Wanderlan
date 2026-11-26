@@ -4,7 +4,7 @@
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Cell, Clear, Paragraph, Row, Table};
+use ratatui::widgets::{Cell, Paragraph, Row, Table};
 
 use super::{list, titled};
 use crate::tui::app::App;
@@ -97,7 +97,7 @@ pub fn draw(frame: &mut Frame, app: &App, picker: &PortPicker, area: Rect) {
     let table_height = u16::try_from(rows.len().max(1) + 1).unwrap_or(u16::MAX);
     let height = table_height + 2 + info_height + 2;
     let popup = area.centered(Constraint::Length(width), Constraint::Max(height));
-    frame.render_widget(Clear, popup);
+    super::clear_around(frame, popup);
     let block = titled(format!(" {} ", picker.title()));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);

@@ -1,6 +1,7 @@
 //! Non-interactive subcommands for scripts.
 
 use std::io::{BufRead as _, Write as _};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -240,6 +241,37 @@ pub enum Command {
         #[arg(long)]
         confirm: bool,
     },
+    /// Sites by hand: add one, remove one, or set its VLANs. A new site
+    /// usually joins with an invitation instead (`wanderlan invite`).
+    ///
+    /// Examples: `wanderlan site add lab 10.8.0.5 --server hq --vlans 10,20`,
+    /// `wanderlan site vlans lab default`, `wanderlan site remove lab`.
+    Site {
+        #[command(subcommand)]
+        action: SiteAction,
+    },
+    /// Set the VLANs of the network: every site takes part in them unless
+    /// it has VLANs of its own (`wanderlan site vlans`).
+    ///
+    /// Example: `wanderlan vlans native,10-50`, `wanderlan vlans all`.
+    Vlans {
+        /// VLANs, e.g. native,10-50, or "all" (every VLAN and the untagged
+        /// traffic).
+        vlans: String,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// VLAN mappings: a VLAN of the network (the source VLAN) has another
+    /// ID on the trunk of one site (the mapped VLAN), or is untagged there
+    /// ("native").
+    ///
+    /// Examples: `wanderlan map add lab 30 native`,
+    /// `wanderlan map add office 20 120`, `wanderlan map del lab 30`.
+    Map {
+        #[command(subcommand)]
+        action: MapAction,
+    },
     /// The settings of this site: shown, or one of them changed. They change
     /// this site only; every site sets its own.
     ///
@@ -344,6 +376,78 @@ fn parse_translation(text: &str) -> Result<api::Translation, String> {
         local: vid(local)?,
         shared: vid(shared)?,
     })
+}
+
+/// What `wanderlan site` does.
+#[derive(Debug, Subcommand)]
+pub enum SiteAction {
+    /// Add a site by hand: online right away and managed by this site.
+    Add {
+        /// Its name (a-z, 0-9 and -, at most 12 characters).
+        name: String,
+        /// The IPv4 address the other sites reach it at.
+        address: Ipv4Addr,
+        /// The site it is a client of (its only tunnel leads there); "none":
+        /// a server. Default: this site.
+        #[arg(long)]
+        server: Option<String>,
+        /// Its VLANs, e.g. 10,20; default: those of the network.
+        #[arg(long)]
+        vlans: Option<String>,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Remove a site with its VLAN mappings and tunnel limits (not while
+    /// it has clients).
+    #[command(alias = "rm", alias = "delete")]
+    Remove {
+        /// The site.
+        name: String,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Set the VLANs of a site; "default": those of the network.
+    Vlans {
+        /// The site.
+        name: String,
+        /// VLANs, e.g. 10,20 or native,30-40, or "default".
+        vlans: String,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+/// What `wanderlan map` does.
+#[derive(Debug, Subcommand)]
+pub enum MapAction {
+    /// Add a mapping, or change the mapped VLAN of a source VLAN.
+    Add {
+        /// The site whose trunk uses another VLAN ID.
+        site: String,
+        /// The VLAN in the network (one of the VLANs of the site).
+        #[arg(value_parser = clap::value_parser!(u16).range(1..=4094))]
+        source: u16,
+        /// Its ID on the trunk of the site, or "native" (untagged there).
+        mapped: String,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Delete the mapping of a source VLAN at a site.
+    #[command(alias = "delete", alias = "remove", alias = "rm")]
+    Del {
+        /// The site.
+        site: String,
+        /// The source VLAN of the mapping.
+        #[arg(value_parser = clap::value_parser!(u16).range(1..=4094))]
+        source: u16,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 /// What `wanderlan invite` does.
@@ -480,6 +584,24 @@ pub async fn run(args: Args) -> Result<ExitCode> {
                     Some(v) => format!("{} has the own VLANs {v}", entry.name),
                     None => format!("{} has no own VLANs", entry.name),
                 })
+            })
+            .await
+        }
+        Some(Command::Site { action }) => site_command(&socket, action).await,
+        Some(Command::Map { action }) => map_command(&socket, action).await,
+        Some(Command::Vlans { vlans, confirm }) => {
+            let vlans = match vlans.trim() {
+                "" | "all" => config::VlanSet::all(),
+                text => text.parse().map_err(|e| anyhow!("{text}: {e}"))?,
+            };
+            edit_network(&socket, confirm, |network, _| {
+                if network.vlans == vlans {
+                    return Ok(Edit::Nothing(format!(
+                        "The network has the VLANs {vlans} already."
+                    )));
+                }
+                network.vlans = vlans.clone();
+                Ok(Edit::Done(format!("The network has the VLANs {vlans}")))
             })
             .await
         }
@@ -1123,6 +1245,33 @@ async fn edit_site(
     confirm: bool,
     edit: impl FnOnce(&mut config::Site, &str) -> Result<String, String>,
 ) -> Result<ExitCode> {
+    edit_network(socket, confirm, |network, me| {
+        let Some(entry) = network.sites.iter_mut().find(|s| s.name == site) else {
+            bail!("there is no site \"{site}\"");
+        };
+        Ok(match edit(entry, me) {
+            Ok(done) => Edit::Done(done),
+            Err(nothing) => Edit::Nothing(nothing),
+        })
+    })
+    .await
+}
+
+/// What an edit of the running network came to.
+enum Edit {
+    /// Changed: what to print once applied.
+    Done(String),
+    /// Nothing to change: printed, nothing is applied.
+    Nothing(String),
+}
+
+/// Edits the running network (`edit` gets it and the name of this site)
+/// and applies it like the TUI would. Who may is checked by the daemon.
+async fn edit_network(
+    socket: &Path,
+    confirm: bool,
+    edit: impl FnOnce(&mut config::Network, &str) -> Result<Edit>,
+) -> Result<ExitCode> {
     let client = connect(socket).await?;
     settle(&client).await?;
     let status: Status = client.call(Request::Status).await?;
@@ -1134,19 +1283,200 @@ async fn edit_site(
         .ok()
         .and_then(|p| p.network)
         .context("cannot read the running configuration")?;
-    let Some(entry) = network.sites.iter_mut().find(|s| s.name == site) else {
-        bail!("there is no site \"{site}\"");
-    };
     let me = status.site.unwrap_or_default();
-    let done = match edit(entry, &me) {
-        Ok(done) => done,
-        Err(nothing) => {
-            println!("{nothing}");
-            return Ok(ExitCode::SUCCESS);
+    match edit(&mut network, &me)? {
+        Edit::Nothing(text) => {
+            println!("{text}");
+            Ok(ExitCode::SUCCESS)
         }
-    };
-    let local = running.local.clone();
-    send_edit(&client, &network, local, running.revision, confirm, &done).await
+        Edit::Done(done) => {
+            let local = running.local.clone();
+            send_edit(&client, &network, local, running.revision, confirm, &done).await
+        }
+    }
+}
+
+/// `wanderlan site add|remove|vlans`.
+async fn site_command(socket: &Path, action: SiteAction) -> Result<ExitCode> {
+    match action {
+        SiteAction::Add {
+            name,
+            address,
+            server,
+            vlans,
+            confirm,
+        } => {
+            if let Some(msg) = config::site_name_error(&name) {
+                bail!("\"{name}\": {msg}");
+            }
+            let vlans = vlans
+                .map(|text| {
+                    text.parse::<config::VlanSet>()
+                        .map_err(|e| anyhow!("{text}: {e}"))
+                })
+                .transpose()?;
+            edit_network(socket, confirm, |network, me| {
+                if network.site(&name).is_some() {
+                    bail!("\"{name}\" is already a site of the network");
+                }
+                // Like a new site in the TUI: a client of this site.
+                let uplink = match server.as_deref() {
+                    Some("none") => None,
+                    Some(s) => Some(s.to_string()),
+                    None => Some(me.to_string()),
+                };
+                if let Some(up) = uplink.as_deref().filter(|u| network.site(u).is_none()) {
+                    bail!("there is no site \"{up}\" to be a client of");
+                }
+                let role = role_text(uplink.as_deref());
+                network.sites.push(config::Site {
+                    name: name.clone(),
+                    address,
+                    id: None,
+                    vlans: vlans.clone(),
+                    own_vlans: None,
+                    online: true,
+                    managed_by: Some(me.to_string()),
+                    self_managed: false,
+                    uplink,
+                    breakout: Default::default(),
+                    ports: Default::default(),
+                });
+                Ok(Edit::Done(format!(
+                    "Site \"{name}\" ({address}, {role}) is added"
+                )))
+            })
+            .await
+        }
+        SiteAction::Remove { name, confirm } => edit_network(socket, confirm, |network, me| {
+            if network.site(&name).is_none() {
+                bail!("there is no site \"{name}\"");
+            }
+            if name == me {
+                bail!(
+                    "\"{name}\" is this site: `wanderlan reset` removes wanderlan from this host"
+                );
+            }
+            let clients: Vec<&str> = network
+                .sites
+                .iter()
+                .filter(|s| s.uplink.as_deref() == Some(name.as_str()))
+                .map(|s| s.name.as_str())
+                .collect();
+            if !clients.is_empty() {
+                bail!(
+                    "\"{name}\" still has clients ({}): remove them first",
+                    clients.join(", ")
+                );
+            }
+            network.sites.retain(|s| s.name != name);
+            let maps = network.maps.len();
+            network.maps.retain(|m| m.site != name);
+            let maps = maps - network.maps.len();
+            network.tunnels.retain(|t| !t.touches(&name));
+            let extra = if maps > 0 {
+                format!(" with its {maps} VLAN mapping(s)")
+            } else {
+                String::new()
+            };
+            Ok(Edit::Done(format!("Site \"{name}\" is removed{extra}")))
+        })
+        .await,
+        SiteAction::Vlans {
+            name,
+            vlans,
+            confirm,
+        } => {
+            let vlans = match vlans.trim() {
+                "" | "default" => None,
+                text => Some(
+                    text.parse::<config::VlanSet>()
+                        .map_err(|e| anyhow!("{text}: {e}"))?,
+                ),
+            };
+            edit_site(socket, &name, confirm, |entry, _| {
+                if entry.vlans == vlans {
+                    return Err(format!("{} has these VLANs already.", entry.name));
+                }
+                entry.vlans.clone_from(&vlans);
+                Ok(match &vlans {
+                    Some(v) => format!("{} has the VLANs {v}", entry.name),
+                    None => format!("{} has the VLANs of the network", entry.name),
+                })
+            })
+            .await
+        }
+    }
+}
+
+/// `wanderlan map add|del`.
+async fn map_command(socket: &Path, action: MapAction) -> Result<ExitCode> {
+    match action {
+        MapAction::Add {
+            site,
+            source,
+            mapped,
+            confirm,
+        } => {
+            let local = if mapped.trim().eq_ignore_ascii_case("native") {
+                config::LocalVid::Native
+            } else {
+                match mapped.trim().parse::<u16>() {
+                    Ok(v) if (1..=4094).contains(&v) => config::LocalVid::Vid(v),
+                    _ => bail!("\"{mapped}\": the mapped VLAN is \"native\" or a VLAN ID (1-4094)"),
+                }
+            };
+            edit_network(socket, confirm, |network, _| {
+                if network.site(&site).is_none() {
+                    bail!("there is no site \"{site}\"");
+                }
+                let there = match local {
+                    config::LocalVid::Native => format!("untagged at {site}"),
+                    config::LocalVid::Vid(v) => format!("VLAN {v} at {site}"),
+                };
+                let text = format!("source VLAN {source} = {there}");
+                match network
+                    .maps
+                    .iter_mut()
+                    .find(|m| m.site == site && m.shared == source)
+                {
+                    Some(m) if m.local == local => {
+                        return Ok(Edit::Nothing(format!(
+                            "The mapping {text} is there already."
+                        )));
+                    }
+                    Some(m) => m.local = local,
+                    None => network.maps.push(config::VlanMap {
+                        site: site.clone(),
+                        local,
+                        shared: source,
+                    }),
+                }
+                Ok(Edit::Done(format!("Mapping {text}")))
+            })
+            .await
+        }
+        MapAction::Del {
+            site,
+            source,
+            confirm,
+        } => {
+            edit_network(socket, confirm, |network, _| {
+                let Some(i) = network
+                    .maps
+                    .iter()
+                    .position(|m| m.site == site && m.shared == source)
+                else {
+                    bail!("site \"{site}\" has no mapping of source VLAN {source}");
+                };
+                network.maps.remove(i);
+                Ok(Edit::Done(format!(
+                    "The mapping of source VLAN {source} at {site} is deleted"
+                )))
+            })
+            .await
+        }
+    }
 }
 
 /// Sends an edited configuration: the warnings of a success are printed;
@@ -1245,6 +1575,13 @@ async fn rename(socket: &Path, site: &str, new: &str, confirm: bool) -> Result<E
 
 async fn reset(socket: &Path, yes: bool) -> Result<ExitCode> {
     let client = connect(socket).await?;
+    // Its name, for the hint to the other sites.
+    let name = client
+        .call::<Status>(Request::Status)
+        .await
+        .ok()
+        .and_then(|s| s.site)
+        .unwrap_or_else(|| "<name>".to_string());
     if !yes {
         println!(
             "This removes everything wanderlan set up on this site: the bridge {}, all tunnels,\n\
@@ -1273,7 +1610,9 @@ async fn reset(socket: &Path, yes: bool) -> Result<ExitCode> {
         "Reset done ({} changes): this site is unconfigured again.",
         report.removed
     );
-    println!("Other sites still list it until it is removed there (`wanderlan`, Sites, d).");
+    println!(
+        "Other sites still list it until it is removed there: `wanderlan site remove {name}` (or in `wanderlan`: Sites, d)."
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1793,5 +2132,54 @@ fn print_event(e: &Event) {
     match &e.peer {
         Some(peer) => println!("{stamp} {level:<5} [{peer}] {}", e.message),
         None => println!("{stamp} {level:<5} {}", e.message),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory as _;
+
+    use super::*;
+
+    fn parse(args: &[&str]) -> Option<Command> {
+        Args::try_parse_from(std::iter::once("wanderlan").chain(args.iter().copied()))
+            .map(|a| a.command)
+            .unwrap_or_else(|e| panic!("{args:?}: {e}"))
+    }
+
+    #[test]
+    fn the_site_vlan_and_map_commands_parse() {
+        Args::command().debug_assert();
+        assert!(matches!(
+            parse(&["site", "add", "lab", "10.8.0.5", "--server", "hq", "--vlans", "10,20"]),
+            Some(Command::Site { action: SiteAction::Add { name, server: Some(s), vlans: Some(_), .. } })
+                if name == "lab" && s == "hq"
+        ));
+        assert!(matches!(
+            parse(&["site", "rm", "lab", "--confirm"]),
+            Some(Command::Site {
+                action: SiteAction::Remove { confirm: true, .. }
+            })
+        ));
+        assert!(matches!(
+            parse(&["map", "add", "lab", "30", "native"]),
+            Some(Command::Map {
+                action: MapAction::Add { source: 30, .. }
+            })
+        ));
+        assert!(matches!(
+            parse(&["vlans", "all"]),
+            Some(Command::Vlans { .. })
+        ));
+        for wrong in [
+            &["site", "add", "lab", "lab.example"][..],
+            &["map", "del", "lab", "5000"],
+        ] {
+            assert!(
+                Args::try_parse_from(std::iter::once("wanderlan").chain(wrong.iter().copied()))
+                    .is_err(),
+                "{wrong:?}"
+            );
+        }
     }
 }

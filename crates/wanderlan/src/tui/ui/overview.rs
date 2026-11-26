@@ -112,6 +112,19 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
             theme::warn(),
         ));
     }
+    // Other sites that are offline (a site that just joined starts so).
+    let offline: Vec<&str> = status
+        .sites
+        .iter()
+        .filter(|s| !s.online && !s.is_self)
+        .map(|s| s.name.as_str())
+        .collect();
+    if !offline.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(format!(" Offline: {}", offline.join(", ")), theme::warn()),
+            Span::styled("  (o on the site below takes it online)", theme::dim()),
+        ]));
+    }
     if let Some(manager) = app.restricted_by() {
         lines.push(Line::styled(
             format!(" Managed by {manager}: VLANs, mappings and online state change only there."),
@@ -356,27 +369,47 @@ fn draw_sites(frame: &mut Frame, app: &App, status: &Status, area: Rect) {
         .iter()
         .map(|s| (s.name.as_str(), s.uplink.as_deref()))
         .collect();
-    let rows: Vec<Row> = topology::tree_order_by(&pairs)
+    // Widths from the texts; the VLANs get the rest, "…" where cut.
+    let entries: Vec<(Vec<String>, Style)> = topology::tree_order_by(&pairs)
         .into_iter()
         .filter_map(|(i, depth)| status.sites.get(i).map(|s| (s, depth)))
         .map(|(site, depth)| {
             let (link, style) = link(status, site);
+            (
+                vec![
+                    topology::tree_name(&site.name, depth),
+                    site.address.clone(),
+                    site.vlans.clone(),
+                    format::role(site.uplink.as_deref()),
+                    link,
+                ],
+                style,
+            )
+        })
+        .collect();
+    let headers = ["SITE", "ADDRESS", "VLANS", "ROLE", "LINK"];
+    let texts: Vec<Vec<String>> = entries.iter().map(|e| e.0.clone()).collect();
+    let widths = list::fit_widths(
+        area.width.saturating_sub(3),
+        &headers,
+        &texts,
+        &[16, 15, 40, 22, 16],
+        2,
+    );
+    let rows: Vec<Row> = entries
+        .into_iter()
+        .map(|(texts, style)| {
+            let cell = |c: usize| list::fit(&texts[c], widths[c]);
             Row::new(vec![
-                Cell::from(topology::tree_name(&site.name, depth)),
-                Cell::from(site.address.clone()),
-                Cell::from(site.vlans.clone()),
-                Cell::from(format::role(site.uplink.as_deref())),
-                Cell::from(link).style(style),
+                Cell::from(cell(0)),
+                Cell::from(cell(1)),
+                Cell::from(cell(2)),
+                Cell::from(cell(3)),
+                Cell::from(cell(4)).style(style),
             ])
         })
         .collect();
-    let widths = [
-        Constraint::Length(12),
-        Constraint::Length(15),
-        Constraint::Length(12),
-        Constraint::Length(17),
-        Constraint::Min(10),
-    ];
+    let widths: Vec<Constraint> = widths.into_iter().map(Constraint::Length).collect();
     let title = format!(" Network: {} sites (Enter: show) ", status.sites.len());
     let total = rows.len();
     let selected = app

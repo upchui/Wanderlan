@@ -39,8 +39,9 @@ pub const SECTIONS: &[Section] = &[
     Section {
         title: "1 Overview",
         keys: &[
-            ("Up/Down", "select a peer"),
+            ("Up/Down", "select a peer, below them a site of the network"),
             ("Enter", "details: traffic graph, round trips, counters"),
+            ("o", "the selected site online or offline (to the review)"),
             ("u", "unblock the port of the peer (loop guard)"),
             ("U", "unblock a trunk port (loop guard)"),
             ("p", "measure the path MTU to all peers now"),
@@ -92,6 +93,7 @@ pub const SECTIONS: &[Section] = &[
             ),
             ("s", "sort by the next column (MAC, VLAN, port, age)"),
             ("o", "reverse the order"),
+            ("Up/Down, PgUp/PgDn", "scroll"),
         ],
         text: "A filter word vlan:20 shows VLAN 20 only.",
     },
@@ -132,6 +134,7 @@ pub const SECTIONS: &[Section] = &[
     Section {
         title: "7 Breakout",
         keys: &[
+            ("Up/Down", "select a breakout"),
             ("n", "a VLAN of a site uses its own uplink to the internet"),
             (
                 "e, Enter",
@@ -239,6 +242,17 @@ pub fn lines() -> Vec<HelpLine> {
     out
 }
 
+/// The line of the help screen where the section of `view` starts (the
+/// help opens there).
+pub fn section_line(view: View) -> u16 {
+    let number = format!("{} ", view.index() + 1);
+    lines()
+        .iter()
+        .position(|l| matches!(l, HelpLine::Title(t) if t.starts_with(&number)))
+        .and_then(|i| u16::try_from(i).ok())
+        .unwrap_or(0)
+}
+
 /// Largest useful scroll offset of the help screen.
 pub fn max_scroll() -> u16 {
     u16::try_from(lines().len().saturating_sub(1)).unwrap_or(u16::MAX)
@@ -334,11 +348,13 @@ pub fn bar(app: &App) -> Vec<Binding> {
     }
     let common: [Binding; 2] = [("?", "help"), ("q", "quit")];
     let mut keys: Vec<Binding> = if !matches!(app.conn, Conn::Connected) {
-        vec![("1-8", "views")]
+        // Every view shows the same "not reachable" box.
+        Vec::new()
     } else {
         match app.view {
             View::Overview => vec![
                 ("Enter", "details"),
+                ("o", "on/offline"),
                 ("u", "unblock"),
                 ("p", "probe MTU"),
                 ("Up/Down", "choose"),
@@ -372,10 +388,10 @@ pub fn bar(app: &App) -> Vec<Binding> {
                 ("/", "search"),
             ],
             View::Vlans => vec![
+                ("t", "tunnels"),
                 ("n", "new"),
                 ("Enter", "edit"),
                 ("d", "delete"),
-                ("t", "tunnels"),
                 ("v", "VLANs"),
                 ("o", "own VLANs"),
                 ("/", "search"),
@@ -426,7 +442,7 @@ pub fn bar(app: &App) -> Vec<Binding> {
             },
         }
     };
-    if app.view != View::Setup || !matches!(app.conn, Conn::Connected) {
+    if app.view != View::Setup && matches!(app.conn, Conn::Connected) {
         if app.draft_dirty() {
             keys.push(("a", "apply"));
             keys.push(("x", "discard"));

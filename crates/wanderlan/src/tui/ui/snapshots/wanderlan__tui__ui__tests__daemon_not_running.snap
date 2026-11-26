@@ -24,5 +24,5 @@ expression: render(&app)
 "                                                                                "
 "                                                                                "
 "                                                                                "
-"                                                                        offline "
-" 1-8  views   ?  help   q  quit                                                 "
+"                                                                      no daemon "
+" ?  help   q  quit                                                              "

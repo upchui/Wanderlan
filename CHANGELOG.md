@@ -7,6 +7,40 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
+### TUI: fixes and easier to use; sites and mappings on the command line
+
+- Editing a site in the TUI kept neither its own ports nor its breakouts (a
+  site with its own ports could not be edited by its manager at all).
+- A rolled-back change comes back with what was edited during the
+  countdown, also when a confirm or rollback comes too late; a review shows
+  the draft as it is after a sync; changes of `local.toml` by the CLI are
+  noticed (status: `local_fingerprint`); a draft that a sync overtook keeps
+  the ports and identities of the other sites. Changes from a peer and joins
+  are confirmed by the daemon itself: the TUI says so and waits for them.
+- Selections follow their site, mapping or breakout after a sync; new
+  mappings and breakouts only offer sites this site may change; the
+  invitation form survives a lost connection.
+- Site form: "Server" and "Changes" (nobody, a site as manager, or the
+  manager and the site itself). "This site" in Settings has a form of its
+  own; list and form use the same names.
+- From a join to a running site: the server says when the site joined and
+  that it starts offline, the Overview names offline sites, and `o` on a
+  site of the Overview goes straight to the review.
+- Finding out why a tunnel is down: the peer details show where it is
+  probed (address, control and tunnel port of that site) and what to check;
+  site details show its ports; the status line counts tunnels that are down;
+  the reason is under the Sites list.
+- Tables size their columns to the content and cut with `…`; the line below
+  shows the selected row in full. `?` opens the help at the current view;
+  without a daemon the status line says `no daemon`. Popups keep a blank
+  margin. The breakout view has one row per segment, `native` for VLAN 1 and
+  all uplinks; the daemon reports the uplinks before the first breakout.
+- The warning about a ring of tunnels names the limit of a direct tunnel
+  when that limit is what leaves the VLANs out.
+- CLI: `wanderlan site add|remove|vlans`, `wanderlan vlans` and
+  `wanderlan map add|del`, checked by the daemon like every other change;
+  `wanderlan reset` names `wanderlan site remove` for the other sites.
+
 ### Local internet breakout per VLAN
 
 - A VLAN of a site can reach the internet through that site's own uplink

@@ -460,12 +460,21 @@ stays valid until used or deleted: Sites, `I` (`d` deletes), or
 `wanderlan invite list` / `wanderlan invite delete <code>`. Codes can be
 created on any site; the new site becomes a client of that site.
 
-**Take a site online or offline.** Sites, select it, `o`; or
-`wanderlan online <site> --confirm` / `wanderlan offline <site> --confirm`.
+**Take a site online or offline.** `o` on the site in Sites or in the
+list of sites of the Overview (the Overview goes straight to the review);
+or `wanderlan online <site> --confirm` / `wanderlan offline <site> --confirm`.
+A site that joined with an invitation starts offline; the Overview names
+the sites that are offline.
+
+**Add or remove a site by hand.** Sites, `n` (a client of this site unless
+"Server" says otherwise) or `d` (not while it has clients). CLI:
+`wanderlan site add lab 10.8.0.5 --server hq --vlans 10,20`,
+`wanderlan site remove lab`.
 
 **Choose the VLANs of a site.** Sites, `e` on the site, field "VLANs"
 (empty: the VLANs of the network). The VLANs of the network: VLANs (`3`),
-`v`, or Sites (`2`), `m`.
+`v`, or Sites (`2`), `m`. CLI: `wanderlan site vlans lab 10,20` (`default`:
+those of the network), `wanderlan vlans native,10-50` (`all`: every VLAN).
 
 **Give a site VLANs of its own.** VLANs (`3`), `o`: VLANs on this site's
 trunk and towards its own clients, never to its server; possible even when
@@ -474,7 +483,8 @@ the server manages everything else. CLI: `wanderlan own-vlans <site> 50,60`
 
 **Put untagged traffic into a VLAN, translate a VLAN.** VLANs (`3`), `n`:
 site, source VLAN (e.g. `30`), mapped VLAN `native` (or the VLAN ID on that
-site's trunk, e.g. `130`).
+site's trunk, e.g. `130`). CLI: `wanderlan map add lab 30 native`,
+`wanderlan map add lab 40 140`, `wanderlan map del lab 30`.
 
 **Let a VLAN use the internet of its own site.** Breakout (`7`), `n`: site,
 VLAN, uplink (empty: the default route; the window names the interfaces of
@@ -485,8 +495,8 @@ shows for this site where IPv4 and IPv6 leave now and the traffic. CLI:
 `wanderlan breakout` shows the breakouts of this site.
 
 **Let a site change its own VLANs, move it.** Sites, `e` on the site:
-"Changes" (anyone, a site as its manager, or the manager and the site
-itself) and "Server" (none: a server; or the site it is a client of). A
+"Changes" (nobody, so every server may change it; a site as its manager;
+or the manager and the site itself) and "Server" (none: a server; or the site it is a client of). A
 site added by hand is a client of this site. CLI:
 `wanderlan manage <site> --self-managed yes`,
 `wanderlan role <site> client <server>`, `wanderlan role <site> server`.
@@ -824,7 +834,10 @@ event log (`wanderlan log`).
 
 `wanderlan` without arguments starts the TUI: keyboard first, works over SSH
 and needs at least 80×24 (larger terminals show more). `?` shows all keys,
-the bar at the bottom the most important ones of each view. Every list
+starting at the section of the current view; the bar at the bottom shows the
+most important ones of each view. Columns are as wide as their content; a
+text cut short ends with `…` and the line below the list shows the selected
+row in full. Every list
 scrolls with Up/Down, PgUp/PgDn, Home and End and shows a scrollbar when it
 holds more than fits; `/` searches in Sites, VLANs, MACs and Log. `--mouse`
 enables the mouse: a click selects a row (a second click opens it), the
@@ -833,8 +846,8 @@ clicked.
 
 | Key | View |
 |-----|------|
-| `1` | Overview: this site with its role, the tunnel neighbours live (reply, round trip, path MTU, MSS, port state, MAC addresses, throughput, config in sync or `refused`), traffic of the tunnels and of every trunk, and all known sites with role and link (`via hq` for sites without a tunnel from here), each server with its clients indented below. One cursor runs through the neighbours and the sites. `Enter` on a neighbour: traffic graph, the VLANs of the tunnel with their live traffic (Up/Down, `Enter` opens one: every port, MACs, graph; `m` its MAC table), round-trip history, min/avg/max round trip, jitter, probe loss, latency, counters (Left/Right: the next neighbour); on a site: its details. |
-| `2` | Sites: name, address, VLANs, role, manager, tunnel; clients indented below their server. `Enter`: details (role, VLANs, every tunnel with what it carries, mappings, who may change it; Up/Down: the next site). Invite (`i`), open invitations (`I`), online/offline (`o`), new (`n`), edit (`e`: name, address, VLANs, "Server", "Changes"), rename (`N`), delete (`d`), the VLANs of the network (`m`), trunk ports of this host (`l`). |
+| `1` | Overview: this site with its role, the tunnel neighbours live (reply, round trip, path MTU, MSS, port state, MAC addresses, throughput, config in sync or `refused`), traffic of the tunnels and of every trunk, and all known sites with role and link (`via hq` for sites without a tunnel from here), each server with its clients indented below. One cursor runs through the neighbours and the sites. `Enter` on a neighbour: traffic graph, the VLANs of the tunnel with their live traffic (Up/Down, `Enter` opens one: every port, MACs, graph; `m` its MAC table), round-trip history, min/avg/max round trip, jitter, probe loss, latency, counters, where it is probed (its address and ports) and, without answers, what to check (Left/Right: the next neighbour); on a site: its details. `o` on a site takes it online or offline (to the review), `u` / `U` unblock the port of a neighbour / a trunk port, `p` measures the path MTU. |
+| `2` | Sites: name, address, VLANs, role, manager, tunnel; clients indented below their server. `Enter`: details (role, address and ports, VLANs, every tunnel with what it carries, mappings, who may change it; Up/Down: the next site). Invite (`i`), open invitations (`I`), online/offline (`o`), new (`n`), edit (`e`: name, address, VLANs, "Server", "Changes"), rename (`N`), delete (`d`), the VLANs of the network (`m`), trunk ports of this host (`l`). |
 | `3` | VLANs: the VLANs of the network (`v`), the own VLANs of this site (`o`) and the mappings (`n`, `Enter`, `d`) with their site and its role; conflicts are marked right away. `t` switches to the tunnels: what each carries, its limit (`Enter`, `d`). |
 | `4` | MAC addresses: filter (`/`; `vlan:20` for one VLAN), sort (`s`, `o`). |
 | `5` | Log: live events in local time (`t`: UTC), filter by level (`l`), site (`p`) and text (`/`). |
@@ -850,9 +863,10 @@ open. `x` discards the draft, `q` quits; where a wrong "yes" would lose
 something (reset, discard, roll back, quitting with a draft, closing a form
 with input) Enter means no and only `y` is yes. Messages that do not fit get
 a second line, `M` shows the last ones, and the status line of every view
-names problems of this site (an error, blocked ports, refused changes).
-When the daemon is not reachable, the TUI shows the state of the service and
-its last log lines and keeps trying.
+names problems of this site (an error, blocked ports, refused changes,
+tunnels that are down). When the daemon is not reachable (`no daemon` in the
+status line), the TUI shows the state of the service and its last log lines
+and keeps trying.
 
 ## Command line
 
@@ -868,6 +882,11 @@ its last log lines and keeps trying.
 | `wanderlan manage <site> [--by S] [--self-managed yes\|no]` | Who may change (and rename) a site |
 | `wanderlan rename <site> <new-name>` | Rename a site: this site always, a site it manages too |
 | `wanderlan role <site> server\|client <server>` | Make a site a server or a client |
+| `wanderlan site add <name> <address> [--server S\|none] [--vlans V]` | Add a site by hand (default: a client of this site, managed by it) |
+| `wanderlan site remove <name>` | Remove a site with its mappings (not while it has clients) |
+| `wanderlan site vlans <name> <vlans\|default>` | The VLANs of a site |
+| `wanderlan vlans <vlans\|all>` | The VLANs of the network |
+| `wanderlan map add <site> <source> <mapped\|native>` / `wanderlan map del <site> <source>` | VLAN mappings: source VLAN = mapped VLAN on the site's trunk |
 | `wanderlan settings [<setting> <value\|default>]` | The settings of this site (`commit-timeout`, `mtu-check`, `mss`, `control-port`, `tunnel-port`): shown, or one changed. Only this site's: every site sets its own |
 | `wanderlan trunk <site> <interfaces\|default>` | Trunk ports of the tunnel to a site, or (this site's name) of the default trunk; several separated by commas |
 | `wanderlan own-vlans <site> <vlans\|none>` | Own VLANs of a site (trunk and its own clients only) |
@@ -881,7 +900,8 @@ its last log lines and keeps trying.
 | `wanderlan reset [--yes]` | Remove everything wanderlan set up on this site |
 
 Commands that change the configuration (`online`, `offline`, `manage`,
-`role`, `trunk`, `own-vlans`, `tunnel-vlans`, `breakout`) take `--confirm` to confirm right away; without it, run
+`role`, `site`, `vlans`, `map`, `trunk`, `own-vlans`, `tunnel-vlans`,
+`breakout`, `settings`) take `--confirm` to confirm right away; without it, run
 `wanderlan confirm` within the commit timeout. They wait for a change that is
 still being synchronised. The daemon's socket can be chosen with `--socket`
 or `WANDERLAN_SOCKET`.

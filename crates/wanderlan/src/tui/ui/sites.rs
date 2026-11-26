@@ -2,6 +2,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
 use wanderlan_core::config::FieldPath;
@@ -63,7 +64,9 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
             .map_or_else(|| name.to_string(), |(old, _)| old.clone())
     };
     let order = app.visible_sites();
-    let rows: Vec<Row> = order
+    // The texts first: the columns are as wide as they need, the VLANs get
+    // the rest, and a cut text ends with "…" (the hint line has it all).
+    let entries: Vec<(usize, Span, Vec<String>, Style, bool, Style)> = order
         .iter()
         .filter_map(|(i, depth)| draft.network.sites.get(*i).map(|s| (*i, *depth, s)))
         .map(|(i, depth, site)| {
@@ -88,27 +91,61 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
                     }
                 }
             };
+            let own_vlans = site
+                .own_vlans
+                .as_ref()
+                .map_or_else(String::new, |o| format!(" +{o}"));
+            let (vlans, default_vlans) = match &site.vlans {
+                Some(v) => (format!("{v}{own_vlans}"), false),
+                None => (format!("{}{own_vlans}", draft.network.vlans), true),
+            };
+            let texts = vec![
+                String::new(),
+                topology::tree_name(&site.name, depth),
+                site.address.to_string(),
+                vlans,
+                format::role(site.uplink.as_deref()),
+                policy::managed_label(&draft.network, site),
+                tunnel,
+            ];
             let style = severity_style(draft.worst_within(&FieldPath::site(i)));
+            (i, marker, texts, style, default_vlans, tunnel_style)
+        })
+        .collect();
+    let headers = [
+        "",
+        "NAME",
+        "ADDRESS",
+        "VLANS",
+        "ROLE",
+        "MANAGED BY",
+        "TUNNEL",
+    ];
+    let texts: Vec<Vec<String>> = entries.iter().map(|e| e.2.clone()).collect();
+    // Inside the border and the scrollbar.
+    let widths = list::fit_widths(
+        area.width.saturating_sub(3),
+        &headers,
+        &texts,
+        &[1, 16, 15, 40, 22, 20, 12],
+        3,
+    );
+    let rows: Vec<Row> = entries
+        .into_iter()
+        .map(|(_, marker, texts, style, default_vlans, tunnel_style)| {
+            let cell = |c: usize| list::fit(&texts[c], widths[c]);
             Row::new(vec![
                 Cell::from(marker),
-                Cell::from(topology::tree_name(&site.name, depth)),
-                Cell::from(site.address.to_string()),
-                {
-                    let own = site
-                        .own_vlans
-                        .as_ref()
-                        .map_or_else(String::new, |o| format!(" +{o}"));
-                    match &site.vlans {
-                        Some(v) => Cell::from(format!("{v}{own}")),
-                        None => Cell::from(Span::styled(
-                            format!("{}{own}", draft.network.vlans),
-                            theme::dim(),
-                        )),
-                    }
+                Cell::from(cell(1)),
+                Cell::from(cell(2)),
+                if default_vlans {
+                    Cell::from(Span::styled(cell(3), theme::dim()))
+                } else {
+                    Cell::from(cell(3))
                 },
-                Cell::from(format::role(site.uplink.as_deref())),
-                Cell::from(policy::managed_label(&draft.network, site)),
-                Cell::from(tunnel).style(tunnel_style),
+                Cell::from(cell(4)),
+                Cell::from(cell(5)),
+                Cell::from(cell(6)).style(tunnel_style),
             ])
             .style(style)
         })
@@ -124,15 +161,7 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
     if removed > 0 {
         title.push_str(&format!("- {removed} removed "));
     }
-    let widths = [
-        Constraint::Length(1),
-        Constraint::Length(12),
-        Constraint::Length(15),
-        Constraint::Length(9),
-        Constraint::Length(15),
-        Constraint::Length(10),
-        Constraint::Min(9),
-    ];
+    let widths: Vec<Constraint> = widths.into_iter().map(Constraint::Length).collect();
     let table = Table::new(rows, widths)
         .header(header)
         .block(titled(title))
@@ -172,13 +201,27 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
         lines.push(line);
     }
     if let Some(site) = draft.network.sites.get(app.sites_selected) {
+        // Everything of the row, uncut, and what to do next.
+        let vlans = site.vlans.as_ref().map_or_else(
+            || format!("{} (the network's)", draft.network.vlans),
+            ToString::to_string,
+        );
+        let own = site
+            .own_vlans
+            .as_ref()
+            .map_or_else(String::new, |o| format!(" +own {o}"));
+        // The keys are in the bar; offline only the way back.
+        let keys = if site.online { "" } else { " (o: take online)" };
         let text = format!(
-            " {}: {}; changed by {} (Enter: details, e: edit).",
+            " {}: {}; VLANs {vlans}{own}; managed by {}{keys}",
             site.name,
             format::role(site.uplink.as_deref()),
             policy::managed_label(&draft.network, site)
         );
         lines.push(Line::styled(text, theme::dim()));
+        if let Some(why) = app.peer(&site.name).and_then(|p| p.down_reason.clone()) {
+            lines.push(Line::styled(format!(" Tunnel down: {why}"), theme::warn()));
+        }
         if let Some(trunk) = draft
             .local
             .tunnel_trunks
@@ -194,9 +237,16 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
             ));
         }
     }
-    if lines.is_empty() {
-        let marks = "+ new, * changed (not applied yet). a: review and apply the draft. Network and host settings: m, l or Settings (8).";
-        lines.push(Line::styled(format!(" {marks}"), theme::dim()));
+    if app.draft_dirty() {
+        lines.push(Line::styled(
+            " + new, * changed (not applied yet): a reviews and applies them, x discards them.",
+            theme::dim(),
+        ));
+    } else if lines.is_empty() {
+        lines.push(Line::styled(
+            " n adds a site, i invites one; m: the VLANs of the network, l: the trunk ports of this host.",
+            theme::dim(),
+        ));
     }
     lines.truncate(3);
     lines

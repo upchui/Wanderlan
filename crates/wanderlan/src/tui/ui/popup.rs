@@ -73,7 +73,7 @@ pub fn form(frame: &mut Frame, form: &Form, area: Rect) {
         Constraint::Length(popup_width),
         Constraint::Max(u16::try_from(total + 2).unwrap_or(u16::MAX)),
     );
-    frame.render_widget(Clear, popup);
+    super::clear_around(frame, popup);
     let block = titled(format!(" {} ", form.title));
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -145,7 +145,7 @@ pub fn ask(frame: &mut Frame, ask: &Ask, area: Rect) {
     let lines = format::wrap(&ask.text, 56);
     let height = u16::try_from(lines.len() + 4).unwrap_or(u16::MAX);
     let popup = area.centered(Constraint::Max(60), Constraint::Max(height));
-    frame.render_widget(Clear, popup);
+    super::clear_around(frame, popup);
     let mut text: Vec<Line> = lines
         .into_iter()
         .map(|l| Line::raw(format!(" {l}")))

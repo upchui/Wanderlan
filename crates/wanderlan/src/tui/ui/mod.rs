@@ -131,6 +131,18 @@ fn draw_body(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// Clears `popup` and one cell around it: no text of the view below
+/// touches its border.
+pub fn clear_around(frame: &mut Frame, popup: Rect) {
+    let around = Rect {
+        x: popup.x.saturating_sub(1),
+        y: popup.y.saturating_sub(1),
+        width: popup.width.saturating_add(2),
+        height: popup.height.saturating_add(2),
+    };
+    frame.render_widget(Clear, around.intersection(frame.area()));
+}
+
 /// The "daemon not reachable" screen. The TUI stays usable and retries.
 fn offline(frame: &mut Frame, app: &App, error: &str, retry_in: Option<u32>, area: Rect) {
     let journal = app.diagnosis.as_ref().map_or(&[][..], |d| &d.journal[..]);
@@ -171,7 +183,7 @@ fn offline(frame: &mut Frame, app: &App, error: &str, retry_in: Option<u32>, are
         theme::dim(),
     ));
     let block = titled(" Daemon not reachable ").border_style(theme::bad());
-    frame.render_widget(Clear, popup);
+    clear_around(frame, popup);
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
@@ -319,6 +331,16 @@ fn problems(app: &App) -> Option<(String, Style)> {
     if refused > 0 {
         warn.push(format!("{refused} refused"));
     }
+    // Tunnels that should run but do not (offline sites are meant so).
+    let down = s
+        .peers
+        .iter()
+        .filter(|p| matches!(p.port_state, PortState::Down | PortState::Missing) || !p.reachable)
+        .filter(|p| p.port_state != PortState::Offline)
+        .count();
+    if down > 0 {
+        warn.push(format!("{down} down"));
+    }
     if bad.is_empty() && warn.is_empty() {
         return None;
     }
@@ -361,7 +383,8 @@ fn status_badge(app: &App) -> Line<'static> {
                 spans.push(Span::styled(format!("{name} r{}", s.revision), theme::ok()));
             }
         }
-        Conn::Connecting | Conn::Down { .. } => spans.push(Span::styled("offline", theme::bad())),
+        // Not "offline": that is a state of a site.
+        Conn::Connecting | Conn::Down { .. } => spans.push(Span::styled("no daemon", theme::bad())),
     }
     spans.push(Span::raw(" "));
     Line::from(spans)

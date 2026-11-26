@@ -136,6 +136,35 @@ fn peer_vlans(frame: &mut Frame, app: &App, peer: &str, vlan: Option<u16>, area:
     );
 }
 
+/// Where the peer is probed (its own ports) and, without answers, what to
+/// check.
+fn probes_line(app: &App, peer: &PeerStatus) -> Line<'static> {
+    let network = app.running.as_ref().and_then(|r| r.network.as_ref());
+    let (control, tunnel) = network.map_or((0, 0), |n| {
+        (n.control_port_of(&peer.name), n.tunnel_port_of(&peer.name))
+    });
+    let mut spans = vec![
+        label("Probes"),
+        Span::raw(format!(
+            "to {} UDP/TCP {control}, tunnel UDP {tunnel}",
+            peer.address
+        )),
+    ];
+    if !peer.reachable {
+        let since = peer.last_reply_secs.map_or_else(
+            || "never answered".to_string(),
+            |s| format!("last answer {}", format::age(s)),
+        );
+        spans.push(Span::styled(
+            format!(
+                "   {since}: check the route to it and that its firewall lets these ports in (log: 5, p)"
+            ),
+            theme::warn(),
+        ));
+    }
+    Line::from(spans)
+}
+
 /// The peer's identity.
 fn identity_line(peer: &PeerStatus) -> Line<'static> {
     use wanderlan_core::api::IdentityState;
@@ -233,6 +262,7 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, vlan: Option<u16>, area: R
         ]),
         rtt_line(peer),
         quality_line(peer),
+        probes_line(app, peer),
         identity_line(peer),
         vxlan_line(peer),
         Line::from(vec![
@@ -412,8 +442,20 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, scroll: u16, area: Rect) {
             if site.online {
                 dim("   online")
             } else {
-                Span::styled("   OFFLINE", theme::warn())
+                Span::styled(
+                    "   OFFLINE (o in Sites or the Overview takes it online)",
+                    theme::warn(),
+                )
             },
+        ]),
+        // Where the other sites reach it (each site has its own ports).
+        Line::from(vec![
+            label("Ports"),
+            Span::raw(format!(
+                "control {} (UDP/TCP), tunnel {} (UDP)",
+                network.control_port_of(&site.name),
+                network.tunnel_port_of(&site.name)
+            )),
         ]),
         Line::from(vec![
             label("Identity"),
@@ -543,7 +585,7 @@ pub fn invites(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
     let height = u16::try_from(rows + 4 + below).unwrap_or(u16::MAX);
     // Wider than the other windows: the rules of an invitation can be long.
     let popup = area.centered(Constraint::Max(100), Constraint::Max(height));
-    frame.render_widget(Clear, popup);
+    super::clear_around(frame, popup);
     let block = titled(" Open invitations ");
     let inner = block.inner(popup);
     frame.render_widget(block, popup);

@@ -384,10 +384,20 @@ impl Validator {
             } else {
                 String::new()
             };
+            // A direct tunnel whose limit leaves these VLANs out: that
+            // limit is the fix.
+            let fix = match network.tunnel_limit(&a, &b) {
+                Some(limit) if crate::topology::tunnel_vlans(network, &a, &b).is_some() => {
+                    format!(
+                        "the limit of their direct tunnel ({limit}) leaves them out; add them to it or break the ring"
+                    )
+                }
+                _ => "give them their direct tunnel or break the ring".to_string(),
+            };
             self.warning(
                 FieldPath::network("forwarding"),
                 format!(
-                    "VLANs {vlans}: \"{a}\" and \"{b}\" do not reach each other{more}: their tunnels form a ring, which no site passes on; give them their direct tunnel or break the ring"
+                    "VLANs {vlans}: \"{a}\" and \"{b}\" do not reach each other{more}: their tunnels form a ring, which no site passes on; {fix}"
                 ),
             );
         }

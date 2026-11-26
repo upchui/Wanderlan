@@ -662,6 +662,8 @@ pub struct App {
     /// The review waits for a change from a peer or a join to settle,
     /// then applies.
     apply_when_settled: bool,
+    /// A join to this site ended; the next configuration tells how.
+    join_ended: Option<String>,
     wizard_offered: bool,
     in_flight: InFlight,
     seen: Option<(u64, String, bool, SiteState)>,
@@ -715,6 +717,7 @@ impl App {
             applied_draft: None,
             restore_draft: None,
             apply_when_settled: false,
+            join_ended: None,
             wizard_offered: false,
             in_flight: InFlight::default(),
             seen: None,
@@ -1143,8 +1146,15 @@ impl App {
             self.seen = Some(seen);
         }
         let had_pending = self.pending().is_some();
-        if had_pending && status.pending.is_none() && self.busy.is_none() {
-            self.on_pending_ended(status.state, fx);
+        if had_pending && status.pending.is_none() {
+            // A join ended: whether the site is there the configuration
+            // tells (requested with the status change).
+            if let Some(ChangeSource::Join { site }) = self.pending().map(|p| p.source.clone()) {
+                self.join_ended = Some(site);
+            }
+            if self.busy.is_none() {
+                self.on_pending_ended(status.state, fx);
+            }
         }
         if status.invites == 0 {
             self.invitation = None;
@@ -1299,6 +1309,27 @@ impl App {
             self.refresh_review();
         }
         self.apply_if_settled(fx);
+        if let Some(site) = self.join_ended.take() {
+            let joined = self
+                .running
+                .as_ref()
+                .and_then(|r| r.network.as_ref())
+                .and_then(|n| n.site(&site))
+                .map(|s| s.online);
+            match joined {
+                Some(false) => self.say(
+                    MessageKind::Success,
+                    format!(
+                        "{site} joined. It starts offline: o on it in the Overview takes it online (then Enter and c)."
+                    ),
+                ),
+                Some(true) => self.say(MessageKind::Success, format!("{site} joined.")),
+                None => self.say(
+                    MessageKind::Info,
+                    format!("The join of {site} did not complete (it did not answer in time); its code works again."),
+                ),
+            }
+        }
         if configured && std::mem::take(&mut self.invite_after_setup) {
             self.modal = None;
             self.invite();
@@ -1711,7 +1742,7 @@ impl App {
         self.say(
             MessageKind::Success,
             format!(
-                "Joined via {via} as {site} ({} sites); confirmed automatically as soon as {via} answers. {site} starts offline: its tunnel stays down until {via} takes it online (there: Sites (2), select {site}, o, then a).",
+                "Joined via {via} as {site} ({} sites); confirmed automatically as soon as {via} answers. {site} starts offline: its tunnel stays down until {via} takes it online (there: o on {site} in the Overview, then Enter and c).",
                 joined.sites,
                 via = joined.via,
                 site = joined.site,
@@ -2129,7 +2160,12 @@ impl App {
                     self.set_view(view, fx);
                 }
             }
-            KeyCode::Char('?') => self.modal = Some(Modal::Help { scroll: 0 }),
+            // At the section of this view; Up and Home lead to the rest.
+            KeyCode::Char('?') => {
+                self.modal = Some(Modal::Help {
+                    scroll: super::help::section_line(self.view),
+                });
+            }
             KeyCode::Char('M') => self.modal = Some(Modal::Messages { scroll: 0 }),
             KeyCode::Char('q') => self.request_quit(fx),
             KeyCode::Char('a') => self.open_review(),
@@ -2823,8 +2859,8 @@ impl App {
                     self.say(
                         MessageKind::Info,
                         format!(
-                            "VLAN mapping {} {} = shared {} removed from the draft.",
-                            map.site, map.local, map.shared
+                            "The mapping of {} (source VLAN {} = mapped VLAN {}) is removed from the draft.",
+                            map.site, map.shared, map.local
                         ),
                     );
                 }
@@ -3051,6 +3087,36 @@ impl App {
                     None => self.say(MessageKind::Info, "No trunk port is blocked."),
                 }
             }
+            // A site of the list online or offline: straight to the review.
+            KeyCode::Char('o') => {
+                let name = self
+                    .overview_sites()
+                    .get(self.overview_selected.saturating_sub(peers))
+                    .filter(|_| self.overview_selected >= peers)
+                    .map(|s| s.name.clone());
+                let index = name.as_ref().and_then(|n| {
+                    self.draft
+                        .as_ref()?
+                        .network
+                        .sites
+                        .iter()
+                        .position(|s| s.name == *n)
+                });
+                match index {
+                    Some(i) => {
+                        let before = self.draft.clone();
+                        self.sites_selected = i;
+                        self.toggle_online();
+                        if self.draft != before {
+                            self.open_review();
+                        }
+                    }
+                    None => self.say(
+                        MessageKind::Info,
+                        "Select a site of the network list (below the peers).",
+                    ),
+                }
+            }
             KeyCode::Char('p') if self.is_connected() => {
                 fx.push(Effect::Request(Request::ProbeNow));
             }
@@ -3165,7 +3231,7 @@ impl App {
                         let Some(draft) = &self.draft else { return };
                         // This host only: local.toml or its own ports.
                         let mut form = match row.scope {
-                            Scope::Local => Form::local(draft),
+                            Scope::Local => Form::local(draft, row.key),
                             Scope::OwnSite => Form::own_ports(draft),
                         };
                         form.focus_on(row.key);
@@ -3445,8 +3511,8 @@ impl App {
                     self.modal = Some(Modal::Ask(Ask {
                         title: "Delete VLAN mapping".into(),
                         text: format!(
-                            "Remove the VLAN mapping of {}: {} on its trunk = shared VLAN {}?",
-                            map.site, map.local, map.shared
+                            "Remove the mapping of {}: source VLAN {} = mapped VLAN {} on its trunk?",
+                            map.site, map.shared, map.local
                         ),
                         action: AskAction::DeleteMap(map.clone()),
                     }));

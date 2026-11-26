@@ -148,10 +148,11 @@ pub fn managers(network: &Network, site: &Site) -> String {
     }
 }
 
-/// Short form for tables: `anyone`, `a`, `a+self`.
+/// Short form for tables: `nobody` (every server may change it), `a`,
+/// `a+self`.
 pub fn managed_label(network: &Network, site: &Site) -> String {
     match (manager(network, site), site.self_managed) {
-        (None, _) => "anyone".into(),
+        (None, _) => "nobody".into(),
         (Some(m), false) => m.to_string(),
         (Some(m), true) => format!("{m}+self"),
     }
@@ -562,7 +563,7 @@ mod tests {
     #[test]
     fn labels_and_messages() {
         let m = network();
-        assert_eq!(managed_label(&m, &m.sites[0]), "anyone");
+        assert_eq!(managed_label(&m, &m.sites[0]), "nobody");
         assert_eq!(managed_label(&m, &m.sites[2]), "a");
         assert_eq!(managed_label(&m, &m.sites[3]), "a+self");
         assert!(why_not(&m, &m.sites[0], "c", "change").contains("make the change on \"a\""));
