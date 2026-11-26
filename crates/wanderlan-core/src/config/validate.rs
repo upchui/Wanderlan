@@ -160,7 +160,7 @@ impl Validator {
 
     fn sites(&mut self, network: &Network) {
         if network.sites.is_empty() {
-            self.error(FieldPath::root(), "network.toml defines no [[site]]");
+            self.error(FieldPath::root(), "network.toml defines no site");
             return;
         }
         let mut names: BTreeMap<&str, usize> = BTreeMap::new();

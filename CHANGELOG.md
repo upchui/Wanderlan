@@ -35,17 +35,20 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
   the same one once both have an identity (a server with two clients
   `c1`); where a name is not unique the UI shows `c1#Ab3dK9xQ`, and the
   command line takes that form, an identity, or a name only one site has.
-- The files are converted when the daemon starts (the old one is kept as
-  `network.toml.v1`/`.v2`); the new form is written once every site has an
-  identity, until then the one with names. Older forms are read forever,
-  and references by name still work in files edited by hand.
+- The daemon writes and sends only this form, also for a site without a
+  box yet (a placeholder that follows its name, marked with a comment).
+  Names are for people: in a file edited by hand a site may be named by its
+  name (`server = "hq"`, `self = "hq"`, a new site as `[site.hq]`), and
+  the older forms are read; the daemon replaces the names with the
+  identities when it loads (also on `systemctl reload`) or applies the
+  file and writes it back (the old file is kept as `network.toml.v1`/`.v2`).
 - Tunnels are named by the identity of the peer (`vx` and 13 characters,
   alias `wanderlan <site>` in `ip link`): after the update every tunnel is
   built anew once (a few seconds), afterwards a rename keeps it up. The
   sets of the clients behind NAT are named by their tunnels.
-- The sites exchange the network in the old form as long as every name in
-  it is unique: older sites keep working with newer ones until two sites
-  share a name; after that they get no changes until they are updated.
+- The sites exchange the network in this form only: **update all sites**.
+  Until then the older ones get no changes, and a newer site asks an older
+  one for the same network every 30 s (their fingerprints differ).
 - `wanderlan vlan` shows a tunnel by the site it leads to.
 
 ### Fixes, third review

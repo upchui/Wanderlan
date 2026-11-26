@@ -1,16 +1,11 @@
 //! Canonical TOML rendering of the configuration.
 //!
-//! The forms of `network.toml`, all canonical (the same network always gives
-//! the same bytes):
-//! * [`render_network`]: what the daemon writes to disk, what the TUI and
-//!   the CLI show and send. Format 3 (sites by identity) once every site has
-//!   an identity of its own or two sites share a name, else format 2.
-//! * [`render_network_wire`]: what the sites send each other and what the
-//!   fingerprint of the sync is computed over. Format 1 as long as the
-//!   network can be written with names alone (older sites read only that);
-//!   it never changes, so that sites of different versions keep
-//!   understanding each other and see the same network as the same. Format
-//!   3 otherwise.
+//! `network.toml` has one form, canonical (the same network always gives the
+//! same bytes): every site in a table named by its identity, with its name
+//! inside, and every reference an identity (the name in a comment). Names
+//! are for people: the daemon writes, sends and fingerprints only this
+//! form; files written by hand may name sites by their names (and older
+//! forms are read), they are written back in this form.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -24,24 +19,6 @@ const NETWORK_HEADER: &str = "\
 # wanderlan network configuration, shared by all sites.
 # This file is kept identical on all sites by the wanderlan daemon.
 # Change it with the `wanderlan` TUI or edit it and run `wanderlan apply`.
-";
-
-const NETWORK_HEADER_2: &str = "\
-# wanderlan network configuration, shared by all sites.
-# This file is kept identical on all sites by the wanderlan daemon.
-# Change it with the `wanderlan` TUI or edit it and run `wanderlan apply`.
-#
-# [site.<name>]: `server` is the site it is a client of (none: a server);
-# map = { <source VLAN> = <VLAN on its trunk, or \"native\"> };
-# tunnel_vlans = { <other site> = <the most that tunnel carries> };
-# breakout = { <VLAN> = { uplink = <interface>, except = [<networks>] } }:
-# at a client, the public destinations of the VLAN leave through its own uplink.
-";
-
-const NETWORK_HEADER_3: &str = "\
-# wanderlan network configuration, shared by all sites.
-# This file is kept identical on all sites by the wanderlan daemon.
-# Change it with the `wanderlan` TUI or edit it and run `wanderlan apply`.
 #
 # [site.\"<identity>\"]: a site, `name` is what it is called (several sites
 # may have the same name); every other site is referred to by its identity.
@@ -50,6 +27,8 @@ const NETWORK_HEADER_3: &str = "\
 # tunnel_vlans = { \"<other site>\" = <the most that tunnel carries> };
 # breakout = { <VLAN> = { uplink = <interface>, except = [<networks>] } }:
 # at a client, the public destinations of the VLAN leave through its own uplink.
+# By hand a site may be named by its name instead (`server = \"hq\"`, a new
+# site as [site.hq]): the daemon writes it back with the identities.
 ";
 
 const LOCAL_HEADER: &str = "\
@@ -64,49 +43,7 @@ fn duration(d: Duration) -> String {
     quote(&humantime::format_duration(d).to_string())
 }
 
-/// True if `network` can be written in format 1 or 2, with names: no two
-/// sites share a name, every site without an identity of its own has the
-/// one of its name, and every reference names a site of the network or a
-/// site it does not have by a name none of its sites has.
-pub fn expressible_by_names(network: &Network) -> bool {
-    if !network.names_unique() {
-        return false;
-    }
-    if network
-        .sites
-        .iter()
-        .any(|s| !s.has_identity() && s.id != SiteId::provisional(&s.name))
-    {
-        return false;
-    }
-    let fine = |id: SiteId| {
-        network.site(id).is_some()
-            || id
-                .provisional_name()
-                .is_some_and(|name| network.named(name).next().is_none())
-    };
-    network
-        .sites
-        .iter()
-        .flat_map(|s| s.uplink.iter().chain(s.managed_by.iter()))
-        .chain(network.maps.iter().map(|m| &m.site))
-        .chain(network.tunnels.iter().flat_map(|t| t.sites.iter()))
-        .all(|id| fine(*id))
-}
-
-/// A site as a reference in format 1 or 2: its name; a site the network
-/// does not have by the name of its provisional identity, else by its
-/// identity.
-fn named(network: &Network, id: SiteId) -> String {
-    match network.site(id) {
-        Some(site) => site.name.clone(),
-        None => id
-            .provisional_name()
-            .map_or_else(|| id.to_string(), str::to_string),
-    }
-}
-
-/// The site that holds the limit of a tunnel in formats 2 and 3: the client
+/// The site that holds the limit of a tunnel (in its table): the client
 /// of the tunnel, between two servers the one listed first, never a site
 /// that is not in the list.
 fn holder(network: &Network, tunnel: &TunnelVlans) -> SiteId {
@@ -126,89 +63,21 @@ fn holder(network: &Network, tunnel: &TunnelVlans) -> SiteId {
     }
 }
 
-/// The format `network.toml` is written in: 3 once every site has an
-/// identity of its own (or two share a name), else (also without sites) 2.
-pub fn disk_format(network: &Network) -> u8 {
-    if !network.sites.is_empty() && (network.all_identified() || !network.names_unique()) {
-        3
-    } else {
-        2
-    }
-}
-
-/// Renders `network.toml` as it is written to disk (see [`disk_format`]).
+/// Renders `network.toml` as the daemon writes it to disk, as the TUI and
+/// the CLI show and send it.
 pub fn render_network(network: &Network) -> String {
-    if disk_format(network) == 3 {
-        render_network_3(network, true)
-    } else {
-        render_network_2(network)
-    }
+    render_form(network, true)
 }
 
-/// Renders `network.toml` in format 2.
-fn render_network_2(network: &Network) -> String {
-    let mut out = String::from(NETWORK_HEADER_2);
-    network_section(&mut out, network, true);
-    let holders: Vec<SiteId> = network.tunnels.iter().map(|t| holder(network, t)).collect();
-    let mut owners: Vec<SiteId> = network.sites.iter().map(|s| s.id).collect();
-    // A mapping or limit of a site that is not in the list (a draft with an
-    // error) still gets written, in a table of its own.
-    for id in network
-        .maps
-        .iter()
-        .map(|m| m.site)
-        .chain(holders.iter().copied())
-    {
-        if !owners.contains(&id) {
-            owners.push(id);
-        }
-    }
-    let mut written = std::collections::BTreeSet::new();
-    for id in owners {
-        let name = named(network, id);
-        // Each name once (a draft can list a site twice).
-        if !written.insert(name.clone()) {
-            continue;
-        }
-        let _ = writeln!(out, "\n[site.{}]", key(&name));
-        if let Some(site) = network.site(id) {
-            let _ = writeln!(out, "address = {}", quote(&site.address.to_string()));
-            if let Some(id) = site.own_id() {
-                let _ = writeln!(out, "id = {}", quote(&id.to_string()));
-            }
-            if let Some(up) = site.uplink {
-                let _ = writeln!(out, "server = {}", quote(&named(network, up)));
-            }
-            if let Some(by) = site.managed_by {
-                let _ = writeln!(out, "managed_by = {}", quote(&named(network, by)));
-            }
-            site_rules(&mut out, network, site);
-        }
-        site_maps(&mut out, network, id);
-        let limits: Vec<String> = network
-            .tunnels
-            .iter()
-            .zip(&holders)
-            .filter(|(_, h)| **h == id)
-            .map(|(t, _)| {
-                format!(
-                    "{} = {}",
-                    key(&named(network, t.other(id))),
-                    quote(&limit_text(t))
-                )
-            })
-            .collect();
-        if !limits.is_empty() {
-            let _ = writeln!(out, "tunnel_vlans = {{ {} }}", limits.join(", "));
-        }
-    }
-    out
+/// Renders `network.toml` as the sites exchange it (the same form).
+pub fn render_network_wire(network: &Network) -> String {
+    render_form(network, true)
 }
 
-/// Renders `network.toml` in format 3: the sites by their identity, every
-/// reference an identity (with the name as a comment where `comments`).
-fn render_network_3(network: &Network, with_revision: bool) -> String {
-    let mut out = String::from(NETWORK_HEADER_3);
+/// The form of `network.toml`: the sites by their identity, every
+/// reference an identity with the name as a comment.
+fn render_form(network: &Network, with_revision: bool) -> String {
+    let mut out = String::from(NETWORK_HEADER);
     network_section(&mut out, network, with_revision);
     let holders: Vec<SiteId> = network.tunnels.iter().map(|t| holder(network, t)).collect();
     let mut owners: Vec<SiteId> = network.sites.iter().map(|s| s.id).collect();
@@ -227,8 +96,15 @@ fn render_network_3(network: &Network, with_revision: bool) -> String {
         if !written.insert(id) {
             continue;
         }
-        let _ = writeln!(out, "\n[site.{}]", quote(&id.to_string()));
-        if let Some(site) = network.site(id) {
+        let site = network.site(id);
+        // A placeholder until a box joins as the site (it has no key).
+        let placeholder = if site.is_some_and(|s| !s.has_identity()) {
+            "  # no box has joined as this site yet"
+        } else {
+            ""
+        };
+        let _ = writeln!(out, "\n[site.{}]{placeholder}", quote(&id.to_string()));
+        if let Some(site) = site {
             let _ = writeln!(out, "name = {}", quote(&site.name));
             let _ = writeln!(out, "address = {}", quote(&site.address.to_string()));
             if let Some(up) = site.uplink {
@@ -305,7 +181,7 @@ fn network_section(out: &mut String, network: &Network, with_revision: bool) {
     }
 }
 
-/// The rules of a site in formats 2 and 3, after its references.
+/// The rules of a site, after its references.
 fn site_rules(out: &mut String, network: &Network, site: &super::model::Site) {
     let _ = network;
     if site.self_managed {
@@ -326,7 +202,7 @@ fn site_rules(out: &mut String, network: &Network, site: &super::model::Site) {
     out.push_str(&ports_lines(site.ports));
 }
 
-/// `map = { .. }` of a site in formats 2 and 3.
+/// `map = { .. }` of a site.
 fn site_maps(out: &mut String, network: &Network, id: SiteId) {
     let maps: Vec<String> = network
         .maps_of(id)
@@ -347,96 +223,6 @@ fn limit_text(tunnel: &TunnelVlans) -> String {
     } else {
         tunnel.vlans.to_string()
     }
-}
-
-/// Renders `network.toml` as the sites exchange it: format 1, kept byte for
-/// byte as wanderlan 1.0 wrote it, as long as the network can be written
-/// with names ([`expressible_by_names`]): older sites read only that, and
-/// [`fingerprint`] hashes it. Format 3 otherwise.
-pub fn render_network_wire(network: &Network) -> String {
-    if expressible_by_names(network) {
-        render_network_1(network, true)
-    } else {
-        render_network_3(network, true)
-    }
-}
-
-/// A site name as a TOML key: bare where it can be, otherwise quoted.
-fn key(name: &str) -> String {
-    if !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        name.to_string()
-    } else {
-        quote(name)
-    }
-}
-
-/// Format 1: `[[site]]`, `[[map]]` and `[[tunnel]]`, references by name.
-fn render_network_1(network: &Network, with_revision: bool) -> String {
-    let mut out = String::from(NETWORK_HEADER);
-    network_section(&mut out, network, with_revision);
-    for site in &network.sites {
-        out.push_str("\n[[site]]\n");
-        let _ = writeln!(out, "name = {}", quote(&site.name));
-        let _ = writeln!(out, "address = {}", quote(&site.address.to_string()));
-        if let Some(id) = site.own_id() {
-            let _ = writeln!(out, "id = {}", quote(&id.to_string()));
-        }
-        if let Some(vlans) = &site.vlans {
-            let _ = writeln!(out, "vlans = {}", quote(&vlans.to_string()));
-        }
-        if let Some(own) = site.own_vlans.as_ref().filter(|v| !v.is_empty()) {
-            let _ = writeln!(out, "own_vlans = {}", quote(&own.to_string()));
-        }
-        if !site.online {
-            out.push_str("online = false\n");
-        }
-        if let Some(by) = site.managed_by {
-            let _ = writeln!(out, "managed_by = {}", quote(&named(network, by)));
-        }
-        if site.self_managed {
-            out.push_str("self_managed = true\n");
-        }
-        // Only where it is set: networks without a breakout keep the form
-        // (and the fingerprint) older sites know.
-        if let Some(line) = breakout_line(&site.breakout) {
-            out.push_str(&line);
-        }
-        // Only where set: older sites know the form without them.
-        out.push_str(&ports_lines(site.ports));
-        match site.uplink {
-            Some(up) => {
-                let _ = writeln!(out, "uplink = {}", quote(&named(network, up)));
-            }
-            // A server with a manager says so, otherwise it would be read
-            // as a client of its manager (configurations before uplinks).
-            None if site.managed_by.is_some() => out.push_str("uplink = \"\"\n"),
-            None => {}
-        }
-    }
-    for map in &network.maps {
-        out.push_str("\n[[map]]\n");
-        let _ = writeln!(out, "site = {}", quote(&named(network, map.site)));
-        match map.local {
-            LocalVid::Native => out.push_str("local = \"native\"\n"),
-            LocalVid::Vid(v) => {
-                let _ = writeln!(out, "local = {v}");
-            }
-        }
-        let _ = writeln!(out, "shared = {}", map.shared);
-    }
-    for tunnel in &network.tunnels {
-        out.push_str("\n[[tunnel]]\n");
-        // The smaller name first, as 1.0 wrote it.
-        let [a, b] = tunnel.sites.map(|id| named(network, id));
-        let (a, b) = if a <= b { (a, b) } else { (b, a) };
-        let _ = writeln!(out, "between = [{}, {}]", quote(&a), quote(&b));
-        let _ = writeln!(out, "vlans = {}", quote(&limit_text(tunnel)));
-    }
-    out
 }
 
 /// `breakout = { 10 = {}, 20 = { uplink = "ens20", except = [..] } }`, or
@@ -536,7 +322,7 @@ fn ports(ports: &[String]) -> String {
 }
 
 /// SHA-256 over the canonical network form without the revision, hex
-/// encoded: format 1 where the sites exchange that, else format 3.
+/// encoded.
 ///
 /// Two networks with the same content have the same fingerprint regardless of
 /// their revision counter, of formatting or comments in the source file and
@@ -544,11 +330,7 @@ fn ports(ports: &[String]) -> String {
 pub fn fingerprint(network: &Network) -> String {
     let mut canonical = network.clone();
     canonical.canonicalize();
-    let text = if expressible_by_names(&canonical) {
-        render_network_1(&canonical, false)
-    } else {
-        render_network_3(&canonical, false)
-    };
+    let text = render_form(&canonical, false);
     hex(&Sha256::digest(text.as_bytes()))
 }
 

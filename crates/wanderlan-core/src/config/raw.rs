@@ -5,22 +5,22 @@
 //! rejected to catch typos.
 //!
 //! `network.toml` comes in three formats with the same model:
-//! * format 3: `[site."<identity>"]` tables with the site's `name` inside;
-//!   every reference to a site (`server`, `managed_by`, `tunnel_vlans`) is
-//!   its identity, so several sites may have the same name. Written once
-//!   every site has an identity of its own.
-//! * format 2 (written since 1.0.21): `[site.<name>]` tables with the
-//!   mappings (`map = { <source VLAN> = <VLAN on the trunk> }`) and tunnel
-//!   limits (`tunnel_vlans = { <site> = "<VLANs>" }`) inside the site;
-//!   references are names.
+//! * format 3, the one the daemon writes and the sites exchange:
+//!   `[site."<identity>"]` tables with the site's `name` inside; every
+//!   reference to a site (`server`, `managed_by`, `tunnel_vlans`) is its
+//!   identity, so several sites may have the same name. A site without a
+//!   box yet has a placeholder ([`SiteId::provisional`]) that follows its
+//!   name.
+//! * format 2 (written by 1.0.21 and later): `[site.<name>]` tables with
+//!   the mappings and tunnel limits inside the site; references are names.
 //! * format 1: `[[site]]`, `[[map]]` and `[[tunnel]]` arrays, references
-//!   are names. The sites exchange the network in this format as long as no
-//!   two sites share a name (see `render_network_wire`), so it is read
-//!   forever.
+//!   are names.
 //!
-//! A reference may always be an identity or a name; a name no site of the
-//! file has stands for its provisional identity
-//! ([`SiteId::provisional`]), which keeps the name.
+//! Names are for people: written by hand, a file may name a site by its
+//! name anywhere (also as the key of a new site, next to tables named by
+//! identities); older versions wrote formats 1 and 2. All of it is read,
+//! and written back in format 3. A name no site of the file has stands for
+//! its provisional identity, which keeps the name.
 
 use std::net::Ipv4Addr;
 use std::ops::Range;
@@ -534,6 +534,18 @@ fn link(
             vlans: t.vlans,
         });
     }
+    // A site without a box that was renamed by hand: its placeholder
+    // follows its name, with every reference to it (two such sites with
+    // one name are reported above).
+    let renamed: Vec<(SiteId, SiteId)> = network
+        .sites
+        .iter()
+        .filter(|s| s.id.is_provisional() && s.id != SiteId::provisional(&s.name))
+        .map(|s| (s.id, SiteId::provisional(&s.name)))
+        .collect();
+    for (old, new) in renamed {
+        network.rekey(old, new);
+    }
 }
 
 /// Format 1: `[[site]]` is an array, or there are only `[[map]]` or
@@ -649,7 +661,7 @@ fn parse_network_2(
             lw.error(
                 path,
                 format!(
-                    "[[{key}]] belongs to the older format of this file; write it into its site instead, e.g. {example} under [site.<name>]"
+                    "[[{key}]] belongs to an older format of this file; write it into the table of its site instead, e.g. {example}"
                 ),
             );
         }
@@ -1078,19 +1090,10 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, SiteRefs
                 None
             }
         });
-    // A provisional identity only as the one of its name (format 3 names a
-    // site of an older version so).
-    let provisional = name.as_deref().map(SiteId::provisional);
+    // A placeholder of a site without a box follows its name (see `link`).
     let id = match id_text.map(|text| (text.parse::<SiteId>(), text)) {
         None => Some(None),
-        Some((Ok(id), _)) if !id.is_provisional() || Some(id) == provisional => Some(Some(id)),
-        Some((Ok(_), text)) => {
-            lw.error(
-                id_path,
-                format!("{label}: id \"{text}\" is not the key of a box"),
-            );
-            None
-        }
+        Some((Ok(id), _)) => Some(Some(id)),
         Some((Err(e), text)) => {
             lw.error(id_path, format!("{label}: id \"{text}\" is {e}"));
             None

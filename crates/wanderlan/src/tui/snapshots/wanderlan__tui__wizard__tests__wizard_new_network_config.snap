@@ -1,16 +1,21 @@
 ---
 source: crates/wanderlan/src/tui/wizard.rs
+assertion_line: 591
 expression: render_network(&network)
 ---
 # wanderlan network configuration, shared by all sites.
 # This file is kept identical on all sites by the wanderlan daemon.
 # Change it with the `wanderlan` TUI or edit it and run `wanderlan apply`.
 #
-# [site.<name>]: `server` is the site it is a client of (none: a server);
+# [site."<identity>"]: a site, `name` is what it is called (several sites
+# may have the same name); every other site is referred to by its identity.
+# `server` is the site it is a client of (none: a server);
 # map = { <source VLAN> = <VLAN on its trunk, or "native"> };
-# tunnel_vlans = { <other site> = <the most that tunnel carries> };
+# tunnel_vlans = { "<other site>" = <the most that tunnel carries> };
 # breakout = { <VLAN> = { uplink = <interface>, except = [<networks>] } }:
 # at a client, the public destinations of the VLAN leave through its own uplink.
+# By hand a site may be named by its name instead (`server = "hq"`, a new
+# site as [site.hq]): the daemon writes it back with the identities.
 
 [network]
 revision = 0
@@ -19,5 +24,6 @@ control_port = 51821
 mtu_probe_interval = "5m"
 commit_timeout = "1m"
 
-[site.heim]
+[site."d2FuZGVybAAEaGVpbQAAAAAAAAAAAAAAAAAAAAAAAAA="]  # no box has joined as this site yet
+name = "heim"
 address = "10.8.0.1"

@@ -499,21 +499,28 @@ fn uplinks_make_clients_and_old_configurations_are_migrated() {
     assert_eq!(network.by_name("alex").unwrap().uplink, None);
     // Written explicitly from now on; the canonical form reads back the same.
     let text = render_network(&network);
-    assert_eq!(text.matches("server = \"alex\"").count(), 2, "{text}");
+    let alex = pid("alex");
+    assert_eq!(
+        text.matches(&format!("server = \"{alex}\"  # alex"))
+            .count(),
+        2,
+        "{text}"
+    );
     assert_eq!(parse_network(&text).unwrap().network.unwrap(), network);
-    // A server with a manager stays a server: no `server` in format 2,
-    // `uplink = ""` in the form the sites exchange.
+    // A server with a manager stays a server: no `server`, in the file and
+    // in the form the sites exchange.
     let mut server = network.clone();
     server.sites[1].uplink = None;
     let text = render_network(&server);
+    let marcel = pid("marcel");
     assert!(
-        text.contains("[site.marcel]\naddress = \"10.0.10.5\"\nmanaged_by = \"alex\"\n"),
+        text.contains(&format!(
+            "[site.\"{marcel}\"]  # no box has joined as this site yet\nname = \"marcel\"\naddress = \"10.0.10.5\"\nmanaged_by = \"{alex}\"  # alex\n"
+        )),
         "{text}"
     );
     assert_eq!(parse_network(&text).unwrap().network.unwrap(), server);
-    let wire = crate::config::render_network_wire(&server);
-    assert!(wire.contains("uplink = \"\""), "{wire}");
-    assert_eq!(parse_network(&wire).unwrap().network.unwrap(), server);
+    assert_eq!(crate::config::render_network_wire(&server), text);
 }
 
 #[test]
@@ -647,16 +654,15 @@ fn tunnel_limits_are_read_written_and_checked() {
     // Three servers: both limits at heim, the first of them.
     let text = render_network(&cfg.network);
     assert!(
-        text.contains("tunnel_vlans = { buero = \"20-30\", haus2 = \"none\" }\n"),
+        text.contains(&format!(
+            "tunnel_vlans = {{ \"{}\" = \"20-30\", \"{}\" = \"none\" }}  # buero, haus2\n",
+            pid("buero"),
+            pid("haus2")
+        )),
         "{text}"
     );
     let again = parse_network(&text).unwrap().network.unwrap();
     assert_eq!(again.tunnels, cfg.network.tunnels);
-    let wire = crate::config::render_network_wire(&cfg.network);
-    assert!(
-        wire.contains("[[tunnel]]\nbetween = [\"buero\", \"heim\"]\nvlans = \"20-30\"\n"),
-        "{wire}"
-    );
     assert_ne!(
         fingerprint(&again),
         fingerprint(&Network {
@@ -777,7 +783,13 @@ fn a_trunk_port_belongs_to_one_segment() {
     );
 }
 
-// Format 2: `[site.<name>]` with `map` and `tunnel_vlans` inside.
+// Format 2: `[site.<name>]` with `map` and `tunnel_vlans` inside, as
+// people write it (and older versions did).
+
+/// The placeholder of a site without a box, as written.
+fn pid(name: &str) -> String {
+    crate::identity::SiteId::provisional(name).to_string()
+}
 
 const EXAMPLE_NETWORK_2: &str = include_str!("../../../../../packaging/examples/network.toml");
 
@@ -800,52 +812,65 @@ fn both_formats_describe_the_same_network() {
 }
 
 #[test]
-fn format_2_is_written_and_read_back() {
+fn names_by_hand_are_written_back_with_identities() {
     let network = parse_network(EXAMPLE_NETWORK_2).unwrap().network.unwrap();
     let text = render_network(&network);
     assert!(
-        text.contains(
-            "\n[site.haus3]\naddress = \"10.8.0.12\"\nmap = { 20 = \"native\", 30 = 130 }\n"
-        ),
+        text.contains(&format!(
+            "\n[site.\"{}\"]  # no box has joined as this site yet\nname = \"haus3\"\naddress = \"10.8.0.12\"\nmap = {{ 20 = \"native\", 30 = 130 }}\n",
+            pid("haus3")
+        )),
         "{text}"
     );
     assert!(
-        !text.contains("[[site]]") && !text.contains("[[map]]"),
+        !text.contains("[[site]]") && !text.contains("[site.haus3]"),
         "{text}"
     );
     let again = parse_network(&text).unwrap();
-    assert!(!again.old_format());
+    assert_eq!(again.format, 3);
     assert_eq!(again.network.as_ref(), Some(&network));
     assert_eq!(render_network(&network), text, "canonical");
 }
 
-/// The form the sites send each other, and its fingerprint: exactly what
-/// wanderlan 1.0 sent. If this changes, sites of different versions no
-/// longer see the same network as the same.
+/// The sites exchange the form of the file, and its fingerprint is the
+/// same on every site whatever the revision.
 #[test]
-fn the_wire_form_never_changes() {
+fn the_sites_exchange_the_form_of_the_file() {
     let network = parse_network(EXAMPLE_NETWORK_2).unwrap().network.unwrap();
     let wire = crate::config::render_network_wire(&network);
-    assert_eq!(
-        wire,
-        "# wanderlan network configuration, shared by all sites.\n\
-         # This file is kept identical on all sites by the wanderlan daemon.\n\
-         # Change it with the `wanderlan` TUI or edit it and run `wanderlan apply`.\n\
-         \n[network]\nrevision = 0\nvlans = \"10-50\"\ncontrol_port = 51821\n\
-         mtu_probe_interval = \"5m\"\ncommit_timeout = \"1m\"\n\
-         \n[[site]]\nname = \"heim\"\naddress = \"10.8.0.1\"\n\
-         \n[[site]]\nname = \"buero\"\naddress = \"10.8.0.2\"\n\
-         \n[[site]]\nname = \"haus2\"\naddress = \"10.8.0.11\"\nvlans = \"20,30\"\n\
-         \n[[site]]\nname = \"haus3\"\naddress = \"10.8.0.12\"\n\
-         \n[[map]]\nsite = \"haus3\"\nlocal = \"native\"\nshared = 20\n\
-         \n[[map]]\nsite = \"haus3\"\nlocal = 130\nshared = 30\n"
+    assert_eq!(wire, render_network(&network));
+    assert_eq!(parse_network(&wire).unwrap().format, 3);
+    let newer = Network {
+        revision: network.revision + 1,
+        ..network.clone()
+    };
+    assert_eq!(fingerprint(&network), fingerprint(&newer));
+}
+
+#[test]
+fn a_site_without_a_box_renamed_by_hand_keeps_its_references() {
+    let text = edit(
+        EXAMPLE_NETWORK_2,
+        "[site.haus2]\naddress = \"10.8.0.11\"\n",
+        "[site.haus2]\naddress = \"10.8.0.11\"\nserver = \"heim\"\n",
     );
-    assert_eq!(
-        fingerprint(&network),
-        "8bafc5da21a7724f3687059252586b7ce8751c9a463d6831eefdeaaa260b76cf"
+    let network = parse_network(&text).unwrap().network.unwrap();
+    let written = render_network(&network);
+    // Only the name changes, the placeholder of heim stays in the file.
+    let renamed = edit(&written, "name = \"heim\"", "name = \"home\"");
+    let again = parse_network(&renamed).unwrap().network.unwrap();
+    let home = again.by_name("home").expect("renamed");
+    assert_eq!(home.id, crate::identity::SiteId::provisional("home"));
+    assert_eq!(again.by_name("haus2").unwrap().uplink, Some(home.id));
+    // Two sites without a box under one name are refused.
+    let twice = edit(&written, "name = \"heim\"", "name = \"buero\"");
+    assert!(
+        parse_network(&twice)
+            .unwrap_err()
+            .iter()
+            .any(|d| d.message.contains("defined twice")),
+        "{twice}"
     );
-    // And older sites read it: format 1.
-    assert!(parse_network(&wire).unwrap().old_format());
 }
 
 #[test]
@@ -890,13 +915,15 @@ fn server_and_tunnel_limits_in_format_2() {
     );
     // Written back at the client, between two servers at the first one.
     let rendered = render_network(&network);
+    let (heim, buero) = (pid("heim"), pid("buero"));
     assert!(
-        rendered.contains("[site.haus2]\naddress = \"10.8.0.11\"\nserver = \"heim\"\nvlans = \"20,30\"\ntunnel_vlans = { heim = \"20\" }\n"),
+        rendered.contains(&format!("name = \"haus2\"\naddress = \"10.8.0.11\"\nserver = \"{heim}\"  # heim\nvlans = \"20,30\"\ntunnel_vlans = {{ \"{heim}\" = \"20\" }}  # heim\n")),
         "{rendered}"
     );
     assert!(
-        rendered
-            .contains("[site.heim]\naddress = \"10.8.0.1\"\ntunnel_vlans = { buero = \"none\" }\n"),
+        rendered.contains(&format!(
+            "name = \"heim\"\naddress = \"10.8.0.1\"\ntunnel_vlans = {{ \"{buero}\" = \"none\" }}  # buero\n"
+        )),
         "{rendered}"
     );
     assert_eq!(parse_network(&rendered).unwrap().network.unwrap(), network);
@@ -923,10 +950,11 @@ fn format_1_files_with_a_manager_become_explicit_clients() {
         Some("heim".into())
     );
     let new = render_network(&network);
+    let heim = pid("heim");
     assert!(
-        new.contains(
-            "[site.haus2]\naddress = \"10.8.0.11\"\nserver = \"heim\"\nmanaged_by = \"heim\"\n"
-        ),
+        new.contains(&format!(
+            "name = \"haus2\"\naddress = \"10.8.0.11\"\nserver = \"{heim}\"  # heim\nmanaged_by = \"{heim}\"  # heim\n"
+        )),
         "{new}"
     );
     assert_eq!(parse_network(&new).unwrap().network.unwrap(), network);
@@ -1018,7 +1046,7 @@ fn errors_in_format_2_name_the_line() {
             "\n[site.heim]",
             "\n[[map]]\nsite = \"heim\"\nlocal = 5\nshared = 20\n\n[site.heim]",
             "[[map]]",
-            "belongs to the older format",
+            "belongs to an older format",
         ),
     ] {
         let text = edit(EXAMPLE_NETWORK_2, from, to);
@@ -1080,25 +1108,34 @@ fn site_ids_are_read_and_written_in_both_formats() {
     let site = parsed.by_name("haus2").unwrap();
     assert_eq!(site.id.to_string(), ID_A);
     assert!(parsed.sites.iter().filter(|s| s.has_identity()).count() == 1);
-    for text in [
-        render_network(&parsed),
-        crate::config::render_network_wire(&parsed),
-    ] {
-        assert!(text.contains(&format!("id = \"{ID_A}\"")), "{text}");
-        assert_eq!(parse_network(&text).unwrap().network.unwrap(), parsed);
-    }
+    let text = render_network(&parsed);
+    // Its table is named by it (no placeholder comment), no `id` line.
+    assert!(
+        text.contains(&format!("[site.\"{ID_A}\"]\nname = \"haus2\"\n")),
+        "{text}"
+    );
+    assert!(!text.contains("id ="), "{text}");
+    assert_eq!(parse_network(&text).unwrap().network.unwrap(), parsed);
 }
 
 #[test]
-fn without_ids_the_wire_form_and_fingerprint_stay_as_before() {
-    // The bytes older versions exchange and hash: no `id` line appears.
+fn placeholders_are_marked_and_identities_change_the_fingerprint() {
     let network = parse_network(EXAMPLE_NETWORK).unwrap().network.unwrap();
-    let wire = crate::config::render_network_wire(&network);
-    assert!(!wire.contains("id ="), "{wire}");
-    assert!(!render_network(&network).contains("id ="));
+    let text = render_network(&network);
+    assert_eq!(
+        text.matches("# no box has joined as this site yet").count(),
+        4,
+        "{text}"
+    );
     let mut with_id = network.clone();
     let first = with_id.sites[0].id;
     with_id.rekey(first, ID_A.parse().unwrap());
+    assert_eq!(
+        render_network(&with_id)
+            .matches("# no box has joined as this site yet")
+            .count(),
+        3
+    );
     assert_ne!(fingerprint(&network), fingerprint(&with_id));
 }
 

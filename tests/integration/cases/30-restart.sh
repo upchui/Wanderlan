@@ -30,11 +30,19 @@ expect_ping c-site4 10.20.0.13 "VLAN 20: site4 reaches site5"
 begin "Upgrade from an older build: its configuration file is moved and converted"
 
 rev=$(jqs site4 .revision)
-# The network as the sites exchange it, in format 1 (what older builds
-# also wrote to disk): site1 asks site4 for it.
-x site1 "exec 3<>/dev/tcp/${ADDR[site4]}/51821 && printf 'NETWORK\n' >&3 && cat <&3" >"$RUN_DIR/site4-format1.toml"
-check "the sites exchange the network in format 1" \
-  grep -q '^name = "site4"$' "$RUN_DIR/site4-format1.toml"
+# The network as the sites exchange it: the sites by their identities.
+x site1 "exec 3<>/dev/tcp/${ADDR[site4]}/51821 && printf 'NETWORK\n' >&3 && cat <&3" >"$RUN_DIR/site4-wire.toml"
+check "the sites exchange the network with the identities" \
+  eval "grep -q '^\[site\.\"' '$RUN_DIR/site4-wire.toml' && ! grep -q '^\[\[site\]\]' '$RUN_DIR/site4-wire.toml'"
+# What an older build wrote: format 1, `[[site]]` with the `id` line and
+# references by identity (no site has a manager here).
+awk '
+  /^\[site\."/ { id = $0; sub(/^\[site\."/, "", id); sub(/".*/, "", id)
+                  print "[[site]]"; print "id = \"" id "\""; next }
+  /^server = / { sub(/^server/, "uplink"); sub(/  #.*/, ""); print; next }
+  { print }' "$RUN_DIR/site4-wire.toml" >"$RUN_DIR/site4-format1.toml"
+check "the file of the older build is in format 1" \
+  grep -q '^\[\[site\]\]$' "$RUN_DIR/site4-format1.toml"
 x site4 "wl-daemon stop"
 # What an older build left behind: the file under its old name with the old
 # table name, the confirmed copy likewise, and the package's new template.

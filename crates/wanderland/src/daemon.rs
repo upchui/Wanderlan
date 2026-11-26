@@ -1268,6 +1268,11 @@ impl Controller {
                 .warn("Ignoring SIGHUP while a change is waiting for confirmation");
             return;
         }
+        // Written with names (by hand): with the identities at once.
+        match self.paths.migrate() {
+            Ok(moved) => moved.into_iter().for_each(|m| self.events.info(m)),
+            Err(e) => self.events.error(format!("{e:#}")),
+        }
         if let Some(mut cfg) = self.load_files() {
             // Files written without the `id` lines keep the identities.
             if let Some(old) = &self.confirmed {

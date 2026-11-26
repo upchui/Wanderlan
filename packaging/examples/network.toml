@@ -13,6 +13,11 @@
 # each other there. A site with `server` is a client of that site: its only
 # tunnel leads there (sites that join with an invitation become
 # clients of the inviting site).
+#
+# Written by hand, the sites are named by their names, as here. The daemon
+# replaces the names with the identities of the boxes when it applies the
+# file, and writes it back as [site."<identity>"] tables with `name` inside
+# (the names stay as labels, and as comments next to every identity).
 
 [network]
 vlans = "10-50"               # VLANs of every site that does not list its own
@@ -31,7 +36,7 @@ address = "10.8.0.11"
 vlans = "20,30"               # haus2 only takes part in VLANs 20 and 30
 # As a client (server = "heim"), public destinations of VLAN 20 could leave
 # through haus2's own uplink (only clients break out, servers have the gateways):
-# breakout ={ 20 = {}, 30 = { uplink = "ens20", except = ["203.0.113.0/24"] } }
+# breakout = { 20 = {}, 30 = { uplink = "ens20", except = ["203.0.113.0/24"] } }
 
 [site.haus3]
 address = "10.8.0.12"

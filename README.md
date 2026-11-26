@@ -434,18 +434,15 @@ told apart by their identities: where a name is not unique, the terminal
 UI and the status show it with the start of its identity (`c1#Ab3dK9xQ`),
 and the command line takes that form (or the identity, or a name only one
 site has); for a name two sites have it lists them. A site added by hand
-(no box joined as it yet) is known by its name alone and needs one of its
-own. Older sites read the network only while every name in what they get
-is unique: after the first name that two sites share they keep running
-with what they have and get no changes until they are updated; update all
-sites first.
+(no box joined as it yet) has a placeholder that follows its name, so it
+needs a name of its own until a box joins as it.
 
 ### Identities and keys
 
 Every box has an **identity**: a key pair it creates the first time it is
 configured or joins (`/var/lib/wanderlan/identity`, readable by root only).
-The public half is the site's `id` in `network.toml`, like a WireGuard
-public key; `wanderlan status` shows it, the terminal UI its first
+The public half names the site in `network.toml` (`[site."<identity>"]`),
+like a WireGuard public key; `wanderlan status` shows it, the terminal UI its first
 characters. The two sites of a tunnel derive the keys of that tunnel from
 their identities; no key travels over the network or is written to a file:
 
@@ -465,8 +462,8 @@ it is a new box afterwards) takes over its old entry, with all its rules,
 only if the old box does not answer any more; a second box at the address
 of a site that is still running is refused. A box with the identity of a
 site that runs elsewhere (a cloned machine) is refused too: run `wanderlan
-reset` on it first. Identities are never edited by hand: a `network.toml`
-written without the `id` lines keeps them.
+reset` on it first. Identities are never edited by hand: a site written
+by hand with its name keeps the identity it has.
 
 The keys **authenticate, they do not encrypt**: the traffic between the
 sites is only as private as the transport network (the VPN). The VNI is
@@ -719,18 +716,18 @@ the VLAN mapping view: `source VLAN = VLAN on the trunk of this site` (or
 `"native"` for the untagged traffic). The `network.toml` of `lab` contains
 only `hq` (as its server) and `lab`.
 
-A reference may also be a name only one site has: in a file edited by hand,
-`server = "hq"` works too. Older forms are still read: `[site.<name>]`
-tables with references by name (written by 1.0.21 and later until every
-site has an identity: a site of an older version that never claimed one is
-known by its name alone, and the file keeps that form until it has one), and
-`[[site]]` with `name`, `[[map]]`, `[[tunnel]]` (1.0.20 and older). The
-daemon writes a file of an older form in the current one when it starts
-and keeps the old one as `network.toml.v1` or `network.toml.v2` (an older
-version can only read that one); `local.toml` gets the identities too. The
-sites exchange the network in the oldest form (`[[site]]`) as long as every
-name in it is unique, so sites with older and newer versions keep working
-together until two sites share a name.
+Names are for people. The daemon writes, sends and compares only this form;
+a site without a box yet (added by hand) has a placeholder instead of an
+identity (marked with a comment) until a box joins as it. Edited by hand,
+a file may name sites by their names: `server = "hq"` (a name only one site
+has), `self = "hq"`, or a new site as `[site.hq]` with its address. The
+daemon replaces them with the identities when it applies or loads the file
+(also after `systemctl reload wanderland`) and writes it back in this form.
+The forms of older versions are read the same way: `[site.<name>]` tables
+(1.0.21 and later) and `[[site]]` with `name`, `[[map]]`, `[[tunnel]]`
+(1.0.20 and older); the file as it was is kept as `network.toml.v1` or
+`.v2`. Versions before this one read only those forms: update all sites,
+until then the older ones get no changes.
 
 ### Settings
 
@@ -780,8 +777,8 @@ network.toml:24: error: site "office": vlans: VLAN ID 5000 is outside 1-4094
 network.toml:26: error: map #2: source VLAN 60 is not one of the VLANs of site "office" (10,20)
 ```
 
-Identities and addresses are unique (names too for sites without an
-identity of their own), servers are existing sites and never form
+Identities and addresses are unique (names too for sites without a box
+yet), servers are existing sites and never form
 a circle, mappings use VLANs of their site (at most one native mapping
 per site, no mapped VLAN used twice, no source VLAN mapped twice per site),
 `self` exists, and unknown keys are errors (typos). Older files load
@@ -1159,10 +1156,10 @@ or `WANDERLAN_SOCKET`, the network of the box with `--net` or
   not by its name: names may repeat and change, the tunnel stays; its
   alias tells the site. Site names keep at most 12 characters (older
   sites check that).
-* **Identities, not names, in the files.** Every reference to a site is
-  its identity; the name is a label. The sites still exchange the network
-  in the oldest form while the names in it are unique, so a network keeps
-  working across versions until two sites share a name.
+* **Identities in the files, names for people.** Every reference to a
+  site is its identity, in the files and in what the sites exchange; the
+  name is a label for people (shown everywhere, accepted by the commands
+  and in files written by hand, then replaced by the identity).
 * **Local breakout by destination, not by gateway.** The devices keep their
   gateway; the box takes the frames to public destinations out of the
   bridge before they reach the tunnel, and masquerades them (IPv6 too, so

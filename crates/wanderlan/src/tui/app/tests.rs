@@ -583,7 +583,8 @@ fn a_site_managed_elsewhere_cannot_be_changed_here() {
 fn restricted() -> App {
     let mut app = connected();
     let mut texts = fixtures::config_texts();
-    let heim = "[site.heim]\naddress = \"10.8.0.1\"\n";
+    // Written by hand: a name for the manager.
+    let heim = "name = \"heim\"\naddress = \"10.8.0.1\"\n";
     assert!(texts.network.contains(heim), "{}", texts.network);
     texts.network = texts
         .network
@@ -859,7 +860,8 @@ fn a_restricted_site_sets_its_own_vlans() {
 fn managed_by_itself() -> App {
     let mut app = connected();
     let mut texts = fixtures::config_texts();
-    let heim = "[site.heim]\naddress = \"10.8.0.1\"\n";
+    // Written by hand: a name for the manager.
+    let heim = "name = \"heim\"\naddress = \"10.8.0.1\"\n";
     texts.network = texts
         .network
         .replace(heim, &format!("{heim}managed_by = \"heim\"\n"));

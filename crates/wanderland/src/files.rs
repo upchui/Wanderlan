@@ -30,6 +30,8 @@ const TAG_FILE: &str = "tag";
 const BOX_STATE: &[&str] = &[NETWORKS_DIR, "breakout-sysctl"];
 /// What a reset of another network keeps: its tag.
 const NETWORK_STATE: &[&str] = &[TAG_FILE];
+/// The form of `network.toml` the daemon writes: the sites by identity.
+const CURRENT_FORMAT: u8 = 3;
 /// The tags the other networks can get (`x` is the default network's).
 const TAGS: &str = "abcdefghijklmnopqrstuvwyz0123456789";
 
@@ -208,13 +210,14 @@ impl Paths {
             let Some(network) = parsed.network else {
                 continue;
             };
-            let format = wanderlan_core::config::disk_format(&network);
-            if parsed.format != format {
+            // Written with names (by hand, or by an older version): from now
+            // on with the identities (an empty network has no sites to name).
+            if parsed.format != CURRENT_FORMAT && !network.sites.is_empty() {
                 if backup {
                     let copy = self.old_format_copy(parsed.format);
                     write_atomic(&copy, &text)?;
                     moved.push(format!(
-                        "{} was converted to format {format}; the old file is kept as {}",
+                        "{} was converted to format {CURRENT_FORMAT}; the old file is kept as {}",
                         path.display(),
                         copy.display()
                     ));
@@ -375,7 +378,9 @@ impl Paths {
         for name in [
             "network.toml.rejected",
             "local.toml.rejected",
+            "network.toml.v0",
             "network.toml.v1",
+            "network.toml.v2",
         ] {
             attempt(remove_optional(&self.config_dir.join(name)));
         }
@@ -544,8 +549,8 @@ mod tests {
 
     const OLD: &str = "# comment\n[mesh]\nrevision = 3\nvlans = \"10-50\"\n\n[[site]]\nname = \"a\"\naddress = \"10.0.0.1\"\n";
 
-    /// The same network in format 2.
-    fn in_format_2(text: &str) -> String {
+    /// The same network as the daemon writes it.
+    fn as_written(text: &str) -> String {
         let network = wanderlan_core::config::parse_network(text)
             .unwrap()
             .network
@@ -564,12 +569,15 @@ mod tests {
         assert_eq!(moved.len(), 1, "{moved:?}");
         assert!(moved[0].contains("network.toml.v1"), "{moved:?}");
         let new = std::fs::read_to_string(paths.network()).unwrap();
+        // With the identities (placeholders: no box has joined yet).
+        let hq = wanderlan_core::identity::SiteId::provisional("hq");
         assert!(
-            new.contains(
-                "[site.lab]\naddress = \"10.0.0.2\"\nserver = \"hq\"\nmap = { 30 = 130 }\n"
-            ),
+            new.contains(&format!(
+                "name = \"lab\"\naddress = \"10.0.0.2\"\nserver = \"{hq}\"  # hq\nmap = {{ 30 = 130 }}\n"
+            )),
             "{new}"
         );
+        assert!(!new.contains("[site.lab]"), "{new}");
         assert!(new.contains("revision = 7"), "{new}");
         assert_eq!(
             std::fs::read_to_string(paths.old_format_copy(1)).unwrap(),
@@ -597,10 +605,10 @@ mod tests {
         std::fs::create_dir_all(paths.confirmed_dir()).unwrap();
         std::fs::write(paths.confirmed_dir().join("mesh.toml"), OLD).unwrap();
         let moved = paths.migrate().unwrap();
-        // Three files moved, then network.toml written in format 2.
+        // Three files moved, then network.toml written with the identities.
         assert_eq!(moved.len(), 4, "{moved:?}");
         let new = std::fs::read_to_string(paths.network()).unwrap();
-        assert_eq!(new, in_format_2(&OLD.replace("[mesh]", "[network]")));
+        assert_eq!(new, as_written(&OLD.replace("[mesh]", "[network]")));
         assert_eq!(
             std::fs::read_to_string(paths.old_format_copy(1)).unwrap(),
             OLD.replace("[mesh]", "[network]")
@@ -623,7 +631,7 @@ mod tests {
         assert_eq!(paths.migrate().unwrap().len(), 2);
         assert_eq!(
             std::fs::read_to_string(paths.network()).unwrap(),
-            in_format_2(&OLD.replace("[mesh]", "[network]"))
+            as_written(&OLD.replace("[mesh]", "[network]"))
         );
         std::fs::remove_dir_all(base).unwrap();
     }

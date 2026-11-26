@@ -406,10 +406,10 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, scroll: u16, area: Rect) {
         ]),
         Line::from(vec![
             label("Identity"),
-            Span::raw(
-                site.own_id()
-                    .map_or_else(|| "none yet (older version)".into(), |id| id.to_string()),
-            ),
+            Span::raw(site.own_id().map_or_else(
+                || "none yet: no box has joined as it".into(),
+                |id| id.to_string(),
+            )),
         ]),
         Line::from(vec![
             label("VLANs"),

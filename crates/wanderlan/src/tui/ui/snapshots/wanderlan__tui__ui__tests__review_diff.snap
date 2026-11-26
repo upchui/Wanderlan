@@ -1,12 +1,13 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
+assertion_line: 131
 expression: render(&app)
 ---
 " 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Breakout  8 Settings   "
 "┌ Review: draft against the running configuration ─────────────────────────────┐"
 "│--- network.toml (running)                                                    │"
 "│+++ network.toml (draft)                                                      │"
-"│@@ -10,7 +10,7 @@                                                             │"
+"│@@ -14,7 +14,7 @@                                                             │"
 "│                                                                              │"
 "│ [network]                                                                    │"
 "│ revision = 7                                                                 │"

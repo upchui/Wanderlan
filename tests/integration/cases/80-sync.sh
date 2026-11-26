@@ -89,9 +89,11 @@ begin "CLI: sites, VLANs and mappings by hand"
 
 check "site1 adds the site lab (a client of site1)" \
   x site1 "wanderlan site add lab 10.100.1.99 --vlans 10,20 --confirm"
-# lab has no identity of its own (no box joined as it): known by its name,
-# the file names the sites by theirs again until it has one (format 2).
-wait_for 90 "site3 knows lab (synced)" eval 'entry_of site3 lab | grep -Eq "^server = (\"site1\"|.*  # site1)\$"'
+# lab has no identity of its own (no box joined as it): a placeholder that
+# follows its name, the file names every site by its identity all the same.
+wait_for 90 "site3 knows lab (synced)" eval 'entry_of site3 lab | grep -Eq "^server = \".*\"  # site1\$"'
+check "lab has a placeholder, not its name, as its key" \
+  eval 'entry_of site3 lab | head -n 1 | grep -q "^\[site\.\".*\"\]  # no box has joined as this site yet\$"'
 check "lab cannot be added twice" \
   x site1 "! wanderlan site add lab 10.100.1.98 2>/tmp/add.err && grep -q 'already a site' /tmp/add.err"
 check "site1 maps source VLAN 20 to VLAN 120 at lab" x site1 "wanderlan map add lab 20 120 --confirm"

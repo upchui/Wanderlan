@@ -18,8 +18,7 @@ pub use raw::{
     ParsedLocal, ParsedNetwork, local_uses_names, parse_local, parse_network, parse_network_in,
 };
 pub use render::{
-    disk_format, expressible_by_names, fingerprint, local_fingerprint, render_local,
-    render_network, render_network_wire, unified_diff,
+    fingerprint, local_fingerprint, render_local, render_network, render_network_wire, unified_diff,
 };
 pub use validate::{
     COMMIT_TIMEOUT_RANGE, IFNAME_MAX, MSS_MAX, MSS_MIN, PROBE_INTERVAL_MIN, ifname_error,
