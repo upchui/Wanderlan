@@ -1,0 +1,29 @@
+---
+source: crates/wanderlan/src/tui/ui/tests.rs
+assertion_line: 838
+expression: render(&app)
+---
+" 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Breakout  8 Settings   "
+"┌ Uplinks of this box ─────────────────────────────────────────────────────────┐"
+"│ ens18 (default route)  192.168.1.50, 2001:db8:51::2                          │"
+"│ ens20  192.0.2.2  (+1 more)                                                  │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                                                                "
+"┌ Uplink of the breakout at heim ──────────────────────────────────────────────┐"
+"│    INTERFACE     STATE ADDRESSES             DEFAULT ROUTE      NOTE         │"
+"│(•) default route                                                now ens18    │"
+"│( ) ens18         up    192.168.1.50, 2001:db IPv4 via 192.168.1              │"
+"│( ) ens20         up    192.0.2.2             IPv4 via 192.0.2.1              │"
+"│( ) wg0           up    10.66.0.2             none               point-to-poin│"
+"│ other:                   an interface that is not listed                     │"
+"│                                                                              │"
+"│ Where the public traffic of the VLAN leaves this box. The default route      │"
+"│ follows the box's own; an interface needs a default route of its own (any    │"
+"│ metric) or is a point-to-point link.                                         │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"                                                                                "
+" IPv4: public destinations leave out of ens18, masqueraded                      "
+" IPv6: public destinations leave out of ens18, masqueraded                      "
+"                                                                                "
+"                          1 blocked, 1 down (see 1)  draft: no changes  heim r7 "
+" Up/Down  choose   Enter  take it   Esc  back                                   "

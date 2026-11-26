@@ -84,6 +84,9 @@ pub struct Field {
     pub error: Option<String>,
     /// Warning from validation.
     pub warning: Option<String>,
+    /// Enter on the field opens a list to choose its value from (instead
+    /// of saving the form).
+    pub pick: bool,
 }
 
 impl Field {
@@ -102,6 +105,7 @@ impl Field {
             touched: false,
             error: None,
             warning: None,
+            pick: false,
         }
     }
 
@@ -148,6 +152,9 @@ pub enum FormEvent {
     Cancel,
     /// The user wants to save.
     Submit,
+    /// The user wants to choose the value of the focused field from a list
+    /// ([`Field::pick`]).
+    Pick,
 }
 
 /// A modal form.
@@ -420,12 +427,12 @@ impl Form {
     }
 
     /// Form for the local breakout of a VLAN of a site (`existing`), or a
-    /// new one (at `site_hint`). `uplinks` names the uplinks of this box.
+    /// new one (at `site_hint`). Enter on the uplink lists the interfaces
+    /// of this box to choose from.
     pub fn breakout(
         draft: &Draft,
         existing: Option<(SiteId, u16)>,
         site_hint: Option<SiteId>,
-        uplinks: &str,
     ) -> Self {
         let network = &draft.network;
         let sites: Vec<String> = network
@@ -457,13 +464,6 @@ impl Form {
         let except: Vec<String> = entry
             .map(|b| b.except.iter().map(ToString::to_string).collect())
             .unwrap_or_default();
-        // The uplinks of this box only for a breakout of this box.
-        let own = site.is_some() && draft.local.self_id == site;
-        let uplink_hint = if uplinks.is_empty() || !own {
-            "empty: the interface of the site's default route; or e.g. ens20".to_string()
-        } else {
-            format!("empty: the default route; at this box: {uplinks}")
-        };
         let title = match &existing {
             Some((s, v)) => format!("Breakout of VLAN {v} at {}", network.label(*s)),
             None => "New local breakout".to_string(),
@@ -482,7 +482,15 @@ impl Form {
                 "the VLAN in the network: native (untagged), or a VLAN ID (a mapped one: its source VLAN)",
                 vid,
             ),
-            Field::text("uplink", "Uplink", uplink_hint, uplink),
+            Field {
+                pick: true,
+                ..Field::text(
+                    "uplink",
+                    "Uplink",
+                    "empty: the site's default route; Enter: choose from the interfaces",
+                    uplink,
+                )
+            },
             Field::text(
                 "except",
                 "Except",
@@ -668,7 +676,17 @@ impl Form {
     pub fn handle_key(&mut self, key: &KeyEvent) -> FormEvent {
         match key.code {
             KeyCode::Esc => return FormEvent::Cancel,
-            KeyCode::Enter => return FormEvent::Submit,
+            KeyCode::Enter => {
+                let pick = self
+                    .fields
+                    .get(self.focus)
+                    .is_some_and(|f| f.pick && f.enabled);
+                return if pick {
+                    FormEvent::Pick
+                } else {
+                    FormEvent::Submit
+                };
+            }
             KeyCode::Tab | KeyCode::Down => {
                 self.move_focus(true);
                 return FormEvent::Nothing;
@@ -854,7 +872,11 @@ impl Form {
             FormKind::Map(_) => FieldPath::map_field(i, key),
             FormKind::TunnelVlans(..) => FieldPath::tunnel_field(i, key),
             FormKind::Breakout(_) => {
-                let vid = self.value("vlan").trim().to_string();
+                // As the diagnostics name it: the untagged traffic is VLAN 1.
+                let vid = match self.value("vlan").trim() {
+                    "native" => wanderlan_core::config::NATIVE_VID.to_string(),
+                    other => other.to_string(),
+                };
                 match key {
                     "vlan" => FieldPath::site_field(i, &format!("breakout.{vid}")),
                     "site" => FieldPath::site_field(i, "name"),
@@ -1154,8 +1176,25 @@ impl Form {
     }
 
     /// The site chosen in a breakout form ("marcel (client)" → marcel).
-    fn breakout_site(&self, draft: &Draft) -> Option<SiteId> {
+    pub fn breakout_site(&self, draft: &Draft) -> Option<SiteId> {
         site_choice(&draft.network, &self.value("site"))
+    }
+
+    /// The value of field `key` (trimmed).
+    pub fn field_value(&self, key: &str) -> String {
+        self.value(key)
+    }
+
+    /// Sets field `key` of text to `value` (a choice from a list), as if
+    /// typed.
+    pub fn set_field_value(&mut self, key: &str, value: &str, draft: &Draft) {
+        if let Some(field) = self.fields.iter_mut().find(|f| f.key == key)
+            && let Input::Text(text) = &mut field.input
+        {
+            text.set(value);
+            field.touched = true;
+        }
+        self.revalidate(draft);
     }
 
     /// The network as it would be with the invited site (at an address no

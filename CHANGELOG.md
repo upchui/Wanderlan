@@ -7,6 +7,14 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
+### Terminal UI
+
+- Breakout: `Enter` on the uplink of a breakout lists the interfaces of
+  this box to choose from (the default route first, then those that can
+  take the traffic, with their addresses and default routes; point-to-point
+  links such as WireGuard count), or a name typed in; trunk ports are not
+  offered.
+
 ### Several networks on one box
 
 - One daemon takes part in several independent networks:

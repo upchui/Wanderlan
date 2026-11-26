@@ -146,6 +146,7 @@ pub const SECTIONS: &[Section] = &[
                 "edit: uplink (empty: default route), exceptions",
             ),
             ("d, Del", "the VLAN goes through the tunnel again"),
+            ("Enter on Uplink", "choose from the interfaces of this box"),
         ],
         text: "Public IPv4 and IPv6 destinations of the VLAN leave through the uplink of \
                that client (masqueraded) instead of the tunnel to its server; its devices \
@@ -289,6 +290,7 @@ pub fn bar(app: &App) -> Vec<Binding> {
             }
             Modal::Ask(_) => vec![("y", "yes"), ("n/Enter/Esc", "no")],
             Modal::Messages { .. } => vec![("Up/Down", "scroll"), ("Esc", "close")],
+            Modal::Uplinks(_) => vec![("Up/Down", "choose"), ("Enter", "take it"), ("Esc", "back")],
             Modal::Networks { .. } => {
                 vec![("Up/Down", "choose"), ("Enter", "switch"), ("Esc", "close")]
             }

@@ -4479,6 +4479,7 @@ impl Controller {
                     .map(|g| g.map_or_else(|| "direct".to_string(), |g| g.to_string())),
                 default4: uplinks.auto4.as_deref() == Some(name.as_str()),
                 default6: uplinks.auto6.as_deref() == Some(name.as_str()),
+                pointopoint: u.pointopoint,
             })
             .collect();
         Status {

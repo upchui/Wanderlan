@@ -792,6 +792,10 @@ pub struct UplinkStatus {
     pub default4: bool,
     /// The same for IPv6.
     pub default6: bool,
+    /// A point-to-point link (e.g. a WireGuard interface): an uplink
+    /// without a default route of its own.
+    #[serde(default)]
+    pub pointopoint: bool,
 }
 
 fn online_default() -> bool {

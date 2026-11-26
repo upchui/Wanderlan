@@ -1,5 +1,6 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
+assertion_line: 807
 expression: render(&app)
 ---
 " 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Breakout  8 Settings   "
@@ -14,8 +15,8 @@ expression: render(&app)
 "│ │                  the VLAN in the network: native (untagged), or a VLAN   │ │"
 "│ │                  ID (a mapped one: its source VLAN)                      │ │"
 "│ │ Uplink                                                                   │ │"
-"│ │                  empty: the default route; at this box: ens18 (default), │ │"
-"│ │                  ens20                                                   │ │"
+"│ │                  empty: the site's default route; Enter: choose from the │ │"
+"│ │                  interfaces                                              │ │"
 "│ │ Except                                                                   │ │"
 "│ │                  public destinations that still go through the tunnel,   │ │"
 "│ │                  e.g. 203.0.113.0/24, 2001:db8::/32                      │ │"

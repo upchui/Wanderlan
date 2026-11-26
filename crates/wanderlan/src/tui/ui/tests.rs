@@ -777,6 +777,7 @@ fn with_breakouts() -> App {
             gateway6: Some("fe80::1".into()),
             default4: true,
             default6: true,
+            pointopoint: false,
         },
         UplinkStatus {
             name: "ens20".into(),
@@ -804,6 +805,67 @@ fn breakout_form() {
     key(&mut app, KeyCode::Char('7'));
     key(&mut app, KeyCode::Char('n'));
     insta::assert_snapshot!(render(&app));
+}
+
+/// Enter on the uplink of a breakout lists the interfaces of this box (not
+/// its trunk port); the one chosen goes into the form, Esc changes nothing.
+#[test]
+fn breakout_uplinks() {
+    use wanderlan_core::api::UplinkStatus;
+    let mut app = with_breakouts();
+    if let Some(status) = app.status.as_mut() {
+        status.uplinks.push(UplinkStatus {
+            name: "ens19".into(),
+            up: true,
+            gateway4: Some("192.0.2.1".into()),
+            ..UplinkStatus::default()
+        });
+        status.uplinks.push(UplinkStatus {
+            name: "wg0".into(),
+            up: true,
+            addresses: vec!["10.66.0.2".into()],
+            pointopoint: true,
+            ..UplinkStatus::default()
+        });
+    }
+    key(&mut app, KeyCode::Char('7'));
+    key(&mut app, KeyCode::Char('n'));
+    // Site, VLAN, then the uplink.
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Enter);
+    assert!(
+        matches!(app.modal, Some(Modal::Uplinks(_))),
+        "{:?}",
+        app.modal
+    );
+    insta::assert_snapshot!(render(&app));
+    let uplink = |app: &App| match &app.modal {
+        Some(Modal::Form(form)) => form.field_value("uplink"),
+        other => panic!("the form: {other:?}"),
+    };
+    // default route, ens18, ens20, wg0: the trunk port ens19 is not listed.
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(uplink(&app), "ens20");
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Esc);
+    assert_eq!(uplink(&app), "ens20", "Esc keeps it");
+    // A trunk port typed in is refused.
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::End);
+    for c in "ens19".chars() {
+        key(&mut app, KeyCode::Char(c));
+    }
+    key(&mut app, KeyCode::Enter);
+    match &app.modal {
+        Some(Modal::Uplinks(p)) => {
+            assert!(p.error.as_deref().is_some_and(|e| e.contains("trunk port")));
+        }
+        other => panic!("still the window: {other:?}"),
+    }
 }
 
 /// Every key the help bar offers in a view is explained in the section of

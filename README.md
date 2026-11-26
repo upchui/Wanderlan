@@ -561,8 +561,9 @@ site's trunk, e.g. `130`). CLI: `wanderlan map add lab 30 native`,
 
 **Let a VLAN of a client use the internet of its own site.** Breakout (`7`),
 `n`: client,
-VLAN, uplink (empty: the default route; the window names the interfaces of
-this box) and exceptions; `Enter` changes one, `d` removes it. The view
+VLAN, uplink (empty: the default route; `Enter` on it lists the interfaces of
+this box to choose from, with their addresses and default routes) and
+exceptions; `Enter` changes one, `d` removes it. The view
 shows for this site where IPv4 and IPv6 leave now and the traffic. CLI:
 `wanderlan breakout office 10,20 on`, `wanderlan breakout office 20 on
 --uplink ens20 --except 203.0.113.0/24`, `wanderlan breakout office 20 off`;
@@ -961,7 +962,7 @@ clicked.
 | `4` | MAC addresses: filter (`/`; `vlan:20` for one VLAN), sort (`s`, `o`). |
 | `5` | Log: live events in local time (`t`: UTC), filter by level (`l`), site (`p`) and text (`/`). |
 | `6` | Setup: new network or join; on a configured site invite (`i`) and reset (`R`). |
-| `7` | Breakout: the [local breakouts](#local-breakout) of all sites, per VLAN, with uplink and exceptions; for this site where IPv4 and IPv6 leave now (or why they go through the tunnel) and the traffic, above it the uplinks of this box. New (`n`), edit (`Enter`), remove (`d`). |
+| `7` | Breakout: the [local breakouts](#local-breakout) of all sites, per VLAN, with uplink and exceptions; for this site where IPv4 and IPv6 leave now (or why they go through the tunnel) and the traffic, above it the uplinks of this box. New (`n`), edit (`Enter`; `Enter` on the uplink lists the interfaces of this box to choose from), remove (`d`). |
 | `8` | Settings of this host only (this site, trunk, commit timeout, path MTU check, MSS, its ports), each with an explanation, the trunk of every tunnel, and the role and rights of this site. `Enter` on a trunk lists the interfaces of the host to choose from (`Space`, `m`: main port). |
 
 Changes are collected in a draft; the status line says how many it holds,

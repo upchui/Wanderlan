@@ -24,6 +24,7 @@ mod ports;
 mod theme;
 mod traffic;
 mod ui;
+mod uplinks;
 mod wizard;
 
 use std::collections::VecDeque;

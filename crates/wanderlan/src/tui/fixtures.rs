@@ -79,6 +79,12 @@ pub fn config_texts() -> ConfigTexts {
 }
 
 /// The answer of `get_config` on a site without configuration.
+/// The draft of [`config_texts`].
+pub fn draft() -> super::draft::Draft {
+    let running = super::draft::Running::parse(&config_texts()).unwrap();
+    super::draft::Draft::from_running(&running).unwrap()
+}
+
 pub fn unconfigured_texts() -> ConfigTexts {
     ConfigTexts {
         configured: false,

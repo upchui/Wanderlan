@@ -34,6 +34,7 @@ use super::macs::MacState;
 use super::ports::{PortPicker, PortTarget};
 use super::traffic;
 use super::ui::list;
+use super::uplinks::UplinkPicker;
 use super::wizard::{self, Mode, Step, Wizard};
 use crate::client::ClientError;
 use crate::hostinfo;
@@ -378,6 +379,8 @@ pub enum Modal {
         /// Selected row.
         selected: usize,
     },
+    /// Choosing the uplink of a breakout (from its form).
+    Uplinks(UplinkPicker),
 }
 
 impl Modal {
@@ -386,7 +389,7 @@ impl Modal {
     pub fn loses_nothing(&self) -> bool {
         !matches!(
             self,
-            Self::Form(_) | Self::Ask(_) | Self::Review(_) | Self::Ports(_)
+            Self::Form(_) | Self::Ask(_) | Self::Review(_) | Self::Ports(_) | Self::Uplinks(_)
         )
     }
 }
@@ -509,6 +512,8 @@ pub struct Scrolls {
     pub invites: list::Scroll,
     /// Interfaces in the trunk port window.
     pub ports: list::Scroll,
+    /// Interfaces in the uplink window of a breakout.
+    pub uplinks: list::Scroll,
     /// The VLANs in the peer details.
     pub peer_vlans: list::Scroll,
     /// The ports in the VLAN window.
@@ -538,6 +543,7 @@ enum ListId {
     Macs,
     Invites,
     Ports,
+    Uplinks,
     PeerVlans,
     Breakouts,
     /// The ports of the VLAN window (scrolled, nothing to choose).
@@ -2125,6 +2131,7 @@ impl App {
         match (&self.modal, self.view) {
             (Some(Modal::Invites { .. }), _) => vec![(ListId::Invites, &self.scrolls.invites)],
             (Some(Modal::Ports(_)), _) => vec![(ListId::Ports, &self.scrolls.ports)],
+            (Some(Modal::Uplinks(_)), _) => vec![(ListId::Uplinks, &self.scrolls.uplinks)],
             (Some(Modal::Peer { .. }), _) => vec![(ListId::PeerVlans, &self.scrolls.peer_vlans)],
             (Some(Modal::Vlan { .. }), _) => vec![(ListId::VlanPorts, &self.scrolls.vlan_ports)],
             (Some(_), _) => Vec::new(),
@@ -2224,6 +2231,15 @@ impl App {
                 again
             }
             ListId::VlanPorts => false,
+            // A click chooses the row, a second one takes it.
+            ListId::Uplinks => {
+                let Some(Modal::Uplinks(picker)) = &mut self.modal else {
+                    return;
+                };
+                let again = picker.cursor == index;
+                picker.cursor = index;
+                again
+            }
             // A click on the row under the cursor ticks it.
             ListId::Ports => {
                 let Some(Modal::Ports(picker)) = &mut self.modal else {
@@ -2362,7 +2378,7 @@ impl App {
             && self.wizard.captures_text(&self.interfaces);
         match &self.modal {
             None => !typing && !wizard_text && !(self.view == View::Macs && self.macs.editing),
-            Some(Modal::Form(_) | Modal::Ask(_)) => false,
+            Some(Modal::Form(_) | Modal::Ask(_) | Modal::Uplinks(_)) => false,
             Some(Modal::Review(r)) => r.state != ReviewState::Applying,
             Some(Modal::Ports(p)) => {
                 !p.changed()
@@ -2596,6 +2612,7 @@ impl App {
             Modal::Site { name, scroll } => self.on_site_key(name, scroll, key),
             Modal::Review(review) => self.on_review_key(review, key, fx),
             Modal::Ports(picker) => self.on_ports_key(picker, key),
+            Modal::Uplinks(picker) => self.on_uplinks_key(picker, key),
         }
     }
 
@@ -2876,6 +2893,42 @@ impl App {
         Some(Modal::Ports(picker))
     }
 
+    /// Keys of the uplink window: choose, type one, take it into the form
+    /// (Enter) or go back to the form as it was (Esc).
+    fn on_uplinks_key(&mut self, mut picker: UplinkPicker, key: &KeyEvent) -> Option<Modal> {
+        let Some(draft) = &self.draft else {
+            return None;
+        };
+        let rows = picker.rows(draft, self.status.as_ref());
+        let count = rows.len() + 1;
+        let typing = picker.cursor >= rows.len();
+        let moves = !typing
+            || matches!(
+                key.code,
+                KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+            );
+        if moves && let Some(n) = nav(key.code, picker.cursor, count, self.scrolls.uplinks.page()) {
+            picker.cursor = n;
+            picker.error = None;
+            return Some(Modal::Uplinks(picker));
+        }
+        match key.code {
+            KeyCode::Esc => Some(Modal::Form(*picker.form)),
+            KeyCode::Enter => match picker.chosen(&rows, draft) {
+                Ok(value) => Some(Modal::Form(picker.take(&value, draft))),
+                Err(e) => {
+                    picker.error = Some(e);
+                    Some(Modal::Uplinks(picker))
+                }
+            },
+            _ if typing => {
+                picker.type_key(key);
+                Some(Modal::Uplinks(picker))
+            }
+            _ => Some(Modal::Uplinks(picker)),
+        }
+    }
+
     fn on_form_key(
         &mut self,
         mut form: Form,
@@ -2890,6 +2943,15 @@ impl App {
         match form.handle_key(key) {
             FormEvent::Nothing => {}
             FormEvent::Changed => form.revalidate(draft),
+            // The uplink of a breakout: chosen from the interfaces.
+            FormEvent::Pick if matches!(form.kind, FormKind::Breakout(_)) => {
+                return Some(Modal::Uplinks(UplinkPicker::new(
+                    form,
+                    draft,
+                    self.status.as_ref(),
+                )));
+            }
+            FormEvent::Pick => {}
             FormEvent::Cancel if form.is_touched() => {
                 return Some(Modal::Ask(Ask {
                     title: "Discard input".into(),
@@ -3782,9 +3844,8 @@ impl App {
         match key.code {
             KeyCode::Char('n') => {
                 let site = selected.map(|(s, _)| s).or(draft.local.self_id);
-                let uplinks = self.uplink_hint();
                 if let Some(draft) = self.draft.clone() {
-                    let mut form = Form::breakout(&draft, None, site, &uplinks);
+                    let mut form = Form::breakout(&draft, None, site);
                     // Only clients (a server is where the gateways are),
                     // and only those this site may change.
                     let client = |s: SiteId| {
@@ -3814,14 +3875,8 @@ impl App {
                 }
             }
             KeyCode::Enter | KeyCode::Char('e') => {
-                let uplinks = self.uplink_hint();
                 if let (Some(draft), Some(selected)) = (&self.draft, selected) {
-                    self.modal = Some(Modal::Form(Form::breakout(
-                        draft,
-                        Some(selected),
-                        None,
-                        &uplinks,
-                    )));
+                    self.modal = Some(Modal::Form(Form::breakout(draft, Some(selected), None)));
                 }
             }
             KeyCode::Char('d') | KeyCode::Delete => {
@@ -3838,41 +3893,6 @@ impl App {
             }
             _ => {}
         }
-    }
-
-    /// The uplinks of this box, for the hint of the uplink field; none at a
-    /// server (it breaks out nothing, its forms are for other boxes).
-    fn uplink_hint(&self) -> String {
-        let client = self.draft.as_ref().is_some_and(|d| {
-            d.local
-                .self_id
-                .and_then(|me| d.network.site(me))
-                .is_some_and(|s| !wanderlan_core::topology::is_server(s))
-        });
-        let Some(status) = self.status.as_ref().filter(|_| client) else {
-            return String::new();
-        };
-        let mut names: Vec<String> = status
-            .uplinks
-            .iter()
-            .filter(|u| u.gateway4.is_some() || u.gateway6.is_some())
-            .map(|u| {
-                if u.default4 || u.default6 {
-                    format!("{} (default)", u.name)
-                } else {
-                    u.name.clone()
-                }
-            })
-            .collect();
-        if names.is_empty() {
-            names = self
-                .interfaces
-                .iter()
-                .filter(|i| i.is_listed() && i.master.is_none() && i.kind != "bridge")
-                .map(|i| i.name.clone())
-                .collect();
-        }
-        names.join(", ")
     }
 
     /// Keys of the tunnel table in the VLAN view.
