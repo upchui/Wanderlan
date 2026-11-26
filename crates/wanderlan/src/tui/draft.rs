@@ -84,6 +84,8 @@ pub struct Draft {
     pub diagnostics: Vec<Diagnostic>,
     /// The network the draft was copied from (what its edits are against).
     pub base: Option<Box<Network>>,
+    /// The `local.toml` the draft was copied from.
+    pub base_local: Option<Box<Local>>,
 }
 
 impl Draft {
@@ -95,6 +97,7 @@ impl Draft {
             local,
             diagnostics: Vec::new(),
             base: None,
+            base_local: None,
         };
         draft.revalidate();
         draft
@@ -105,6 +108,7 @@ impl Draft {
         running.network.clone().map(|network| {
             let mut draft = Self::new(running.revision, network.clone(), running.local.clone());
             draft.base = Some(Box::new(network));
+            draft.base_local = Some(Box::new(running.local.clone()));
             draft
         })
     }
@@ -146,7 +150,14 @@ impl Draft {
                     if n != b && n != d {
                         both.push(format!("site {}", n.name));
                     }
-                    Some(d.clone())
+                    // Its identity and (for another site) its ports are its
+                    // own: always as they run now.
+                    let mut site = d.clone();
+                    site.id = n.id.or(d.id);
+                    if Some(n.name.as_str()) != self.local.self_name.as_deref() {
+                        site.ports = n.ports;
+                    }
+                    Some(site)
                 }
                 // Removed (or renamed) in the draft.
                 (Some(_), None) => None,
@@ -180,6 +191,25 @@ impl Draft {
         }
         merged.revision = now.revision;
         self.network = merged;
+        // local.toml the same way, setting by setting.
+        if let Some(base_local) = self.base_local.as_deref().cloned() {
+            let mine = self.local.clone();
+            let mut local = running.local.clone();
+            macro_rules! local_setting {
+                ($field:ident) => {
+                    if mine.$field != base_local.$field {
+                        local.$field = mine.$field.clone();
+                    }
+                };
+            }
+            local_setting!(self_name);
+            local_setting!(trunk);
+            local_setting!(tunnel_trunks);
+            local_setting!(commit_timeout);
+            local_setting!(mtu_probe_interval);
+            local_setting!(mss);
+            self.local = local;
+        }
         self.rebase(running);
         both
     }
@@ -194,6 +224,7 @@ impl Draft {
     pub fn rebase(&mut self, running: &Running) {
         self.base_revision = running.revision;
         self.base = running.network.clone().map(Box::new);
+        self.base_local = Some(Box::new(running.local.clone()));
         self.revalidate();
     }
 
@@ -327,6 +358,9 @@ impl Draft {
         let local = old_local.map_or(0, |l| {
             usize::from(l.self_name != self.local.self_name)
                 + usize::from(l.trunk != self.local.trunk)
+                + usize::from(l.commit_timeout != self.local.commit_timeout)
+                + usize::from(l.mtu_probe_interval != self.local.mtu_probe_interval)
+                + usize::from(l.mss != self.local.mss)
                 + l.tunnel_trunks
                     .keys()
                     .chain(self.local.tunnel_trunks.keys())
@@ -485,6 +519,33 @@ mod tests {
         );
         // The diff shows only the own edit now.
         assert!(draft.differs_from(&newer));
+
+        // Another site's ports and identity are as they run; local.toml
+        // setting by setting.
+        let mut draft = Draft::from_running(&running).unwrap();
+        for s in &mut draft.network.sites {
+            if s.name == "buero" {
+                s.vlans = Some(VlanSet::from_range(30, 30));
+            }
+        }
+        draft.local.mss = Some(1300);
+        let mut newer = running.clone();
+        newer.revision = 8;
+        newer.local.commit_timeout = Some(std::time::Duration::from_secs(120));
+        for s in &mut newer.network.as_mut().unwrap().sites {
+            if s.name == "buero" {
+                s.ports.control = Some(52821);
+            }
+        }
+        draft.rebase_onto(&newer);
+        let buero = draft.network.site("buero").unwrap();
+        assert_eq!(buero.ports.control, Some(52821));
+        assert_eq!(buero.vlans, Some(VlanSet::from_range(30, 30)));
+        assert_eq!(draft.local.mss, Some(1300));
+        assert_eq!(
+            draft.local.commit_timeout,
+            Some(std::time::Duration::from_secs(120))
+        );
     }
 
     #[test]

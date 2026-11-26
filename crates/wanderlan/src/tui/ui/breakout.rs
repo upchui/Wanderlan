@@ -1,4 +1,4 @@
-//! View 8: the local internet breakouts, per site and VLAN. Their public
+//! View 7: the local internet breakouts, per site and VLAN. Their public
 //! IPv4 and IPv6 destinations leave through that site's own uplink instead
 //! of the tunnel; for this site with what it does now.
 
@@ -66,15 +66,25 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                 .and_then(|b| b.uplink.clone())
                 .unwrap_or_else(|| "auto".into());
             let except = entry.map_or(0, |b| b.except.len());
-            let state = (*site == me)
-                .then(|| live.iter().find(|b| b.vid == *vid))
-                .flatten();
-            let (v4, v6, traffic) = match state {
+            // One per segment (bridge) of this site with the VLAN.
+            let states: Vec<&BreakoutStatus> = if *site == me {
+                live.iter().filter(|b| b.vid == *vid).collect()
+            } else {
+                Vec::new()
+            };
+            let (v4, v6, traffic) = match states.first() {
                 Some(b) => (
                     family(&b.ipv4),
                     family(&b.ipv6),
-                    if b.ready {
-                        format!("{}/{}", short_rate(b.rx_bps), short_rate(b.tx_bps))
+                    if states.iter().all(|s| s.ready) {
+                        let rx: u64 = states.iter().map(|s| s.rx_bps).sum();
+                        let tx: u64 = states.iter().map(|s| s.tx_bps).sum();
+                        let segments = if states.len() > 1 {
+                            format!(" ({} segments)", states.len())
+                        } else {
+                            String::new()
+                        };
+                        format!("{}/{}{segments}", short_rate(rx), short_rate(tx))
                     } else {
                         "setting up".into()
                     },
@@ -88,7 +98,11 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             };
             Row::new(vec![
                 Cell::from(Line::from(vec![marker, Span::raw(shown)])),
-                Cell::from(vid.to_string()),
+                Cell::from(if *vid == wanderlan_core::config::NATIVE_VID {
+                    "native".to_string()
+                } else {
+                    vid.to_string()
+                }),
                 Cell::from(uplink),
                 Cell::from(v4),
                 Cell::from(v6),
@@ -155,9 +169,19 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             let path = FieldPath::site_field(i, &format!("breakout.{vid}"));
             lines.extend(draft.within(&path).map(diagnostic_line));
         }
-        if *site == me
-            && let Some(b) = live.iter().find(|b| b.vid == *vid)
-        {
+        let states: Vec<&BreakoutStatus> = if *site == me {
+            live.iter().filter(|b| b.vid == *vid).collect()
+        } else {
+            Vec::new()
+        };
+        let several = states.len() > 1;
+        for b in states {
+            // Several segments: each named by its bridge.
+            let at = if several {
+                format!(" [{}]", b.bridge)
+            } else {
+                String::new()
+            };
             for (name, f) in [("IPv4", &b.ipv4), ("IPv6", &b.ipv6)] {
                 match (&f.dev, &f.reason) {
                     (Some(dev), _) => {
@@ -168,13 +192,13 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
                             .map_or_else(String::new, |g| format!(" via {g}"));
                         lines.push(Line::styled(
                             format!(
-                                " {name}: public destinations leave out of {dev}{via}, masqueraded"
+                                "{at} {name}: public destinations leave out of {dev}{via}, masqueraded"
                             ),
                             theme::dim(),
                         ));
                     }
                     (None, Some(why)) => lines.push(Line::styled(
-                        format!(" {name} goes through the tunnel: {why}"),
+                        format!("{at} {name} goes through the tunnel: {why}"),
                         theme::warn(),
                     )),
                     (None, None) => {}
@@ -213,12 +237,16 @@ fn short_rate(bps: u64) -> String {
     }
 }
 
-/// The uplinks of this box (known while this site has a breakout).
+/// The uplinks of this box: the interfaces with a gateway.
 fn draw_uplinks(frame: &mut Frame, app: &App, area: Rect) {
     let uplinks = app.status.as_ref().map_or(&[][..], |s| &s.uplinks[..]);
-    let mut lines: Vec<Line> = uplinks
+    let with_gateway: Vec<_> = uplinks
         .iter()
         .filter(|u| u.gateway4.is_some() || u.gateway6.is_some())
+        .collect();
+    let more = with_gateway.len().saturating_sub(2);
+    let mut lines: Vec<Line> = with_gateway
+        .into_iter()
         .take(2)
         .map(|u| {
             let default = match (u.default4, u.default6) {
@@ -236,9 +264,15 @@ fn draw_uplinks(frame: &mut Frame, app: &App, area: Rect) {
             ])
         })
         .collect();
+    if more > 0
+        && let Some(last) = lines.last_mut()
+    {
+        last.spans
+            .push(Span::styled(format!("  (+{more} more)"), theme::dim()));
+    }
     if lines.is_empty() {
         lines.push(Line::styled(
-            " The interfaces of this box are shown once this site has a breakout.",
+            " No interface of this box has a gateway (an uplink to the internet).",
             theme::dim(),
         ));
     }

@@ -1,5 +1,5 @@
-//! View 7: every setting of the network and of this host, with an
-//! explanation. Enter opens the form with the focus on that setting; changes
+//! View 8: the settings of this host only, each with an explanation
+//! (every site sets its own). Enter opens the form with the focus on that setting; changes
 //! go into the draft like everywhere else.
 
 use ratatui::Frame;
@@ -97,6 +97,8 @@ fn value(draft: &Draft, key: &str) -> String {
             format::duration(l.commit_timeout.unwrap_or(m.commit_timeout)),
             from(l.commit_timeout.is_some())
         ),
+        // A fixed MSS: nothing is measured.
+        "mtu_probe_interval" if l.mss.or(m.mss).is_some() => "off (fixed MSS)".to_string(),
         "mtu_probe_interval" => format!(
             "every {}{}",
             format::duration(l.mtu_probe_interval.unwrap_or(m.mtu_probe_interval)),
@@ -114,10 +116,11 @@ fn value(draft: &Draft, key: &str) -> String {
         "tunnel_port" => format!(
             "{} (UDP){}",
             m.tunnel_port_of(me),
-            if ports.tunnel.is_some() {
-                ""
-            } else {
-                "  (control port + 1)"
+            match (ports.tunnel, ports.control, m.tunnel_port) {
+                (Some(_), _, _) => "",
+                // Follows the control port (of its own, or the network's).
+                (None, Some(_), _) | (None, None, None) => "  (follows the control port)",
+                (None, None, Some(_)) => "  (network default)",
             }
         ),
         "self" => draft.local.self_name.clone().unwrap_or_else(|| "-".into()),

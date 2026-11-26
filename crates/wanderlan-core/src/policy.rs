@@ -178,7 +178,7 @@ pub fn why_not(network: &Network, site: &Site, editor: &str, what: &str) -> Stri
         );
     }
     format!(
-        "this site (\"{editor}\") may not {what} site \"{name}\": its VLANs, mappings and online state are managed by {}; make the change there",
+        "this site (\"{editor}\") may not {what} site \"{name}\": its VLANs, mappings, breakouts and online state are managed by {}; make the change there",
         managers(network, site)
     )
 }
@@ -195,7 +195,7 @@ pub fn why_not_network(network: &Network, editor: &str) -> String {
 
 fn restricted_reason(manager: &str) -> String {
     format!(
-        "it is managed by \"{manager}\" and may not change VLANs, mappings or the online state (except of sites it invited itself); make the change on \"{manager}\""
+        "it is managed by \"{manager}\" and may not change VLANs, mappings, breakouts or the online state (except of sites it invited itself); make the change on \"{manager}\""
     )
 }
 

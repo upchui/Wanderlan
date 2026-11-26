@@ -11,7 +11,7 @@ expression: render(&app)
 "│  Path MTU check       every 5m  (network default)                            █"
 "│  TCP MSS              from the path MTU                                      █"
 "│  Control port         51821 (UDP, TCP)  (network default)                    █"
-"│  Tunnel port          51822 (UDP)  (control port + 1)                        █"
+"│  Tunnel port          51822 (UDP)  (follows the control port)                █"
 "│Role and rights        who may change VLANs: Sites (2), e, Changes            █"
 "│  Role                 server (connected with the other servers)              █"
 "│  Clients              haus6                                                  ║"

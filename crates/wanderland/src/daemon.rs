@@ -3067,16 +3067,16 @@ impl Controller {
     }
 
     /// What the local breakouts depend on besides the configuration: the
-    /// uplinks and the sysctls (looked at only while this site has one).
+    /// uplinks (always: the status shows them, so the first breakout can
+    /// choose one) and the sysctls (only while this site has a breakout).
     async fn refresh_breakout(&mut self, cfg: &config::Config) {
-        if cfg.self_site().is_none_or(|s| s.breakout.is_empty()) {
-            self.runtime.uplinks = Default::default();
-            self.runtime.sysctls.clear();
-            return;
-        }
         match self.sys.uplinks().await {
             Ok(uplinks) => self.runtime.uplinks = uplinks,
-            Err(e) => warn!("{e}"),
+            Err(e) => debug!("{e}"),
+        }
+        if cfg.self_site().is_none_or(|s| s.breakout.is_empty()) {
+            self.runtime.sysctls.clear();
+            return;
         }
         let uplinks = &self.runtime.uplinks;
         let mut devs: BTreeSet<String> = BTreeSet::new();
@@ -3411,6 +3411,7 @@ impl Controller {
                 vlans: None,
                 revision: 0,
                 fingerprint: String::new(),
+                local_fingerprint: String::new(),
                 pending,
                 last_error: self.last_error.clone(),
                 peers: Vec::new(),
@@ -3672,6 +3673,7 @@ impl Controller {
             vlans: me.map(|s| cfg.network.effective_vlans(s).to_string()),
             revision: cfg.network.revision,
             fingerprint: derived.fingerprint.clone(),
+            local_fingerprint: config::local_fingerprint(&cfg.local),
             pending,
             last_error: self.last_error.clone(),
             peers,

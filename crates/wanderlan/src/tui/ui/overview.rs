@@ -132,6 +132,15 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
             status.revision,
             format::short_fingerprint(&status.fingerprint)
         )),
+        // The identity of this box (what the other sites know it by).
+        Span::styled("  identity ", theme::dim()),
+        Span::raw(
+            status
+                .site_id
+                .as_deref()
+                .and_then(|t| t.parse::<wanderlan_core::identity::SiteId>().ok())
+                .map_or_else(|| "-".to_string(), |id| id.fingerprint()),
+        ),
         Span::styled("  daemon ", theme::dim()),
         Span::raw(status.version.clone()),
     ]));

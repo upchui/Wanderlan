@@ -604,6 +604,10 @@ pub struct Status {
     pub revision: u64,
     /// Network fingerprint.
     pub fingerprint: String,
+    /// Fingerprint of this site's `local.toml` in effect (it changes
+    /// without a new network revision, e.g. `wanderlan settings`).
+    #[serde(default)]
+    pub local_fingerprint: String,
     /// A change waiting for confirmation.
     pub pending: Option<PendingChange>,
     /// Last error applying the configuration.

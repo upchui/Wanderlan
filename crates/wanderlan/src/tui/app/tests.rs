@@ -276,6 +276,111 @@ fn a_change_that_was_rolled_back_comes_back_into_the_draft() {
 }
 
 #[test]
+fn edits_made_during_the_countdown_survive_a_rollback() {
+    let mut app = connected();
+    let mut applied = fixtures::config_texts();
+    if let Some(d) = &mut app.draft {
+        d.network.vlans = VlanSet::from_range(10, 60);
+        d.revalidate();
+        applied.network = wanderlan_core::config::render_network(&d.network);
+        applied.revision = 8;
+    }
+    app.update(ch('a'));
+    app.update(key(KeyCode::Enter));
+    app.update(reply(
+        Request::Apply(ApplyParams {
+            config: ConfigInput {
+                network: String::new(),
+                local: String::new(),
+            },
+            base_revision: None,
+            timeout_secs: None,
+        }),
+        Reply::Applied(Applied {
+            confirm_within_secs: 60,
+            diff: String::new(),
+            changes: Vec::new(),
+            warnings: Vec::new(),
+        }),
+    ));
+    with_pending(&mut app, ChangeSource::Local);
+    // The applied change runs; during the countdown buero gets VLAN 20.
+    app.update(reply(Request::GetConfig, Reply::Config(applied)));
+    if let Some(d) = &mut app.draft {
+        let buero = d
+            .network
+            .sites
+            .iter_mut()
+            .find(|s| s.name == "buero")
+            .unwrap();
+        buero.vlans = Some(VlanSet::from_range(20, 20));
+        d.revalidate();
+    }
+    // Rolled back by the timer: both edits are in the draft again.
+    app.update(reply(
+        Request::Status,
+        Reply::Status(Box::new(fixtures::status())),
+    ));
+    app.update(reply(
+        Request::GetConfig,
+        Reply::Config(fixtures::config_texts()),
+    ));
+    let d = app.draft.as_ref().unwrap();
+    assert_eq!(d.network.vlans.to_string(), "10-60");
+    assert_eq!(
+        d.network.site("buero").unwrap().vlans,
+        Some(VlanSet::from_range(20, 20))
+    );
+    assert_eq!(d.base_revision, 7, "it builds on what runs");
+}
+
+#[test]
+fn a_failed_confirm_after_the_countdown_brings_the_change_back() {
+    let mut app = connected();
+    if let Some(d) = &mut app.draft {
+        d.network.vlans = VlanSet::from_range(10, 60);
+        d.revalidate();
+    }
+    app.update(ch('a'));
+    app.update(key(KeyCode::Enter));
+    app.update(reply(
+        Request::Apply(ApplyParams {
+            config: ConfigInput {
+                network: String::new(),
+                local: String::new(),
+            },
+            base_revision: None,
+            timeout_secs: None,
+        }),
+        Reply::Applied(Applied {
+            confirm_within_secs: 60,
+            diff: String::new(),
+            changes: Vec::new(),
+            warnings: Vec::new(),
+        }),
+    ));
+    with_pending(&mut app, ChangeSource::Local);
+    // c at the last second: the daemon rolled back meanwhile.
+    app.update(ch('c'));
+    let fx = app.update(Msg::Response {
+        request: Request::Confirm,
+        result: Err(ClientError::Api(ApiError::new(
+            "there is no change to confirm",
+        ))),
+    });
+    assert!(requests(&fx).contains(&&Request::GetConfig));
+    app.update(reply(
+        Request::GetConfig,
+        Reply::Config(fixtures::config_texts()),
+    ));
+    assert_eq!(
+        app.draft.as_ref().map(|d| d.network.vlans.to_string()),
+        Some("10-60".into()),
+        "the change is kept in the draft"
+    );
+}
+
+#[test]
 fn invalid_draft_is_not_applied() {
     let mut app = connected();
     if let Some(d) = &mut app.draft {
@@ -330,7 +435,10 @@ fn banner_names_the_source_and_the_remaining_time() {
         },
     };
     assert!(banner_text(&synced, false).contains("CHANGE FROM buero"));
-    assert!(banner_text(&synced, true).contains("Esc, then c"));
+    assert!(banner_text(&local, true).contains("Esc, then c"));
+    // A change from a peer settles by itself: no keys offered.
+    assert!(banner_text(&synced, false).contains("confirmed by itself once buero answers"));
+    assert!(!banner_text(&synced, false).contains("c confirm"));
 }
 
 #[test]

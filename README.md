@@ -463,7 +463,7 @@ created on any site; the new site becomes a client of that site.
 **Take a site online or offline.** Sites, select it, `o`; or
 `wanderlan online <site> --confirm` / `wanderlan offline <site> --confirm`.
 
-**Choose the VLANs of a site.** Sites, `Enter` on the site, field "VLANs"
+**Choose the VLANs of a site.** Sites, `e` on the site, field "VLANs"
 (empty: the VLANs of the network). The VLANs of the network: VLANs (`3`),
 `v`, or Sites (`2`), `m`.
 
@@ -484,9 +484,10 @@ shows for this site where IPv4 and IPv6 leave now and the traffic. CLI:
 --uplink ens20 --except 203.0.113.0/24`, `wanderlan breakout office 20 off`;
 `wanderlan breakout` shows the breakouts of this site.
 
-**Let a site change its own VLANs, move it.** Sites, `Enter` on the site:
-"Changes" (only its manager, or the manager and the site itself). A site
-added by hand is a client of this site; the role changes with the CLI:
+**Let a site change its own VLANs, move it.** Sites, `e` on the site:
+"Changes" (anyone, a site as its manager, or the manager and the site
+itself) and "Server" (none: a server; or the site it is a client of). A
+site added by hand is a client of this site. CLI:
 `wanderlan manage <site> --self-managed yes`,
 `wanderlan role <site> client <server>`, `wanderlan role <site> server`.
 
@@ -833,7 +834,7 @@ clicked.
 | Key | View |
 |-----|------|
 | `1` | Overview: this site with its role, the tunnel neighbours live (reply, round trip, path MTU, MSS, port state, MAC addresses, throughput, config in sync or `refused`), traffic of the tunnels and of every trunk, and all known sites with role and link (`via hq` for sites without a tunnel from here), each server with its clients indented below. One cursor runs through the neighbours and the sites. `Enter` on a neighbour: traffic graph, the VLANs of the tunnel with their live traffic (Up/Down, `Enter` opens one: every port, MACs, graph; `m` its MAC table), round-trip history, min/avg/max round trip, jitter, probe loss, latency, counters (Left/Right: the next neighbour); on a site: its details. |
-| `2` | Sites: name, address, VLANs, role, manager, tunnel; clients indented below their server. `Enter`: details (role, VLANs, every tunnel with what it carries, mappings, who may change it; Up/Down: the next site). Invite (`i`), open invitations (`I`), online/offline (`o`), new (`n`), edit (`e`: name, address, VLANs, "Changes"), rename (`N`), delete (`d`), network settings (`m`), trunk ports of this host (`l`). |
+| `2` | Sites: name, address, VLANs, role, manager, tunnel; clients indented below their server. `Enter`: details (role, VLANs, every tunnel with what it carries, mappings, who may change it; Up/Down: the next site). Invite (`i`), open invitations (`I`), online/offline (`o`), new (`n`), edit (`e`: name, address, VLANs, "Server", "Changes"), rename (`N`), delete (`d`), the VLANs of the network (`m`), trunk ports of this host (`l`). |
 | `3` | VLANs: the VLANs of the network (`v`), the own VLANs of this site (`o`) and the mappings (`n`, `Enter`, `d`) with their site and its role; conflicts are marked right away. `t` switches to the tunnels: what each carries, its limit (`Enter`, `d`). |
 | `4` | MAC addresses: filter (`/`; `vlan:20` for one VLAN), sort (`s`, `o`). |
 | `5` | Log: live events in local time (`t`: UTC), filter by level (`l`), site (`p`) and text (`/`). |

@@ -123,6 +123,7 @@ pub const SECTIONS: &[Section] = &[
             ("Enter", "next step"),
             ("Esc", "previous step; leave on the first"),
             ("i", "on a configured site: invite a new site"),
+            ("I", "on a configured site: the open invitations"),
             ("R", "on a configured site: reset it (removes everything)"),
         ],
         text: "Unconfigured: start a new network, or join one with an invitation \
@@ -146,8 +147,8 @@ pub const SECTIONS: &[Section] = &[
     Section {
         title: "8 Settings",
         keys: &[("Up/Down", "choose a setting"), ("Enter", "change it")],
-        text: "Every setting of the network and of this host, with an explanation. \
-               Trunk and the trunk per tunnel open a list of the interfaces of this host.",
+        text: "The settings of this host only, each with an explanation: every site sets \
+               its own. Trunk and the trunk per tunnel open a list of the interfaces of this host.",
     },
     Section {
         title: "Trunk ports",
@@ -391,6 +392,7 @@ pub fn bar(app: &App) -> Vec<Binding> {
             View::Log => vec![
                 ("l", "level"),
                 ("p", "peer"),
+                ("t", "UTC/local"),
                 ("End", "follow"),
                 ("/", "search"),
                 ("PgUp/PgDn", "page"),

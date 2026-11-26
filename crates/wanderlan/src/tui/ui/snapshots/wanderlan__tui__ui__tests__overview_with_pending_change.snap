@@ -3,9 +3,10 @@ source: crates/wanderlan/src/tui/ui/tests.rs
 expression: render(&app)
 ---
 " 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Breakout  8 Settings   "
-" CHANGE FROM buero: rollback in 37 s  |  c confirm  |  r roll back now          "
+" CHANGE FROM buero: confirmed by itself once buero answers (at most 37 s)       "
 " heim  server  address 10.8.0.1  trunk ens19  VLANs 10-50                       "
-" state running  network revision 7 (3f2a9c1b04de)  daemon 0.1.0                 "
+" state running  network revision 7 (3f2a9c1b04de)  identity hEiM1x2y  daemon    "
+"0.1.0                                                                           "
 " tunnels in 1.4Mbit/s  out 394.6kbit/s  (Enter: details)                        "
 " 1 open invitation(s)  (Sites: I)                                               "
 " Blocked by the loop guard: vx-haus2  (select the peer, press u)                "
@@ -21,8 +22,7 @@ expression: render(&app)
 "│heim         10.8.0.1        10-50        server            this site         █"
 "│└ haus6      10.8.0.16       10-50        client of heim    tunnel down       █"
 "│buero        10.8.0.2        10-50        server            tunnel up         █"
-"│haus2        10.8.0.11       20,30        server            tunnel BLOCKED    █"
-"│haus3        10.8.0.12       10-50        server            tunnel up         ║"
+"│haus2        10.8.0.11       20,30        server            tunnel BLOCKED    ║"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "                                                     draft: no changes  heim r7 "
 " Enter  details   u  unblock   p  probe MTU   1-8  views   ?  help   q  quit    "

@@ -376,6 +376,16 @@ pub fn fingerprint(network: &Network) -> String {
     hex
 }
 
+/// SHA-256 over the canonical `local.toml`, hex encoded.
+pub fn local_fingerprint(local: &Local) -> String {
+    let digest = Sha256::digest(render_local(local).as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 /// Unified diff between two texts (empty if they are equal).
 pub fn unified_diff(old_label: &str, old: &str, new_label: &str, new: &str) -> String {
     if old == new {

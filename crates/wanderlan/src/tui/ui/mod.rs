@@ -452,10 +452,10 @@ fn not_configured(frame: &mut Frame, area: Rect) {
     let text = vec![
         Line::styled("This site is not configured yet.", theme::warn()),
         Line::raw(""),
-        Line::raw("Press 6 to run the setup wizard. It creates a minimal configuration"),
-        Line::raw("(this site and one peer); the rest of the network then arrives by sync."),
+        Line::raw("Press 6 to start a new network or to join one with an invitation"),
+        Line::raw("(the address of the inviting site and the code it shows)."),
     ];
-    frame.render_widget(Paragraph::new(text).block(titled(" Draft ")), area);
+    frame.render_widget(Paragraph::new(text).block(titled(" Not configured ")), area);
 }
 
 #[cfg(test)]

@@ -17,12 +17,12 @@ use wanderlan_core::api::{
     Interface, Invitation, InviteParams, Joined, MacEntry, PeerStatus, PendingChange, PortState,
     Request, ResetReport, SiteState, SiteSummary, Status, UnblockParams, VlanTraffic,
 };
-use wanderlan_core::config::{Diagnostic, has_errors, render_local, render_network};
+use wanderlan_core::config::{Diagnostic, VlanMap, has_errors, render_local, render_network};
 use wanderlan_core::policy;
 use wanderlan_core::topology::{self, tunnel_name};
 
 use super::diff::{self, DiffLine};
-use super::draft::{Draft, Running, TunnelRow};
+use super::draft::{Draft, Running, TunnelRow, same_network};
 use super::filter::Filter;
 use super::form::{Form, FormEvent, FormKind};
 use super::format;
@@ -372,6 +372,17 @@ pub enum Modal {
     Ports(PortPicker),
 }
 
+impl Modal {
+    /// True for a window that only shows something: closing it loses no
+    /// input.
+    pub fn loses_nothing(&self) -> bool {
+        !matches!(
+            self,
+            Self::Form(_) | Self::Ask(_) | Self::Review(_) | Self::Ports(_)
+        )
+    }
+}
+
 /// Samples kept per peer for the traffic graphs (one per status answer).
 pub const HISTORY_LEN: usize = 120;
 
@@ -648,6 +659,9 @@ pub struct App {
     /// configuration arrived, the applied draft comes back if it is not in
     /// effect (with this message).
     restore_draft: Option<String>,
+    /// The review waits for a change from a peer or a join to settle,
+    /// then applies.
+    apply_when_settled: bool,
     wizard_offered: bool,
     in_flight: InFlight,
     seen: Option<(u64, String, bool, SiteState)>,
@@ -700,6 +714,7 @@ impl App {
             too_small: false,
             applied_draft: None,
             restore_draft: None,
+            apply_when_settled: false,
             wizard_offered: false,
             in_flight: InFlight::default(),
             seen: None,
@@ -811,6 +826,18 @@ impl App {
 
     fn on_down(&mut self, error: &ClientError, fx: &mut Vec<Effect>) {
         self.attempts += 1;
+        // Its answer never comes on this connection.
+        if let Some(mut form) = self.invite_pending.take() {
+            form.set_note_error(
+                "the connection to the daemon was lost: look at the invitations (I) once connected before creating it again"
+                    .into(),
+            );
+            if self.modal.as_ref().is_none_or(Modal::loses_nothing) {
+                self.modal = Some(Modal::Form(form));
+            } else {
+                self.invite_pending = Some(form);
+            }
+        }
         if self.attempts == 1 || self.attempts.is_multiple_of(5) {
             fx.push(Effect::Diagnose);
         }
@@ -928,7 +955,7 @@ impl App {
         }
         match (request, result) {
             (_, Ok(Reply::Status(status))) => self.on_status(*status, fx),
-            (_, Ok(Reply::Config(texts))) => self.on_config(&texts),
+            (_, Ok(Reply::Config(texts))) => self.on_config(&texts, fx),
             (_, Ok(Reply::History(events))) => self.log.set_history(events),
             (_, Ok(Reply::Interfaces(list))) => self.on_interfaces(list),
             (_, Ok(Reply::Macs(entries))) => {
@@ -937,7 +964,7 @@ impl App {
             }
             (_, Ok(Reply::VlanTraffic(traffic))) => self.on_vlan_traffic(traffic),
             (Request::Apply(_), Ok(Reply::Applied(applied))) => self.on_applied(applied, fx),
-            (Request::Apply(_), Err(e)) => self.on_apply_failed(e),
+            (Request::Apply(_), Err(e)) => self.on_apply_failed(e, fx),
             (Request::Confirm, Ok(Reply::Confirmed(c))) => self.on_confirmed(&c, fx),
             (Request::Rollback, Ok(_)) => self.on_rolled_back(fx),
             (Request::Unblock(p), Ok(_)) => {
@@ -957,14 +984,12 @@ impl App {
             }
             (_, Ok(Reply::Invites(list))) => {
                 self.invitations = list;
-                // A used or deleted code is no longer shown anywhere.
-                if self
+                // A used or deleted code is no longer shown anywhere; an
+                // open one with its command as it is now (another port).
+                self.invitation = self
                     .invitation
-                    .as_ref()
-                    .is_some_and(|i| !self.invitations.iter().any(|o| o.code == i.code))
-                {
-                    self.invitation = None;
-                }
+                    .take()
+                    .and_then(|i| self.invitations.iter().find(|o| o.code == i.code).cloned());
                 let wanted = self
                     .select_invite
                     .take()
@@ -992,11 +1017,20 @@ impl App {
                 // Whatever happened, show the real state of the site.
                 self.busy = None;
                 self.say(MessageKind::Error, format!("reset failed: {e}"));
-                self.request_status(fx);
-                self.request_config(fx);
-                self.request_interfaces(fx);
+                if self.is_connected() {
+                    self.request_status(fx);
+                    self.request_config(fx);
+                    self.request_interfaces(fx);
+                }
             }
-            (request, Err(e)) => self.on_request_failed(&request, &e),
+            (request, Err(e)) => {
+                let ended = matches!(request, Request::Confirm | Request::Rollback);
+                self.on_request_failed(&request, &e);
+                if ended {
+                    self.request_status(fx);
+                    self.request_config(fx);
+                }
+            }
             (_, Ok(_)) => {}
         }
     }
@@ -1026,13 +1060,22 @@ impl App {
                 self.interfaces_error = Some(error.to_string());
                 return;
             }
-            Request::Confirm => {
+            // The change may have ended meanwhile (the countdown ran out):
+            // what runs now tells.
+            Request::Confirm | Request::Rollback => {
                 self.busy = None;
-                "confirm"
-            }
-            Request::Rollback => {
-                self.busy = None;
-                "rollback"
+                if self.applied_draft.is_some() {
+                    self.restore_draft = Some(
+                        "Your change was rolled back (not confirmed in time). It is kept in the draft: a applies it again, x discards it."
+                            .into(),
+                    );
+                }
+                self.in_flight.config = None;
+                if matches!(request, Request::Confirm) {
+                    "confirm"
+                } else {
+                    "rollback"
+                }
             }
             Request::Subscribe => "log subscription",
             Request::Unblock(_) => "unblock",
@@ -1044,10 +1087,17 @@ impl App {
                         ClientError::Api(e) => e.message.clone(),
                         other => other.to_string(),
                     });
-                    if self.modal.is_none() {
+                    // Over a window that loses nothing; else kept for i.
+                    if self.modal.as_ref().is_none_or(Modal::loses_nothing) {
                         self.modal = Some(Modal::Form(form));
                         return;
                     }
+                    self.invite_pending = Some(form);
+                    self.say(
+                        MessageKind::Error,
+                        format!("The invitation was refused: {error}. i shows the form again."),
+                    );
+                    return;
                 }
                 "invitation"
             }
@@ -1079,9 +1129,10 @@ impl App {
 
     fn on_status(&mut self, status: Status, fx: &mut Vec<Effect>) {
         self.in_flight.status = None;
+        // Any change of what runs, also of local.toml alone (by the CLI).
         let seen = (
             status.revision,
-            status.fingerprint.clone(),
+            format!("{}{}", status.fingerprint, status.local_fingerprint),
             status.pending.is_some(),
             status.state,
         );
@@ -1165,7 +1216,7 @@ impl App {
         }
     }
 
-    fn on_config(&mut self, texts: &ConfigTexts) {
+    fn on_config(&mut self, texts: &ConfigTexts, fx: &mut Vec<Effect>) {
         self.in_flight.config = None;
         let running = match Running::parse(texts) {
             Ok(r) => r,
@@ -1178,12 +1229,23 @@ impl App {
             (Some(d), Some(old)) => d.differs_from(old) && d.differs_from(&running),
             _ => false,
         };
+        // The selected rows, to find them again in the new draft.
+        let selection = self.selection();
+        let before = self.draft.clone();
         let restored = match (self.restore_draft.take(), self.applied_draft.take()) {
-            // Not in effect: rolled back; the edits come back.
-            (Some(message), Some(mut applied)) if applied.differs_from(&running) => {
-                applied.rebase(&running);
+            // Not in effect: rolled back; the edits come back, with what
+            // was edited during the countdown (the draft builds on it).
+            (Some(message), Some(applied)) if applied.differs_from(&running) => {
+                let edited_since = self.draft.as_ref().is_some_and(|d| {
+                    !same_network(&d.network, &applied.network) || d.local != applied.local
+                });
+                let mut back = match &self.draft {
+                    Some(d) if edited_since => d.clone(),
+                    _ => applied,
+                };
+                back.rebase(&running);
                 self.say(MessageKind::Info, message);
-                Some(applied)
+                Some(back)
             }
             (Some(_), Some(_)) => {
                 self.say(MessageKind::Success, "Your change was confirmed.");
@@ -1195,15 +1257,23 @@ impl App {
             }
             (Some(_), None) => None,
         };
-        let moved_on = self
-            .running
-            .as_ref()
-            .is_some_and(|old| old.revision != running.revision);
+        // Changed in content (not only a new revision, e.g. by a confirm);
+        // local.toml alone counts too (`wanderlan settings`).
+        let moved_on = self.running.as_ref().is_some_and(|old| {
+            old.local != running.local
+                || match (&old.network, &running.network) {
+                    (Some(a), Some(b)) => !same_network(a, b),
+                    (a, b) => a.is_some() != b.is_some(),
+                }
+        });
         if let Some(draft) = restored {
             self.draft = Some(draft);
         } else if !keep {
             self.draft = Draft::from_running(&running);
-        } else if moved_on && let Some(draft) = &mut self.draft {
+        } else if !moved_on && let Some(draft) = &mut self.draft {
+            // Only a new revision: the draft builds on it.
+            draft.rebase(&running);
+        } else if let Some(draft) = &mut self.draft {
             // Changed elsewhere while edited here: the edits move onto it,
             // so the review shows only them and the apply fits.
             let both = draft.rebase_onto(&running);
@@ -1223,10 +1293,84 @@ impl App {
         }
         let configured = running.network.is_some();
         self.running = Some(running);
+        self.restore_selection(&selection);
         self.clamp_selection();
+        if self.draft != before {
+            self.refresh_review();
+        }
+        self.apply_if_settled(fx);
         if configured && std::mem::take(&mut self.invite_after_setup) {
             self.modal = None;
             self.invite();
+        }
+    }
+
+    /// The selected site, mapping and breakout, by name and content.
+    fn selection(&self) -> (Option<String>, Option<VlanMap>, Option<(String, u16)>) {
+        let Some(d) = &self.draft else {
+            return (None, None, None);
+        };
+        (
+            d.network
+                .sites
+                .get(self.sites_selected)
+                .map(|s| s.name.clone()),
+            d.network.maps.get(self.maps_selected).cloned(),
+            self.breakout_rows().get(self.breakouts_selected).cloned(),
+        )
+    }
+
+    /// Finds the selected rows again after the draft was replaced (a sync
+    /// may have removed or added rows above them).
+    fn restore_selection(
+        &mut self,
+        (site, map, breakout): &(Option<String>, Option<VlanMap>, Option<(String, u16)>),
+    ) {
+        let Some(d) = &self.draft else { return };
+        if let Some(i) = site
+            .as_ref()
+            .and_then(|n| d.network.sites.iter().position(|s| s.name == *n))
+        {
+            self.sites_selected = i;
+        }
+        if let Some(i) = map
+            .as_ref()
+            .and_then(|m| d.network.maps.iter().position(|x| x == m))
+        {
+            self.maps_selected = i;
+        }
+        if let Some(i) = breakout
+            .as_ref()
+            .and_then(|b| self.breakout_rows().iter().position(|x| x == b))
+        {
+            self.breakouts_selected = i;
+        }
+    }
+
+    /// The review waited for a change of the daemon's own to settle: it is
+    /// done, so the draft (rebuilt on what runs now) is applied.
+    fn apply_if_settled(&mut self, fx: &mut Vec<Effect>) {
+        if !self.apply_when_settled || self.pending().is_some() || self.busy.is_some() {
+            return;
+        }
+        self.apply_when_settled = false;
+        if let Some(Modal::Review(mut review)) = self.modal.take() {
+            if review.state == ReviewState::Ready {
+                self.start_apply(&mut review, fx);
+            }
+            self.modal = Some(Modal::Review(review));
+        }
+    }
+
+    /// An open review of the draft that has not been applied yet shows the
+    /// draft as it is now (it was rebased or restored).
+    fn refresh_review(&mut self) {
+        if let Some(Modal::Review(r)) = &self.modal
+            && r.origin == Origin::Draft
+            && matches!(r.state, ReviewState::Ready | ReviewState::Failed(_))
+        {
+            self.modal = None;
+            self.open_review();
         }
     }
 
@@ -1253,8 +1397,6 @@ impl App {
         }
         if origin == Origin::Wizard {
             self.wizard.step = Step::Applied;
-        } else {
-            self.applied_draft = self.draft.clone();
         }
         self.say(
             MessageKind::Success,
@@ -1264,8 +1406,12 @@ impl App {
         self.request_config(fx);
     }
 
-    fn on_apply_failed(&mut self, error: ClientError) {
+    fn on_apply_failed(&mut self, error: ClientError, fx: &mut Vec<Effect>) {
         self.busy = None;
+        self.applied_draft = None;
+        // Refused because the configuration moved on: the new one, so that
+        // the draft builds on it.
+        self.request_config(fx);
         let error = match error {
             ClientError::Api(e) => e,
             other => ApiError::new(other.to_string()),
@@ -1336,6 +1482,11 @@ impl App {
         if self.refuse_while_busy() {
             return;
         }
+        // A form that was refused (or cut off) comes back as it was.
+        if let Some(form) = self.invite_pending.take() {
+            self.modal = Some(Modal::Form(form));
+            return;
+        }
         // The rules are checked against what runs (not the draft): that is
         // what the new site joins.
         match self.running.as_ref().and_then(Draft::from_running) {
@@ -1346,6 +1497,10 @@ impl App {
 
     /// Opens the list of open invitations.
     fn show_invites(&mut self, fx: &mut Vec<Effect>) {
+        if !self.is_connected() {
+            self.say(MessageKind::Error, "Not connected to the daemon.");
+            return;
+        }
         self.modal = Some(Modal::Invites { selected: 0 });
         fx.push(Effect::Request(Request::Invites));
     }
@@ -1403,11 +1558,43 @@ impl App {
 
     /// True if this site may change the rules of `site` (VLANs, mappings,
     /// online); otherwise says who may.
+    /// True if this site may change `site` (as it runs: a site renamed in
+    /// the draft by its old name).
+    pub fn may_change_quietly(&self, site: &str) -> bool {
+        let Some(running) = self.running.as_ref().and_then(|r| r.network.as_ref()) else {
+            return true;
+        };
+        let me = self
+            .running
+            .as_ref()
+            .and_then(|r| r.local.self_name.clone())
+            .unwrap_or_default();
+        match self.running_entry(site) {
+            Some(entry) => policy::may_change(running, entry, &me),
+            // New in the draft.
+            None => true,
+        }
+    }
+
+    /// The entry of `site` as it runs, also when the draft renamed it.
+    fn running_entry(&self, site: &str) -> Option<&wanderlan_core::config::Site> {
+        let running = self.running.as_ref()?.network.as_ref()?;
+        if let Some(entry) = running.site(site) {
+            return Some(entry);
+        }
+        let draft = self.draft.as_ref()?;
+        let old = wanderlan_core::rename::renames(running, &draft.network)
+            .into_iter()
+            .find(|(_, new)| new == site)?
+            .0;
+        running.site(&old)
+    }
+
     fn may_change(&mut self, site: &str) -> bool {
         let Some(running) = self.running.as_ref().and_then(|r| r.network.as_ref()) else {
             return true;
         };
-        let Some(entry) = running.site(site) else {
+        let Some(entry) = self.running_entry(site) else {
             return true;
         };
         let me = self
@@ -1535,6 +1722,10 @@ impl App {
     }
 
     fn ask_reset(&mut self) {
+        if !self.is_connected() {
+            self.say(MessageKind::Error, "Not connected to the daemon.");
+            return;
+        }
         if self.refuse_while_busy() {
             return;
         }
@@ -1973,7 +2164,9 @@ impl App {
         if self.draft_dirty() {
             lost.push("The draft has changes that are not applied; they are lost.".to_string());
         }
-        if let Some(p) = self.pending() {
+        // A change from a peer or a join is confirmed by the daemon itself:
+        // nothing is lost by quitting.
+        if let Some(p) = self.pending().filter(|p| p.source == ChangeSource::Local) {
             lost.push(if self.is_connected() {
                 format!(
                     "The applied change is rolled back in {} s unless confirmed (c).",
@@ -2052,6 +2245,21 @@ impl App {
     }
 
     fn blocked_by_pending(&mut self) -> bool {
+        if let Some(p) = self.pending()
+            && p.source != ChangeSource::Local
+        {
+            let what = match &p.source {
+                ChangeSource::Sync { peer } => format!("A change from \"{peer}\""),
+                ChangeSource::Join { site } => format!("The join of \"{site}\""),
+                ChangeSource::Local => String::new(),
+            };
+            let text = format!(
+                "{what} is confirmed by itself as soon as the other side answers ({} s at most); the apply follows then.",
+                p.remaining_secs
+            );
+            self.say(MessageKind::Info, text);
+            return true;
+        }
         if let Some(p) = self.pending() {
             let keys = if self.confirm_keys_live() {
                 "confirm it (c) or roll it back (r) first"
@@ -2431,6 +2639,7 @@ impl App {
             KeyCode::Enter => match picker.apply(draft) {
                 Ok(new) => {
                     self.draft = Some(new);
+                    self.clamp_selection();
                     let text = if self.draft.as_ref().is_some_and(|d| d.errors() > 0) {
                         "Saved in the draft. The draft still has errors (marked red)."
                     } else {
@@ -2466,9 +2675,11 @@ impl App {
         key: &KeyEvent,
         fx: &mut Vec<Effect>,
     ) -> Option<Modal> {
-        let Some(draft) = &self.draft else {
-            return None;
-        };
+        // An invitation is for the network that runs, not the draft.
+        let running = (form.kind == FormKind::Invite)
+            .then(|| self.running.as_ref().and_then(Draft::from_running))
+            .flatten();
+        let draft = running.as_ref().or(self.draft.as_ref())?;
         match form.handle_key(key) {
             FormEvent::Nothing => {}
             FormEvent::Changed => form.revalidate(draft),
@@ -2508,6 +2719,7 @@ impl App {
                         _ => {}
                     }
                     self.draft = Some(new);
+                    self.clamp_selection();
                     let text = if self.draft.as_ref().is_some_and(|d| d.errors() > 0) {
                         "Saved in the draft. The draft still has errors (marked red)."
                     } else {
@@ -2551,11 +2763,24 @@ impl App {
     /// Sends the reviewed configuration to the daemon, unless it is invalid
     /// or another change is still waiting for confirmation.
     fn start_apply(&mut self, review: &mut Review, fx: &mut Vec<Effect>) {
-        if !review.is_valid() || self.blocked_by_pending() {
+        if !review.is_valid() {
             return;
         }
+        if self.blocked_by_pending() {
+            // A change of the daemon's own: applied once it is done.
+            self.apply_when_settled = self
+                .pending()
+                .is_some_and(|p| p.source != ChangeSource::Local);
+            return;
+        }
+        self.apply_when_settled = false;
         review.state = ReviewState::Applying;
         self.busy = Some(Busy::Applying);
+        if review.origin == Origin::Draft {
+            // What comes back if the change is rolled back (also when the
+            // answer to this request never arrives).
+            self.applied_draft = self.draft.clone();
+        }
         fx.push(Effect::Request(Request::Apply(ApplyParams {
             config: ConfigInput {
                 network: review.network.clone(),
@@ -2895,17 +3120,19 @@ impl App {
             }
             code => {
                 let at = names.iter().position(|n| *n == name).unwrap_or_default();
-                let name = nav(code, at, names.len(), 1)
+                let next = nav(code, at, names.len(), 1)
                     .and_then(|i| names.get(i).cloned())
-                    .unwrap_or(name);
+                    .unwrap_or_else(|| name.clone());
                 if let Some(i) = self
                     .draft
                     .as_ref()
-                    .and_then(|d| d.network.sites.iter().position(|s| s.name == name))
+                    .and_then(|d| d.network.sites.iter().position(|s| s.name == next))
                 {
                     self.sites_selected = i;
                 }
-                Some(Modal::Site { name, scroll: 0 })
+                // Another site starts at the top; any other key keeps it.
+                let scroll = if next == name { scroll } else { 0 };
+                Some(Modal::Site { name: next, scroll })
             }
         }
     }
@@ -3197,7 +3424,19 @@ impl App {
                     None => self.not_configured(),
                 }
             }
-            KeyCode::Char('n') => self.modal = Some(Modal::Form(Form::map(draft, None, None))),
+            KeyCode::Char('n') => {
+                let mut form = Form::map(draft, None, None);
+                // Only sites this site may change.
+                let draft = draft.clone();
+                if form.limit_sites("site", |s| self.may_change_quietly(s), &draft) {
+                    self.modal = Some(Modal::Form(form));
+                } else {
+                    self.say(
+                        MessageKind::Error,
+                        "There is no site whose mappings this site may change.",
+                    );
+                }
+            }
             KeyCode::Enter | KeyCode::Char('e') if selected < count => {
                 self.modal = Some(Modal::Form(Form::map(draft, Some(selected), None)));
             }
@@ -3268,13 +3507,17 @@ impl App {
                     .map(|(s, _)| s.clone())
                     .or_else(|| draft.local.self_name.clone());
                 let uplinks = self.uplink_hint();
-                if let Some(draft) = &self.draft {
-                    self.modal = Some(Modal::Form(Form::breakout(
-                        draft,
-                        None,
-                        site.as_deref(),
-                        &uplinks,
-                    )));
+                if let Some(draft) = self.draft.clone() {
+                    let mut form = Form::breakout(&draft, None, site.as_deref(), &uplinks);
+                    // Only sites this site may change.
+                    if form.limit_sites("site", |s| self.may_change_quietly(s), &draft) {
+                        self.modal = Some(Modal::Form(form));
+                    } else {
+                        self.say(
+                            MessageKind::Error,
+                            "There is no site whose breakouts this site may change.",
+                        );
+                    }
                 }
             }
             KeyCode::Enter | KeyCode::Char('e') => {
@@ -3424,8 +3667,19 @@ impl App {
 pub fn banner_text(pending: &PendingChange, needs_esc: bool) -> String {
     let what = match &pending.source {
         ChangeSource::Local => "UNCONFIRMED CHANGE".to_string(),
-        ChangeSource::Sync { peer } => format!("CHANGE FROM {peer}"),
-        ChangeSource::Join { site } => format!("SITE {site} JOINING"),
+        // Confirmed by the daemon itself once the other side answers.
+        ChangeSource::Sync { peer } => {
+            return format!(
+                " CHANGE FROM {peer}: confirmed by itself once {peer} answers (at most {} s) ",
+                pending.remaining_secs
+            );
+        }
+        ChangeSource::Join { site } => {
+            return format!(
+                " SITE {site} JOINING: confirmed by itself once {site} answers (at most {} s) ",
+                pending.remaining_secs
+            );
+        }
     };
     let keys = if needs_esc {
         "Esc, then c confirm / r roll back"

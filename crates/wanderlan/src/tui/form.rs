@@ -203,21 +203,41 @@ impl Form {
             None => "New site".to_string(),
         };
         let me = draft.local.self_name.clone().unwrap_or_default();
-        let (choices, current) = match existing {
-            Some(s) => {
-                let manager = policy::manager(&draft.network, s).map(str::to_string);
-                let choices = changes_choices(manager.as_deref().unwrap_or(&me), &s.name);
-                // Without a manager yet: this site from now on.
-                let current = match (manager, s.self_managed) {
-                    (None, _) => format!("only {me}"),
-                    (Some(m), false) => format!("only {m}"),
-                    (Some(m), true) => format!("{m} and {}", s.name),
-                };
-                (choices, current)
-            }
-            None => (changes_choices(&me, "the new site"), format!("only {me}")),
+        let site_name = existing.map_or("the new site", |s| s.name.as_str());
+        let names: Vec<&str> = draft
+            .network
+            .sites
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let choices = changes_choices(&names, site_name);
+        let current = match existing {
+            Some(s) => match (policy::manager(&draft.network, s), s.self_managed) {
+                (None, _) => ANYONE.to_string(),
+                (Some(m), false) => format!("only {m}"),
+                (Some(m), true) => format!("{m} and {}", s.name),
+            },
+            // A new site: managed by this site.
+            None => format!("only {me}"),
         };
-        let fields = vec![
+        // What it is plugged into: a server, or a client of another site.
+        let mut servers = vec![NO_SERVER.to_string()];
+        servers.extend(
+            names
+                .iter()
+                .filter(|n| Some(**n) != existing.map(|s| s.name.as_str()))
+                .map(|n| (*n).to_string()),
+        );
+        let server = match existing {
+            Some(s) => s.uplink.clone().unwrap_or_else(|| NO_SERVER.to_string()),
+            None => me.clone(),
+        };
+        // A released site changes its VLANs and online state, not where it
+        // is (its manager decides that).
+        let released_self = existing.is_some_and(|s| {
+            s.name == me && policy::manager(&draft.network, s).is_some_and(|m| m != me)
+        });
+        let mut fields = vec![
             Field::text(
                 "name",
                 "Name",
@@ -240,14 +260,29 @@ impl Form {
                 vlans,
             ),
             Field::choice(
+                "server",
+                "Server",
+                "none: a server (connected with all servers); or the site it is a client of",
+                servers,
+                &server,
+            ),
+            Field::choice(
                 "changes",
                 "Changes",
-                "who may change its VLANs, mappings and online state",
+                "who may change its VLANs, mappings, breakouts and online state",
                 choices,
                 &current,
             ),
             own_vlans_field(existing),
         ];
+        if released_self {
+            for f in &mut fields {
+                if matches!(f.key, "address" | "server" | "changes") {
+                    f.enabled = false;
+                    f.hint = "its manager decides this".into();
+                }
+            }
+        }
         let name = existing.map(|s| s.name.clone());
         Self::new(FormKind::Site(name), title, fields, draft)
     }
@@ -302,6 +337,26 @@ impl Form {
             translations: parse_translations(&self.value("translations")).unwrap_or_default(),
             allow_self: self.value("self_managed") != "only this site",
         }
+    }
+
+    /// Offers in the choice `key` only the sites `keep` says yes to (the
+    /// sites this site may change). False if none is left.
+    pub fn limit_sites(&mut self, key: &str, keep: impl Fn(&str) -> bool, draft: &Draft) -> bool {
+        let Some(field) = self.field_mut(key) else {
+            return true;
+        };
+        let Input::Choice { options, selected } = &mut field.input else {
+            return true;
+        };
+        let current = options.get(*selected).cloned();
+        // "marcel (client)": the name is the first word.
+        options.retain(|o| keep(o.split(' ').next().unwrap_or_default()));
+        *selected = current
+            .and_then(|c| options.iter().position(|o| *o == c))
+            .unwrap_or(0);
+        let any = !options.is_empty();
+        self.revalidate(draft);
+        any
     }
 
     /// Moves the focus to the field `key` (Settings view).
@@ -394,7 +449,13 @@ impl Form {
             .map_or(site.clone(), format::site_with_kind);
         let vid = existing
             .as_ref()
-            .map(|(_, v)| v.to_string())
+            .map(|(_, v)| {
+                if *v == wanderlan_core::config::NATIVE_VID {
+                    "native".to_string()
+                } else {
+                    v.to_string()
+                }
+            })
             .unwrap_or_default();
         let uplink = entry.and_then(|b| b.uplink.clone()).unwrap_or_default();
         let except: Vec<String> = entry
@@ -420,7 +481,7 @@ impl Form {
             Field::text(
                 "vlan",
                 "VLAN",
-                "the VLAN in the network (untagged traffic: 1, or its mapped source VLAN)",
+                "the VLAN in the network: native (untagged), or a VLAN ID (a mapped one: its source VLAN)",
                 vid,
             ),
             Field::text("uplink", "Uplink", uplink_hint, uplink),
@@ -824,9 +885,13 @@ impl Form {
                     None => None,
                 };
                 let site = self.parse_site()?;
-                // Who may change it changes only when the field was changed.
+                // Who may change it and where it is plugged in change only
+                // when the field was changed.
                 let changes_touched = self.field("changes").is_some_and(|f| f.touched);
                 let (managed_by, self_managed) = parse_changes(&self.value("changes"));
+                let server_touched = self.field("server").is_some_and(|f| f.touched);
+                let server = self.value("server");
+                let uplink = (server != NO_SERVER && !server.is_empty()).then_some(server);
                 let own_vlans = self.parse_own_vlans()?;
                 if let (Some(old), Some(me)) = (&name, draft.local.self_name.as_deref())
                     && *old != site.name
@@ -846,21 +911,27 @@ impl Form {
                             site.managed_by = slot.managed_by.clone();
                             site.self_managed = slot.self_managed;
                         }
-                        // Its role stays (`wanderlan role` changes it).
-                        site.uplink = slot.uplink.clone();
-                        // Its identity is the box's, never edited here.
+                        site.uplink = if server_touched {
+                            uplink
+                        } else {
+                            slot.uplink.clone()
+                        };
+                        // Its identity is the box's, its ports are its own,
+                        // its breakouts have a view of their own: kept.
                         site.id = slot.id;
+                        site.ports = slot.ports;
+                        site.breakout = slot.breakout.clone();
                         site.own_vlans = own_vlans;
                         let old = std::mem::replace(slot, site.clone());
                         if old.name != site.name {
                             candidate.rename_references(&old.name, &site.name);
                         }
                     }
-                    // A new site is a client of this one.
+                    // A new site: a client of this one unless chosen.
                     None => candidate.network.sites.push(Site {
                         managed_by,
                         self_managed,
-                        uplink: candidate.local.self_name.clone(),
+                        uplink,
                         own_vlans,
                         ..site
                     }),
@@ -971,7 +1042,14 @@ impl Form {
                     }
                 }
                 let site = self.breakout_site();
-                let vid = match parse_vid(&self.value("vlan")) {
+                // "native": the untagged traffic (VLAN 1 in the network).
+                let vlan = self.value("vlan");
+                let vlan = if vlan.trim() == "native" {
+                    "1".to_string()
+                } else {
+                    vlan
+                };
+                let vid = match parse_vid(&vlan) {
                     Ok(v) => Some(v),
                     Err(msg) => {
                         self.set_error("vlan", msg);
@@ -1366,16 +1444,29 @@ fn own_vlans_field(site: Option<&Site>) -> Field {
 
 /// Choices of the "Changes" field of a site: only its manager, or the
 /// manager and the site itself.
-fn changes_choices(manager: &str, site: &str) -> Vec<String> {
-    let mut choices = vec![format!("only {manager}")];
-    if manager != site {
-        choices.push(format!("{manager} and {site}"));
+/// The "Changes" choice of a site that no site manages.
+const ANYONE: &str = "anyone (not managed)";
+/// The "Server" choice of a server.
+const NO_SERVER: &str = "none (a server)";
+
+/// Who may change `site`: nobody in particular, or any site (alone, or
+/// together with the site itself), like `wanderlan manage --by`.
+fn changes_choices(sites: &[&str], site: &str) -> Vec<String> {
+    let mut choices = vec![ANYONE.to_string()];
+    for manager in sites {
+        choices.push(format!("only {manager}"));
+        if *manager != site {
+            choices.push(format!("{manager} and {site}"));
+        }
     }
     choices
 }
 
 /// `managed_by` and `self_managed` from a "Changes" choice.
 fn parse_changes(value: &str) -> (Option<String>, bool) {
+    if value == ANYONE {
+        return (None, false);
+    }
     if let Some(manager) = value.strip_prefix("only ") {
         return (Some(manager.to_string()), false);
     }
@@ -1420,9 +1511,10 @@ mod tests {
         let form = Form::site(&d, None);
         assert_eq!(
             form.fields.iter().map(|f| f.key).collect::<Vec<_>>(),
-            ["name", "address", "vlans", "changes", "own_vlans"]
+            ["name", "address", "vlans", "server", "changes", "own_vlans"]
         );
         assert_eq!(form.value("changes"), "only heim", "managed by this site");
+        assert_eq!(form.value("server"), "heim", "a client of this site");
         // Empty required fields are errors, but hidden until touched.
         let name = form.field("name").unwrap();
         assert!(name.error.is_some());
@@ -1446,16 +1538,12 @@ mod tests {
         let form = Form::site(&d, Some(haus6));
         assert_eq!(form.value("changes"), "only buero");
         assert_eq!(
-            changes_choices("buero", "haus6"),
-            ["only buero", "buero and haus6"]
+            changes_choices(&["buero", "haus6"], "haus6"),
+            [ANYONE, "only buero", "buero and haus6", "only haus6"]
         );
         let heim = Form::site(&d, Some(0));
-        assert_eq!(
-            heim.value("changes"),
-            "only heim",
-            "no manager yet: this site"
-        );
-        assert_eq!(changes_choices("heim", "heim"), ["only heim"]);
+        assert_eq!(heim.value("changes"), ANYONE, "no manager: shown as such");
+        assert_eq!(parse_changes(ANYONE), (None, false));
         assert_eq!(parse_changes("only buero"), (Some("buero".into()), false));
         assert_eq!(
             parse_changes("buero and haus6"),
@@ -1483,6 +1571,27 @@ mod tests {
         type_text(&mut form, &d, "20");
         let edited = form.submit(&d).unwrap();
         assert_eq!(edited.network.site(&name).unwrap().managed_by, None);
+
+        // Its own ports and its breakouts stay; the server can be chosen.
+        let mut with = d.clone();
+        let i = with
+            .network
+            .sites
+            .iter()
+            .position(|s| s.name == "haus3")
+            .unwrap();
+        with.network.sites[i].ports.control = Some(52821);
+        with.network.sites[i]
+            .breakout
+            .insert(20, wanderlan_core::config::Breakout::default());
+        let mut form = Form::site(&with, Some(i));
+        form.focus_on("vlans");
+        type_text(&mut form, &with, "20");
+        let edited = form.submit(&with).unwrap();
+        let haus3 = edited.network.site("haus3").unwrap();
+        assert_eq!(haus3.ports.control, Some(52821));
+        assert!(haus3.breakout.contains_key(&20));
+        assert_eq!(haus3.uplink, with.network.sites[i].uplink, "untouched");
     }
 
     #[test]
