@@ -86,6 +86,7 @@ pub fn draw(frame: &mut Frame, app: &App, status: &Status, area: Rect) {
             graph,
             "All tunnels",
             &app.recorded.total.iter().copied().collect::<Vec<_>>(),
+            app.recorded.step_ms(),
             app.recorded.now_ms,
             app.graph_range,
         );
@@ -336,11 +337,12 @@ fn loads(app: &App, status: &Status, width: usize) -> Vec<String> {
                 .get(&p.name)
                 .map(|r| r.traffic.iter().copied().collect())
                 .unwrap_or_default();
-            super::graph::buckets(
+            super::graph::grid(
                 &points,
-                app.recorded.now_ms,
+                app.recorded.step_ms(),
                 app.graph_range.ms(),
                 width,
+                app.recorded.now_ms,
                 |t: &wanderlan_core::api::TrafficPoint| t.0,
                 |t| Some(((t.1 + t.2) as f64, 0.0)),
             )
@@ -349,7 +351,14 @@ fn loads(app: &App, status: &Status, width: usize) -> Vec<String> {
             .collect()
         })
         .collect();
-    let max = parts.iter().flatten().flatten().copied().max().unwrap_or(0);
+    // A round scale: it changes only when a peak comes or goes.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let max = super::graph::nice(parts.iter().flatten().flatten().copied().max().unwrap_or(0) as f64)
+        as u64;
     parts
         .iter()
         .map(|values| super::graph::spark(values, max))

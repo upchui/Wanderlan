@@ -328,6 +328,7 @@ pub fn vlan_traffic() -> VlanTraffic {
             port("vx-haus2", 20, 300_000, 300_000),
             port("vx-haus2", 30, 9_000, 0),
         ],
+        sampled_ms: Some(HISTORY_NOW_MS),
     }
 }
 

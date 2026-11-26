@@ -1622,18 +1622,26 @@ impl App {
             _ => None,
         };
         self.vlan_history.retain(|vid, _| Some(*vid) == shown);
+        // One point per sample of the daemon, at its time: an answer with
+        // the sample before (asked again within 2 s) or without rates adds
+        // none.
         if let Some(vid) = shown
             && traffic.available
             && !traffic.ports.is_empty()
+            && let Some(at) = traffic.sampled_ms
+            && self
+                .vlan_history
+                .get(&vid)
+                .and_then(|h| h.back())
+                .is_none_or(|last| at > last.0)
         {
-            let now = super::history::wall_ms();
-            let oldest = now.saturating_sub(super::history::KEEP_MS);
+            let oldest = at.saturating_sub(super::history::KEEP_MS);
             let (rx_bps, tx_bps) = traffic::vlan_totals(&traffic)
                 .get(&vid)
                 .copied()
                 .unwrap_or_default();
             let samples = self.vlan_history.entry(vid).or_default();
-            samples.push_back(TrafficPoint(now, rx_bps, tx_bps));
+            samples.push_back(TrafficPoint(at, rx_bps, tx_bps));
             while samples.front().is_some_and(|p| p.0 < oldest) || samples.len() > VLAN_HISTORY_MAX
             {
                 samples.pop_front();

@@ -31,6 +31,9 @@ pub struct VlanTraffic {
     pub rates: BTreeMap<(String, u16), VlanRate>,
     /// When it was sampled.
     pub at: Option<Instant>,
+    /// The same on the wall clock (ms since the Unix epoch), once there are
+    /// rates (the first sample has none).
+    pub at_ms: Option<u64>,
     /// When someone asked for it last.
     pub wanted: Option<Instant>,
 }
@@ -177,6 +180,7 @@ pub fn spawn(
             if let Ok(mut v) = vlans.write() {
                 v.rates = out;
                 v.at = Some(now);
+                v.at_ms = (secs > 0.0).then(crate::history::now_ms);
             }
         }
     })

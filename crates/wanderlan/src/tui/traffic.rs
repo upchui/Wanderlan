@@ -92,6 +92,7 @@ mod tests {
                 port("vx-buero", 30, 0),
                 port("vx-haus2", 20, 50),
             ],
+            sampled_ms: None,
         }
     }
 

@@ -2,6 +2,10 @@
 //! scale of its own), round trips with the lost probes, and small text
 //! sparklines for tables. The time runs from the left (the start of the
 //! range) to now on the right.
+//!
+//! A graph stands still between two samples: every sample has columns of
+//! its own (see [`grid`]), whenever the graph is drawn; it moves by whole
+//! samples when a new one comes.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -17,31 +21,77 @@ use crate::tui::theme;
 
 /// The smallest top of a traffic scale (bit/s): idle shows as idle.
 const MIN_TOP_BPS: u64 = 1_000;
-/// How often the traffic is sampled (the daemon's rates, the answers of the
-/// VLAN window): a part of the graph is never narrower.
-const TRAFFIC_STEP_MS: u64 = 2_000;
-/// How often a peer is probed.
+/// How often a peer is probed (about: after each probe the next one).
 const RTT_STEP_MS: u64 = 5_000;
+/// The widest label of a traffic scale (`500.0k`): the plot keeps its width
+/// whatever the scale.
+const RATE_LABEL_WIDTH: u16 = 6;
 
-/// [`buckets`] for `columns` columns of dots, never narrower than `step_ms`
-/// (where the samples are farther apart than a column, each column shows
-/// the part it lies in: no gaps between them).
-#[allow(clippy::too_many_arguments)]
-fn columns<T>(
+/// The mean of the values of `points` in each of `columns` columns, the
+/// newest sample on the right; `None` where nothing was recorded.
+///
+/// The columns depend on the samples alone, not on the time of drawing:
+/// sample `s` (its time rounded to `interval_ms` around the time the
+/// samples are taken, so that their jitter does not move them) has the columns `s·P/R` up to
+/// `(s+1)·P/R` of an endless strip (`P` columns for the `R` samples of
+/// `range_ms`; several samples share a column where they do not fit). The
+/// strip ends at the newest sample, or, when the samples stop, where they
+/// should be (whole samples before `now_ms`).
+pub fn grid<T>(
     points: &[T],
-    now_ms: u64,
+    interval_ms: u64,
     range_ms: u64,
     columns: usize,
-    step_ms: u64,
+    now_ms: u64,
     at: impl Fn(&T) -> u64,
     values: impl Fn(&T) -> Option<(f64, f64)>,
 ) -> Vec<Option<(f64, f64)>> {
-    let columns = columns.max(1);
-    let count = usize::try_from(range_ms / step_ms.max(1))
-        .unwrap_or(columns)
-        .clamp(1, columns);
-    let parts = buckets(points, now_ms, range_ms, count, at, values);
-    (0..columns).map(|c| parts[c * count / columns]).collect()
+    let count = columns.max(1);
+    let interval = interval_ms.max(1);
+    let cols = u128::try_from(count).unwrap_or(u128::MAX);
+    let slots = u128::from((range_ms / interval).max(1));
+    let Some(newest_at) = points.iter().map(&at).max() else {
+        return vec![None; count];
+    };
+    // Rounded around the time the samples are taken (the newest tells):
+    // their jitter never carries one into the slot of another.
+    let phase = newest_at % interval;
+    let number = |t: u64| {
+        u128::from(
+            t.saturating_add(interval + interval / 2)
+                .saturating_sub(phase)
+                / interval,
+        )
+    };
+    let start = |s: u128| s * cols / slots;
+    let end = |s: u128| ((s + 1) * cols / slots).max(start(s) + 1);
+    let newest = number(newest_at);
+    // Two samples late: the strip moves on without them.
+    let edge = newest.max(number(now_ms).saturating_sub(2));
+    let last = end(edge) - 1;
+    let first = (last + 1).saturating_sub(cols);
+    let mut sums = vec![(0.0, 0.0, 0u32); count];
+    for p in points {
+        let s = number(at(p));
+        if s > edge {
+            continue;
+        }
+        let Some((a, b)) = values(p) else { continue };
+        for c in start(s).max(first)..end(s).min(last + 1) {
+            let Some(slot) = usize::try_from(c - first)
+                .ok()
+                .and_then(|i| sums.get_mut(i))
+            else {
+                continue;
+            };
+            slot.0 += a;
+            slot.1 += b;
+            slot.2 += 1;
+        }
+    }
+    sums.into_iter()
+        .map(|(a, b, n)| (n > 0).then(|| (a / f64::from(n), b / f64::from(n))))
+        .collect()
 }
 
 /// The next round value at or above `value`: 1, 2 or 5 times a power of ten.
@@ -57,53 +107,21 @@ pub fn nice(value: f64) -> f64 {
         .unwrap_or(10.0 * power)
 }
 
-/// The mean of the values in each of `count` equal parts of the time
-/// before `now_ms` (`range_ms` long); `None` where nothing was recorded.
-pub fn buckets<T>(
-    points: &[T],
-    now_ms: u64,
-    range_ms: u64,
-    count: usize,
-    at: impl Fn(&T) -> u64,
-    values: impl Fn(&T) -> Option<(f64, f64)>,
-) -> Vec<Option<(f64, f64)>> {
-    let count = count.max(1);
-    let start = now_ms.saturating_sub(range_ms);
-    let mut sums = vec![(0.0, 0.0, 0u32); count];
-    #[allow(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss
-    )]
-    for p in points {
-        let t = at(p);
-        if t < start || t > now_ms {
-            continue;
-        }
-        let Some((a, b)) = values(p) else { continue };
-        let i = ((t - start) as f64 / range_ms.max(1) as f64 * count as f64) as usize;
-        let slot = &mut sums[i.min(count - 1)];
-        slot.0 += a;
-        slot.1 += b;
-        slot.2 += 1;
-    }
-    sums.into_iter()
-        .map(|(a, b, n)| (n > 0).then(|| (a / f64::from(n), b / f64::from(n))))
-        .collect()
-}
-
-/// The traffic of `points` in the last `range` before `now_ms`, mirrored:
-/// in (received) above the line, out (sent) below it.
+/// The traffic of `points` (sampled every `interval_ms`) in the last
+/// `range` before `now_ms`, mirrored: in (received) above the line, out
+/// (sent) below it.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
+    clippy::cast_sign_loss,
+    clippy::too_many_arguments
 )]
 pub fn traffic(
     frame: &mut Frame,
     area: Rect,
     name: &str,
     points: &[TrafficPoint],
+    interval_ms: u64,
     now_ms: u64,
     range: Range,
 ) {
@@ -122,45 +140,58 @@ pub fn traffic(
     };
     let now = |pick: fn(&TrafficPoint) -> u64| shown.last().map_or(0, |p| pick(p));
     // As much as fits: now, mean and peak of each direction; then now only.
-    let part = |label: &str, style: Style, pick: fn(&TrafficPoint) -> u64, full: bool| {
-        let mut spans = vec![
-            Span::styled(format!(" {label} "), style),
-            Span::styled(format::rate_unit(now(pick)), style.patch(theme::bold())),
-        ];
-        if full {
-            spans.push(Span::styled(
-                format!(
-                    " avg {} peak {}",
+    // Which form is chosen by the widest numbers: it does not change with
+    // them.
+    let part =
+        |label: &str, style: Style, pick: fn(&TrafficPoint) -> u64, full: bool, widest: bool| {
+            let (now, mean, peak) = if widest {
+                (
+                    "999.9 Mbit/s".to_string(),
+                    "999.9M".to_string(),
+                    "999.9M".to_string(),
+                )
+            } else {
+                (
+                    format::rate_unit(now(pick)),
                     format::rate(mean(pick)),
-                    format::rate(peak(pick))
-                ),
-                theme::dim(),
-            ));
-        }
-        spans
-    };
-    let variant = |full: bool, named: bool| {
+                    format::rate(peak(pick)),
+                )
+            };
+            let mut spans = vec![
+                Span::styled(format!(" {label} "), style),
+                Span::styled(now, style.patch(theme::bold())),
+            ];
+            if full {
+                spans.push(Span::styled(
+                    format!(" avg {mean} peak {peak}"),
+                    theme::dim(),
+                ));
+            }
+            spans
+        };
+    let variant = |full: bool, named: bool, widest: bool| {
         let mut title = Vec::new();
         if named {
             title.push(Span::styled(format!(" {name} "), theme::title()));
         }
-        title.extend(part("in", theme::rx(), |p| p.1, full));
-        title.extend(part("  out", theme::tx(), |p| p.2, full));
+        title.extend(part("in", theme::rx(), |p| p.1, full, widest));
+        title.extend(part("  out", theme::tx(), |p| p.2, full, widest));
         title.push(Span::styled(
             format!("  {} (z) ", range.label()),
             theme::dim(),
         ));
         title
     };
-    let title = fitting(
+    let forms = [(true, true), (true, false), (false, true), (false, false)];
+    let chosen = fitting_index(
         area.width,
-        vec![
-            variant(true, true),
-            variant(true, false),
-            variant(false, true),
-            variant(false, false),
-        ],
+        &forms
+            .iter()
+            .map(|(full, named)| variant(*full, *named, true))
+            .collect::<Vec<_>>(),
     );
+    let (full, named) = forms[chosen];
+    let title = Line::from(variant(full, named, false));
     let block = Block::bordered().title(title);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -171,23 +202,36 @@ pub fn traffic(
         );
         return;
     }
-    // Each direction on its own round scale.
-    let rx_top = nice(peak(|p| p.1).max(MIN_TOP_BPS) as f64);
-    let tx_top = nice(peak(|p| p.2).max(MIN_TOP_BPS) as f64);
-    let rx_label = format::rate(rx_top as u64);
-    let tx_label = format::rate(tx_top as u64);
-    let label_width = rx_label.len().max(tx_label.len()).max(1) as u16;
-    // Two columns of dots per cell (braille).
-    let plot = usize::from(inner.width.saturating_sub(label_width + 1)).max(1) * 2;
-    let parts = columns(
-        &shown,
-        now_ms,
+    // Two columns of dots per cell (braille); the labels as wide as the
+    // widest, so that the plot keeps its width.
+    let plot = usize::from(inner.width.saturating_sub(RATE_LABEL_WIDTH + 1)).max(1) * 2;
+    // All points: the strip has its own start (filtered by the time, its
+    // oldest column would lose its sample every other second).
+    let parts = grid(
+        points,
+        interval_ms,
         range.ms(),
         plot,
-        TRAFFIC_STEP_MS,
+        now_ms,
         |p| p.0,
         |p| Some((p.1 as f64, p.2 as f64)),
     );
+    // Each direction on its own round scale, over what is drawn.
+    let top = |pick: fn(&(f64, f64)) -> f64| {
+        let peak = parts.iter().flatten().map(pick).fold(0.0, f64::max);
+        nice(peak.max(MIN_TOP_BPS as f64))
+    };
+    let rx_top = top(|p| p.0);
+    let tx_top = top(|p| p.1);
+    let label = |top: f64| {
+        format!(
+            "{:>w$}",
+            format::rate(top as u64),
+            w = usize::from(RATE_LABEL_WIDTH)
+        )
+    };
+    let rx_label = label(rx_top);
+    let tx_label = label(tx_top);
     let mut rx = Vec::new();
     let mut tx = Vec::new();
     for (i, part) in parts.iter().enumerate() {
@@ -196,7 +240,8 @@ pub fn traffic(
             tx.push((i as f64, -t / tx_top));
         }
     }
-    let width = plot as f64;
+    // One point per column of dots (the last one at the right edge).
+    let width = plot.saturating_sub(1).max(1) as f64;
     let zero = [(0.0, 0.0), (width, 0.0)];
     let chart = Chart::new(vec![
         Dataset::default()
@@ -236,6 +281,22 @@ pub fn traffic(
     clippy::cast_sign_loss
 )]
 pub fn rtt(frame: &mut Frame, area: Rect, points: &[RttPoint], now_ms: u64, range: Range) {
+    let rtt_columns = |plot: usize| {
+        grid(
+            points,
+            RTT_STEP_MS,
+            range.ms(),
+            plot,
+            now_ms,
+            |p| p.0,
+            |p| {
+                Some((
+                    p.1.map_or(0.0, f64::from),
+                    if p.1.is_some() { 1.0 } else { 0.0 },
+                ))
+            },
+        )
+    };
     let start = now_ms.saturating_sub(range.ms());
     let shown: Vec<&RttPoint> = points
         .iter()
@@ -282,8 +343,9 @@ pub fn rtt(frame: &mut Frame, area: Rect, points: &[RttPoint], now_ms: u64, rang
         format!("  {} (z) ", range.label()),
         theme::dim(),
     ));
-    let short = title.iter().take(2).cloned().collect();
-    let block = Block::bordered().title(fitting(area.width, vec![title, short]));
+    let short: Vec<Span<'static>> = title.iter().take(2).cloned().collect();
+    let chosen = fitting_index(area.width, &[title.clone(), short.clone()]);
+    let block = Block::bordered().title(Line::from(if chosen == 0 { title } else { short }));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if shown.is_empty() {
@@ -296,41 +358,36 @@ pub fn rtt(frame: &mut Frame, area: Rect, points: &[RttPoint], now_ms: u64, rang
     let top = nice(answered.iter().copied().fold(1.0, f64::max));
     let top_label = format::rtt(top);
     let plot = usize::from(inner.width.saturating_sub(top_label.len() as u16 + 1)).max(1) * 2;
-    let parts = columns(
-        &shown,
-        now_ms,
-        range.ms(),
-        plot,
-        RTT_STEP_MS,
-        |p| p.0,
-        |p| {
-            Some((
-                p.1.map_or(0.0, f64::from),
-                if p.1.is_some() { 1.0 } else { 0.0 },
-            ))
-        },
-    );
-    // Answered parts as lines (a gap where none was answered), lost
-    // probes on the base line.
+    let parts = rtt_columns(plot);
+    // A probe that came a little late leaves its slot empty: the line goes
+    // on over a gap of up to two probes.
+    let per_probe = (plot as u64 * RTT_STEP_MS)
+        .div_ceil(range.ms().max(1))
+        .max(1);
+    let bridge = usize::try_from(2 * per_probe).unwrap_or(usize::MAX);
+    // Answered parts as lines (a gap where none was answered for longer),
+    // lost probes on the base line.
     let mut runs: Vec<Vec<(f64, f64)>> = vec![Vec::new()];
     let mut lost_at = Vec::new();
+    let mut empty = 0;
     for (i, part) in parts.iter().enumerate() {
         match part {
             // The mean over the answered ones of this part.
             Some((sum, share)) if *share > 0.0 => {
+                if empty > bridge && runs.last().is_some_and(|r| !r.is_empty()) {
+                    runs.push(Vec::new());
+                }
+                empty = 0;
                 if let Some(run) = runs.last_mut() {
                     run.push((i as f64, sum / share / top));
                 }
             }
             Some(_) => {
+                empty = 0;
                 lost_at.push((i as f64, 0.0));
                 runs.push(Vec::new());
             }
-            None => {
-                if runs.last().is_some_and(|r| !r.is_empty()) {
-                    runs.push(Vec::new());
-                }
-            }
+            None => empty += 1,
         }
     }
     let mut datasets: Vec<Dataset> = runs
@@ -352,7 +409,7 @@ pub fn rtt(frame: &mut Frame, area: Rect, points: &[RttPoint], now_ms: u64, rang
             .data(&lost_at),
     );
     let chart = Chart::new(datasets)
-        .x_axis(Axis::default().bounds([0.0, plot as f64]))
+        .x_axis(Axis::default().bounds([0.0, plot.saturating_sub(1).max(1) as f64]))
         .y_axis(Axis::default().bounds([0.0, 1.0]).labels(vec![
             Span::styled("0", theme::dim()),
             Span::styled(top_label, theme::dim()),
@@ -360,19 +417,14 @@ pub fn rtt(frame: &mut Frame, area: Rect, points: &[RttPoint], now_ms: u64, rang
     frame.render_widget(chart, inner);
 }
 
-/// The first title that fits into a block `width` wide (the last one
-/// otherwise).
-fn fitting(width: u16, variants: Vec<Vec<Span<'static>>>) -> Line<'static> {
+/// The first of `variants` that fits as the title of a block `width` wide
+/// (the last one otherwise).
+fn fitting_index(width: u16, variants: &[Vec<Span<'static>>]) -> usize {
     let room = usize::from(width.saturating_sub(2));
-    let mut last = Line::default();
-    for spans in variants {
-        let line = Line::from(spans);
-        if line.width() <= room {
-            return line;
-        }
-        last = line;
-    }
-    last
+    variants
+        .iter()
+        .position(|spans| Line::from(spans.clone()).width() <= room)
+        .unwrap_or(variants.len().saturating_sub(1))
 }
 
 /// A sparkline of `values` in text (`▁▂▃▄▅▆▇█`), scaled to `max`; a
@@ -405,46 +457,80 @@ mod tests {
         assert!((nice(7.0) - 10.0).abs() < 1e-9);
     }
 
-    #[test]
-    fn means_per_part_and_gaps() {
-        let points = [
-            TrafficPoint(500, 10, 0),
-            TrafficPoint(1_500, 30, 0),
-            TrafficPoint(9_000, 5, 5),
-            TrafficPoint(50_000, 99, 99),
-        ];
-        let parts = buckets(
-            &points,
-            10_000,
-            10_000,
-            5,
-            |p| p.0,
-            |p| Some((p.1 as f64, p.2 as f64)),
-        );
-        assert_eq!(parts[0], Some((20.0, 0.0)), "the mean of the first two");
-        assert_eq!(parts[1], None, "nothing recorded: a gap");
-        assert_eq!(parts[4], Some((5.0, 5.0)));
-        assert_eq!(parts.len(), 5, "after now: left out");
+    fn values(p: &TrafficPoint) -> Option<(f64, f64)> {
+        #[allow(clippy::cast_precision_loss)]
+        Some((p.1 as f64, p.2 as f64))
     }
 
     #[test]
-    fn parts_never_narrower_than_the_samples() {
-        // One sample every 2 s over 20 s on 40 columns: 10 parts, each on
-        // 4 columns, no gaps.
-        let points: Vec<TrafficPoint> = (0..10)
-            .map(|i| TrafficPoint(1_000 + i * 2_000, 5, 5))
-            .collect();
-        let cols = columns(
-            &points,
-            20_000,
-            20_000,
-            40,
-            2_000,
-            |p| p.0,
-            |p| Some((p.1 as f64, p.2 as f64)),
+    fn means_per_column_and_gaps() {
+        // A sample every 2 s, one missing; 5 samples on 5 columns.
+        let points = [
+            TrafficPoint(2_000, 10, 0),
+            TrafficPoint(4_000, 30, 0),
+            TrafficPoint(8_000, 5, 5),
+            TrafficPoint(10_000, 7, 7),
+        ];
+        let cols = grid(&points, 2_000, 10_000, 5, 10_500, |p| p.0, values);
+        assert_eq!(
+            cols,
+            [
+                Some((10.0, 0.0)),
+                Some((30.0, 0.0)),
+                None,
+                Some((5.0, 5.0)),
+                Some((7.0, 7.0))
+            ]
         );
-        assert_eq!(cols.len(), 40);
-        assert!(cols.iter().all(Option::is_some), "{cols:?}");
+        // Three columns per sample on 15 columns; the newest on the right.
+        let cols = grid(&points, 2_000, 10_000, 15, 10_500, |p| p.0, values);
+        assert_eq!(&cols[12..], [Some((7.0, 7.0)); 3]);
+        assert_eq!(&cols[6..9], [None; 3]);
+        // Nothing recorded for a while: the strip moves on without them.
+        let later = grid(&points, 2_000, 10_000, 5, 20_000, |p| p.0, values);
+        assert_eq!(later[4], None);
+        assert!(
+            grid(&[], 2_000, 10_000, 5, 0, |p: &TrafficPoint| p.0, values)
+                .iter()
+                .all(Option::is_none)
+        );
+    }
+
+    /// The picture stands still between two samples, whatever the phase and
+    /// the jitter of their times, and moves on by the new one only.
+    #[test]
+    fn the_picture_stands_still_between_samples() {
+        let jitter = |i: u64| (i * 7_919) % 41;
+        for phase in [15u64, 990, 1_975] {
+            let at = |i: u64| 1_000_000 + i * 2_000 + phase + jitter(i);
+            let points: Vec<TrafficPoint> = (0..400)
+                .map(|i| TrafficPoint(at(i), (i % 7) * 100, i % 3))
+                .collect();
+            let newest = at(399);
+            let mut more = points.clone();
+            more.push(TrafficPoint(at(400), 900, 0));
+            for cols in [146usize, 226, 300, 452] {
+                let draw = |points: &[TrafficPoint], now: u64| {
+                    grid(points, 2_000, 600_000, cols, now, |p| p.0, values)
+                };
+                let a = draw(&points, newest + 10);
+                assert!(
+                    a.iter().all(Option::is_some),
+                    "phase {phase}, {cols}: no gaps"
+                );
+                for later in [1_000, 1_900] {
+                    assert_eq!(a, draw(&points, newest + later), "phase {phase}, {cols}");
+                }
+                // The new sample: the rest moves left by whole columns (the
+                // newest column may take it in where samples share one).
+                let d = draw(&more, at(400) + 10);
+                let n = cols - 1;
+                assert!(
+                    (0..=2).any(|k| a[k..n] == d[..n - k]),
+                    "phase {phase}, {cols}: moved by whole columns"
+                );
+            }
+        }
     }
 
     #[test]

@@ -8,13 +8,8 @@ use wanderlan_core::api::{History, RttPoint, TrafficPoint};
 
 /// How far back the graphs go (as far as the daemon records).
 pub const KEEP_MS: u64 = 3_600_000;
-
-/// Now on the wall clock, in ms since the Unix epoch.
-pub fn wall_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-}
+/// How often the daemon samples the traffic, until it says.
+const DEFAULT_STEP_MS: u64 = 2_000;
 
 /// The time range of the graphs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -82,7 +77,7 @@ pub struct HistoryStore {
     started_ms: Option<u64>,
     /// The daemon's clock at the last answer: the next one asks after it.
     pub now_ms: u64,
-    /// How often the daemon samples the traffic.
+    /// How often the daemon samples the traffic (0 until it said).
     pub interval_ms: u64,
     /// Per direct peer.
     pub peers: BTreeMap<String, PeerSeries>,
@@ -98,6 +93,15 @@ pub struct HistoryStore {
 }
 
 impl HistoryStore {
+    /// How often the traffic is sampled (as the daemon said; 2 s before).
+    pub fn step_ms(&self) -> u64 {
+        if self.interval_ms == 0 {
+            DEFAULT_STEP_MS
+        } else {
+            self.interval_ms
+        }
+    }
+
     /// What to ask for next: what came after the last answer, or
     /// everything (the first time, or when it has to be fetched again).
     pub fn next_since(&mut self) -> Option<u64> {

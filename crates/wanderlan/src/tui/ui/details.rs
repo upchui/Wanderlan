@@ -333,6 +333,7 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, vlan: Option<u16>, area: R
         traffic,
         "Traffic",
         &points,
+        app.recorded.step_ms(),
         app.recorded.now_ms,
         app.graph_range,
     );

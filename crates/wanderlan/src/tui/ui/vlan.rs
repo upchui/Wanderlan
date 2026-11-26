@@ -196,8 +196,8 @@ pub fn draw(frame: &mut Frame, app: &App, vid: u16, back: Option<&str>, area: Re
         list::BOXED,
     );
 
-    // Recorded at the answers (the daemon counts per VLAN only while
-    // asked): "now" is the last one.
+    // Recorded from the answers (the daemon counts per VLAN only while
+    // asked), at the times the daemon sampled: "now" is the last one.
     let points: Vec<_> = app
         .vlan_history
         .get(&vid)
@@ -211,6 +211,7 @@ pub fn draw(frame: &mut Frame, app: &App, vid: u16, back: Option<&str>, area: Re
         graph_area,
         "All ports",
         &points,
+        app.recorded.step_ms(),
         now,
         app.graph_range,
     );

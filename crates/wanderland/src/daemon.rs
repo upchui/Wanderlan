@@ -4059,17 +4059,19 @@ impl Controller {
         let fresh = match self.vlan_rates.write() {
             Ok(mut v) => {
                 v.wanted = Some(std::time::Instant::now());
-                v.is_fresh().then(|| v.rates.clone())
+                v.is_fresh().then(|| (v.rates.clone(), v.at_ms))
             }
             Err(_) => None,
         };
-        let rates = match fresh {
-            Some(rates) => rates,
+        let (rates, sampled_ms) = match fresh {
+            Some(fresh) => fresh,
             None => {
                 let counters = self.sys.vlan_stats().await.unwrap_or_default();
                 let names: std::collections::HashMap<u32, &str> =
                     links.iter().map(|l| (l.index, l.name.as_str())).collect();
-                stats::counters_only(&counters, |i| names.get(&i).map(|n| (*n).to_string()))
+                let rates =
+                    stats::counters_only(&counters, |i| names.get(&i).map(|n| (*n).to_string()));
+                (rates, None)
             }
         };
         let ports = rates
@@ -4093,6 +4095,7 @@ impl Controller {
             available: note.is_none(),
             note,
             ports,
+            sampled_ms,
         })
     }
 

@@ -14,6 +14,13 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
   take the traffic, with their addresses and default routes; point-to-point
   links such as WireGuard count), or a name typed in; trunk ports are not
   offered.
+- The traffic graphs stand still between two samples: every sample of the
+  daemon has columns of its own (whatever the moment of drawing, the
+  jitter of the sampling time or the width of the terminal), and the graph
+  moves by whole samples when a new one comes, instead of every second
+  re-sorting the samples into columns. The scales keep their width, the
+  LOAD column of the overview has a round scale, and the VLAN window
+  records each sample of the daemon once, at its time.
 
 ### Several networks on one box
 

@@ -944,6 +944,10 @@ pub struct VlanTraffic {
     pub note: Option<String>,
     /// One entry per port and VLAN, sorted by port, then VLAN.
     pub ports: Vec<VlanPortTraffic>,
+    /// When the rates were sampled (ms since the Unix epoch); `None` for
+    /// counters without rates (the sampler had not caught up yet).
+    #[serde(default)]
+    pub sampled_ms: Option<u64>,
 }
 
 /// Traffic of one VLAN on one bridge port. Received: from the port into the

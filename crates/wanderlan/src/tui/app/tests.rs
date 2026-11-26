@@ -1165,14 +1165,18 @@ fn the_vlan_history_follows_the_answers() {
         vid: 20,
         back: None,
     });
-    for _ in 0..3 {
-        app.update(reply(
-            Request::VlanTraffic,
-            Reply::VlanTraffic(fixtures::vlan_traffic()),
-        ));
+    // One point per sample of the daemon: the same sample again, or one
+    // without rates, adds none.
+    let sampled = |at: Option<u64>| VlanTraffic {
+        sampled_ms: at,
+        ..fixtures::vlan_traffic()
+    };
+    for at in [Some(2_000), Some(2_000), None, Some(4_000), Some(6_000)] {
+        app.update(reply(Request::VlanTraffic, Reply::VlanTraffic(sampled(at))));
     }
     let samples = app.vlan_history.get(&20).expect("VLAN 20");
     assert_eq!(samples.len(), 3);
+    assert_eq!(samples[1].0, 4_000, "at the time of the sample");
     // All ports: vx-buero 2.4M + vx-haus2 300k + ens19 2.1M in.
     assert_eq!(samples[0].1, 4_800_000);
     // An answer without ports (a read error) keeps the history.
