@@ -78,6 +78,11 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
   re-sorting the samples into columns. The scales keep their width, the
   LOAD column of the overview has a round scale, and the VLAN window
   records each sample of the daemon once, at its time.
+- The graph of the VLAN window tells download from upload: it shows the
+  traffic of the VLAN over the tunnels (in from the other sites, out to
+  them). It added up all ports, and as the bridge sends out on one port
+  what came in on another, in and out were always the same. Its tunnels
+  are named by their site, not by their interface.
 
 ### Several networks on one box
 

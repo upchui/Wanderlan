@@ -37,13 +37,14 @@ pub fn vlan_ports(traffic: &VlanTraffic, vid: u16) -> Vec<&VlanPortTraffic> {
     list
 }
 
-/// The whole traffic per VLAN: into the bridge (sum of what all ports
-/// received) and out of it (sum of what they sent; flooded frames count on
-/// every port), in bit/s. One pass over the entries (every VLAN on every
-/// port: many with the default of all VLANs).
-pub fn vlan_totals(traffic: &VlanTraffic) -> std::collections::BTreeMap<u16, (u64, u64)> {
+/// The traffic per VLAN over the tunnels, in bit/s: in from the other sites
+/// (what the tunnels received), out to them (what they sent). Not over all
+/// ports: the bridge sends out on one port what came in on another, so in
+/// and out of all ports are always the same. One pass over the entries
+/// (every VLAN on every port: many with the default of all VLANs).
+pub fn vlan_tunnel_totals(traffic: &VlanTraffic) -> std::collections::BTreeMap<u16, (u64, u64)> {
     let mut totals = std::collections::BTreeMap::new();
-    for p in &traffic.ports {
+    for p in traffic.ports.iter().filter(|p| p.peer.is_some()) {
         let t: &mut (u64, u64) = totals.entry(p.vid).or_default();
         t.0 += p.rx_bps;
         t.1 += p.tx_bps;
@@ -110,7 +111,8 @@ mod tests {
         let t = traffic();
         let ports: Vec<&str> = vlan_ports(&t, 20).iter().map(|p| p.port.as_str()).collect();
         assert_eq!(ports, ["vx-buero", "vx-haus2", "ens19"], "the trunk last");
-        assert_eq!(vlan_totals(&t)[&20], (5950, 2975));
+        // Over the tunnels only: vx-buero and vx-haus2, not ens19.
+        assert_eq!(vlan_tunnel_totals(&t)[&20], (5050, 2525));
         assert_eq!(vlan_ids(&t), [10, 20, 30]);
         assert_eq!(next_vlan(&t, 20, 1), 30);
         assert_eq!(next_vlan(&t, 20, -1), 10);

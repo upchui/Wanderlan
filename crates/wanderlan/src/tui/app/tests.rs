@@ -1240,8 +1240,10 @@ fn the_vlan_history_follows_the_answers() {
     let samples = app.vlan_history.get(&20).expect("VLAN 20");
     assert_eq!(samples.len(), 3);
     assert_eq!(samples[1].0, 4_000, "at the time of the sample");
-    // All ports: vx-buero 2.4M + vx-haus2 300k + ens19 2.1M in.
-    assert_eq!(samples[0].1, 4_800_000);
+    // Over the tunnels: vx-buero 2.4M + vx-haus2 300k in, 1.8M + 300k out
+    // (the trunk ens19 is not counted: in and out would be the same).
+    assert_eq!(samples[0].1, 2_700_000);
+    assert_eq!(samples[0].2, 2_100_000);
     // An answer without ports (a read error) keeps the history.
     app.update(reply(
         Request::VlanTraffic,

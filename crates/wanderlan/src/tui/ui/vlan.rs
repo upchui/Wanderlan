@@ -144,8 +144,10 @@ pub fn draw(frame: &mut Frame, app: &App, vid: u16, back: Option<&str>, area: Re
     let rows: Vec<Row> = ports
         .iter()
         .map(|p| {
+            // A tunnel by the site it leads to (its interface is named by
+            // the identity of that site).
             let name = match &p.peer {
-                Some(_) => p.port.clone(),
+                Some(peer) => peer.clone(),
                 None => format!("{} (trunk)", p.port),
             };
             let idle = p.rx_bps == 0 && p.tx_bps == 0;
@@ -197,7 +199,8 @@ pub fn draw(frame: &mut Frame, app: &App, vid: u16, back: Option<&str>, area: Re
     );
 
     // Recorded from the answers (the daemon counts per VLAN only while
-    // asked), at the times the daemon sampled: "now" is the last one.
+    // asked), at the times the daemon sampled: "now" is the last one. Over
+    // the tunnels: in from the other sites, out to them.
     let points: Vec<_> = app
         .vlan_history
         .get(&vid)
@@ -209,7 +212,7 @@ pub fn draw(frame: &mut Frame, app: &App, vid: u16, back: Option<&str>, area: Re
     super::graph::traffic(
         frame,
         graph_area,
-        "All ports",
+        "Tunnels",
         &points,
         app.recorded.step_ms(),
         now,

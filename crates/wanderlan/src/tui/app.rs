@@ -1653,7 +1653,7 @@ impl App {
                 .is_none_or(|last| at > last.0)
         {
             let oldest = at.saturating_sub(super::history::KEEP_MS);
-            let (rx_bps, tx_bps) = traffic::vlan_totals(&traffic)
+            let (rx_bps, tx_bps) = traffic::vlan_tunnel_totals(&traffic)
                 .get(&vid)
                 .copied()
                 .unwrap_or_default();
