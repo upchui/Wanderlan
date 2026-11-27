@@ -1,28 +1,27 @@
 //! Who may change what.
 //!
-//! A site that joined with an invitation is managed by the site that created
-//! the invitation (`managed_by`): only that site may change the rules of the
-//! joined site, i.e. its VLANs, its VLAN mappings, whether it is online, who
-//! manages it, and whether it stays in the network at all.
+//! The tunnel between a client and its server belongs to the two of them:
+//! the option `changes` of the client says who changes it, **only its
+//! server**, **only the client** or **both**. That is what goes through the
+//! tunnel: the client's VLANs and VLAN mappings, the VLANs of that tunnel,
+//! its breakouts and whether it is online; and the option itself, for
+//! whoever may change the tunnel now (with "only the client" its server has
+//! no say until the client gives it back). The address of the client, its
+//! server (moving it, making it a server) and whether it stays in the
+//! network are always for its server.
 //!
-//! A managed site that was not allowed to manage itself is **restricted**:
-//! it may not change any VLAN rules, neither its own, nor those of other
-//! sites, nor the VLANs of the network; only those of sites it invited
-//! itself. With `self_managed` ("may change its own VLANs") it has the same
-//! rights as the site that invited it.
+//! "Its server" is always the other end of that tunnel: a client + server
+//! is the server of its own clients, the sites above it have no say there.
+//! A client changes nothing above it.
 //!
-//! Sites without a manager (the first site, sites added by hand) and the
-//! network's VLANs may be changed by every site that is not restricted. A
-//! manager that left the network can no longer decide: its sites are open
-//! again and no longer restricted.
+//! A server has no such option: every server changes it, and the tunnels
+//! between servers.
 //!
-//! A client changes only itself and the sites below it (its clients, their
-//! clients, ...): for them it is the server. It never changes its own
-//! server or sites beside it.
+//! A client that may not change its own tunnel ("only the server") is
+//! **restricted**: it does not change the VLANs of the network either.
 //!
-//! A site may always rename itself. Another site may rename it only if it
-//! is its manager (`managed_by`) and may change it; a client never renames
-//! its server.
+//! A site may always rename itself; its server may rename it too, a client
+//! never renames its server. Its ports only the site itself changes.
 //!
 //! Every wanderland checks this when a change is made on it (TUI, CLI,
 //! edited files), and a server again when it takes over the changes of a
@@ -32,22 +31,20 @@
 
 use std::collections::BTreeSet;
 
-use crate::config::{Breakouts, Network, Site, VlanMap};
+use crate::config::{Breakouts, Changes, Network, Site, VlanMap};
 use crate::identity::SiteId;
 use crate::topology;
 
-/// The parts of a site that only its managers may change.
+/// What goes through the tunnel of a client to its server: changed by whom
+/// its option `changes` names (a server: by every server).
 #[derive(Debug, PartialEq, Eq)]
 struct Rules<'a> {
-    address: std::net::Ipv4Addr,
     vlans: Option<String>,
     online: bool,
-    managed_by: Option<SiteId>,
-    self_managed: bool,
-    uplink: Option<SiteId>,
+    /// Only a client has the option.
+    changes: Option<Changes>,
     maps: Vec<&'a VlanMap>,
-    /// The local breakout bypasses the central firewall: its manager
-    /// decides.
+    /// The local breakout bypasses the central firewall.
     breakout: &'a Breakouts,
 }
 
@@ -55,50 +52,65 @@ fn rules<'a>(network: &'a Network, site: &'a Site) -> Rules<'a> {
     let mut maps: Vec<&VlanMap> = network.maps_of(site.id).collect();
     maps.sort_by_key(|m| (m.local, m.shared));
     Rules {
-        address: site.address,
         vlans: site.vlans.as_ref().map(ToString::to_string),
         online: site.online,
-        managed_by: site.managed_by,
-        self_managed: site.self_managed,
-        uplink: site.uplink,
+        changes: site.uplink.map(|_| site.changes),
         maps,
         breakout: &site.breakout,
     }
 }
 
-/// The manager of `site` if it is still part of the network.
-pub fn manager(network: &Network, site: &Site) -> Option<SiteId> {
-    site.managed_by.filter(|m| network.site(*m).is_some())
+/// The server of `site` if it is a client: the other end of its tunnel.
+pub fn server_of(network: &Network, site: &Site) -> Option<SiteId> {
+    site.uplink.filter(|up| network.site(*up).is_some())
 }
 
-/// The site that manages `editor` if `editor` is restricted (joined with an
-/// invitation and not allowed to manage itself). A site that is managed by
-/// itself ("only alex may change alex") is never restricted.
+/// The server of `editor` if `editor` is restricted: a client that may not
+/// change its own tunnel ("only the server").
 pub fn restricted_by(network: &Network, editor: SiteId) -> Option<SiteId> {
     let site = network.site(editor)?;
-    if site.self_managed {
-        return None;
-    }
-    manager(network, site).filter(|m| *m != editor)
+    server_of(network, site).filter(|_| !site.changes.client())
 }
 
-/// True if `editor` may change the rules of `site` in `network`.
+/// True if `editor` may change the tunnel of `site` to its server (its
+/// VLANs, mappings, breakouts, online state, the option `changes`); a
+/// server: every server.
 pub fn may_change(network: &Network, site: &Site, editor: SiteId) -> bool {
-    // A client only changes itself and the sites below it, never its
-    // server.
-    if client_of(network, editor).is_some() && !itself_or_below(network, site.id, editor) {
-        return false;
+    match server_of(network, site) {
+        Some(server) => {
+            (editor == server && site.changes.server())
+                || (editor == site.id && site.changes.client())
+        }
+        None => client_of(network, editor).is_none(),
     }
-    match manager(network, site) {
-        Some(m) => editor == m || (editor == site.id && site.self_managed),
-        None => restricted_by(network, editor).is_none(),
+}
+
+/// True if `editor` may change the address or the server of `site`, or
+/// remove it: its server; a server every server.
+pub fn may_manage(network: &Network, site: &Site, editor: SiteId) -> bool {
+    match server_of(network, site) {
+        Some(server) => editor == server,
+        None => client_of(network, editor).is_none(),
     }
+}
+
+/// The client of the tunnel between `a` and `b`, if one is the server of
+/// the other.
+fn client_in(network: &Network, a: SiteId, b: SiteId) -> Option<&Site> {
+    [(a, b), (b, a)]
+        .into_iter()
+        .filter_map(|(c, s)| network.site(c).filter(|c| c.uplink == Some(s)))
+        .next()
 }
 
 /// True if `editor` may change the VLANs of the tunnel between `a` and `b`:
-/// whoever may change one of the two sites. A site that is not there yet is
-/// judged when it is added.
+/// between a client and its server as the client's option says, between
+/// servers every server. A site that is not there yet is judged when it is
+/// added.
 pub fn may_change_tunnel(network: &Network, a: SiteId, b: SiteId, editor: SiteId) -> bool {
+    if let Some(client) = client_in(network, a, b) {
+        return may_change(network, client, editor);
+    }
     [a, b].iter().any(|id| {
         network
             .site(*id)
@@ -115,30 +127,19 @@ pub fn why_not_tunnel(network: &Network, a: SiteId, b: SiteId, editor: SiteId) -
         network.label(a),
         network.label(b)
     );
-    if let Some(m) = restricted_by(network, editor) {
-        return format!(
-            "this site (\"{me}\") may not change {what}: {}",
-            restricted_reason(&network.label(m))
-        );
+    match client_in(network, a, b) {
+        Some(client) => format!(
+            "this site (\"{me}\") may not change {what}: it is changed by {}",
+            managers(network, client)
+        ),
+        None => match client_of(network, editor) {
+            Some(up) => format!(
+                "this site (\"{me}\") is a client of \"{}\": it may only change its own tunnels, not {what}",
+                network.label(up)
+            ),
+            None => format!("this site (\"{me}\") may not change {what}"),
+        },
     }
-    if let Some(up) = client_of(network, editor) {
-        return format!(
-            "this site (\"{me}\") is a client of \"{}\": it may only change its own tunnels, not {what}",
-            network.label(up)
-        );
-    }
-    let by = |id: SiteId| {
-        network
-            .site(id)
-            .map_or_else(String::new, |s| managers(network, s))
-    };
-    format!(
-        "this site (\"{me}\") may not change {what}: \"{}\" is managed by {}, \"{}\" by {}",
-        network.label(a),
-        by(a),
-        network.label(b),
-        by(b)
-    )
 }
 
 /// True if `site` is `editor` or hangs (indirectly) off it.
@@ -156,31 +157,34 @@ pub fn may_change_network_vlans(network: &Network, editor: SiteId) -> bool {
     restricted_by(network, editor).is_none()
 }
 
-/// Explains who may change `site`, for displays.
+/// Who changes the tunnel of `site`, for displays: `only its server "hq"`,
+/// `only "office" itself`, `its server "hq" and "office" itself`; for a
+/// server `every server`.
 pub fn managers(network: &Network, site: &Site) -> String {
-    match (manager(network, site), site.self_managed) {
-        (None, _) => "every site that is not managed by another".into(),
-        (Some(m), false) => format!("only \"{}\"", network.label(m)),
-        (Some(m), true) => format!(
-            "\"{}\" and \"{}\" itself",
-            network.label(m),
-            network.label(site.id)
-        ),
+    let name = network.label(site.id);
+    match server_of(network, site) {
+        None => "every server".into(),
+        Some(server) => {
+            let server = network.label(server);
+            match site.changes {
+                Changes::Server => format!("only its server \"{server}\""),
+                Changes::Client => format!("only \"{name}\" itself"),
+                Changes::Both => format!("its server \"{server}\" and \"{name}\" itself"),
+            }
+        }
     }
 }
 
-/// Short form for tables: `nobody` (every server may change it), `a`,
-/// `a+self`.
+/// Short form for tables: `server`, `client` or `both`; `-` for a server.
 pub fn managed_label(network: &Network, site: &Site) -> String {
-    match (manager(network, site), site.self_managed) {
-        (None, _) => "nobody".into(),
-        (Some(m), false) => network.label(m),
-        (Some(m), true) => format!("{}+self", network.label(m)),
+    match server_of(network, site) {
+        None => "-".into(),
+        Some(_) => site.changes.as_str().into(),
     }
 }
 
-/// Why `editor` may not `what` (change, remove) `site`; only meaningful if
-/// it may not.
+/// Why `editor` may not `what` (e.g. `change`) the tunnel of `site`; only
+/// meaningful if it may not.
 pub fn why_not(network: &Network, site: &Site, editor: SiteId, what: &str) -> String {
     let name = network.label(site.id);
     let me = network.label(editor);
@@ -192,18 +196,38 @@ pub fn why_not(network: &Network, site: &Site, editor: SiteId, what: &str) -> St
             network.label(up)
         );
     }
-    if let Some(m) = restricted_by(network, editor)
-        && manager(network, site) != Some(editor)
-    {
-        return format!(
-            "this site (\"{me}\") may not {what} site \"{name}\": {}",
-            restricted_reason(&network.label(m))
-        );
-    }
+    let Some(server) = server_of(network, site) else {
+        return format!("this site (\"{me}\") may not {what} site \"{name}\": every server may");
+    };
+    let on = if site.changes.server() {
+        server
+    } else {
+        site.id
+    };
     format!(
-        "this site (\"{me}\") may not {what} site \"{name}\": its VLANs, mappings, breakouts and online state are managed by {}; make the change there",
-        managers(network, site)
+        "this site (\"{me}\") may not {what} site \"{name}\": its VLANs, mappings, breakouts and online state are changed by {} (Changes: {}); make the change on \"{}\"",
+        managers(network, site),
+        site.changes.label(),
+        network.label(on)
     )
+}
+
+/// Why `editor` may not `what` (remove, move, readdress) `site`; only
+/// meaningful if it may not ([`may_manage`]).
+pub fn why_not_manage(network: &Network, site: &Site, editor: SiteId, what: &str) -> String {
+    let name = network.label(site.id);
+    let me = network.label(editor);
+    match (server_of(network, site), client_of(network, editor)) {
+        (Some(server), _) => format!(
+            "this site (\"{me}\") may not {what} site \"{name}\": that is for its server \"{}\"",
+            network.label(server)
+        ),
+        (None, Some(up)) => format!(
+            "this site (\"{me}\") is a client of \"{}\": it may not {what} site \"{name}\"",
+            network.label(up)
+        ),
+        (None, None) => format!("this site (\"{me}\") may not {what} site \"{name}\""),
+    }
 }
 
 /// Why `editor` may not change the network's VLANs; empty if it may.
@@ -217,27 +241,27 @@ pub fn why_not_network(network: &Network, editor: SiteId) -> String {
     })
 }
 
-fn restricted_reason(manager: &str) -> String {
+fn restricted_reason(server: &str) -> String {
     format!(
-        "it is managed by \"{manager}\" and may not change VLANs, mappings, breakouts or the online state (except of sites it invited itself); make the change on \"{manager}\""
+        "only its server \"{server}\" changes its tunnel (Changes: only the server), and it does not change the VLANs of the network either; make the change on \"{server}\""
     )
 }
 
-/// True if `editor` may rename `site`: the site itself always; its manager
-/// (`managed_by`) if it may change it, so a client never renames its server.
+/// True if `editor` may rename `site`: the site itself always, its server
+/// too; so a client never renames its server.
 pub fn may_rename(network: &Network, site: SiteId, editor: SiteId) -> bool {
     site == editor
         || network
             .site(site)
-            .is_some_and(|s| manager(network, s) == Some(editor) && may_change(network, s, editor))
+            .is_some_and(|s| server_of(network, s) == Some(editor))
 }
 
-/// Who may rename `site`, for displays: `"x" itself and "m"` or
+/// Who may rename `site`, for displays: `"x" itself and its server "s"` or
 /// `only "x" itself`.
 pub fn renamers(network: &Network, site: &Site) -> String {
     let name = network.label(site.id);
-    match manager(network, site).filter(|m| *m != site.id && may_change(network, site, *m)) {
-        Some(m) => format!("\"{name}\" itself and its manager \"{}\"", network.label(m)),
+    match server_of(network, site) {
+        Some(s) => format!("\"{name}\" itself and its server \"{}\"", network.label(s)),
         None => format!("only \"{name}\" itself"),
     }
 }
@@ -335,38 +359,30 @@ fn check_by(
 /// What `editor` may not do to `site` (as it is in `old`) in `new`, if
 /// anything.
 fn check_site(old: &Network, new: &Network, site: &Site, editor: SiteId) -> Result<(), String> {
-    let now = new.site(site.id);
-    // A released site changes its VLANs, mappings and online state; who
-    // manages it, where it is plugged in and its address stay the decision
-    // of its manager.
-    if editor == site.id
-        && site.self_managed
-        && let Some(m) = manager(old, site).filter(|m| *m != editor)
-        && let Some(now) = now
-    {
-        let fixed = |s: &Site| (s.address, s.managed_by, s.uplink);
-        if fixed(now) != fixed(site) {
-            return Err(format!(
-                "this site (\"{}\") may not change who manages it, its server or its address: that is for \"{}\"",
-                old.label(editor),
-                old.label(m)
-            ));
-        }
+    let Some(now) = new.site(site.id) else {
+        return if may_manage(old, site, editor) {
+            Ok(())
+        } else {
+            Err(why_not_manage(old, site, editor, "remove"))
+        };
+    };
+    // Where it is: for its server.
+    if (now.address, now.uplink) != (site.address, site.uplink) && !may_manage(old, site, editor) {
+        return Err(why_not_manage(
+            old,
+            site,
+            editor,
+            "change the address or the server of",
+        ));
     }
-    if may_change(old, site, editor) {
-        return Ok(());
+    if rules(new, now) != rules(old, site) && !may_change(old, site, editor) {
+        return Err(why_not(old, site, editor, "change"));
     }
-    match now {
-        None => Err(why_not(old, site, editor, "remove")),
-        Some(now) if rules(new, now) != rules(old, site) => {
-            Err(why_not(old, site, editor, "change"))
-        }
-        // Its own VLANs: the site itself, or whoever may change it.
-        Some(now) if now.own_vlans != site.own_vlans && editor != site.id => {
-            Err(why_not(old, site, editor, "change the own VLANs of"))
-        }
-        Some(_) => Ok(()),
+    // Its own VLANs: the site itself, or whoever may change its tunnel.
+    if now.own_vlans != site.own_vlans && editor != site.id && !may_change(old, site, editor) {
+        return Err(why_not(old, site, editor, "change the own VLANs of"));
     }
+    Ok(())
 }
 
 /// [`check_edit`] for two networks with the same sites and names.
@@ -515,35 +531,86 @@ mod tests {
         SiteId::provisional(name)
     }
 
-    fn site(name: &str, last: u8, managed_by: Option<&str>, self_managed: bool) -> Site {
+    /// A site; with `server` a client of it whose tunnel `changes` decides.
+    fn site(name: &str, last: u8, server: Option<&str>, changes: Changes) -> Site {
         Site {
-            managed_by: managed_by.map(id),
-            self_managed,
+            uplink: server.map(id),
+            changes,
             ..Site::new(name, Ipv4Addr::new(10, 0, 0, last))
         }
     }
 
+    /// Servers a and b; c and d clients of a: c changed only by a, d by
+    /// both.
     fn network() -> Network {
         let mut network = Network::new(VlanSet::all());
         network.sites = vec![
-            site("a", 1, None, false),
-            site("b", 2, None, false),
-            site("c", 3, Some("a"), false),
-            site("d", 4, Some("a"), true),
+            site("a", 1, None, Changes::Both),
+            site("b", 2, None, Changes::Both),
+            site("c", 3, Some("a"), Changes::Server),
+            site("d", 4, Some("a"), Changes::Both),
         ];
         network
     }
 
     #[test]
-    fn only_the_inviting_site_changes_an_invited_site() {
+    fn the_option_says_who_changes_the_tunnel_of_a_client() {
         let old = network();
+        // Only the server.
         let mut new = old.clone();
         new.sites[2].vlans = Some(VlanSet::from_range(10, 20));
         assert!(check_edit(&old, &new, id("a")).is_ok());
+        let err = check_edit(&old, &new, id("c")).unwrap_err();
+        assert!(err.contains("only its server \"a\""), "{err}");
         let err = check_edit(&old, &new, id("b")).unwrap_err();
         assert!(err.contains("may not change site \"c\""), "{err}");
-        assert!(err.contains("only \"a\""), "{err}");
-        assert!(check_edit(&old, &new, id("c")).is_err(), "not self-managed");
+        // Both.
+        let mut new = old.clone();
+        new.sites[3].online = false;
+        new.maps.push(VlanMap {
+            site: id("d"),
+            local: LocalVid::Native,
+            shared: 20,
+        });
+        assert!(check_edit(&old, &new, id("a")).is_ok());
+        assert!(check_edit(&old, &new, id("d")).is_ok());
+        assert!(check_edit(&old, &new, id("b")).is_err(), "not its server");
+        // Only the client: its server has no say, not even about the
+        // option, until the client gives it back.
+        let mut own = old.clone();
+        own.sites[2].changes = Changes::Client;
+        assert_eq!(restricted_by(&own, id("c")), None);
+        let mut new = own.clone();
+        new.sites[2].online = false;
+        assert!(check_edit(&own, &new, id("c")).is_ok());
+        assert!(check_edit(&own, &new, id("a")).is_err());
+        let mut back = own.clone();
+        back.sites[2].changes = Changes::Server;
+        assert!(check_edit(&own, &back, id("a")).is_err());
+        assert!(check_edit(&own, &back, id("c")).is_ok());
+        // Its address, its server and whether it stays: its server.
+        for change in [
+            |s: &mut Site| s.address = Ipv4Addr::new(10, 0, 0, 9),
+            |s: &mut Site| s.uplink = Some(id("b")),
+        ] {
+            let mut new = own.clone();
+            change(&mut new.sites[2]);
+            let err = check_edit(&own, &new, id("c")).unwrap_err();
+            assert!(err.contains("that is for its server \"a\""), "{err}");
+            assert!(check_edit(&own, &new, id("a")).is_ok());
+        }
+        let mut gone = own.clone();
+        gone.sites.retain(|s| s.name != "c");
+        assert!(check_edit(&own, &gone, id("a")).is_ok());
+        let err = check_edit(&own, &gone, id("b")).unwrap_err();
+        assert!(err.contains("may not remove"), "{err}");
+        // A server: every server, no client.
+        let mut new = old.clone();
+        new.sites[1].vlans = Some(VlanSet::from_range(30, 30));
+        assert!(check_edit(&old, &new, id("a")).is_ok());
+        assert!(check_edit(&old, &new, id("b")).is_ok());
+        let err = check_edit(&old, &new, id("d")).unwrap_err();
+        assert!(err.contains("is a client of \"a\""), "{err}");
     }
 
     #[test]
@@ -563,140 +630,57 @@ mod tests {
     }
 
     #[test]
-    fn a_self_managed_site_changes_itself() {
-        let old = network();
-        let mut new = old.clone();
-        new.sites[3].online = false;
-        assert!(check_edit(&old, &new, id("d")).is_ok());
-        assert!(check_edit(&old, &new, id("a")).is_ok());
-        assert!(check_edit(&old, &new, id("b")).is_err());
-        // Who manages it and where it is plugged in stay its manager's.
-        for change in [
-            |s: &mut Site| s.managed_by = Some(id("d")),
-            |s: &mut Site| s.uplink = Some(id("b")),
-        ] {
-            let mut new = old.clone();
-            change(&mut new.sites[3]);
-            let err = check_edit(&old, &new, id("d")).unwrap_err();
-            assert!(err.contains("that is for \"a\""), "{err}");
-        }
-    }
-
-    #[test]
-    fn mappings_removal_and_management_are_protected() {
-        let old = network();
-        let mut new = old.clone();
-        new.maps.push(VlanMap {
-            site: id("c"),
-            local: LocalVid::Native,
-            shared: 20,
-        });
-        assert!(check_edit(&old, &new, id("b")).is_err());
-        let mut gone = old.clone();
-        gone.sites.retain(|s| s.name != "c");
-        assert!(
-            check_edit(&old, &gone, id("b"))
-                .unwrap_err()
-                .contains("may not remove")
-        );
-        let mut taken = old.clone();
-        taken.sites[2].managed_by = Some(id("b"));
-        assert!(check_edit(&old, &taken, id("b")).is_err());
-        // Which site it is plugged into is a rule too.
-        let mut moved = old.clone();
-        moved.sites[2].uplink = Some(id("b"));
-        assert!(check_edit(&old, &moved, id("b")).is_err());
-        assert!(check_edit(&old, &moved, id("a")).is_ok());
-    }
-
-    #[test]
-    fn open_sites_and_network_settings_are_open_to_unrestricted_sites() {
-        let old = network();
-        let mut new = old.clone();
-        new.sites[1].vlans = Some(VlanSet::from_range(30, 30));
-        new.vlans = VlanSet::from_range(10, 50);
-        assert!(check_edit(&old, &new, id("a")).is_ok());
-        assert!(check_edit(&old, &new, id("b")).is_ok());
-        assert!(
-            check_edit(&old, &new, id("d")).is_ok(),
-            "released: like its manager"
-        );
-        // Without its manager, an invited site is open again.
-        let mut orphan = old.clone();
-        orphan.sites.retain(|s| s.name != "a");
-        let mut changed = orphan.clone();
-        changed.sites[1].online = false;
-        assert!(check_edit(&orphan, &changed, id("b")).is_ok());
-        assert!(
-            check_edit(&orphan, &changed, id("c")).is_ok(),
-            "no longer restricted"
-        );
-    }
-
-    #[test]
     fn a_restricted_site_changes_no_vlan_rules() {
         let old = network();
         assert_eq!(restricted_by(&old, id("c")), Some(id("a")));
-        assert_eq!(restricted_by(&old, id("d")), None, "released");
+        assert_eq!(restricted_by(&old, id("d")), None, "both");
         assert_eq!(restricted_by(&old, id("a")), None);
         // The network's VLANs.
         let mut new = old.clone();
         new.vlans = VlanSet::from_range(10, 50);
         let err = check_edit(&old, &new, id("c")).unwrap_err();
-        assert!(err.contains("managed by \"a\""), "{err}");
-        // An open site (the inviting one).
+        assert!(err.contains("only its server \"a\""), "{err}");
+        assert!(check_edit(&old, &new, id("d")).is_ok());
+        // Its server.
         let mut new = old.clone();
         new.sites[0].vlans = Some(VlanSet::from_range(10, 20));
         assert!(check_edit(&old, &new, id("c")).is_err());
-        // A mapping of an open site.
-        let mut new = old.clone();
-        new.maps.push(VlanMap {
-            site: id("b"),
-            local: LocalVid::Native,
-            shared: 20,
-        });
-        assert!(check_edit(&old, &new, id("c")).is_err());
-        // Its own ports are its own business.
+        // Its own ports and its own VLANs (towards its own clients) are its
+        // own business.
         let mut new = old.clone();
         new.sites[2].ports.tunnel = Some(52833);
+        new.sites[2].own_vlans = Some(VlanSet::from_range(60, 60));
         assert!(check_edit(&old, &new, id("c")).is_ok());
-    }
-
-    #[test]
-    fn a_restricted_site_manages_the_sites_it_invited() {
-        let mut old = network();
-        old.sites.push(site("e", 5, Some("c"), false));
-        let mut new = old.clone();
-        new.sites[4].online = false;
-        assert!(check_edit(&old, &new, id("c")).is_ok());
+        let mut own = old.clone();
+        own.sites[2].own_vlans = Some(VlanSet::from_range(60, 60));
+        assert!(check_edit(&old, &own, id("a")).is_ok(), "its server");
+        let err = check_edit(&old, &own, id("b")).unwrap_err();
         assert!(
-            check_edit(&old, &new, id("a")).is_err(),
-            "e is managed by c only"
+            err.contains("may not change the own VLANs of site \"c\""),
+            "{err}"
         );
     }
 
     #[test]
     fn labels_and_messages() {
         let m = network();
-        assert_eq!(managed_label(&m, &m.sites[0]), "nobody");
-        assert_eq!(managed_label(&m, &m.sites[2]), "a");
-        assert_eq!(managed_label(&m, &m.sites[3]), "a+self");
-        assert!(why_not(&m, &m.sites[0], id("c"), "change").contains("make the change on \"a\""));
-        assert!(why_not(&m, &m.sites[2], id("b"), "change").contains("only \"a\""));
+        assert_eq!(managed_label(&m, &m.sites[0]), "-");
+        assert_eq!(managed_label(&m, &m.sites[2]), "server");
+        assert_eq!(managed_label(&m, &m.sites[3]), "both");
+        assert_eq!(
+            managers(&m, &m.sites[3]),
+            "its server \"a\" and \"d\" itself"
+        );
+        assert!(why_not(&m, &m.sites[2], id("b"), "change").contains("make the change on \"a\""));
         assert!(may_change_network_vlans(&m, id("b")));
         assert!(!may_change_network_vlans(&m, id("c")));
     }
 
     #[test]
-    fn a_client_changes_only_itself_and_the_sites_below_it() {
+    fn a_client_changes_only_itself_and_its_own_clients() {
         let mut old = network();
-        // d is a client of a (released, so its VLANs are its own), e a client of d.
-        old.sites[3].uplink = Some(id("a"));
-        old.sites.push(Site {
-            uplink: Some(id("d")),
-            managed_by: Some(id("d")),
-            ..site("e", 5, None, false)
-        });
+        // e is a client of d (only d changes it).
+        old.sites.push(site("e", 5, Some("d"), Changes::Server));
         let mut new = old.clone();
         new.sites[3].online = false;
         new.sites[4].online = false;
@@ -704,30 +688,20 @@ mod tests {
             check_edit(&old, &new, id("d")).is_ok(),
             "itself and its client"
         );
-        // g hangs off e: d is a server for it too (and manages it).
+        let mut e = old.clone();
+        e.sites[4].online = false;
+        assert!(check_edit(&old, &e, id("a")).is_err(), "not e's server");
+        // g hangs off e: e is its server, not d.
         let mut deep = old.clone();
-        deep.sites.push(Site {
-            uplink: Some(id("e")),
-            managed_by: Some(id("d")),
-            ..site("g", 7, None, false)
-        });
+        deep.sites.push(site("g", 7, Some("e"), Changes::Server));
         let mut changed = deep.clone();
         changed.sites[5].online = false;
-        assert!(
-            check_edit(&deep, &changed, id("d")).is_ok(),
-            "a site below it"
-        );
-        changed.sites[5].managed_by = Some(id("e"));
-        let mut by_e = changed.clone();
-        by_e.sites[5].online = true;
-        assert!(
-            check_edit(&changed, &by_e, id("d")).is_err(),
-            "managed by e"
-        );
+        assert!(check_edit(&deep, &changed, id("e")).is_ok());
+        assert!(check_edit(&deep, &changed, id("d")).is_err());
         // Up from e to d: e would no longer know it.
         let mut moved = deep.clone();
         moved.sites[5].uplink = Some(id("d"));
-        let err = check_edit(&deep, &moved, id("d")).unwrap_err();
+        let err = check_edit(&deep, &moved, id("e")).unwrap_err();
         assert!(err.contains("hangs off \"e\", a client"), "{err}");
         // With e a server, e knows where g went, but d would lose e; with
         // d a server too, nobody is lost.
@@ -740,7 +714,7 @@ mod tests {
         let err = check_edit(&old, &server, id("d")).unwrap_err();
         assert!(err.contains("is a client of \"a\""), "{err}");
         let mut added = old.clone();
-        added.sites.push(site("f", 6, None, false));
+        added.sites.push(site("f", 6, None, Changes::Both));
         assert!(
             check_edit(&old, &added, id("d"))
                 .unwrap_err()
@@ -756,99 +730,59 @@ mod tests {
     }
 
     #[test]
-    fn a_restricted_site_sets_its_own_vlans() {
-        let old = network();
-        assert_eq!(restricted_by(&old, id("c")), Some(id("a")));
-        let mut new = old.clone();
-        new.sites[2].own_vlans = Some(VlanSet::from_range(60, 60));
-        assert!(check_edit(&old, &new, id("c")).is_ok(), "c itself");
-        assert!(check_edit(&old, &new, id("a")).is_ok(), "its manager");
-        let err = check_edit(&old, &new, id("b")).unwrap_err();
-        assert!(
-            err.contains("may not change the own VLANs of site \"c\""),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn a_site_managed_by_itself_is_not_restricted() {
-        let mut old = network();
-        old.sites[0].managed_by = Some(id("a"));
-        assert_eq!(restricted_by(&old, id("a")), None);
-        assert!(may_change_network_vlans(&old, id("a")));
-        let mut new = old.clone();
-        new.vlans = VlanSet::from_range(10, 20);
-        new.sites[0].vlans = Some(VlanSet::from_range(10, 10));
-        new.sites[2].online = false;
-        assert!(
-            check_edit(&old, &new, id("a")).is_ok(),
-            "network, itself, its clients"
-        );
-        // Others still may not change it.
-        let mut other = old.clone();
-        other.sites[0].online = false;
-        assert!(check_edit(&old, &other, id("b")).is_err());
-    }
-
-    #[test]
-    fn a_tunnel_is_changed_by_whoever_may_change_one_of_its_sites() {
+    fn a_tunnel_is_changed_as_the_option_of_its_client_says() {
         let old = network();
         let mut new = old.clone();
-        new.set_tunnel_limit(id("b"), id("c"), Some(VlanSet::from_range(10, 20)));
-        assert!(check_edit(&old, &new, id("b")).is_ok(), "b may change b");
-        assert!(check_edit(&old, &new, id("a")).is_ok(), "a manages c");
+        new.set_tunnel_limit(id("a"), id("c"), Some(VlanSet::from_range(10, 20)));
+        assert!(check_edit(&old, &new, id("a")).is_ok(), "its server");
         let err = check_edit(&old, &new, id("c")).unwrap_err();
         assert!(
-            err.contains("may not change the VLANs of the tunnel between \"b\" and \"c\""),
+            err.contains("may not change the VLANs of the tunnel between \"a\" and \"c\""),
             "{err}"
         );
-        assert!(err.contains("managed by \"a\""), "{err}");
+        assert!(err.contains("only its server \"a\""), "{err}");
+        assert!(check_edit(&old, &new, id("b")).is_err());
         let mut own = old.clone();
         own.set_tunnel_limit(id("a"), id("d"), Some(VlanSet::new()));
-        assert!(
-            check_edit(&old, &own, id("d")).is_ok(),
-            "d may change itself"
-        );
+        assert!(check_edit(&old, &own, id("d")).is_ok(), "both");
+        // Between servers: every server.
+        let mut servers = old.clone();
+        servers.set_tunnel_limit(id("a"), id("b"), Some(VlanSet::from_range(10, 20)));
+        assert!(check_edit(&old, &servers, id("a")).is_ok());
+        assert!(check_edit(&old, &servers, id("b")).is_ok());
+        assert!(check_edit(&old, &servers, id("d")).is_err());
     }
 
     #[test]
-    fn a_site_renames_itself_its_manager_renames_it_a_client_never_its_server() {
+    fn a_site_renames_itself_its_server_renames_it_a_client_never_its_server() {
         let mut old = network();
-        // c (restricted) is a client of a and has a client e of its own.
-        old.sites[2].uplink = Some(id("a"));
-        old.sites.push(Site {
-            uplink: Some(id("c")),
-            managed_by: Some(id("c")),
-            ..site("e", 5, None, false)
-        });
+        // c (restricted) has a client e of its own.
+        old.sites.push(site("e", 5, Some("c"), Changes::Server));
         let mut renamed = old.clone();
         renamed.rename_site(id("c"), "c2");
         assert!(
             check_edit(&old, &renamed, id("c")).is_ok(),
             "its name is its own, also when restricted"
         );
-        assert!(check_edit(&old, &renamed, id("a")).is_ok(), "its manager");
+        assert!(check_edit(&old, &renamed, id("a")).is_ok(), "its server");
         let err = check_edit(&old, &renamed, id("b")).unwrap_err();
         assert!(
-            err.contains("\"c\" itself and its manager \"a\" may"),
+            err.contains("\"c\" itself and its server \"a\" may"),
             "{err}"
         );
-        // c manages its own client e.
         let mut client = old.clone();
         client.rename_site(id("e"), "e2");
         assert!(check_edit(&old, &client, id("c")).is_ok());
-        // A server without a manager: only itself.
+        // A server: only itself.
         let mut server = old.clone();
         server.rename_site(id("b"), "b2");
         assert!(check_edit(&old, &server, id("b")).is_ok());
         let err = check_edit(&old, &server, id("a")).unwrap_err();
         assert!(err.contains("only \"b\" itself may"), "{err}");
-        // A client never renames its server, not even as its manager.
-        let mut odd = old.clone();
-        odd.sites[0].managed_by = Some(id("c"));
-        let mut renamed = odd.clone();
-        renamed.rename_site(id("a"), "a2");
-        let err = check_edit(&odd, &renamed, id("c")).unwrap_err();
+        // A client never renames its server.
+        let mut up = old.clone();
+        up.rename_site(id("a"), "a2");
+        let err = check_edit(&old, &up, id("c")).unwrap_err();
         assert!(err.contains("is a client of \"a\""), "{err}");
         // A rename and another change of the site at once: the change is
         // judged as always.
@@ -863,12 +797,7 @@ mod tests {
         let real = |n: u8| SiteId::from_bytes([n; 32]);
         let mut old = network();
         // e is a client of c, c a client of a.
-        old.sites.push(Site {
-            uplink: Some(id("c")),
-            managed_by: Some(id("c")),
-            ..site("e", 5, None, false)
-        });
-        old.sites[2].uplink = Some(id("a"));
+        old.sites.push(site("e", 5, Some("c"), Changes::Server));
         let mut claimed = old.clone();
         claimed.rekey(id("c"), real(3));
         assert!(
@@ -888,8 +817,8 @@ mod tests {
             err.contains("may not change the identity of site \"c\""),
             "{err}"
         );
-        // Another identity for a known site: only by the site that invited
-        // it, through a join.
+        // Another identity for a known site: only by its server, through a
+        // join.
         let mut other = claimed.clone();
         other.rekey(real(3), real(9));
         assert!(check_edit(&claimed, &other, real(3)).is_err());
@@ -921,13 +850,13 @@ mod tests {
         let mut old = network();
         old.rekey(id("a"), real(1));
         old.rekey(id("b"), real(2));
-        // Two clients called "x": one managed by a, one by b.
+        // Two clients called "x": one of a, one of b.
         for (n, by, last) in [(7, real(1), 7), (8, real(2), 8)] {
             old.sites.push(Site {
                 id: real(n),
                 uplink: Some(by),
-                managed_by: Some(by),
-                ..site("x", last, None, false)
+                changes: Changes::Server,
+                ..Site::new("x", Ipv4Addr::new(10, 0, 0, last))
             });
         }
         let mut new = old.clone();

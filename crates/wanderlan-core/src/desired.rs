@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use crate::BRIDGE_NAME;
-use crate::config::{Config, LocalVid, NATIVE_VID, TunnelMode};
+use crate::config::{Config, LocalVid, NATIVE_VID, Network, TunnelMode};
 use crate::forwarding;
 use crate::identity::{PeerIdentity, SiteId};
 use crate::mtu;
@@ -220,9 +220,27 @@ pub struct Runtime {
     pub sysctl_writable: bool,
     /// The kernel has no IPv6 (`ipv6.disable=1`): no IPv6 sysctls either.
     pub ipv6_disabled: bool,
+    /// The ports (control, tunnel) the direct peers say they use now, in
+    /// their probes: they win over their entries in the network, which
+    /// learn a change only with the sync.
+    pub peer_ports: BTreeMap<SiteId, (u16, u16)>,
 }
 
 impl Runtime {
+    /// The control port of `peer`: the one it uses now, else its entry.
+    pub fn control_port_of(&self, network: &Network, peer: SiteId) -> u16 {
+        self.peer_ports
+            .get(&peer)
+            .map_or_else(|| network.control_port_of(peer), |p| p.0)
+    }
+
+    /// The tunnel port of `peer`: the one it uses now, else its entry.
+    pub fn tunnel_port_of(&self, network: &Network, peer: SiteId) -> u16 {
+        self.peer_ports
+            .get(&peer)
+            .map_or_else(|| network.tunnel_port_of(peer), |p| p.1)
+    }
+
     /// How the tunnel `t` runs: servers among each other direct, a client
     /// tunnel direct once the server reached the client directly.
     pub fn mode(&self, t: &topology::Tunnel<'_>) -> TunnelMode {
@@ -368,10 +386,10 @@ pub fn derive_in(scope: &Scope, cfg: &Config, runtime: &Runtime) -> Desired {
             (TunnelKind::Client, TunnelMode::Direct) => runtime
                 .direct
                 .get(&peer)
-                .map(|ip| SocketAddrV4::new(*ip, network.tunnel_port_of(peer))),
+                .map(|ip| SocketAddrV4::new(*ip, runtime.tunnel_port_of(network, peer))),
             _ => Some(SocketAddrV4::new(
                 t.peer.address,
-                network.tunnel_port_of(peer),
+                runtime.tunnel_port_of(network, peer),
             )),
         };
         let down_reason = down_reason.or_else(|| {
@@ -969,6 +987,15 @@ mod tests {
         assert_eq!(t.remote.map(|r| r.port()), Some(52833));
         let other = d.tunnels.iter().find(|t| t.peer_name == "haus3").unwrap();
         assert_eq!(other.remote.map(|r| r.port()), Some(51822));
+        // A peer that says it uses another port now gets its packets there.
+        let haus3 = cfg.network.named("haus3").next().unwrap().id;
+        let runtime = Runtime {
+            peer_ports: [(haus3, (53000, 53001))].into(),
+            ..Runtime::default()
+        };
+        let d = derive(&cfg, &runtime);
+        let other = d.tunnels.iter().find(|t| t.peer_name == "haus3").unwrap();
+        assert_eq!(other.remote.map(|r| r.port()), Some(53001));
     }
 
     #[test]

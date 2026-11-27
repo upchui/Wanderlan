@@ -132,9 +132,11 @@ pub fn accept(
         && received.site(own).is_none()
     {
         let provisional = SiteId::provisional(&name);
+        // Only an entry at this site's address: one of that name added for
+        // a new box elsewhere is not this site's.
         if received
             .site(provisional)
-            .is_some_and(|s| !s.has_identity())
+            .is_some_and(|s| !s.has_identity() && before.is_none_or(|b| b.address == s.address))
         {
             received.rekey(provisional, own);
             received.revision = crate::config::next_revision(received.revision);
@@ -161,16 +163,11 @@ pub fn accept(
         && let Some(old) = previous.site(me)
         && old.name != entry.name
     {
-        // Only its manager may rename it (see `policy::may_rename`).
-        let manager_may = crate::policy::manager(previous, old)
-            .is_some_and(|m| m != me && crate::policy::may_rename(previous, me, m));
-        // A client may not see its manager (it hangs off another site); its
-        // server, which knows it, decided.
-        let manager_unseen = old.uplink.is_some()
-            && old
-                .managed_by
-                .is_some_and(|m| m != me && previous.site(m).is_none());
-        if !taken_back && !manager_may && !manager_unseen {
+        // Only its server may rename it (see `policy::may_rename`); a
+        // server only itself. The server it has now counts too: made a
+        // client and renamed while this site was away.
+        let server_may = old.uplink.or(entry.uplink).is_some_and(|up| up != me);
+        if !taken_back && !server_may {
             return Err(Rejection::RenamedWithoutConsent(
                 old.name.clone(),
                 entry.name.clone(),
@@ -287,8 +284,8 @@ mod tests {
         let mut received = previous.clone();
         received.rename_site(id("heim"), "home");
         assert!(accept(received, &local, Some(&previous), false, None).is_ok());
-        // This site renamed by another: only if it has a manager (haus2 has
-        // none in the example).
+        // This site renamed by another: only by its server (haus2 is a
+        // server in the example).
         let mut received = previous.clone();
         received.rename_site(me, "h2");
         assert_eq!(
@@ -297,20 +294,15 @@ mod tests {
         );
         let cfg = accept(received.clone(), &local, Some(&previous), true, None).unwrap();
         assert_eq!(cfg.self_name(), "h2", "taken back");
-        let mut managed = previous.clone();
-        managed.site_mut(me).unwrap().managed_by = Some(id("heim"));
-        let cfg = accept(received, &local, Some(&managed), false, None).unwrap();
-        assert_eq!(cfg.self_name(), "h2", "managed by heim");
-        // A client whose manager it does not see (it hangs off another
-        // site): its server knows the manager and decided.
-        let mut unseen = previous.clone();
-        let entry = unseen.site_mut(me).unwrap();
-        entry.managed_by = Some(id("elsewhere"));
-        entry.uplink.get_or_insert_with(|| id("heim"));
-        let mut received = unseen.clone();
-        received.rename_site(me, "h2");
-        let cfg = accept(received, &local, Some(&unseen), false, None).unwrap();
-        assert_eq!(cfg.self_name(), "h2");
+        let mut client = previous.clone();
+        client.site_mut(me).unwrap().uplink = Some(id("heim"));
+        let cfg = accept(received.clone(), &local, Some(&client), false, None).unwrap();
+        assert_eq!(cfg.self_name(), "h2", "renamed by its server heim");
+        // Made a client of heim and renamed while away: heim may.
+        let mut moved = received;
+        moved.site_mut(me).unwrap().uplink = Some(id("heim"));
+        let cfg = accept(moved, &local, Some(&previous), false, None).unwrap();
+        assert_eq!(cfg.self_name(), "h2", "renamed by its new server");
     }
 
     #[test]

@@ -58,14 +58,14 @@ pub const SECTIONS: &[Section] = &[
         title: "2 Sites",
         keys: &[
             ("Up/Down", "select a site"),
-            ("/", "search (name, address, VLANs, role, manager)"),
+            ("/", "search (name, address, VLANs, role, changes)"),
             ("i", "invite a new site with its own rules (code + command)"),
             ("I", "open invitations: show, delete"),
             ("o", "take the site online / offline (in the draft)"),
             ("n", "new site by hand"),
             ("Enter", "details: role, VLANs, tunnels, mappings, rights"),
             ("e", "edit the site; \"Changes\": who may change its VLANs"),
-            ("N", "new name: this site always, and the sites it manages"),
+            ("N", "new name: this site always, and its clients"),
             ("d, Del", "delete the site and its VLAN mappings"),
             ("m", "the VLANs of the network"),
             ("l", "trunk ports of this host"),
@@ -152,13 +152,15 @@ pub const SECTIONS: &[Section] = &[
                that client (masqueraded) instead of the tunnel to its server; its devices \
                keep their gateway and DHCP. Private destinations and the exceptions still \
                go through the tunnel. Only clients break out: a server is where the \
-               gateways are. Its manager decides, like for its VLANs.",
+               gateways are. Who changes the client's tunnel decides.",
     },
     Section {
         title: "8 Settings",
         keys: &[("Up/Down", "choose a setting"), ("Enter", "change it")],
         text: "The settings of this host only, each with an explanation: every site sets \
-               its own. Trunk and the trunk per tunnel open a list of the interfaces of this host.",
+               its own. Trunk and the trunk per tunnel open a list of the interfaces of this host. \
+               Saved, a setting is applied at once, not kept in the draft: c keeps it, otherwise \
+               it is rolled back after the commit timeout. The other sites follow new ports at once.",
     },
     Section {
         title: "Trunk ports",
@@ -169,7 +171,7 @@ pub const SECTIONS: &[Section] = &[
             ),
             ("m", "main port (number 1, never shut by the loop guard)"),
             ("other", "last row: a name not there yet, Enter adds it"),
-            ("Enter", "save the choice in the draft"),
+            ("Enter", "apply the choice at once (c keeps it)"),
         ],
         text: "Grey interfaces cannot be a trunk port, the note says why: they are in \
                a bridge of someone else. A port of another segment moves here when chosen \
@@ -322,7 +324,14 @@ pub fn bar(app: &App) -> Vec<Binding> {
             Modal::Ports(_) => vec![
                 ("Space", "choose"),
                 ("m", "main port"),
-                ("Enter", "save to draft"),
+                ("Enter", "apply"),
+                ("Esc", "cancel"),
+            ],
+            // The settings of this host are applied when saved.
+            Modal::Form(f) if matches!(f.kind, FormKind::Local | FormKind::OwnPorts(_)) => vec![
+                ("Tab", "next field"),
+                ("Left/Right", "choose"),
+                ("Enter", "apply"),
                 ("Esc", "cancel"),
             ],
             Modal::Form(f) if f.kind == FormKind::Invite => vec![

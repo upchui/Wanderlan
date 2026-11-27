@@ -383,8 +383,8 @@ pub fn add_site(
         id,
         vlans,
         online: false,
-        managed_by: Some(inviter),
-        self_managed: rules.allow_self,
+        // Who changes its tunnel to the inviting site.
+        changes: rules.changes(),
         // Plugged into the inviting site: its only tunnel leads there.
         uplink: Some(inviter),
         ..Site::new(&name, address)
@@ -590,15 +590,16 @@ mod tests {
                 local: 130,
                 shared: 15,
             }],
-            allow_self: true,
+            changes: Some(crate::config::Changes::Both),
+            ..SiteRules::default()
         };
         let a = join(&network(), site1(), "wanderlan", true, NEW, &rules).unwrap();
         assert_eq!(a.name, "branch", "the name of the invitation wins");
         let site = a.network.site(a.site).unwrap();
         assert_eq!(site.vlans.as_ref().unwrap().to_string(), "native,10-20");
         assert_eq!(a.network.maps_of(a.site).count(), 1);
-        assert_eq!(site.managed_by, Some(site1()));
-        assert!(site.self_managed);
+        assert_eq!(site.uplink, Some(site1()));
+        assert_eq!(site.changes, crate::config::Changes::Both);
 
         let native = SiteRules {
             native: Some(14),
@@ -663,7 +664,11 @@ mod tests {
         assert_eq!(moved.network.revision, base.revision + 1);
         let site2 = moved.network.site(id_of(NEW)).unwrap();
         assert_eq!(site2.uplink, Some(id_of(site3)));
-        assert_eq!(site2.managed_by, Some(site1()), "the manager stays");
+        assert_eq!(
+            site2.changes,
+            crate::config::Changes::Server,
+            "the option stays"
+        );
 
         // A server joining again stays a server.
         let server_again = join(&base, id_of(site3), "site1", false, SITE1, &none()).unwrap();
@@ -786,7 +791,11 @@ mod tests {
         assert_eq!(took.site, reset);
         let entry = took.network.site(reset).unwrap();
         assert_eq!(entry.name, "site2");
-        assert_eq!(entry.managed_by, Some(site1()), "the rules stay");
+        assert_eq!(
+            entry.changes,
+            crate::config::Changes::Server,
+            "the rules stay"
+        );
         assert!(took.network.site(site2).is_none());
         assert!(matches!(
             add_site(&base, site1(), at(NEW, reset, "site2"), &alive, &none()),

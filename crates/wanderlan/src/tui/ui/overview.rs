@@ -148,7 +148,7 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
     }
     if let Some(manager) = app.restricted_by() {
         lines.push(Line::styled(
-            format!(" Managed by {manager}: VLANs, mappings and online state change only there."),
+            format!(" Only the server {manager} changes the tunnel of this site: VLANs, mappings and online state change there."),
             theme::warn(),
         ));
     }

@@ -229,7 +229,8 @@ fn invitations() {
                         local: 130,
                         shared: 30,
                     }],
-                    allow_self: true,
+                    changes: Some(wanderlan_core::config::Changes::Both),
+                    allow_self: false,
                 },
             ),
         ]),
@@ -610,8 +611,13 @@ fn several_trunk_ports_in_the_settings() {
     key(&mut app, KeyCode::Char('m'));
     insta::assert_snapshot!(render(&app));
     key(&mut app, KeyCode::Enter);
-    let d = app.draft.as_ref().expect("draft");
-    assert_eq!(d.local.trunk, ["ens20", "ens19"]);
+    // Applied at once, not kept in the draft; shown once it runs.
+    assert!(!app.draft_dirty());
+    let mut texts = fixtures::config_texts();
+    texts.local = texts
+        .local
+        .replace("trunk = \"ens19\"", "trunk = [\"ens20\", \"ens19\"]");
+    reply(&mut app, Request::GetConfig, Reply::Config(texts));
     assert!(render(&app).contains("ens20, ens19"));
 }
 

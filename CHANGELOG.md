@@ -68,6 +68,25 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
 ### Fixes, third review
 
+- Who changes a client's tunnel to its server is one option with three
+  choices, `changes = "server" | "client" | "both"` (TUI: "Changes";
+  `wanderlan manage <site> server|client|both`; `wanderlan invite --changes`).
+  It covers what goes through that tunnel (VLANs, mappings, its tunnel
+  VLANs, breakouts, online state) and the option itself; the address, the
+  server and removing the client stay with its server, servers are changed
+  by every server. It replaces `managed_by`/`self_managed`, which are read
+  once and become `changes`. Older sites do not read it: update all sites.
+- Settings take effect at once. The probes of a site carry its control
+  and tunnel port (behind their tag, older versions ignore them), so its
+  peers follow a change right after the apply (and a rollback) instead of
+  after the confirmation and the sync. After another control port the old
+  one keeps answering (probes and sync) until every peer probes the new
+  one: a server no longer loses its clients (they never get contacted
+  first, behind NAT the old port was the only way to it). A new interval
+  of the path MTU check counts at once, and after another tunnel port a
+  client tunnel runs through NAT until its test finds it direct again. In
+  the TUI the settings of this host (Settings `8`, the trunk ports) are
+  applied when saved, like `wanderlan settings`; `c` keeps them.
 - Breakout only at clients: a server is where the gateways of its devices
   are, a breakout there would only bypass them. The Breakout view and
   `wanderlan breakout` offer only clients, a site that becomes a server

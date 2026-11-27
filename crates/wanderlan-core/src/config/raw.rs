@@ -7,7 +7,7 @@
 //! `network.toml` comes in three formats with the same model:
 //! * format 3, the one the daemon writes and the sites exchange:
 //!   `[site."<identity>"]` tables with the site's `name` inside; every
-//!   reference to a site (`server`, `managed_by`, `tunnel_vlans`) is its
+//!   reference to a site (`server`, `tunnel_vlans`) is its
 //!   identity, so several sites may have the same name. A site without a
 //!   box yet has a placeholder ([`SiteId::provisional`]) that follows its
 //!   name.
@@ -31,8 +31,9 @@ use serde_spanned::Spanned;
 
 use super::diag::{ConfigFile, Diagnostic, FieldPath, SpanMap};
 use super::model::{
-    Breakout, Breakouts, DEFAULT_COMMIT_TIMEOUT, DEFAULT_CONTROL_PORT, DEFAULT_MTU_PROBE_INTERVAL,
-    Local, LocalVid, Network, Site, SitePorts, TunnelVlans, VlanMap, site_pair,
+    Breakout, Breakouts, Changes, DEFAULT_COMMIT_TIMEOUT, DEFAULT_CONTROL_PORT,
+    DEFAULT_MTU_PROBE_INTERVAL, Local, LocalVid, Network, Site, SitePorts, TunnelVlans, VlanMap,
+    site_pair,
 };
 use super::vlan::{VID_MAX, VID_MIN, VlanSet};
 use crate::identity::SiteId;
@@ -86,6 +87,8 @@ struct RawSite {
     vlans: Option<Spanned<RawVlans>>,
     own_vlans: Option<Spanned<RawVlans>>,
     online: Option<Spanned<bool>>,
+    changes: Option<Spanned<String>>,
+    /// Before `changes`: read to take its meaning over, never written.
     managed_by: Option<Spanned<String>>,
     self_managed: Option<Spanned<bool>>,
     rename_by_manager: Option<Spanned<bool>>,
@@ -181,6 +184,7 @@ struct RawSite2 {
     address: Option<Spanned<String>>,
     id: Option<Spanned<String>>,
     server: Option<Spanned<String>>,
+    changes: Option<Spanned<String>>,
     managed_by: Option<Spanned<String>>,
     self_managed: Option<Spanned<bool>>,
     rename_by_manager: Option<Spanned<bool>>,
@@ -248,6 +252,9 @@ pub struct ParsedNetwork {
     /// (`[site.<name>]`), 3 (`[site."<identity>"]`), 0 for tables of both
     /// format 2 and 3.
     pub format: u8,
+    /// Sites without a box renamed by hand: their placeholders as written
+    /// and as they follow the names now (`local.toml` follows too).
+    pub rekeyed: Vec<(SiteId, SiteId)>,
 }
 
 impl ParsedNetwork {
@@ -268,7 +275,11 @@ struct Ref {
 /// The references of one site, resolved once all sites are read.
 struct SiteRefs {
     uplink: Option<Ref>,
+    /// `changes` as written; without it, taken from `managed_by` and
+    /// `self_managed` (files of earlier versions).
+    changes: Option<Changes>,
     managed_by: Option<Ref>,
+    self_managed: bool,
     /// `uplink` was given at all (format 1: `uplink = ""` marks a server).
     uplink_given: bool,
 }
@@ -448,7 +459,7 @@ fn link(
     tunnels: Vec<PendingTunnel>,
     context: Option<&Network>,
     format_1: bool,
-) {
+) -> Vec<(SiteId, SiteId)> {
     // Sites without an identity are known by their name alone.
     for (i, site) in network.sites.iter().enumerate() {
         if site.has_identity() {
@@ -486,9 +497,23 @@ fn link(
             }
             (uplink, _) => uplink,
         };
+        // Before `changes`: the manager (usually the server) alone, with the
+        // site itself if released, or the site alone if it managed itself;
+        // no manager: anyone (both).
+        let changes = r.changes.unwrap_or(match managed_by {
+            Some(m) if m == me => Changes::Client,
+            Some(_) if r.self_managed => Changes::Both,
+            Some(_) => Changes::Server,
+            None => Changes::Both,
+        });
         let site = &mut network.sites[i];
         site.uplink = uplink;
-        site.managed_by = managed_by;
+        // A server has no such option.
+        site.changes = if uplink.is_some() {
+            changes
+        } else {
+            Changes::default()
+        };
     }
     let target = |lw: &mut Lowering, network: &Network, t: &Target| match t {
         Target::Known(id) => Some(*id),
@@ -543,9 +568,15 @@ fn link(
         .filter(|s| s.id.is_provisional() && s.id != SiteId::provisional(&s.name))
         .map(|s| (s.id, SiteId::provisional(&s.name)))
         .collect();
-    for (old, new) in renamed {
-        network.rekey(old, new);
+    // All at once (two sites may have swapped their names): first to
+    // placeholders no name has, then to those of the names.
+    for (i, (old, _)) in renamed.iter().enumerate() {
+        network.rekey(*old, SiteId::provisional(&format!("\0{i}")));
     }
+    for (i, (_, new)) in renamed.iter().enumerate() {
+        network.rekey(SiteId::provisional(&format!("\0{i}")), *new);
+    }
+    renamed
 }
 
 /// Format 1: `[[site]]` is an array, or there are only `[[map]]` or
@@ -574,6 +605,7 @@ fn parse_network_1(
             spans: lw.spans,
             warnings: Vec::new(),
             format: 1,
+            rekeyed: Vec::new(),
         });
     }
 
@@ -619,7 +651,7 @@ fn parse_network_1(
             tunnels.push(tunnel);
         }
     }
-    link(&mut lw, &mut network, refs, maps, tunnels, context, true);
+    let rekeyed = link(&mut lw, &mut network, refs, maps, tunnels, context, true);
 
     if lw.diags.iter().any(Diagnostic::is_error) {
         Err(lw.diags)
@@ -629,6 +661,7 @@ fn parse_network_1(
             spans: lw.spans,
             warnings: lw.diags,
             format: 1,
+            rekeyed,
         })
     }
 }
@@ -649,6 +682,7 @@ fn parse_network_2(
             spans: lw.spans,
             warnings: Vec::new(),
             format: 2,
+            rekeyed: Vec::new(),
         });
     }
     for (key, value, example) in [
@@ -738,6 +772,7 @@ fn parse_network_2(
             vlans: raw_site.vlans,
             own_vlans: raw_site.own_vlans,
             online: raw_site.online,
+            changes: raw_site.changes,
             managed_by: raw_site.managed_by,
             self_managed: raw_site.self_managed,
             rename_by_manager: raw_site.rename_by_manager,
@@ -801,7 +836,7 @@ fn parse_network_2(
             }
         }
     }
-    link(&mut lw, &mut network, refs, maps, tunnels, context, false);
+    let rekeyed = link(&mut lw, &mut network, refs, maps, tunnels, context, false);
 
     let format = match (by_id, by_name) {
         (_, 0) if by_id > 0 => 3,
@@ -816,6 +851,7 @@ fn parse_network_2(
             spans: lw.spans,
             warnings: lw.diags,
             format,
+            rekeyed,
         })
     }
 }
@@ -1007,6 +1043,8 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, SiteRefs
     let online = lw
         .take(&FieldPath::site_field(i, "online"), s.online)
         .unwrap_or(true);
+    let changes_path = FieldPath::site_field(i, "changes");
+    let changes = lw.take(&changes_path, s.changes);
     let managed_path = FieldPath::site_field(i, "managed_by");
     let managed_by = lw.take(&managed_path, s.managed_by);
     let self_managed = lw
@@ -1015,7 +1053,7 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, SiteRefs
     // Written by 1.0.23 and 1.0.24; the mode is detected now.
     let mode_path = FieldPath::site_field(i, "tunnel_mode");
     let tunnel_mode = lw.take(&mode_path, s.tunnel_mode).is_some();
-    // Written by 1.0.22; renaming follows `managed_by` now.
+    // Written by 1.0.22; its server may rename a site now.
     let rename_path = FieldPath::site_field(i, "rename_by_manager");
     let rename_by_manager = lw.take(&rename_path, s.rename_by_manager).is_some();
     // `uplink = ""` marks a server explicitly.
@@ -1052,7 +1090,7 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, SiteRefs
         lw.warning(
             rename_path,
             format!(
-                "{label}: `rename_by_manager` is no longer used and is ignored; its manager (`managed_by`) may rename it"
+                "{label}: `rename_by_manager` is no longer used and is ignored; its server may rename it"
             ),
         );
     }
@@ -1100,6 +1138,16 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, SiteRefs
         }
     };
     let breakout = breakout.map_or_else(Breakouts::new, |b| lower_breakout(lw, i, &label, b));
+    let changes = changes.and_then(|c| match c.parse::<Changes>() {
+        Ok(c) => Some(c),
+        Err(e) => {
+            lw.error(
+                changes_path,
+                format!("{label}: changes: {e} (who changes its tunnel to its server)"),
+            );
+            None
+        }
+    });
     let name = name?;
     let refs = SiteRefs {
         uplink: uplink.map(|text| Ref {
@@ -1107,11 +1155,13 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, SiteRefs
             path: uplink_path,
             what: format!("site \"{name}\": server"),
         }),
+        changes,
         managed_by: managed_by.map(|text| Ref {
             text,
             path: managed_path,
             what: format!("site \"{name}\": managed_by"),
         }),
+        self_managed,
         uplink_given,
     };
     Some((
@@ -1122,8 +1172,7 @@ fn lower_site(lw: &mut Lowering, i: usize, s: RawSite) -> Option<(Site, SiteRefs
             vlans,
             own_vlans,
             online,
-            managed_by: None,
-            self_managed,
+            changes: Changes::default(),
             uplink: None,
             breakout,
             ports,

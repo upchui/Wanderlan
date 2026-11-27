@@ -385,8 +385,9 @@ from an earlier version is ignored with a warning (`wanderlan breakout <site>
 server: in a segment with just tunnels to its own clients it is their
 server.
 
-A breakout bypasses the firewall of the network, so **its manager decides**,
-like for the VLANs of a site (Breakout (`7`), or `wanderlan breakout`).
+A breakout bypasses the firewall of the network, so it is part of the
+client's tunnel: **who changes the tunnel decides** ("Changes", see below;
+Breakout (`7`), or `wanderlan breakout`).
 
 
 ### Who knows what
@@ -401,27 +402,34 @@ on the way, and each checks them.
 
 ### Who may change what
 
-The site that created an invitation **manages** the site that joined with it.
+The tunnel between a client and its server belongs to the two of them. The
+option **Changes** of the client says who changes it: **only the server**
+(the default of an invitation), **only the client**, or **both**. It covers
+what goes through that tunnel, and the option itself:
 
 | Change | Who |
 |--------|-----|
-| VLANs, mappings, local breakout, online state of a managed site, removing it | its manager; the site itself too if it was released ("may change its own VLANs") |
-| The same for a site without a manager (the first site) and the VLANs of the network | every site that is not *restricted* |
-| Timeouts, MTU check, MSS, control port, invitations | every site |
-| The name of a site | the site itself, always; its manager only if the site allows it |
+| VLANs, mappings, the VLANs of its tunnel, local breakout and online state of a client; its option "Changes" | as its option says: its server, the client itself, or both |
+| Address of a client, its server (moving it, making it a server), removing it | its server |
+| The same for a server, the tunnels between servers | every server |
+| The VLANs of the network | every site that is not *restricted* |
+| Timeouts, MTU check, MSS, ports, invitations | every site, each for itself |
+| The name of a site | the site itself, always; its server too |
 
-A site that joined and was not released is **restricted**: it cannot change
-the VLANs its server gave it, only those of sites it invited itself. Its own
-VLANs (see above) are always its own business. A client may in any case only
-change itself and the sites below it, never its server. The daemons enforce
-these rules among themselves (someone with root on a site could bypass
-them); which box is behind a site, however, is protected by its key (see
-[Identities and keys](#identities-and-keys)).
+"Its server" is always the other end of that tunnel: a client + server is
+the server of its own clients, the sites above it have no say there, and a
+client changes nothing above it. With "only the client", its server has no
+say about the tunnel until the client gives it back. A client with "only the
+server" is **restricted**: it does not change the VLANs of the network
+either. Its own VLANs (see above) are always its own business too. The
+daemons enforce these rules among themselves (someone with root on a site
+could bypass them); which box is behind a site, however, is protected by its
+key (see [Identities and keys](#identities-and-keys)).
 
 **Renaming a site.** Sites (`2`), `N` (only the new name), or `wanderlan
 rename <site> <new-name>`. A site may always rename itself, also a
-restricted one; its manager (`managed_by`, "Changes") may rename it too; a
-client never renames its server. Its identity stays, so every site
+restricted one; its server may rename it too; a client never renames its
+server. Its identity stays, so every site
 recognises the renamed one: everything refers to it by its identity, so
 only its name changes; its tunnels stay up (they are named by the
 identity too). Older sites do not understand a rename made by their
@@ -480,7 +488,8 @@ sites).
 
 A site that joins starts **offline**: its tunnel exists but stays down, while
 the control channel already shows whether it is reachable, its round trip and
-path MTU. Once everything is right, its manager takes it online; online stays
+path MTU. Once everything is right, its server takes it online (or the client
+itself, as its option "Changes" says); online stays
 online, also across restarts, until someone takes it offline.
 
 Every change is applied immediately and must be **confirmed** within the
@@ -527,7 +536,8 @@ Keys refer to the terminal UI (`wanderlan`); every change ends with `a`
 (review and apply) and `c` (confirm).
 
 **Invite a site.** Sites, `i`: name, VLANs, untagged VLAN, translations and
-"Changes" (whether it may change its own VLANs). CLI:
+"Changes" (who changes its tunnel later: only this site, only the new site,
+or both). CLI:
 `wanderlan invite --name lab --native 30 --map 130:30`. A code works once and
 stays valid until used or deleted: Sites, `I` (`d` deletes), or
 `wanderlan invite list` / `wanderlan invite delete <code>`. Codes can be
@@ -551,7 +561,7 @@ those of the network), `wanderlan vlans native,10-50` (`all`: every VLAN).
 
 **Give a site VLANs of its own.** VLANs (`3`), `o`: VLANs on this site's
 trunk and towards its own clients, never to its server; possible even when
-the server manages everything else. CLI: `wanderlan own-vlans <site> 50,60`
+only its server changes its tunnel. CLI: `wanderlan own-vlans <site> 50,60`
 (`none` removes them).
 
 **Put untagged traffic into a VLAN, translate a VLAN.** VLANs (`3`), `n`:
@@ -569,17 +579,17 @@ shows for this site where IPv4 and IPv6 leave now and the traffic. CLI:
 --uplink ens20 --except 203.0.113.0/24`, `wanderlan breakout office 20 off`;
 `wanderlan breakout` shows the breakouts of this site.
 
-**Let a site change its own VLANs, move it.** Sites, `e` on the site:
-"Changes" (nobody, so every server may change it; a site as its manager;
-or the manager and the site itself) and "Server" (none: a server; or the site it is a client of). A
-site added by hand is a client of this site. CLI:
-`wanderlan manage <site> --self-managed yes`,
+**Let a client change its own tunnel, move it.** Sites, `e` on the site:
+"Changes" (only the server, only the client, or both) and "Server" (none: a
+server; or the site it is a client of). A site added by hand is a client of
+this site, changed by it. CLI: `wanderlan manage <site> server|client|both`,
 `wanderlan role <site> client <server>`, `wanderlan role <site> server`.
 
 **Limit what one tunnel carries.** VLANs (`3`), `t` lists every tunnel with
 what it carries; `Enter` limits it (e.g. `30-40`, or `none`), `d` lifts the
-limit. CLI: `wanderlan tunnel-vlans dc lab 30-40` (`all` lifts it). Whoever may
-change one of the two sites may limit their tunnel.
+limit. CLI: `wanderlan tunnel-vlans dc lab 30-40` (`all` lifts it). The
+tunnel of a client is limited as its option "Changes" says, one between
+servers by every server.
 
 **Use several trunk ports.** The trunk can be several local interfaces;
 they are bridged like the ports of a switch and all carry the same VLANs and
@@ -696,7 +706,7 @@ address = "10.8.0.2"
 name = "office"
 address = "10.8.0.11"
 server = "Ab3dK9xQ…="  # hq     a client of hq
-managed_by = "Ab3dK9xQ…="  # hq invited by hq
+changes = "server"            # only hq changes its tunnel ("client", "both")
 vlans = "10,20"               # office only takes part in VLANs 10 and 20
 map = { 20 = 120 }            # source VLAN 20 = VLAN 120 at office
 
@@ -704,7 +714,7 @@ map = { 20 = 120 }            # source VLAN 20 = VLAN 120 at office
 name = "lab"
 address = "10.8.0.12"
 server = "Ab3dK9xQ…="  # hq
-managed_by = "Ab3dK9xQ…="  # hq
+changes = "both"              # hq and lab change its tunnel
 online = false                # joined, not taken online yet
 map = { 30 = "native" }       # source VLAN 30 = untagged at lab
 tunnel_vlans = { "Ab3dK9xQ…=" = "30-40" }  # hq: that tunnel carries at most 30-40
@@ -740,6 +750,16 @@ them). The values of `[network]` are only the defaults of the sites
 without their own; they cannot be changed any more (they would change the
 other sites).
 
+A setting takes effect when it is applied (in the TUI when it is saved;
+`c` or `--confirm` keeps it, otherwise it is rolled back after the commit
+timeout). New ports reach the other sites at once: every probe carries the
+control and tunnel port of its site, so they follow right away (and back
+after a rollback) and get the network with them later. The old control
+port keeps answering until every peer probes the new one, also for a
+client behind NAT that only learns the new port there; a peer that is
+off meanwhile still finds it when it comes back, as long as the daemon
+was not restarted in between.
+
 | Key | Default | Meaning |
 |-----|---------|---------|
 | `network.vlans` | all | VLANs of every site without its own list. Missing, empty or `"all"`: every VLAN and the untagged traffic. Otherwise e.g. `"native,10-50"`, `"10,20,30-40"` or `[10, "20-30"]`. |
@@ -753,8 +773,7 @@ other sites).
 | `site.<id>.name` | | What it is called: `a-z`, `0-9` and `-`, at most 12 characters. Two sites with identities may have the same one. |
 | `site.<id>.address` | | Unique IPv4 address of the site in the transport network (clients behind one NAT share it). |
 | `site.<id>.server` | none | The site this one is a client of (its identity); none: a server. |
-| `site.<id>.managed_by` | none | The site that manages this one (the inviting site). |
-| `site.<id>.self_managed` | `false` | The site may also change its own VLANs, mappings and online state. |
+| `site.<id>.changes` | `both` | Of a client: who changes its tunnel to its server (its VLANs, mappings, the VLANs of that tunnel, breakouts, online state): `"server"`, `"client"` or `"both"`. Invitations write `"server"` unless chosen otherwise. A server has none (every server). |
 | `site.<id>.online` | `true` | `false`: the tunnels of the site stay down. Sites that join start with `false`. |
 | `site.<id>.vlans` | `network.vlans` | VLANs this site takes part in. |
 | `site.<id>.own_vlans` | none | The site's own VLANs: on its trunk and towards its own clients, never towards its server. The site itself may always change them. |
@@ -785,7 +804,9 @@ per site, no mapped VLAN used twice, no source VLAN mapped twice per site),
 `self` exists, and unknown keys are errors (typos). Older files load
 too: `role` and `hub` (wanderlan 0.1) are ignored with a warning, and in the
 old form (`[[site]]`) a site with `managed_by` but without `uplink` is a
-client of its manager.
+client of its manager. `managed_by` and `self_managed` (before `changes`)
+become `changes`: a manager alone `server`, with `self_managed` `both`, the
+site itself `client`, none `both`.
 
 ## How it works
 
@@ -957,15 +978,16 @@ clicked.
 | Key | View |
 |-----|------|
 | `1` | Overview: this site with its role, the tunnel neighbours live (reply, round trip, path MTU, MSS, port state, MAC addresses, throughput, config in sync or `refused`), traffic of the tunnels and of every trunk, a graph of all tunnels and the LOAD of each over time (`z`: 2 min, 10 min, 1 h), and all known sites with role and link (`via hq` for sites without a tunnel from here), each server with its clients indented below. One cursor runs through the neighbours and the sites. `Enter` on a neighbour: traffic graph, the VLANs of the tunnel with their live traffic (Up/Down, `Enter` opens one: every port, MACs, graph; `m` its MAC table, PgUp/PgDn scroll its ports), round-trip graph with the lost probes, min/avg/max round trip, jitter, probe loss, counters, where it is probed (its address and ports) and, without answers, what to check (Left/Right: the next neighbour); on a site: its details. `o` on a site takes it online or offline (to the review), `u` / `U` unblock the port of a neighbour / a trunk port, `p` measures the path MTU. |
-| `2` | Sites: name, address, VLANs, role, manager, tunnel; clients indented below their server. `Enter`: details (role, address and ports, VLANs, every tunnel with what it carries, mappings, who may change it; Up/Down: the next site). Invite (`i`), open invitations (`I`), online/offline (`o`), new (`n`), edit (`e`: name, address, VLANs, "Server", "Changes"), rename (`N`), delete (`d`), the VLANs of the network (`m`), trunk ports of this host (`l`). |
+| `2` | Sites: name, address, VLANs, role, who changes it ("Changes"), tunnel; clients indented below their server. `Enter`: details (role, address and ports, VLANs, every tunnel with what it carries, mappings, who may change it; Up/Down: the next site). Invite (`i`), open invitations (`I`), online/offline (`o`), new (`n`), edit (`e`: name, address, VLANs, "Server", "Changes"), rename (`N`), delete (`d`), the VLANs of the network (`m`), trunk ports of this host (`l`). |
 | `3` | VLANs: the VLANs of the network (`v`), the own VLANs of this site (`o`) and the mappings (`n`, `Enter`, `d`) with their site and its role; conflicts are marked right away. `t` switches to the tunnels: what each carries, its limit (`Enter`, `d`). |
 | `4` | MAC addresses: filter (`/`; `vlan:20` for one VLAN), sort (`s`, `o`). |
 | `5` | Log: live events in local time (`t`: UTC), filter by level (`l`), site (`p`) and text (`/`). |
 | `6` | Setup: new network or join; on a configured site invite (`i`) and reset (`R`). |
 | `7` | Breakout: the [local breakouts](#local-breakout) of all sites, per VLAN, with uplink and exceptions; for this site where IPv4 and IPv6 leave now (or why they go through the tunnel) and the traffic, above it the uplinks of this box. New (`n`), edit (`Enter`; `Enter` on the uplink lists the interfaces of this box to choose from), remove (`d`). |
-| `8` | Settings of this host only (this site, trunk, commit timeout, path MTU check, MSS, its ports), each with an explanation, the trunk of every tunnel, and the role and rights of this site. `Enter` on a trunk lists the interfaces of the host to choose from (`Space`, `m`: main port). |
+| `8` | Settings of this host only (this site, trunk, commit timeout, path MTU check, MSS, its ports), each with an explanation, the trunk of every tunnel, and the role and rights of this site. `Enter` on a trunk lists the interfaces of the host to choose from (`Space`, `m`: main port). Saved, a setting (also a trunk) is applied at once, not kept in the draft; `c` keeps it. |
 
-Changes are collected in a draft; the status line says how many it holds,
+Changes of the network are collected in a draft (the settings of this host
+and its trunk ports are applied when saved); the status line says how many it holds,
 and new or changed rows are marked `+` or `*`. `a` shows the difference to
 the running configuration and applies it; a banner counts down until it is
 confirmed (`c`) or rolled back (`r`, asks first), also while a window is
@@ -987,14 +1009,14 @@ and keeps trying.
 | `wanderlan status [--json]` | This site, all known sites with role and link, the tunnel neighbours |
 | `wanderlan log [-f]` | Event log |
 | `wanderlan vlan <vid> [--json]` | Traffic of one VLAN on every port of this site now, its counters and MAC addresses |
-| `wanderlan invite [--name N] [--vlans V] [--native VID] [--map MAPPED:SOURCE]... [--self-managed]` | Create an invitation with rules; prints `wanderlan join <address> <code>` |
+| `wanderlan invite [--name N] [--vlans V] [--native VID] [--map MAPPED:SOURCE]... [--changes server\|client\|both]` | Create an invitation with rules; prints `wanderlan join <address> <code>` |
 | `wanderlan invite list` / `wanderlan invite delete <code>` | Open invitations of this site |
 | `wanderlan join <address>[:port] <code> [--name N] [--trunk IF]` | Join a network (on an unconfigured site) |
 | `wanderlan online <site>` / `wanderlan offline <site>` | Take a site online or offline |
-| `wanderlan manage <site> [--by S] [--self-managed yes\|no]` | Who may change (and rename) a site |
-| `wanderlan rename <site> <new-name>` | Rename a site: this site always, a site it manages too |
+| `wanderlan manage <site> server\|client\|both` | Who changes the tunnel of a client to its server |
+| `wanderlan rename <site> <new-name>` | Rename a site: this site always, a client of this site too |
 | `wanderlan role <site> server\|client <server>` | Make a site a server or a client |
-| `wanderlan site add <name> <address> [--server S\|none] [--vlans V]` | Add a site by hand (default: a client of this site, managed by it) |
+| `wanderlan site add <name> <address> [--server S\|none] [--vlans V]` | Add a site by hand (default: a client of this site, changed by it) |
 | `wanderlan site remove <name>` | Remove a site with its mappings (not while it has clients) |
 | `wanderlan site vlans <name> <vlans\|default>` | The VLANs of a site |
 | `wanderlan vlans <vlans\|all>` | The VLANs of the network |
@@ -1124,9 +1146,11 @@ or `WANDERLAN_SOCKET`, the network of the box with `--net` or
 * **Clients only know their part.** A client's configuration contains its
   server and the sites below it only; servers merge the changes of their
   clients, a client + server passes those of its clients on.
-* **Who may change a site**: its manager (the inviting site), the site itself
-  only if released. The daemons enforce this among themselves; someone with
-  root on a site could bypass it.
+* **Who changes a client's tunnel**: one option per client, "Changes":
+  only its server, only the client, or both. Its address, its server and
+  removing it stay with its server; servers are changed by every server.
+  The daemons enforce this among themselves; someone with root on a site
+  could bypass it.
 * **New sites start offline**, so a site is checked before its traffic flows.
 * **Native = VLAN 1 between the sites**, like the default native VLAN of
   switches; an empty VLAN list means all VLANs plus native.

@@ -44,13 +44,7 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
     let running = app.running.as_ref().and_then(|r| r.network.as_ref());
     let own = draft.local.self_id;
     let header = Row::new(vec![
-        "",
-        "NAME",
-        "ADDRESS",
-        "VLANS",
-        "ROLE",
-        "MANAGED BY",
-        "TUNNEL",
+        "", "NAME", "ADDRESS", "VLANS", "ROLE", "CHANGES", "TUNNEL",
     ])
     .style(theme::header());
     // A site of an older version renamed (a provisional identity of its
@@ -114,15 +108,7 @@ fn draw_table(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
             (i, marker, texts, style, default_vlans, tunnel_style)
         })
         .collect();
-    let headers = [
-        "",
-        "NAME",
-        "ADDRESS",
-        "VLANS",
-        "ROLE",
-        "MANAGED BY",
-        "TUNNEL",
-    ];
+    let headers = ["", "NAME", "ADDRESS", "VLANS", "ROLE", "CHANGES", "TUNNEL"];
     let texts: Vec<Vec<String>> = entries.iter().map(|e| e.2.clone()).collect();
     // Inside the border and the scrollbar.
     let widths = list::fit_widths(
@@ -216,12 +202,12 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
         let keys = if site.online { "" } else { " (o: take online)" };
         let name = draft.network.label(site.id);
         let text = format!(
-            " {name}: {}; VLANs {vlans}{own}; managed by {}{keys}",
+            " {name}: {}; VLANs {vlans}{own}; changed by {}{keys}",
             format::role(
                 site.uplink.map(|up| draft.network.label(up)).as_deref(),
                 topology::has_clients(&draft.network, site.id)
             ),
-            policy::managed_label(&draft.network, site)
+            policy::managers(&draft.network, site)
         );
         lines.push(Line::styled(text, theme::dim()));
         // The peer row has the name the site runs under.

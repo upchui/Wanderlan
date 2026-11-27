@@ -355,10 +355,25 @@ pub fn rtt(frame: &mut Frame, area: Rect, points: &[RttPoint], now_ms: u64, rang
         );
         return;
     }
-    let top = nice(answered.iter().copied().fold(1.0, f64::max));
-    let top_label = format::rtt(top);
-    let plot = usize::from(inner.width.saturating_sub(top_label.len() as u16 + 1)).max(1) * 2;
+    let first_top = nice(answered.iter().copied().fold(1.0, f64::max));
+    let plot = usize::from(
+        inner
+            .width
+            .saturating_sub(format::rtt(first_top).len() as u16 + 1),
+    )
+    .max(1)
+        * 2;
     let parts = rtt_columns(plot);
+    // The scale over what is drawn (the strip may hold a probe a little
+    // older than the range).
+    let drawn = parts
+        .iter()
+        .flatten()
+        .filter(|(_, share)| *share > 0.0)
+        .map(|(sum, share)| sum / share)
+        .fold(first_top, f64::max);
+    let top = nice(drawn);
+    let top_label = format::rtt(top);
     // A probe that came a little late leaves its slot empty: the line goes
     // on over a gap of up to two probes.
     let per_probe = (plot as u64 * RTT_STEP_MS)

@@ -480,11 +480,13 @@ impl LearnOps for LearnCli {
     }
 
     async fn learned(&self) -> SysResult<BTreeMap<String, Vec<Learned>>> {
-        Ok(list()
-            .await?
-            .as_deref()
-            .map(parse_learned)
-            .unwrap_or_default())
+        let listed = list().await?;
+        // Gone (a firewall flushed every table): the reconcile writes it
+        // again at once, not when the remembered state expires.
+        if listed.is_none() {
+            self.store(Some(None));
+        }
+        Ok(listed.as_deref().map(parse_learned).unwrap_or_default())
     }
 }
 

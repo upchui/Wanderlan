@@ -68,6 +68,9 @@ const LABEL_REPLY: &[u8] = b"wanderlan sync reply";
 pub struct Offer {
     /// Address to listen on.
     pub bind: Option<SocketAddrV4>,
+    /// Former addresses (another control port before): served on until
+    /// every peer uses the new one.
+    pub former: Vec<SocketAddrV4>,
     /// What each allowed address gets: the confirmed network.toml as that
     /// peer may see it (shared, so every connection does not copy it).
     pub views: Arc<BTreeMap<Ipv4Addr, String>>,
@@ -141,11 +144,14 @@ pub fn spawn(offer: watch::Receiver<Offer>, inputs: mpsc::Sender<Input>) -> Join
 }
 
 async fn run(mut offer: watch::Receiver<Offer>, inputs: mpsc::Sender<Input>) {
+    // The listeners of former control ports, serving on.
+    let mut formers: Vec<(SocketAddrV4, JoinHandle<()>)> = Vec::new();
     loop {
-        let bind = offer.borrow().bind;
-        let Some(bind) = bind else {
+        let current = offer.borrow_and_update().clone();
+        retire_formers(&mut formers, &current).await;
+        let Some(bind) = current.bind else {
             if offer.changed().await.is_err() {
-                return;
+                break;
             }
             continue;
         };
@@ -155,7 +161,7 @@ async fn run(mut offer: watch::Receiver<Offer>, inputs: mpsc::Sender<Input>) {
                 warn!("Cannot listen for configuration sync on {bind}: {e}; retrying in 10s");
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(10)) => {}
-                    r = offer.changed() => if r.is_err() { return },
+                    r = offer.changed() => if r.is_err() { break },
                 }
                 continue;
             }
@@ -163,52 +169,108 @@ async fn run(mut offer: watch::Receiver<Offer>, inputs: mpsc::Sender<Input>) {
         info!("Serving the network configuration to peers on {bind} (TCP)");
         let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
         let per_address: PerAddress = Arc::new(Mutex::new(HashMap::new()));
+        let mut gone = false;
         loop {
             tokio::select! {
-                accepted = listener.accept() => match accepted {
-                    Ok((stream, from)) => {
-                        let SocketAddr::V4(from) = from else { continue };
-                        // Too many at once from there, or at all (a flood):
-                        // close this one.
-                        let Some(per) = AddressSlot::take(&per_address, *from.ip()) else {
-                            debug!("sync request from {from} refused: too many connections from there");
-                            continue;
-                        };
-                        let Ok(slot) = slots.clone().try_acquire_owned() else {
-                            debug!("sync request from {from} refused: too many connections");
-                            continue;
-                        };
-                        let current = offer.borrow().clone();
-                        let inputs = inputs.clone();
-                        tokio::spawn(async move {
-                            let _slots = (slot, per);
-                            match tokio::time::timeout(
-                                CONNECTION_TIMEOUT,
-                                serve(stream, from, &current, &inputs),
-                            )
-                            .await
-                            {
-                                Ok(Ok(())) => {}
-                                Ok(Err(e)) => debug!("sync request from {from} failed: {e:#}"),
-                                Err(_) => debug!("sync request from {from} took too long"),
-                            }
-                        });
-                    }
-                    // E.g. out of file descriptors: no busy loop.
-                    Err(e) => {
-                        debug!("sync accept failed: {e}");
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                    }
-                },
+                accepted = listener.accept() => {
+                    accept(accepted, &slots, &per_address, &offer, &inputs).await;
+                }
                 r = offer.changed() => {
                     if r.is_err() {
-                        return;
-                    }
-                    if offer.borrow().bind != Some(bind) {
+                        gone = true;
                         break;
                     }
+                    let current = offer.borrow().clone();
+                    if current.bind != Some(bind) {
+                        break;
+                    }
+                    retire_formers(&mut formers, &current).await;
                 }
             }
+        }
+        if gone {
+            break;
+        }
+        // Another control port: the old listener serves on (without a gap)
+        // while the daemon keeps it, a peer may still fetch there.
+        let next = offer.borrow().clone();
+        if next.former.contains(&bind) && next.bind.is_some_and(|b| b.port() != bind.port()) {
+            let (offer, inputs) = (offer.clone(), inputs.clone());
+            formers.push((
+                bind,
+                tokio::spawn(async move {
+                    loop {
+                        let accepted = listener.accept().await;
+                        accept(accepted, &slots, &per_address, &offer, &inputs).await;
+                    }
+                }),
+            ));
+        }
+    }
+    for (_, task) in formers {
+        task.abort();
+    }
+}
+
+/// Closes the listeners of former ports the offer no longer keeps, and one
+/// at the port to bind now (moved back), before that is bound.
+async fn retire_formers(formers: &mut Vec<(SocketAddrV4, JoinHandle<()>)>, offer: &Offer) {
+    let port = offer.bind.map(|b| b.port());
+    let mut i = 0;
+    while i < formers.len() {
+        let addr = formers[i].0;
+        if offer.former.contains(&addr) && Some(addr.port()) != port {
+            i += 1;
+            continue;
+        }
+        let (_, task) = formers.swap_remove(i);
+        task.abort();
+        let _ = task.await;
+        debug!("No longer serving the configuration at the former port {addr}");
+    }
+}
+
+/// Serves one accepted connection, within the limits.
+async fn accept(
+    accepted: std::io::Result<(TcpStream, SocketAddr)>,
+    slots: &Arc<tokio::sync::Semaphore>,
+    per_address: &PerAddress,
+    offer: &watch::Receiver<Offer>,
+    inputs: &mpsc::Sender<Input>,
+) {
+    match accepted {
+        Ok((stream, from)) => {
+            let SocketAddr::V4(from) = from else { return };
+            // Too many at once from there, or at all (a flood): close this
+            // one.
+            let Some(per) = AddressSlot::take(per_address, *from.ip()) else {
+                debug!("sync request from {from} refused: too many connections from there");
+                return;
+            };
+            let Ok(slot) = slots.clone().try_acquire_owned() else {
+                debug!("sync request from {from} refused: too many connections");
+                return;
+            };
+            let current = offer.borrow().clone();
+            let inputs = inputs.clone();
+            tokio::spawn(async move {
+                let _slots = (slot, per);
+                match tokio::time::timeout(
+                    CONNECTION_TIMEOUT,
+                    serve(stream, from, &current, &inputs),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => debug!("sync request from {from} failed: {e:#}"),
+                    Err(_) => debug!("sync request from {from} took too long"),
+                }
+            });
+        }
+        // E.g. out of file descriptors: no busy loop.
+        Err(e) => {
+            debug!("sync accept failed: {e}");
+            tokio::time::sleep(Duration::from_millis(200)).await;
         }
     }
 }
@@ -596,6 +658,7 @@ mod tests {
         };
         let offer = Offer {
             bind: None,
+            former: Vec::new(),
             views: Arc::new([(Ipv4Addr::LOCALHOST, "the network\n".to_string())].into()),
             me: Some(b.id()),
             keyed: Arc::new(

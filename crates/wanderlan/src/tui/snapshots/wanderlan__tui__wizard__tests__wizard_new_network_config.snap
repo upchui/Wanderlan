@@ -1,6 +1,5 @@
 ---
 source: crates/wanderlan/src/tui/wizard.rs
-assertion_line: 591
 expression: render_network(&network)
 ---
 # wanderlan network configuration, shared by all sites.
@@ -9,7 +8,8 @@ expression: render_network(&network)
 #
 # [site."<identity>"]: a site, `name` is what it is called (several sites
 # may have the same name); every other site is referred to by its identity.
-# `server` is the site it is a client of (none: a server);
+# `server` is the site it is a client of (none: a server); changes = who
+# changes the tunnel to it ("server", "client" or "both");
 # map = { <source VLAN> = <VLAN on its trunk, or "native"> };
 # tunnel_vlans = { "<other site>" = <the most that tunnel carries> };
 # breakout = { <VLAN> = { uplink = <interface>, except = [<networks>] } }:

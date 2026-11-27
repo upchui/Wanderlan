@@ -1,5 +1,6 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
+assertion_line: 188
 expression: render(&app)
 ---
 " 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Breakout  8 Settings   "
@@ -13,8 +14,8 @@ expression: render(&app)
 "│Role and rights        read only here; Sites (2), e on a site changes them    █"
 "│  Role                 server (connected with the other servers)              █"
 "│  Clients              haus6                                                  █"
-"│  Managed by           - (not managed by another site)                        █"
-"│  Manages              -                                                      █"
+"│  Changed by           every server                                           █"
+"│  Changes              haus6                                                  █"
 "│Trunk per tunnel       this host only; another trunk = own segment            ║"
 "│  to buero             default (ens19)                                        ║"
 "│  to haus2             ens20 (own segment wl-ens20)                           ║"
@@ -22,7 +23,7 @@ expression: render(&app)
 " Local interfaces bridged with the tunnel to haus2 (Enter lists those of this   "
 " host); none: the default trunk. Others make it a segment of its own (bridge    "
 " wl-<first>): only their network reaches haus2.                                 "
-" Changes go into the draft; a reviews and applies them, c confirms.             "
+" Saved, a setting is applied at once; c keeps it, otherwise it is rolled back.  "
 "                                                                                "
 "                            1 blocked, 1 down (see 1)  draft: 1 change  heim r7 "
 " Enter  change   Up/Down  choose   a  apply   x  discard   ?  help   q  quit    "

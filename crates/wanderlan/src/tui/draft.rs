@@ -629,7 +629,6 @@ mod tests {
         draft.rename_site(id("haus3"), "haus33");
         draft.network.sites[0].name = "home".into();
         draft.rename_site(id("heim"), "home");
-        // buero manages haus6.
         draft.network.sites[1].name = "office".into();
         draft.rename_site(id("buero"), "office");
         draft.revalidate();
@@ -646,7 +645,7 @@ mod tests {
             Some("ens20")
         );
         let haus6 = draft.network.by_name("haus6").unwrap();
-        assert_eq!(haus6.managed_by, Some(id("office")));
+        assert_eq!(haus6.uplink, Some(id("home")));
     }
 
     #[test]

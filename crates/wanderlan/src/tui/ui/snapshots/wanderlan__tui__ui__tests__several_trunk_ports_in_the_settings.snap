@@ -1,5 +1,6 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
+assertion_line: 612
 expression: render(&app)
 ---
 " 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Breakout  8 Settings   "
@@ -22,7 +23,7 @@ expression: render(&app)
 "  └──────────────────────────────────────────────────────────────────────────┘  "
 "                                                                                "
 " the main port. The one the tunnels run over is marked.                         "
-" Changes go into the draft; a reviews and applies them, c confirms.             "
+" Saved, a setting is applied at once; c keeps it, otherwise it is rolled back.  "
 "                                                                                "
 "                          1 blocked, 1 down (see 1)  draft: no changes  heim r7 "
-" Space  choose   m  main port   Enter  save to draft   Esc  cancel              "
+" Space  choose   m  main port   Enter  apply   Esc  cancel                      "

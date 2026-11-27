@@ -1,6 +1,6 @@
 //! View 8: the settings of this host only, each with an explanation
-//! (every site sets its own). Enter opens the form with the focus on that setting; changes
-//! go into the draft like everywhere else.
+//! (every site sets its own). Enter opens the form with the focus on that setting; saved,
+//! a setting is applied at once (c keeps it, like every change), not kept in the draft.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -163,12 +163,11 @@ fn permissions(draft: &Draft) -> [(&'static str, String); 4] {
             }
         },
     );
+    // Who changes the tunnel of this site to its server, and the tunnels
+    // of which clients this site changes.
     let managed = match (site, policy::restricted_by(network, me)) {
-        (_, Some(m)) => format!("{}: no VLAN changes here", network.label(m)),
-        (Some(site), None) => match policy::manager(network, site) {
-            Some(m) => format!("{}, may change its own VLANs", network.label(m)),
-            None => "- (not managed by another site)".to_string(),
-        },
+        (_, Some(m)) => format!("only its server {}: no VLAN changes here", network.label(m)),
+        (Some(site), None) => policy::managers(network, site),
         (None, None) => "-".to_string(),
     };
     let list = |names: Vec<String>| {
@@ -182,7 +181,7 @@ fn permissions(draft: &Draft) -> [(&'static str, String); 4] {
         network
             .sites
             .iter()
-            .filter(|s| s.id != me && policy::manager(network, s) == Some(me))
+            .filter(|s| s.uplink == Some(me) && s.changes.server())
             .map(|s| network.label(s.id))
             .collect(),
     );
@@ -197,8 +196,8 @@ fn permissions(draft: &Draft) -> [(&'static str, String); 4] {
     [
         ("Role", role),
         ("Clients", clients),
-        ("Managed by", managed),
-        ("Manages", manages),
+        ("Changed by", managed),
+        ("Changes", manages),
     ]
 }
 
@@ -362,7 +361,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         .collect();
     lines.truncate(3);
     lines.extend([Line::styled(
-        " Changes go into the draft; a reviews and applies them, c confirms.",
+        " Saved, a setting is applied at once; c keeps it, otherwise it is rolled back.",
         theme::dim(),
     )]);
     frame.render_widget(Paragraph::new(lines), help);

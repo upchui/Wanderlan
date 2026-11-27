@@ -1,6 +1,6 @@
 use crate::config::{
-    ConfigFile, Diagnostic, Loaded, Network, Severity, check, fingerprint, has_errors, load,
-    parse_network, render_local, render_network,
+    Changes, ConfigFile, Diagnostic, Loaded, Network, Severity, check, fingerprint, has_errors,
+    load, parse_network, render_local, render_network,
 };
 
 const EXAMPLE_NETWORK: &str = include_str!("../testdata/network-v1.toml");
@@ -497,6 +497,32 @@ fn uplinks_make_clients_and_old_configurations_are_migrated() {
         Some("alex".into())
     );
     assert_eq!(network.by_name("alex").unwrap().uplink, None);
+    // Who changes the tunnel: before `changes`, the manager alone (its
+    // server), with the site itself if released; no manager: both.
+    assert_eq!(network.by_name("marcel").unwrap().changes, Changes::Server);
+    assert_eq!(network.by_name("site2").unwrap().changes, Changes::Both);
+    for (extra, changes) in [
+        ("self_managed = true\n", Changes::Both),
+        ("changes = \"client\"\n", Changes::Client),
+    ] {
+        let text = CLIENTS.replace(
+            "managed_by = \"alex\"\n",
+            &format!("managed_by = \"alex\"\n{extra}"),
+        );
+        let n = parse_network(&text).unwrap().network.unwrap();
+        assert_eq!(n.by_name("marcel").unwrap().changes, changes, "{extra}");
+    }
+    let wrong = CLIENTS.replace("uplink = \"alex\"", "uplink = \"alex\"\nchanges = \"boss\"");
+    let err = single_error(&wrong, "self = \"alex\"\ntrunk = \"ens19\"\n");
+    assert!(
+        err.message
+            .contains("changes: \"boss\" is not server, client or both"),
+        "{err}"
+    );
+    assert_eq!(
+        err.line,
+        Some(line_of(&wrong, "name = \"site2\"", "changes"))
+    );
     // Written explicitly from now on; the canonical form reads back the same.
     let text = render_network(&network);
     let alex = pid("alex");
@@ -506,16 +532,19 @@ fn uplinks_make_clients_and_old_configurations_are_migrated() {
         2,
         "{text}"
     );
+    assert!(text.contains("changes = \"server\"\n") && text.contains("changes = \"both\"\n"));
+    assert!(!text.contains("managed_by"), "{text}");
     assert_eq!(parse_network(&text).unwrap().network.unwrap(), network);
     // A server with a manager stays a server: no `server`, in the file and
     // in the form the sites exchange.
     let mut server = network.clone();
     server.sites[1].uplink = None;
+    server.sites[1].changes = Changes::default();
     let text = render_network(&server);
     let marcel = pid("marcel");
     assert!(
         text.contains(&format!(
-            "[site.\"{marcel}\"]  # no box has joined as this site yet\nname = \"marcel\"\naddress = \"10.0.10.5\"\nmanaged_by = \"{alex}\"  # alex\n"
+            "[site.\"{marcel}\"]  # no box has joined as this site yet\nname = \"marcel\"\naddress = \"10.0.10.5\"\n\n"
         )),
         "{text}"
     );
@@ -871,6 +900,28 @@ fn a_site_without_a_box_renamed_by_hand_keeps_its_references() {
             .any(|d| d.message.contains("defined twice")),
         "{twice}"
     );
+    // Two names swapped: each site keeps what refers to it.
+    let swapped = edit(
+        &edit(&written, "name = \"heim\"", "name = \"tmp\""),
+        "name = \"buero\"",
+        "name = \"heim\"",
+    );
+    let swapped = edit(&swapped, "name = \"tmp\"", "name = \"buero\"");
+    let again = parse_network(&swapped).unwrap().network.unwrap();
+    let buero = again.by_name("buero").unwrap();
+    assert_eq!(buero.address.to_string(), "10.8.0.1", "the former heim");
+    assert_eq!(again.by_name("haus2").unwrap().uplink, Some(buero.id));
+    // local.toml follows: haus2 keeps its own trunk for the tunnel to it.
+    let local = format!(
+        "self = \"{}\"\ntrunk = \"ens19\"\n\n[tunnels.\"{}\"]\ntrunk = \"ens20\"\n",
+        pid("haus2"),
+        pid("heim")
+    );
+    let outcome = load(&swapped, &local).expect("valid");
+    let Loaded::Configured(cfg) = outcome.loaded else {
+        panic!("configured")
+    };
+    assert_eq!(cfg.trunk_for(buero.id), "ens20");
 }
 
 #[test]
@@ -917,7 +968,7 @@ fn server_and_tunnel_limits_in_format_2() {
     let rendered = render_network(&network);
     let (heim, buero) = (pid("heim"), pid("buero"));
     assert!(
-        rendered.contains(&format!("name = \"haus2\"\naddress = \"10.8.0.11\"\nserver = \"{heim}\"  # heim\nvlans = \"20,30\"\ntunnel_vlans = {{ \"{heim}\" = \"20\" }}  # heim\n")),
+        rendered.contains(&format!("name = \"haus2\"\naddress = \"10.8.0.11\"\nserver = \"{heim}\"  # heim\nchanges = \"both\"\nvlans = \"20,30\"\ntunnel_vlans = {{ \"{heim}\" = \"20\" }}  # heim\n")),
         "{rendered}"
     );
     assert!(
@@ -953,7 +1004,7 @@ fn format_1_files_with_a_manager_become_explicit_clients() {
     let heim = pid("heim");
     assert!(
         new.contains(&format!(
-            "name = \"haus2\"\naddress = \"10.8.0.11\"\nserver = \"{heim}\"  # heim\nmanaged_by = \"{heim}\"  # heim\n"
+            "name = \"haus2\"\naddress = \"10.8.0.11\"\nserver = \"{heim}\"  # heim\nchanges = \"server\"\n"
         )),
         "{new}"
     );

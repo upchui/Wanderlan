@@ -510,7 +510,7 @@ fn an_invitation_carries_the_rules_of_the_form() {
     assert_eq!(sent[0].name.as_deref(), Some("haus7"));
     assert_eq!(sent[0].vlans.as_deref(), Some("native,20,30"));
     assert_eq!(sent[0].translations.len(), 1);
-    assert!(!sent[0].allow_self);
+    assert_eq!(sent[0].changes(), wanderlan_core::config::Changes::Server);
     assert!(app.modal.is_none());
     assert!(
         !app.draft_dirty(),
@@ -559,8 +559,14 @@ fn a_site_goes_online_through_the_draft() {
 }
 
 #[test]
-fn a_site_managed_elsewhere_cannot_be_changed_here() {
+fn a_client_that_changes_its_tunnel_itself_is_not_changed_by_its_server() {
     let mut app = connected();
+    let mut texts = fixtures::config_texts();
+    assert!(texts.network.contains("changes = \"server\""));
+    texts.network = texts
+        .network
+        .replace("changes = \"server\"", "changes = \"client\"");
+    app.update(reply(Request::GetConfig, Reply::Config(texts)));
     app.update(ch('2'));
     let haus6 = app
         .draft
@@ -569,26 +575,30 @@ fn a_site_managed_elsewhere_cannot_be_changed_here() {
         .unwrap();
     app.sites_selected = haus6;
     app.update(ch('o'));
-    assert!(!app.draft_dirty(), "haus6 is managed by buero");
+    assert!(!app.draft_dirty(), "only haus6 changes its tunnel");
     assert!(
         app.message
             .as_ref()
-            .is_some_and(|m| m.text.contains("managed by only \"buero\""))
+            .is_some_and(|m| m.text.contains("only \"haus6\" itself")),
+        "{:?}",
+        app.message
     );
+    // Where it is stays for its server: the form opens for that.
     app.update(ch('e'));
-    assert!(app.modal.is_none());
+    assert!(matches!(app.modal, Some(Modal::Form(_))));
 }
 
 /// The fixture app on a site that is managed by "buero" (restricted).
 fn restricted() -> App {
     let mut app = connected();
     let mut texts = fixtures::config_texts();
-    // Written by hand: a name for the manager.
+    // heim a client of buero, which alone changes its tunnel.
     let heim = "name = \"heim\"\naddress = \"10.8.0.1\"\n";
     assert!(texts.network.contains(heim), "{}", texts.network);
-    texts.network = texts
-        .network
-        .replace(heim, &format!("{heim}managed_by = \"buero\"\n"));
+    texts.network = texts.network.replace(
+        heim,
+        &format!("{heim}server = \"buero\"\nchanges = \"server\"\n"),
+    );
     app.update(reply(Request::GetConfig, Reply::Config(texts)));
     app
 }
@@ -612,7 +622,7 @@ fn a_restricted_site_changes_no_vlans() {
     app.update(ch('2'));
     app.update(ch('m'));
     assert!(refused(&app));
-    // An open site (here buero, which has no manager).
+    // Its server (a client changes nothing above it).
     app.message = None;
     app.update(ch('2'));
     app.sites_selected = 1;
@@ -749,26 +759,78 @@ fn a_tunnel_gets_its_own_trunk_in_the_settings() {
     }
     app.update(key(KeyCode::Enter));
     assert_eq!(picker(&app).chosen, ["ens20"], "Enter adds it");
-    app.update(key(KeyCode::Enter));
-    assert!(app.modal.is_none(), "saved");
-    let draft = app.draft.as_ref().unwrap();
-    assert_eq!(
-        draft
-            .local
-            .tunnel_trunks
-            .get(&id("haus2"))
-            .map(Vec::as_slice),
-        Some(&["ens20".to_string()][..])
+    // A setting of this host: applied at once, the draft stays as it was.
+    let fx = app.update(key(KeyCode::Enter));
+    assert!(app.modal.is_none(), "applied");
+    let local = applied_local(&fx);
+    assert!(
+        local.contains(&format!("[tunnels.\"{}\"]\ntrunk = \"ens20\"", id("haus2"))),
+        "{local}"
     );
-    assert!(app.draft_dirty());
-    // Taken out again: back to the default trunk. ens20 is listed last
-    // (not on this host), right above "other".
+    assert!(!app.draft_dirty());
+}
+
+/// The local.toml of the configuration applied with `fx`.
+fn applied_local(fx: &[Effect]) -> String {
+    requests(fx)
+        .into_iter()
+        .find_map(|r| match r {
+            Request::Apply(p) => Some(p.config.local.clone()),
+            _ => None,
+        })
+        .expect("an apply")
+}
+
+#[test]
+fn a_setting_is_applied_when_saved_and_the_draft_keeps_its_edits() {
+    let mut app = connected();
+    // An edit in the draft, not applied.
+    let running = app.running.as_ref().and_then(Draft::from_running).unwrap();
+    let site = &mut app.draft.as_mut().unwrap().network.sites[1];
+    site.online = !site.online;
+    let draft = app.draft.clone();
+    app.update(ch('8'));
+    app.update(key(KeyCode::Down));
+    app.update(key(KeyCode::Down));
     app.update(key(KeyCode::Enter));
-    app.update(key(KeyCode::End));
-    app.update(key(KeyCode::Up));
-    app.update(ch(' '));
+    for c in "2m".chars() {
+        app.update(ch(c));
+    }
+    let fx = app.update(key(KeyCode::Enter));
+    assert!(app.modal.is_none(), "{:?}", app.message);
+    let Some(Request::Apply(params)) = requests(&fx).into_iter().next() else {
+        panic!("an apply: {fx:?}");
+    };
+    // The running configuration with that one change.
+    assert!(params.config.local.contains("commit_timeout = \"2m\""));
+    assert_eq!(params.config.network, running.network_text());
+    assert_eq!(params.base_revision, Some(7));
+    assert_eq!(app.draft, draft, "the draft keeps its edits");
+    // While a change waits for confirmation, a setting is not applied.
+    app.update(reply(
+        Request::Apply(params.clone()),
+        Reply::Applied(Applied {
+            confirm_within_secs: 60,
+            diff: String::new(),
+            changes: Vec::new(),
+            warnings: Vec::new(),
+        }),
+    ));
+    with_pending(&mut app, ChangeSource::Local);
     app.update(key(KeyCode::Enter));
-    assert!(app.draft.as_ref().unwrap().local.tunnel_trunks.is_empty());
+    for c in "3m".chars() {
+        app.update(ch(c));
+    }
+    let fx = app.update(key(KeyCode::Enter));
+    assert!(
+        requests(&fx)
+            .iter()
+            .all(|r| !matches!(r, Request::Apply(_)))
+    );
+    assert!(
+        matches!(app.modal, Some(Modal::Form(_))),
+        "the form stays open"
+    );
 }
 
 #[test]
@@ -805,14 +867,13 @@ fn several_trunk_ports_with_a_main_port() {
     ));
     app.update(ch('n'));
     assert_eq!(picker(&app).chosen, ["usb0", "ens19"], "nothing lost");
-    app.update(key(KeyCode::Enter));
+    let fx = app.update(key(KeyCode::Enter));
     assert!(app.modal.is_none());
-    assert_eq!(app.draft.as_ref().unwrap().local.trunk, ["usb0", "ens19"]);
-    // The default trunk needs a port. Rows: br-lan, ens18, ens19, eth1, usb0.
+    assert!(applied_local(&fx).contains("trunk = [\"usb0\", \"ens19\"]"));
+    // The daemon has not answered yet: the picker shows what runs.
+    app.busy = None;
+    // The default trunk needs a port. Rows: br-lan, ens18, ens19, eth1.
     app.update(ch('l'));
-    app.update(key(KeyCode::Down));
-    app.update(key(KeyCode::Down));
-    app.update(ch(' '));
     app.update(key(KeyCode::Down));
     app.update(key(KeyCode::Down));
     app.update(ch(' '));
@@ -856,22 +917,23 @@ fn a_restricted_site_sets_its_own_vlans() {
     );
 }
 
-/// The fixture app on a server that is managed by itself ("only heim").
-fn managed_by_itself() -> App {
+/// The fixture app on a client that alone changes its tunnel ("only the
+/// client").
+fn changes_itself() -> App {
     let mut app = connected();
     let mut texts = fixtures::config_texts();
-    // Written by hand: a name for the manager.
     let heim = "name = \"heim\"\naddress = \"10.8.0.1\"\n";
-    texts.network = texts
-        .network
-        .replace(heim, &format!("{heim}managed_by = \"heim\"\n"));
+    texts.network = texts.network.replace(
+        heim,
+        &format!("{heim}server = \"buero\"\nchanges = \"client\"\n"),
+    );
     app.update(reply(Request::GetConfig, Reply::Config(texts)));
     app
 }
 
 #[test]
-fn a_server_managed_by_itself_edits_vlans_and_mappings() {
-    let mut app = managed_by_itself();
+fn a_client_that_changes_its_own_tunnel_edits_vlans_and_mappings() {
+    let mut app = changes_itself();
     assert_eq!(app.restricted_by(), None);
     app.update(ch('3'));
     app.update(ch('v'));

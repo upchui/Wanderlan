@@ -6,7 +6,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table};
 
 use super::{list, titled};
-use crate::tui::macs::{MacState, port_site};
+use crate::tui::macs::{MacState, entry_site};
 use crate::tui::{format, theme};
 
 /// Width of the filter input.
@@ -64,7 +64,7 @@ pub fn draw(frame: &mut Frame, state: &MacState, scroll: &list::Scroll, area: Re
                 Cell::from(e.mac.clone()),
                 Cell::from(e.vlan.map_or_else(|| "-".into(), |v| v.to_string())),
                 Cell::from(e.port.clone()),
-                Cell::from(port_site(&e.port).unwrap_or("this site").to_string()),
+                Cell::from(entry_site(e).unwrap_or("this site").to_string()),
                 Cell::from(e.age_secs.map_or_else(|| "-".into(), format::age)),
             ])
         })

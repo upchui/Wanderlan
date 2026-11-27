@@ -17,6 +17,13 @@
 //! client asks for a test frame now and then and listens for it at its
 //! tunnel interface for a moment; the server sends it from a socket of its
 //! own (not the tunnel port) and follows what the client says about it.
+//!
+//! A request also carries the ports its sender uses now (behind its tag, see
+//! [`wire2::Ports`]): the peers follow a change of them at once, before they
+//! have the network with it. After a change of the control port the old
+//! socket keeps answering (see [`ProbeConfig::former`]), so that a peer that
+//! still sends there (a client behind NAT, which is never contacted first)
+//! learns the new ports.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -109,10 +116,14 @@ impl Eq for Me {}
 pub struct ProbeConfig {
     /// Local address and port to bind.
     pub bind: Option<SocketAddrV4>,
-    /// This site's tunnel port: the kernel takes it (and the one above, the
-    /// source of a tunnel through NAT) when a tunnel comes up, so the
-    /// socket for the tests of the client tunnels never does.
-    pub tunnel_port: Option<u16>,
+    /// Former addresses of this daemon (another control port before): they
+    /// keep answering until every peer probes the new one.
+    pub former: Vec<SocketAddrV4>,
+    /// This site's ports, in every request. The kernel takes the tunnel
+    /// port (and the one above, the source of a tunnel through NAT) when a
+    /// tunnel comes up, so the socket for the tests of the client tunnels
+    /// never does.
+    pub ports: Option<wire2::Ports>,
     /// Direct peers by name: where their daemon listens (each site has its
     /// own control port).
     pub peers: BTreeMap<SiteId, SocketAddrV4>,
@@ -159,16 +170,20 @@ pub struct UplinkTunnel {
     pub interface: String,
     /// The tunnel runs direct now.
     pub direct: bool,
+    /// This site's tunnel port, where the test frame arrives: another one
+    /// is tested anew.
+    pub port: u16,
 }
 
 impl ProbeConfig {
     /// The ports of this site no other socket of this daemon may take.
     fn own_ports(&self) -> Vec<u16> {
         let mut ports: Vec<u16> = self.bind.map(|b| b.port()).into_iter().collect();
-        if let Some(tunnel) = self.tunnel_port {
-            ports.push(tunnel);
-            ports.push(tunnel.saturating_add(1));
+        if let Some(own) = self.ports {
+            ports.push(own.tunnel);
+            ports.push(own.tunnel.saturating_add(1));
         }
+        ports.extend(self.former.iter().map(SocketAddrV4::port));
         ports.extend(self.other_ports.iter().copied());
         ports
     }
@@ -244,6 +259,13 @@ pub struct PeerProbe {
     /// another port.
     #[serde(skip)]
     pub control_at: Option<SocketAddrV4>,
+    /// The ports the peer says it uses now (in its authenticated requests).
+    #[serde(skip)]
+    pub ports: Option<wire2::Ports>,
+    /// When a request of the peer arrived last at the socket of this
+    /// daemon's control port (not at a former one).
+    #[serde(skip)]
+    pub requested_at: Option<Instant>,
     #[serde(skip)]
     lost: u32,
     /// Recent probes: round trip in ms, or `None` if unanswered.
@@ -319,6 +341,8 @@ pub enum ProbeEvent {
     Direct { peer: SiteId, at: Option<Ipv4Addr> },
     /// The daemon of a peer started again (its probes carry a new nonce).
     Restarted { peer: SiteId },
+    /// A peer uses other ports now (said in its authenticated requests).
+    Ports { peer: SiteId, ports: wire2::Ports },
 }
 
 /// A probe waiting for its reply: from where it was sent to, with that
@@ -343,7 +367,7 @@ struct Answer {
 }
 
 struct Shared {
-    socket: UdpSocket,
+    socket: Arc<UdpSocket>,
     pending: Mutex<HashMap<PendingKey, Waiter>>,
     seq: AtomicU32,
     config: watch::Receiver<ProbeConfig>,
@@ -429,21 +453,24 @@ async fn run(
     events: mpsc::Sender<ProbeEvent>,
     history: crate::history::SharedHistory,
 ) {
+    // The sockets of former control ports, answering on.
+    let mut formers: Vec<Former> = Vec::new();
     loop {
-        let bind = config.borrow().bind;
-        let Some(bind) = bind else {
+        let current = config.borrow_and_update().clone();
+        retire_formers(&mut formers, &current).await;
+        let Some(bind) = current.bind else {
             if config.changed().await.is_err() {
-                return;
+                break;
             }
             continue;
         };
         let socket = match bind_socket(bind).await {
-            Ok(s) => s,
+            Ok(s) => Arc::new(s),
             Err(e) => {
                 warn!("Cannot listen for control probes on {bind}: {e:#}; retrying in 10s");
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(10)) => {}
-                    r = config.changed() => if r.is_err() { return },
+                    r = config.changed() => if r.is_err() { break },
                 }
                 continue;
             }
@@ -491,6 +518,7 @@ async fn run(
             {
                 break;
             }
+            retire_formers(&mut formers, &current).await;
             sync_probers(&mut prober, &current, &shared, &table, &events);
             // Every few seconds also without a change: a task that ended is
             // started again (the receiver with a new socket).
@@ -506,7 +534,7 @@ async fn run(
                 break;
             }
         }
-        // The old tasks hold the sockets: they end before the next bind
+        // The old tasks hold the socket: they end before the next bind
         // (else it may find the address still in use).
         receiver.abort();
         let _ = receiver.await;
@@ -514,13 +542,158 @@ async fn run(
             task.abort();
             let _ = task.await;
         }
+        let socket = shared.socket.clone();
         drop(shared);
         // Without a listening address (reset, unconfigured) or with a new
         // one, nothing measured or announced before is valid any more.
         if let Ok(mut t) = table.write() {
             t.clear();
         }
+        if gone {
+            break;
+        }
+        // Another control port: the old one answers on (without a gap)
+        // while the daemon keeps it, a peer may still probe there.
+        let next = config.borrow().clone();
+        if next.former.contains(&bind) && next.bind.is_some_and(|b| b.port() != bind.port()) {
+            info!(
+                "Still answering at the former control port {bind} until every peer uses the new one"
+            );
+            formers.push(Former {
+                addr: bind,
+                task: tokio::spawn(answer_former(socket, config.clone(), nonce)),
+            });
+        }
     }
+    for former in formers {
+        former.task.abort();
+    }
+}
+
+/// A socket of a former control port of this daemon.
+struct Former {
+    addr: SocketAddrV4,
+    task: JoinHandle<()>,
+}
+
+/// Closes the former sockets the configuration no longer keeps, and one at
+/// the port to bind now (moved back), before that is bound.
+async fn retire_formers(formers: &mut Vec<Former>, config: &ProbeConfig) {
+    let port = config.bind.map(|b| b.port());
+    let mut i = 0;
+    while i < formers.len() {
+        let addr = formers[i].addr;
+        if config.former.contains(&addr) && Some(addr.port()) != port {
+            i += 1;
+            continue;
+        }
+        let former = formers.swap_remove(i);
+        former.task.abort();
+        let _ = former.task.await;
+        info!("No longer answering at the former control port {addr}");
+    }
+}
+
+/// How often a peer that still probes a former control port gets a request
+/// with the ports in effect from there.
+const FORMER_NUDGE: Duration = Duration::from_secs(2);
+
+/// Answers the probes that still arrive at a former control port, and sends
+/// a peer that probes there a request back from it, with the ports in
+/// effect: it follows them at once (a client behind NAT too, its flow leads
+/// here). Nothing here counts as heard at the control port.
+async fn answer_former(
+    socket: Arc<UdpSocket>,
+    config: watch::Receiver<ProbeConfig>,
+    nonce: wire2::Nonce,
+) {
+    let mut buf = vec![0u8; 65536];
+    let mut nudged: HashMap<SiteId, Instant> = HashMap::new();
+    let mut seq: u32 = 0x8000_0000;
+    loop {
+        let (n, from) = match socket.recv_from(&mut buf).await {
+            Ok(r) => r,
+            Err(e) => {
+                debug!("probe receive error at a former port: {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
+        let SocketAddr::V4(from) = from else { continue };
+        let Some(packet) = buf.get(..n) else { continue };
+        let answers = former_answer(
+            &config.borrow(),
+            packet,
+            from,
+            &nonce,
+            &mut nudged,
+            &mut seq,
+        );
+        for answer in answers {
+            if let Err(e) = socket.send_to(&answer, from).await {
+                debug!("cannot answer probe from {from} at a former port: {e}");
+            }
+        }
+    }
+}
+
+/// What a former socket sends to `from` for `packet`: the answer to a
+/// request, and (once in [`FORMER_NUDGE`] per peer) a request with the
+/// ports in effect.
+fn former_answer(
+    cfg: &ProbeConfig,
+    packet: &[u8],
+    from: SocketAddrV4,
+    nonce: &wire2::Nonce,
+    nudged: &mut HashMap<SiteId, Instant>,
+    seq: &mut u32,
+) -> Vec<Vec<u8>> {
+    if let Some(wire::Probe::Request { seq, len, .. }) = wire::decode(packet) {
+        return cfg
+            .peer_at(*from.ip())
+            .map(|(peer, _)| wire::reply(seq, len, &cfg.announce_of(peer)))
+            .into_iter()
+            .collect();
+    }
+    let Some(wire2::Probe::Request(request)) = wire2::decode(packet) else {
+        return Vec::new();
+    };
+    let (Some(me), Some(peer)) = (&cfg.me, cfg.peer_with(request.sender)) else {
+        return Vec::new();
+    };
+    let Some(keys) = cfg.keys.get(&peer).map(|k| &k.keys) else {
+        return Vec::new();
+    };
+    if !wire2::verify_request(packet, keys) {
+        return Vec::new();
+    }
+    let announce = cfg.announce_of(peer);
+    // A client tunnel that runs direct stays so.
+    let flags = if cfg.direct.get(&peer) == Some(from.ip()) {
+        wire2::FLAG_DIRECT
+    } else {
+        0
+    };
+    let mut out = vec![wire2::reply(&request, flags, &announce, &me.0.id(), keys)];
+    let now = Instant::now();
+    let due = nudged
+        .get(&peer)
+        .is_none_or(|at| now.duration_since(*at) >= FORMER_NUDGE);
+    if due && cfg.ports.is_some() {
+        nudged.insert(peer, now);
+        *seq = seq.wrapping_add(1);
+        out.push(wire2::request(
+            *seq,
+            RTT_SIZE,
+            0,
+            &announce,
+            &me.0.id(),
+            nonce,
+            keys,
+            cfg.ports,
+        ));
+    }
+    out
 }
 
 /// A socket on a free port, never on one of `avoid`: port 0 may well get
@@ -589,6 +762,14 @@ fn sync_probers(
     // What was found out about a peer that is gone is forgotten: back, it
     // is tested anew (and told so) instead of keeping an old result.
     shared.forget_all_but(|name| config.peers.contains_key(name));
+    // What the daemon changed itself (a test anew after another tunnel
+    // port) is reported again when found.
+    if let Ok(mut reported) = shared.reported.lock() {
+        reported.retain(|peer, at| match &config.uplink {
+            Some(u) if u.peer == *peer => at.is_some() == u.direct,
+            _ => config.direct.get(peer).copied() == *at,
+        });
+    }
     for (name, addr) in &config.peers {
         if probers.contains_key(name) {
             continue;
@@ -656,6 +837,7 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
                     let keyed = shared.config.borrow().keys.contains_key(&peer);
                     if direct && !keyed {
                         note_announce(&table, &events, peer, announce);
+                        note_request(&table, &events, peer, None);
                     }
                 }
                 wire::Probe::Reply {
@@ -700,6 +882,7 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
                     }
                     if direct && verified {
                         note_announce(&table, &events, peer, request.announce);
+                        note_request(&table, &events, peer, wire2::ports(packet, &keys));
                         note_nonce(&shared, &events, peer, request.nonce);
                         if !passive && let Ok(mut t) = table.write() {
                             t.entry(peer).or_default().control_at = Some(from);
@@ -764,6 +947,26 @@ fn answer(
     }
     pending.remove(&(from, seq));
     true
+}
+
+/// Notes that a request of `peer` arrived at the control port, and the
+/// ports it says it uses: a change is told to the controller (kept as known
+/// only once told, so a full queue gets it with the next request).
+fn note_request(
+    table: &ProbeTable,
+    events: &mpsc::Sender<ProbeEvent>,
+    peer: SiteId,
+    ports: Option<wire2::Ports>,
+) {
+    let Ok(mut t) = table.write() else { return };
+    let entry = t.entry(peer).or_default();
+    entry.requested_at = Some(Instant::now());
+    if let Some(ports) = ports
+        && entry.ports != Some(ports)
+        && events.try_send(ProbeEvent::Ports { peer, ports }).is_ok()
+    {
+        entry.ports = Some(ports);
+    }
 }
 
 /// Notes the nonce of a verified request of `peer`: another one than
@@ -973,12 +1176,13 @@ async fn probe_seq(
     flags: u8,
     seq: u32,
 ) -> Outcome {
-    let (announce, me, keys) = {
+    let (announce, me, keys, ports) = {
         let cfg = shared.config.borrow();
         (
             cfg.announce_of(name),
             cfg.me.clone(),
             cfg.keys.get(&name).cloned(),
+            cfg.ports,
         )
     };
     let (packet, keys) = match (me, keys) {
@@ -991,6 +1195,7 @@ async fn probe_seq(
                 &me.0.id(),
                 &shared.nonce,
                 &k.keys,
+                ports,
             ),
             Some((k.keys, k.id)),
         ),
@@ -1062,15 +1267,32 @@ async fn probe_peer(
     };
     let mut next_mtu: Option<Instant> = Some(Instant::now());
     let mut last_pmtu: Option<u16> = None;
+    // The last good measurement, and the interval it was made for.
+    let mut measured_at: Option<Instant> = None;
+    let mut every = shared.config.borrow().mtu_interval;
     let mut generation = shared.config.borrow().generation;
-    // At a client, towards its uplink: the test of the tunnel.
+    // At a client, towards its uplink: the test of the tunnel, and the own
+    // tunnel port it tests.
     let mut test: Option<UplinkTest> = None;
+    let mut test_port: Option<u16> = None;
     let mut lost_in_row = 0u32;
     loop {
-        let current = shared.config.borrow().generation;
+        let (current, wake) = {
+            let cfg = shared.config.borrow();
+            (cfg.generation, wake_key(&cfg))
+        };
         if current != generation {
             generation = current;
             next_mtu = Some(Instant::now());
+        }
+        // Another interval counts from the last measurement; measured at
+        // once when the measurement starts (no fixed MSS any more).
+        if wake.1 != every {
+            next_mtu = match (every, wake.1, measured_at) {
+                (Some(_), Some(every), Some(at)) => at.checked_add(every),
+                _ => Some(Instant::now()),
+            };
+            every = wake.1;
         }
         if passive {
             let candidate = shared
@@ -1109,11 +1331,14 @@ async fn probe_peer(
             .uplink
             .clone()
             .filter(|u| u.peer == name);
-        match (&uplink, &test) {
+        match (&uplink, test.as_mut()) {
             (Some(u), None) => test = Some(UplinkTest::new(u.direct)),
+            // Another tunnel port of this site: what was found holds no more.
+            (Some(u), Some(t)) if test_port != Some(u.port) => t.restart(Instant::now()),
             (None, Some(_)) => test = None,
             _ => {}
         }
+        test_port = uplink.as_ref().map(|u| u.port);
         let seq = shared.seq.fetch_add(1, Ordering::Relaxed);
         let mut flags = test.as_ref().map_or(0, UplinkTest::flags);
         let mut tap = None;
@@ -1230,6 +1455,7 @@ async fn probe_peer(
             // stays) and is tried again soon.
             let pmtu = measured.or(last_pmtu);
             let wait = if measured.is_some() {
+                measured_at = Some(Instant::now());
                 interval
             } else {
                 MTU_RETRY.min(interval)
@@ -1262,7 +1488,39 @@ async fn probe_peer(
                 let _ = events.send(ProbeEvent::Pmtu { peer: name, pmtu }).await;
             }
         }
-        tokio::time::sleep(RTT_INTERVAL).await;
+        pause(&shared, wake).await;
+    }
+}
+
+/// What makes a prober go on before its next probe is due: other ports of
+/// this site (the peer learns them with the next request), another
+/// interval of the path MTU measurement.
+fn wake_key(cfg: &ProbeConfig) -> (Option<wire2::Ports>, Option<Duration>) {
+    (cfg.ports, cfg.mtu_interval)
+}
+
+/// Waits until the next probe is due, or until [`wake_key`] differs from
+/// `sent` (what the last probe was made with).
+async fn pause(shared: &Shared, sent: (Option<wire2::Ports>, Option<Duration>)) {
+    let mut config = shared.config.clone();
+    let sleep = tokio::time::sleep(RTT_INTERVAL);
+    tokio::pin!(sleep);
+    if wake_key(&config.borrow_and_update()) != sent {
+        return;
+    }
+    loop {
+        tokio::select! {
+            () = &mut sleep => return,
+            r = config.changed() => {
+                if r.is_err() {
+                    (&mut sleep).await;
+                    return;
+                }
+                if wake_key(&config.borrow_and_update()) != sent {
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -1301,6 +1559,19 @@ impl UplinkTest {
             pause: TEST_NAT,
             problem: None,
         }
+    }
+
+    /// This site's tunnel port changed: what was found holds no more, the
+    /// tunnel runs through NAT until a test (at once, after the gap the
+    /// server keeps between two) finds it reached directly again.
+    fn restart(&mut self, now: Instant) {
+        self.reached = false;
+        self.server_direct = false;
+        self.failures = 0;
+        self.pause = TEST_NAT;
+        self.next = self.last.map_or(now, |l| {
+            (l + TEST_MIN_GAP + Duration::from_secs(1)).max(now)
+        });
     }
 
     /// The flags of every request to the uplink.
@@ -1525,7 +1796,7 @@ mod tests {
         // The sender stays alive with the service (leaked for the test).
         std::mem::forget(_tx);
         let shared = Arc::new(Shared {
-            socket,
+            socket: Arc::new(socket),
             pending: Mutex::new(HashMap::new()),
             seq: AtomicU32::new(1),
             config: rx,

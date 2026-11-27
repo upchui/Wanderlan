@@ -14,6 +14,9 @@
 //!   control port of an earlier one gets nothing (the kernel takes one VNI
 //!   per tunnel port, a socket takes a control port once).
 //! - **A local breakout** is made by one network on the box at most.
+//! - **The trunk ports of a later network** are not required: one that is
+//!   missing (an unplugged adapter) leaves its segment out, it does not stop
+//!   the box.
 //!
 //! The rest (tunnels, MSS clamping, split horizon, the learn table) only
 //! adds up: the names of the tunnels differ between the networks.
@@ -23,13 +26,134 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::config::VlanSet;
 use crate::desired::{Desired, TrunkSpec};
 
+/// Something a network lost to an earlier network of the box.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Lost {
+    /// Everything: `port` is a port of network `owner`.
+    Ports {
+        /// The port.
+        port: u16,
+        /// The network that has it.
+        owner: String,
+    },
+    /// A trunk port network `owner` has too, with VLAN mappings (`mapped`)
+    /// or in another bridge.
+    Trunk {
+        /// The port.
+        port: String,
+        /// The network that has it.
+        owner: String,
+        /// One of them maps VLANs there.
+        mapped: bool,
+    },
+    /// A segment whose bridge name an earlier network has.
+    Segment {
+        /// The bridge.
+        bridge: String,
+    },
+    /// A tunnel: its segment has no trunk port left, or its name is taken.
+    Tunnel {
+        /// Its interface.
+        name: String,
+    },
+    /// A VLAN of a bridge network `owner` has too.
+    Vlan {
+        /// The bridge.
+        bridge: String,
+        /// The VLAN.
+        vid: u16,
+        /// The network that has it there.
+        owner: String,
+    },
+    /// The local breakout: network `owner` breaks out on this box.
+    Breakout {
+        /// The network that does.
+        owner: String,
+    },
+}
+
+impl Lost {
+    /// What was lost, whoever took it (a change is checked by this).
+    pub fn what(&self) -> (u8, String, u16) {
+        match self {
+            Self::Ports { port, .. } => (0, String::new(), *port),
+            Self::Trunk { port, .. } => (1, port.clone(), 0),
+            Self::Segment { bridge } => (2, bridge.clone(), 0),
+            Self::Tunnel { name } => (3, name.clone(), 0),
+            Self::Vlan { bridge, vid, .. } => (4, bridge.clone(), *vid),
+            Self::Breakout { .. } => (5, String::new(), 0),
+        }
+    }
+}
+
+/// `lost` in sentences: the VLANs of a bridge together, the tunnels in one.
+pub fn describe(lost: &[Lost]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut vlans: BTreeMap<(&str, &str), Vec<u16>> = BTreeMap::new();
+    let mut tunnels: Vec<&str> = Vec::new();
+    for item in lost {
+        match item {
+            Lost::Ports { port, owner } => out.push(format!(
+                "everything: port {port} is a port of network \"{owner}\" (`wanderlan settings` gives this site other ports)"
+            )),
+            Lost::Trunk {
+                port,
+                owner,
+                mapped: true,
+            } => out.push(format!(
+                "trunk port {port}: it is a port of network \"{owner}\" too, and one of them maps VLANs there"
+            )),
+            Lost::Trunk { port, owner, .. } => out.push(format!(
+                "trunk port {port}: it is in another bridge of network \"{owner}\""
+            )),
+            Lost::Segment { bridge } => out.push(format!(
+                "segment {bridge}: an unrelated bridge of the same name belongs to another network"
+            )),
+            Lost::Tunnel { name } => tunnels.push(name),
+            Lost::Vlan { bridge, vid, owner } => {
+                vlans.entry((bridge, owner)).or_default().push(*vid);
+            }
+            Lost::Breakout { owner } => out.push(format!(
+                "the local breakout: network \"{owner}\" breaks out on this box (one network does at most)"
+            )),
+        }
+    }
+    for ((bridge, owner), vids) in vlans {
+        let set: VlanSet = vids.into_iter().collect();
+        out.push(format!(
+            "VLANs {set} in bridge {bridge}: network \"{owner}\" has them there"
+        ));
+    }
+    if !tunnels.is_empty() {
+        out.push(format!(
+            "tunnels {}: their segment has no trunk port left, or the name is taken",
+            tunnels.join(", ")
+        ));
+    }
+    out
+}
+
 /// The box's desired state and what the networks lost.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Merged {
     /// What the box should look like.
     pub desired: Desired,
     /// What a network lost to an earlier one, by network.
+    pub lost: BTreeMap<String, Vec<Lost>>,
+    /// The same in sentences ([`describe`]).
     pub conflicts: BTreeMap<String, Vec<String>>,
+    /// The bridges each network's segments are in on the box.
+    pub bridges: BTreeMap<String, Vec<String>>,
+}
+
+impl Merged {
+    /// True if `network` got its ports (else it got nothing at all).
+    pub fn has_ports(&self, network: &str) -> bool {
+        !self
+            .lost
+            .get(network)
+            .is_some_and(|l| l.iter().any(|x| matches!(x, Lost::Ports { .. })))
+    }
 }
 
 /// Puts the desired states of the networks together, the first one wins
@@ -39,7 +163,12 @@ pub fn merge(parts: &[(&str, &Desired)]) -> Option<Merged> {
         Some((first, rest)) => ((first, rest), first.1.clone()),
         None => return None,
     };
-    let mut conflicts: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut all_lost: BTreeMap<String, Vec<Lost>> = BTreeMap::new();
+    let mut bridges: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    bridges.insert(
+        first.0.to_string(),
+        first.1.bridges().map(str::to_string).collect(),
+    );
     // Who has what, for the messages.
     let mut port_of: BTreeMap<u16, &str> = ports(first.1).map(|p| (p, first.0)).collect();
     let mut trunk_of: BTreeMap<String, &str> = first
@@ -52,14 +181,20 @@ pub fn merge(parts: &[(&str, &Desired)]) -> Option<Merged> {
     for (network, part) in rest {
         let mut lost = Vec::new();
         if let Some((port, other)) = ports(part).find_map(|p| Some((p, port_of.get(&p)?))) {
-            lost.push(format!(
-                "everything: port {port} is a port of network \"{other}\" (`wanderlan settings` gives this site other ports)"
-            ));
-            conflicts.insert(network.to_string(), lost);
+            lost.push(Lost::Ports {
+                port,
+                owner: (*other).to_string(),
+            });
+            all_lost.insert(network.to_string(), lost);
             continue;
         }
         port_of.extend(ports(part).map(|p| (p, *network)));
         let mut part = (*part).clone();
+        // Only the main port of the first network must be there: a missing
+        // port of a later one leaves its segment out (not the box).
+        for trunk in &mut part.trunks {
+            trunk.required = false;
+        }
         // Where the bridges of this network go: into the bridge of an
         // earlier network that has one of its ports, else its own.
         let mut bridge_map: BTreeMap<String, String> = BTreeMap::new();
@@ -70,19 +205,21 @@ pub fn merge(parts: &[(&str, &Desired)]) -> Option<Merged> {
             };
             let owner = trunk_of.get(&trunk.name).copied().unwrap_or("?");
             if !trunk.tc.is_empty() || !theirs.tc.is_empty() {
-                lost.push(format!(
-                    "trunk port {}: it is a port of network \"{owner}\" too, and one of them maps VLANs there",
-                    trunk.name
-                ));
+                lost.push(Lost::Trunk {
+                    port: trunk.name.clone(),
+                    owner: owner.to_string(),
+                    mapped: true,
+                });
                 dropped.insert(trunk.name.clone());
                 continue;
             }
             match bridge_map.get(&trunk.bridge) {
                 Some(target) if *target != theirs.bridge => {
-                    lost.push(format!(
-                        "trunk port {}: it is in another bridge ({}) of network \"{owner}\"",
-                        trunk.name, theirs.bridge
-                    ));
+                    lost.push(Lost::Trunk {
+                        port: trunk.name.clone(),
+                        owner: owner.to_string(),
+                        mapped: false,
+                    });
                     dropped.insert(trunk.name.clone());
                 }
                 Some(_) => {}
@@ -103,27 +240,26 @@ pub fn merge(parts: &[(&str, &Desired)]) -> Option<Merged> {
             .collect();
         let clashing: BTreeSet<String> = own.intersection(&used).cloned().collect();
         for bridge in &clashing {
-            lost.push(format!(
-                "segment {bridge}: an unrelated bridge of the same name belongs to another network"
-            ));
+            lost.push(Lost::Segment {
+                bridge: bridge.clone(),
+            });
         }
         part.trunks.retain(|t| !clashing.contains(&t.bridge));
-        part.breakout.retain(|b| !clashing.contains(&b.bridge));
-        // A segment without a trunk port has no bridge: its tunnels go.
-        let segments: BTreeSet<&String> = part.trunks.iter().map(|t| &t.bridge).collect();
+        // A segment without a trunk port has no bridge: its tunnels and its
+        // breakout go.
+        let segments: BTreeSet<String> = part.trunks.iter().map(|t| t.bridge.clone()).collect();
+        part.breakout.retain(|b| segments.contains(&b.bridge));
         let orphans: BTreeSet<String> = part
             .tunnels
             .iter()
             .filter(|t| !segments.contains(&t.bridge))
             .map(|t| t.name.clone())
             .collect();
-        if !orphans.is_empty() {
-            let list: Vec<&str> = orphans.iter().map(String::as_str).collect();
-            lost.push(format!(
-                "tunnels {}: their segment has no trunk port left",
-                list.join(", ")
-            ));
-        }
+        lost.extend(
+            orphans
+                .iter()
+                .map(|name| Lost::Tunnel { name: name.clone() }),
+        );
         drop_tunnels(&mut part, &orphans);
         let rename = |bridge: &mut String| {
             if let Some(target) = bridge_map.get(bridge.as_str()) {
@@ -147,17 +283,17 @@ pub fn merge(parts: &[(&str, &Desired)]) -> Option<Merged> {
             if overlap.is_empty() {
                 continue;
             }
-            let owners: BTreeSet<&str> = out
+            let owner = out
                 .trunks
                 .iter()
                 .filter(|t| t.bridge == *bridge)
-                .filter_map(|t| trunk_of.get(&t.name).copied())
-                .collect();
-            let owners: Vec<String> = owners.iter().map(|o| format!("\"{o}\"")).collect();
-            lost.push(format!(
-                "VLANs {overlap} in bridge {bridge}: network {} has them there",
-                owners.join(", ")
-            ));
+                .find_map(|t| trunk_of.get(&t.name).copied())
+                .unwrap_or("?");
+            lost.extend(overlap.iter().map(|vid| Lost::Vlan {
+                bridge: bridge.clone(),
+                vid,
+                owner: owner.to_string(),
+            }));
             for t in part.trunks.iter_mut().filter(|t| t.bridge == *bridge) {
                 t.vlans.retain(|v, _| !overlap.contains(*v));
             }
@@ -169,9 +305,9 @@ pub fn merge(parts: &[(&str, &Desired)]) -> Option<Merged> {
         }
         if !part.breakout.is_empty() {
             if let Some(other) = breakout_of {
-                lost.push(format!(
-                    "the local breakout: network \"{other}\" breaks out on this box (one network does at most)"
-                ));
+                lost.push(Lost::Breakout {
+                    owner: other.to_string(),
+                });
                 part.breakout.clear();
             } else {
                 breakout_of = Some(network);
@@ -184,10 +320,17 @@ pub fn merge(parts: &[(&str, &Desired)]) -> Option<Merged> {
             .filter(|t| out.tunnels.iter().any(|o| o.name == t.name))
             .map(|t| t.name.clone())
             .collect();
-        for name in &taken {
-            lost.push(format!("tunnel {name}: the name is taken"));
-        }
+        lost.extend(taken.iter().map(|name| Lost::Tunnel { name: name.clone() }));
         drop_tunnels(&mut part, &taken);
+        bridges.insert(
+            network.to_string(),
+            part.trunks
+                .iter()
+                .map(|t| t.bridge.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
+        );
         for trunk in part.trunks {
             match out.trunks.iter_mut().find(|t| t.name == trunk.name) {
                 Some(theirs) => add_vlans(theirs, &trunk),
@@ -204,12 +347,18 @@ pub fn merge(parts: &[(&str, &Desired)]) -> Option<Merged> {
         out.learn.extend(&part.learn);
         out.breakout.extend(part.breakout);
         if !lost.is_empty() {
-            conflicts.insert(network.to_string(), lost);
+            all_lost.insert(network.to_string(), lost);
         }
     }
+    let conflicts = all_lost
+        .iter()
+        .map(|(n, l)| (n.clone(), describe(l)))
+        .collect();
     Some(Merged {
         desired: out,
+        lost: all_lost,
         conflicts,
+        bridges,
     })
 }
 

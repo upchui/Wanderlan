@@ -73,7 +73,7 @@ fn draw_vlans(frame: &mut Frame, draft: &Draft, restricted_by: Option<&str>, are
     match (draft.at(&path).next(), restricted_by) {
         (Some(d), _) => lines.push(diagnostic_line(d)),
         (None, Some(manager)) => lines.push(Line::styled(
-            format!(" Managed by {manager}: VLANs and mappings change only there."),
+            format!(" Only the server {manager} changes the tunnel of this site: VLANs and mappings change there."),
             theme::warn(),
         )),
         (None, None) => lines.push(Line::styled(

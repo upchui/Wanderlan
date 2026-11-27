@@ -154,26 +154,25 @@ pub enum Command {
         #[arg(long)]
         confirm: bool,
     },
-    /// Set who may change a site's VLANs, mappings and online state.
+    /// Set who changes the tunnel of a client to its server: its VLANs,
+    /// mappings, the VLANs of that tunnel, breakouts and online state.
+    /// "server": only its server, "client": only the client, "both". Its
+    /// address, its server and removing it stay with its server.
     ///
-    /// Example: `wanderlan manage buero --self-managed yes` lets "buero"
-    /// change its own VLANs too.
+    /// Example: `wanderlan manage buero both` lets "buero" change its tunnel
+    /// too.
     Manage {
-        /// The site.
+        /// The site (a client).
         site: String,
-        /// The managing site (default: the current one, or this site). It
-        /// may also rename the site.
-        #[arg(long)]
-        by: Option<String>,
-        /// Whether the site may change its own VLANs too (yes/no).
-        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
-        self_managed: Option<bool>,
+        /// "server", "client" or "both".
+        #[arg(value_parser = ["server", "client", "both"])]
+        changes: String,
         /// Confirm the change right away.
         #[arg(long)]
         confirm: bool,
     },
-    /// Rename a site: this site always, another site if this site manages
-    /// it (`managed_by`). Everything that names it follows, on every site.
+    /// Rename a site: this site always, a client of this site too.
+    /// Everything that names it follows, on every site.
     ///
     /// Example: `wanderlan rename site5 lab`.
     Rename {
@@ -391,10 +390,10 @@ pub struct RuleArgs {
     /// is source VLAN 30 (repeatable).
     #[arg(long = "map", value_name = "MAPPED:SOURCE", value_parser = parse_translation)]
     maps: Vec<api::Translation>,
-    /// The new site may change its own VLANs and mappings too (otherwise
-    /// only this site may).
-    #[arg(long)]
-    self_managed: bool,
+    /// Who changes the tunnel of the new site later: "server" (only this
+    /// site, the default), "client" (only the new site) or "both".
+    #[arg(long, value_parser = ["server", "client", "both"])]
+    changes: Option<String>,
 }
 
 impl RuleArgs {
@@ -404,7 +403,8 @@ impl RuleArgs {
             vlans: self.vlans,
             native: self.native,
             translations: self.maps,
-            allow_self: self.self_managed,
+            changes: self.changes.as_deref().and_then(|c| c.parse().ok()),
+            ..SiteRules::default()
         }
     }
 }
@@ -613,6 +613,10 @@ pub async fn run(args: Args) -> Result<ExitCode> {
                     )));
                 }
                 entry.uplink = uplink;
+                // A server has no option of who changes its tunnel.
+                if uplink.is_none() {
+                    entry.changes = config::Changes::default();
+                }
                 // A server breaks out nothing: the gateways are there.
                 let gone = if uplink.is_none() && !entry.breakout.is_empty() {
                     entry.breakout.clear();
@@ -753,31 +757,34 @@ pub async fn run(args: Args) -> Result<ExitCode> {
         }) => rename(&socket, &site, &new_name, confirm).await,
         Some(Command::Manage {
             site,
-            by,
-            self_managed,
+            changes,
             confirm,
         }) => {
+            let changes: config::Changes = changes.parse().map_err(|e: String| anyhow!(e))?;
             edit_site(&socket, &site, confirm, |entry, known| {
-                let before = (entry.managed_by, entry.self_managed);
-                let by = by.as_deref().map(|m| known.find(m)).transpose()?;
-                let manager = by.or(entry.managed_by).unwrap_or(known.me);
-                entry.managed_by = Some(manager);
-                if let Some(v) = self_managed {
-                    entry.self_managed = v;
-                }
-                let who = match (entry.managed_by.map(|m| known.label(m)), entry.self_managed) {
-                    (None, _) => "every site may change it".to_string(),
-                    (Some(m), false) => format!("only \"{m}\" may change and rename it"),
-                    (Some(m), true) => format!(
-                        "\"{m}\" and \"{}\" itself may change it, \"{m}\" may rename it",
+                let Some(server) = entry.uplink else {
+                    bail!(
+                        "\"{}\" is a server: it has no such option, every server may change it",
+                        entry.name
+                    );
+                };
+                let who = match changes {
+                    config::Changes::Server => {
+                        format!("only its server \"{}\" changes", known.label(server))
+                    }
+                    config::Changes::Client => format!("only \"{}\" itself changes", entry.name),
+                    config::Changes::Both => format!(
+                        "its server \"{}\" and \"{}\" itself change",
+                        known.label(server),
                         entry.name
                     ),
                 };
-                if before == (entry.managed_by, entry.self_managed) {
-                    Ok(Edit::Nothing(format!("Nothing to change: {who}.")))
-                } else {
-                    Ok(Edit::Done(format!("{}: {who}", entry.name)))
+                let who = format!("{who} its tunnel (VLANs, mappings, breakouts, online state)");
+                if entry.changes == changes {
+                    return Ok(Edit::Nothing(format!("Nothing to change: {who}.")));
                 }
+                entry.changes = changes;
+                Ok(Edit::Done(format!("{}: {who}", entry.name)))
             })
             .await
         }
@@ -787,8 +794,23 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             name,
             trunk,
         }) => {
-            add_chosen_network(&socket).await?;
-            join_network(&socket, &target, &code, name, trunk).await
+            let added = add_chosen_network(&socket).await?;
+            let joined = join_network(&socket, &target, &code, name, trunk).await;
+            // A network added for a join that did not work goes again.
+            if joined.is_err()
+                && let Some(name) = added
+            {
+                let client = Client::connect(&socket).await?.0;
+                let removed: Result<ResetReport, _> = client
+                    .call(Request::RemoveNetwork(api::NetworkParams {
+                        name: name.clone(),
+                    }))
+                    .await;
+                if removed.is_ok() {
+                    eprintln!("Network {name} was removed from this box again.");
+                }
+            }
+            joined
         }
         Some(Command::Reset { yes }) => reset(&socket, yes).await,
         Some(Command::Networks { action }) => networks(&socket, action).await,
@@ -952,15 +974,21 @@ async fn join_network(
         joined.via, joined.site, joined.sites
     );
     println!("Waiting until \"{}\" answers ...", joined.via);
-    for _ in 0..120 {
+    // As long as the daemon waits for the confirmation (the commit timeout
+    // of the network), and a little more.
+    let mut deadline = std::time::Instant::now() + Duration::from_secs(120);
+    while std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_secs(1)).await;
         let st: Status = client.call(Request::Status).await?;
         if st.state == SiteState::Unconfigured {
             bail!(
-                "\"{}\" did not answer in time; the change was rolled back. Check that this site reaches it in the transport network (TCP and UDP {port}, the tunnels UDP {}) and join again with a new invitation.",
+                "\"{}\" did not answer in time; the change was rolled back. Check that this site reaches it in the transport network (TCP and UDP {port}, the tunnels UDP {}) and join again (the invitation works again).",
                 joined.via,
                 port.saturating_add(1)
             );
+        }
+        if let Some(p) = &st.pending {
+            deadline = std::time::Instant::now() + Duration::from_secs(p.remaining_secs + 10);
         }
         if st.pending.is_none() {
             // The inviting site confirms on its own once this site answers;
@@ -993,7 +1021,7 @@ async fn join_network(
             return Ok(ExitCode::SUCCESS);
         }
     }
-    bail!("no confirmation after two minutes; see `wanderlan status` and `wanderlan log`")
+    bail!("no confirmation in time; see `wanderlan status` and `wanderlan log`")
 }
 
 /// Waits until no automatic change (a site joining, a synchronised change)
@@ -1499,7 +1527,8 @@ async fn site_command(socket: &Path, action: SiteAction) -> Result<ExitCode> {
                 let role = role_text(uplink.map(|up| known.label(up)).as_deref(), false);
                 network.sites.push(config::Site {
                     vlans: vlans.clone(),
-                    managed_by: Some(known.me),
+                    // Like an invitation: its server changes its tunnel.
+                    changes: config::Changes::Server,
                     uplink,
                     ..config::Site::new(&name, address)
                 });
@@ -1788,22 +1817,23 @@ async fn reset(socket: &Path, yes: bool) -> Result<ExitCode> {
 
 /// Adds the chosen network to the box if it does not have it yet (a join
 /// into a new network).
-async fn add_chosen_network(socket: &Path) -> Result<()> {
+async fn add_chosen_network(socket: &Path) -> Result<Option<String>> {
     let Some(name) = chosen_network() else {
-        return Ok(());
+        return Ok(None);
     };
     let client = Client::connect(socket).await?.0;
     let list: Vec<api::NetworkInfo> = client
         .call(Request::Networks)
         .await
         .map_err(|e| anyhow!("the daemon cannot choose a network (an older version?): {e}"))?;
-    if !list.iter().any(|n| n.name == name) {
-        let n: api::NetworkInfo = client
-            .call(Request::AddNetwork(api::NetworkParams { name }))
-            .await?;
-        println!("Network {} added to this box (tag {}).", n.name, n.tag);
+    if list.iter().any(|n| n.name == name) {
+        return Ok(None);
     }
-    Ok(())
+    let n: api::NetworkInfo = client
+        .call(Request::AddNetwork(api::NetworkParams { name }))
+        .await?;
+    println!("Network {} added to this box (tag {}).", n.name, n.tag);
+    Ok(Some(n.name))
 }
 
 /// Connects to the daemon, for the chosen network; one the box does not

@@ -64,10 +64,14 @@ pub struct MacState {
     pub selected: usize,
 }
 
-/// The site behind a bridge port: the peer for tunnel ports, `None` for
-/// local ports.
-pub fn port_site(port: &str) -> Option<&str> {
-    port.strip_prefix(TUNNEL_PREFIX)
+/// The site behind the port of an entry: the peer of a tunnel port (as
+/// the daemon names it; an older one only by the name of the port), `None`
+/// for a port of this site.
+pub fn entry_site(entry: &MacEntry) -> Option<&str> {
+    entry
+        .peer
+        .as_deref()
+        .or_else(|| entry.port.strip_prefix(TUNNEL_PREFIX))
 }
 
 impl MacState {
@@ -99,9 +103,15 @@ impl MacState {
             .filter(|e| {
                 let vlan = e.vlan.map(|v| v.to_string()).unwrap_or_default();
                 let port = e.port.to_lowercase();
+                let site = entry_site(e).unwrap_or("this site").to_lowercase();
                 words.iter().all(|w| match w.strip_prefix("vlan:") {
                     Some(only) => vlan == only,
-                    None => e.mac.contains(w.as_str()) || vlan == *w || port.contains(w.as_str()),
+                    None => {
+                        e.mac.contains(w.as_str())
+                            || vlan == *w
+                            || port.contains(w.as_str())
+                            || site.contains(w.as_str())
+                    }
                 })
             })
             .collect();
@@ -216,7 +226,27 @@ mod tests {
 
     #[test]
     fn port_sites() {
-        assert_eq!(port_site("vx-buero"), Some("buero"));
-        assert_eq!(port_site("ens19"), None);
+        let entry = |port: &str, peer: Option<&str>| MacEntry {
+            mac: "02:00:00:00:00:01".into(),
+            vlan: Some(20),
+            port: port.into(),
+            age_secs: None,
+            peer: peer.map(str::to_string),
+        };
+        // As the daemon names it: a tunnel is named by the identity.
+        assert_eq!(
+            entry_site(&entry("vxk3faaaaaaaaaa", Some("buero"))),
+            Some("buero")
+        );
+        assert_eq!(entry_site(&entry("vx-buero", None)), Some("buero"), "older");
+        assert_eq!(entry_site(&entry("ens19", None)), None);
+        // The filter finds it by its site.
+        let mut state = MacState::default();
+        state.set_entries(vec![
+            entry("vxk3faaaaaaaaaa", Some("buero")),
+            entry("ens19", None),
+        ]);
+        state.filter.set("buero");
+        assert_eq!(state.visible().len(), 1);
     }
 }

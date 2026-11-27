@@ -63,6 +63,31 @@ check "the log says what was moved and converted" \
   x site4 "wanderlan log | grep -q 'to /etc/wanderlan/network.toml' && wanderlan log | grep -q 'converted to format 3'"
 expect_ping c-site4 10.20.0.13 "VLAN 20: site4 reaches site5"
 
+begin "A file written by hand with names keeps the identities"
+
+id4=$(jqs site4 .site_id)
+rev4=$(jqs site4 .revision)
+# The sites by their names, without identities (as a person writes it).
+# (Nothing in the pipe may read stdin: `jqs` there would eat the file.)
+awk '
+  /^\[site\."/ { print "[[site]]"; next }
+  /^server = / { sub(/^server/, "uplink"); sub(/  #.*/, ""); print; next }
+  { print }' "$RUN_DIR/site4-wire.toml" | sed "s/^revision = .*/revision = $rev4/" \
+  >"$RUN_DIR/site4-names.toml"
+put site4 /etc/wanderlan/network.toml <"$RUN_DIR/site4-names.toml"
+check "the file names the sites by their names only" \
+  x site4 "! grep -q '^\[site\.\"' /etc/wanderlan/network.toml"
+x site4 "wl-daemon reload"
+wait_for 30 "site4 wrote it back with its identity" \
+  eval "x site4 'site-entry site4' | head -n 1 | grep -qF \"\$(jqs site4 .site_id)\""
+for i in 1 2; do
+  x site4 "wl-daemon stop; wl-daemon start"
+  wait_for 30 "restart $i: site4 runs" x site4 "wanderlan status --json | jq -e '.state == \"running\"'"
+  check "restart $i: site4 has its identity" test "$(jqs site4 .site_id)" = "$id4"
+done
+wait_for 60 "site4's tunnels are up again" x site4 "[ -n \"\$(tun site5)\" ]"
+expect_ping c-site4 10.20.0.13 "VLAN 20: site4 reaches site5"
+
 begin "A second daemon started by mistake changes nothing"
 
 mark=$(daemon_log_lines site4)

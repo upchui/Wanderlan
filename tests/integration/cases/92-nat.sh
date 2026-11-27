@@ -82,6 +82,28 @@ done
 wait_for 60 "VLAN 20: natc1 reaches site1's client" ping_once c-natc1 10.20.0.1
 wait_for 60 "VLAN 20: natc2 reaches natc1 through site1" ping_once c-natc2 10.20.0.31
 
+begin "NAT: the server moves its ports, its clients behind the NAT follow at once"
+
+# They never get contacted first: they learn the new ports at the old one.
+check "site1 moves its control port (the tunnel port follows: 52902)" \
+  x site1 "wanderlan settings control-port 52901 --confirm"
+for c in natc1 natc2; do
+  wait_for 20 "$c sends its tunnel packets to the new tunnel port of site1" \
+    x "$c" "bridge fdb show dev \$(tun site1) | grep -q 'dst 10.100.1.10 port 52902'"
+  wait_for 30 "$c has the new ports of site1 in its network" \
+    eval "entry_of $c site1 | grep -q '^control_port = 52901'"
+done
+wait_for 30 "VLAN 20: natc1 reaches site1's client at the new ports" ping_once c-natc1 10.20.0.1
+wait_for 30 "VLAN 20: natc2 reaches natc1 through site1" ping_once c-natc2 10.20.0.31
+wait_for 30 "site1 closed the old control port once every peer probes the new one" \
+  x site1 "! ss -Hlun | grep -q ':51821 '"
+check "site1 takes the default ports again" x site1 "wanderlan settings control-port default --confirm"
+for c in natc1 natc2; do
+  wait_for 20 "$c follows back to the default tunnel port" \
+    x "$c" "! bridge fdb show dev \$(tun site1) | grep -q 'port 52902'"
+done
+wait_for 30 "VLAN 20: natc1 reaches site1's client at the default ports" ping_once c-natc1 10.20.0.1
+
 begin "Names: two clients with the same name, told apart by their identities"
 
 fp2=$(jqs natc2 .site_id | cut -c1-8)

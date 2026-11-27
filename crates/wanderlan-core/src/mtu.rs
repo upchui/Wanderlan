@@ -201,8 +201,25 @@ pub mod wire2 {
     const LABEL_REQUEST: &[u8] = b"wlp2 request";
     const LABEL_REPLY: &[u8] = b"wlp2 reply";
 
+    /// Magic bytes of the ports a request may carry behind its tag.
+    const PORTS_MAGIC: &[u8; 4] = b"WLPP";
+    /// Size of the ports behind the tag of a request: magic, control port,
+    /// tunnel port and their own tag (older versions take it for padding).
+    pub const PORTS_LEN: usize = 4 + 2 + 2 + TAG_LEN;
+    const LABEL_PORTS: &[u8] = b"wlp2 ports";
+
     /// The nonce of a request.
     pub type Nonce = [u8; NONCE_LEN];
+
+    /// The ports a site uses now, carried by its requests: its peers follow
+    /// a change at once, before they have the network with it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Ports {
+        /// The port of its daemon (probes, sync).
+        pub control: u16,
+        /// The port of its tunnels.
+        pub tunnel: u16,
+    }
 
     /// Flag of a reply: the request's tag was wrong for the responder (it
     /// answers anyway, so that the requester learns that another box sits
@@ -259,7 +276,9 @@ pub mod wire2 {
         Reply(Reply),
     }
 
-    /// Encodes a request whose IP packet is `ip_size` bytes long.
+    /// Encodes a request whose IP packet is `ip_size` bytes long (larger if
+    /// the ports do not fit otherwise).
+    #[allow(clippy::too_many_arguments)]
     pub fn request(
         seq: u32,
         ip_size: u16,
@@ -268,10 +287,10 @@ pub mod wire2 {
         sender: &SiteId,
         nonce: &Nonce,
         keys: &PairKeys,
+        ports: Option<Ports>,
     ) -> Vec<u8> {
-        let len = usize::from(ip_size)
-            .saturating_sub(IP_UDP)
-            .max(REQUEST_HEADER);
+        let header = REQUEST_HEADER + if ports.is_some() { PORTS_LEN } else { 0 };
+        let len = usize::from(ip_size).saturating_sub(IP_UDP).max(header);
         let mut buf = Vec::with_capacity(len);
         buf.extend_from_slice(MAGIC);
         buf.push(KIND_REQUEST);
@@ -283,8 +302,32 @@ pub mod wire2 {
         buf.extend_from_slice(nonce);
         let tag = keys.probe_tag(&[LABEL_REQUEST, &buf]);
         buf.extend_from_slice(&tag);
+        if let Some(ports) = ports {
+            let mut ext = Vec::with_capacity(PORTS_LEN);
+            ext.extend_from_slice(PORTS_MAGIC);
+            ext.extend_from_slice(&ports.control.to_be_bytes());
+            ext.extend_from_slice(&ports.tunnel.to_be_bytes());
+            let tag = keys.probe_tag(&[LABEL_PORTS, &buf, &ext]);
+            buf.extend_from_slice(&ext);
+            buf.extend_from_slice(&tag);
+        }
         buf.resize(len, 0);
         buf
+    }
+
+    /// The ports the request in `buf` carries, if their tag is valid for
+    /// `keys` (the request's own tag is checked with [`verify_request`]).
+    pub fn ports(buf: &[u8], keys: &PairKeys) -> Option<Ports> {
+        let signed = buf.get(..REQUEST_HEADER)?;
+        let ext = buf.get(REQUEST_HEADER..REQUEST_HEADER + 8)?;
+        let tag = buf.get(REQUEST_HEADER + 8..REQUEST_HEADER + PORTS_LEN)?;
+        if ext.get(..4)? != PORTS_MAGIC || !keys.probe_verify(&[LABEL_PORTS, signed, ext], tag) {
+            return None;
+        }
+        Some(Ports {
+            control: u16::from_be_bytes(array(ext, 4)?),
+            tunnel: u16::from_be_bytes(array(ext, 6)?),
+        })
     }
 
     /// Encodes the reply to `request`.
@@ -408,6 +451,7 @@ mod tests {
             &a.id(),
             &nonce,
             &ab,
+            None,
         );
         assert_eq!(req.len(), 1400 - 28);
         let wire2::Probe::Request(decoded) = wire2::decode(&req).unwrap() else {
@@ -431,7 +475,7 @@ mod tests {
         let mut flagged = req.clone();
         flagged[5] |= wire2::FLAG_REACHED;
         assert!(!wire2::verify_request(&flagged, &ba));
-        let small = wire2::request(1, 10, 0, &announce, &a.id(), &nonce, &ab);
+        let small = wire2::request(1, 10, 0, &announce, &a.id(), &nonce, &ab, None);
         assert_eq!(small.len(), wire2::REQUEST_HEADER);
         assert_eq!(wire2::REQUEST_HEADER, 114);
 
@@ -450,6 +494,25 @@ mod tests {
         let ca = c.pair(&a.id()).unwrap();
         let fake = wire2::reply(&decoded, 0, &announce, &b.id(), &ca);
         assert!(!wire2::verify_reply(&fake, &nonce, &ab));
+        // Without ports there are none; with them they need their tag.
+        assert_eq!(wire2::ports(&req, &ba), None);
+        let ports = wire2::Ports {
+            control: 52821,
+            tunnel: 52833,
+        };
+        let small = wire2::request(1, 160, 0, &announce, &a.id(), &nonce, &ab, Some(ports));
+        assert_eq!(small.len(), wire2::REQUEST_HEADER + wire2::PORTS_LEN);
+        assert!(wire2::verify_request(&small, &ba));
+        assert_eq!(wire2::ports(&small, &ba), Some(ports));
+        let mut moved = small.clone();
+        moved[wire2::REQUEST_HEADER + 5] ^= 1;
+        assert_eq!(wire2::ports(&moved, &ba), None);
+        assert_eq!(wire2::ports(&small, &ca), None);
+        let large = wire2::request(1, 1400, 0, &announce, &a.id(), &nonce, &ab, Some(ports));
+        assert_eq!(
+            (large.len(), wire2::ports(&large, &ba)),
+            (1372, Some(ports))
+        );
         // Version 1 does not read version 2 and the other way round.
         assert_eq!(wire::decode(&req), None);
         assert_eq!(wire2::decode(&wire::reply(1, 2, &announce)), None);

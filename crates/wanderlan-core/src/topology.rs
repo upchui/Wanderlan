@@ -36,18 +36,26 @@ pub fn is_tag(c: char) -> bool {
     c.is_ascii_lowercase() || c.is_ascii_digit()
 }
 
-/// The tag of the network whose tunnel interface `name` is, if it is one
-/// (`v`, the tag, then `-` and a name or the start of an identity).
+/// The tag of the network whose tunnel interface `name` is, if it is one:
+/// `v`, the tag and the start of an identity (13 characters of base32);
+/// `vx-<name>` towards a peer of an older version in the default network.
+/// Other names that start with `v` (`ve-foo` of systemd-nspawn, `vlan10`)
+/// are not wanderlan's.
 pub fn tunnel_tag(name: &str) -> Option<char> {
+    if name
+        .strip_prefix(TUNNEL_PREFIX)
+        .is_some_and(|n| !n.is_empty())
+    {
+        return Some(DEFAULT_TAG);
+    }
     let rest = name.strip_prefix('v')?;
     let tag = rest.chars().next().filter(|c| is_tag(*c))?;
     let rest = &rest[1..];
-    let named = rest.strip_prefix('-').is_some_and(|n| !n.is_empty());
     let by_id = rest.len() == IFNAME_PART_LEN
         && rest
             .bytes()
             .all(|c| c.is_ascii_lowercase() || (b'2'..=b'7').contains(&c));
-    (named || by_id).then_some(tag)
+    by_id.then_some(tag)
 }
 
 /// True for the name of a tunnel interface of wanderlan, of any network
@@ -91,13 +99,15 @@ impl Tunnel<'_> {
 
 /// Name of the tunnel interface towards a peer in the network with `tag`:
 /// `v`, the tag and the start of the peer's identity, so that it stays when
-/// the peer is renamed and two peers with the same name get their own;
-/// `v<tag>-<name>` for a peer of an older version without an identity.
+/// the peer is renamed and two peers with the same name get their own. In
+/// the default network a peer of an older version without an identity
+/// keeps `vx-<name>`; in a further network such a peer is named by its
+/// placeholder (which follows its name).
 pub fn tunnel_name(tag: char, peer: &Site) -> String {
-    if peer.has_identity() {
+    if peer.has_identity() || tag != DEFAULT_TAG {
         format!("v{tag}{}", peer.id.ifname_part())
     } else {
-        format!("v{tag}-{}", peer.name)
+        format!("{TUNNEL_PREFIX}{}", peer.name)
     }
 }
 
@@ -431,9 +441,12 @@ mod tests {
         assert_eq!(tunnels[0].ifname('a'), "vaaaaaaaaaaaaaa");
         assert!(is_tunnel_name("vxaaaaaaaaaaaaa"));
         assert_eq!(tunnel_tag("v3aaaaaaaaaaaaa"), Some('3'));
-        assert_eq!(tunnel_tag("vb-lab"), Some('b'));
+        assert_eq!(tunnel_tag("vx-lab"), Some(DEFAULT_TAG));
         assert!(!is_tunnel_name("vxaaaaaaaaaaaa"));
         assert!(!is_tunnel_name("veth1a2b3c4"));
+        // systemd-nspawn and others: not wanderlan's.
+        assert!(!is_tunnel_name("ve-foo"));
+        assert!(!is_tunnel_name("vb-lab"));
         assert_eq!(
             peer_of(&with_id, DEFAULT_TAG, "vxaaaaaaaaaaaaa").map(|s| s.name.as_str()),
             Some("buero")

@@ -95,7 +95,7 @@ mod tests {
 
     fn site(name: &str, last: u8, uplink: Option<&str>) -> Site {
         Site {
-            managed_by: uplink.map(id),
+            changes: crate::config::Changes::Server,
             uplink: uplink.map(id),
             ..Site::new(name, Ipv4Addr::new(10, 0, 0, last))
         }

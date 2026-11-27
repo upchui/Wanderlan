@@ -566,6 +566,12 @@ fn bar_key(label: &str) -> Option<KeyCode> {
     }
 }
 
+/// The forms of the settings of this host (local.toml, its own ports): they
+/// are applied when saved, not kept in the draft.
+fn applies_at_once(kind: &FormKind) -> bool {
+    matches!(kind, FormKind::Local | FormKind::OwnPorts(_))
+}
+
 /// Moves a selection in a list of `count` rows: Up/Down (j/k) one row,
 /// PgUp/PgDn a `page`, Home/End to the ends. `None` if `code` does not
 /// move.
@@ -1024,6 +1030,14 @@ impl App {
             }
             (_, Ok(Reply::Networks(list))) => {
                 self.networks = list;
+                // The window opened before the list came: on the network
+                // shown, not on the first.
+                let current = self.network_name();
+                if let Some(Modal::Networks { selected }) = &mut self.modal
+                    && let Some(i) = self.networks.iter().position(|n| n.name == current)
+                {
+                    *selected = i;
+                }
             }
             (_, Ok(Reply::Invites(list))) => {
                 self.invitations = list;
@@ -1735,6 +1749,31 @@ impl App {
     }
 
     fn may_change(&mut self, site: SiteId) -> bool {
+        self.allowed(site, false)
+    }
+
+    /// True if this site may change anything of `site` the site form
+    /// offers: its tunnel, or where it is; otherwise says why not.
+    fn may_edit(&mut self, site: SiteId) -> bool {
+        let manages = self
+            .running
+            .as_ref()
+            .and_then(|r| r.network.as_ref())
+            .zip(self.running_entry(site))
+            .zip(self.me())
+            .is_some_and(|((n, entry), me)| policy::may_manage(n, entry, me));
+        manages || self.may_change(site)
+    }
+
+    /// True if this site may remove `site` (or change where it is): its
+    /// server; otherwise says why not.
+    fn may_manage(&mut self, site: SiteId) -> bool {
+        self.allowed(site, true)
+    }
+
+    /// True if this site may change the tunnel of `site` (`manage`: where
+    /// it is, or remove it) in the running network; otherwise says why not.
+    fn allowed(&mut self, site: SiteId, manage: bool) -> bool {
         let Some(running) = self.running.as_ref().and_then(|r| r.network.as_ref()) else {
             return true;
         };
@@ -1744,10 +1783,17 @@ impl App {
         let Some(me) = self.me() else {
             return true;
         };
-        if policy::may_change(running, entry, me) {
-            return true;
-        }
-        let text = policy::why_not(running, entry, me, "change");
+        let text = if manage {
+            if policy::may_manage(running, entry, me) {
+                return true;
+            }
+            policy::why_not_manage(running, entry, me, "remove")
+        } else {
+            if policy::may_change(running, entry, me) {
+                return true;
+            }
+            policy::why_not(running, entry, me, "change")
+        };
         self.say(MessageKind::Error, text);
         false
     }
@@ -2241,11 +2287,13 @@ impl App {
             ListId::VlanPorts => false,
             // A click chooses the row, a second one takes it.
             ListId::Uplinks => {
-                let Some(Modal::Uplinks(picker)) = &mut self.modal else {
+                let (Some(Modal::Uplinks(picker)), Some(draft)) = (&mut self.modal, &self.draft)
+                else {
                     return;
                 };
-                let again = picker.cursor == index;
-                picker.cursor = index;
+                let rows = picker.rows(draft, self.status.as_ref());
+                let again = picker.cursor(&rows) == index;
+                picker.select(&rows, index);
                 again
             }
             // A click on the row under the cursor ticks it.
@@ -2619,7 +2667,7 @@ impl App {
             Modal::Vlan { vid, back } => self.on_vlan_key(vid, back, key, fx),
             Modal::Site { name, scroll } => self.on_site_key(name, scroll, key),
             Modal::Review(review) => self.on_review_key(review, key, fx),
-            Modal::Ports(picker) => self.on_ports_key(picker, key),
+            Modal::Ports(picker) => self.on_ports_key(picker, key, fx),
             Modal::Uplinks(picker) => self.on_uplinks_key(picker, key),
         }
     }
@@ -2820,19 +2868,24 @@ impl App {
 
     /// Opens the window to choose trunk ports (the interfaces come from
     /// the daemon, with the tunnels that run over each).
+    /// The trunk ports (local.toml) as they run: applied when chosen.
     fn open_ports(&mut self, target: PortTarget, fx: &mut Vec<Effect>) {
-        let Some(draft) = &self.draft else {
+        let Some(running) = self.running.as_ref().and_then(Draft::from_running) else {
             self.not_configured();
             return;
         };
-        self.modal = Some(Modal::Ports(PortPicker::new(target, draft)));
+        self.modal = Some(Modal::Ports(PortPicker::new(target, &running)));
         self.request_interfaces(fx);
     }
 
-    fn on_ports_key(&mut self, mut picker: PortPicker, key: &KeyEvent) -> Option<Modal> {
-        let Some(draft) = &self.draft else {
-            return None;
-        };
+    fn on_ports_key(
+        &mut self,
+        mut picker: PortPicker,
+        key: &KeyEvent,
+        fx: &mut Vec<Effect>,
+    ) -> Option<Modal> {
+        let running = self.running.as_ref().and_then(Draft::from_running);
+        let draft = running.as_ref()?;
         if !self.interfaces_loaded && self.interfaces_error.is_none() {
             // Still loading: only Esc.
             return (key.code != KeyCode::Esc).then_some(Modal::Ports(picker));
@@ -2870,15 +2923,9 @@ impl App {
             }
             KeyCode::Enter => match picker.apply(draft) {
                 Ok(new) => {
-                    self.draft = Some(new);
-                    self.clamp_selection();
-                    let text = if self.draft.as_ref().is_some_and(|d| d.errors() > 0) {
-                        "Saved in the draft. The draft still has errors (marked red)."
-                    } else {
-                        "Saved in the draft. Press a to review and apply the changes."
-                    };
-                    self.say(MessageKind::Info, text);
-                    return None;
+                    if self.apply_setting(&new, fx) {
+                        return None;
+                    }
                 }
                 Err(e) => picker.error = Some(e),
             },
@@ -2909,14 +2956,15 @@ impl App {
         };
         let rows = picker.rows(draft, self.status.as_ref());
         let count = rows.len() + 1;
-        let typing = picker.cursor >= rows.len();
+        let cursor = picker.cursor(&rows);
+        let typing = cursor >= rows.len();
         let moves = !typing
             || matches!(
                 key.code,
                 KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
             );
-        if moves && let Some(n) = nav(key.code, picker.cursor, count, self.scrolls.uplinks.page()) {
-            picker.cursor = n;
+        if moves && let Some(n) = nav(key.code, cursor, count, self.scrolls.uplinks.page()) {
+            picker.select(&rows, n);
             picker.error = None;
             return Some(Modal::Uplinks(picker));
         }
@@ -2943,8 +2991,9 @@ impl App {
         key: &KeyEvent,
         fx: &mut Vec<Effect>,
     ) -> Option<Modal> {
-        // An invitation is for the network that runs, not the draft.
-        let running = (form.kind == FormKind::Invite)
+        // An invitation is for the network that runs, not the draft; a
+        // setting of this host is applied to it at once.
+        let running = (form.kind == FormKind::Invite || applies_at_once(&form.kind))
             .then(|| self.running.as_ref().and_then(Draft::from_running))
             .flatten();
         let draft = running.as_ref().or(self.draft.as_ref())?;
@@ -2981,6 +3030,13 @@ impl App {
                         self.invite_pending = Some(form);
                         return None;
                     }
+                }
+            }
+            FormEvent::Submit if applies_at_once(&form.kind) => {
+                if let Some(new) = form.submit(draft)
+                    && self.apply_setting(&new, fx)
+                {
+                    return None;
                 }
             }
             FormEvent::Submit => {
@@ -3065,22 +3121,63 @@ impl App {
                 .is_some_and(|p| p.source != ChangeSource::Local);
             return;
         }
-        self.apply_when_settled = false;
         review.state = ReviewState::Applying;
-        self.busy = Some(Busy::Applying);
         if review.origin == Origin::Draft {
             // What comes back if the change is rolled back (also when the
             // answer to this request never arrives).
             self.applied_draft = self.draft.clone();
         }
+        self.send_apply(
+            review.network.clone(),
+            review.local.clone(),
+            review.base_revision,
+            fx,
+        );
+    }
+
+    /// Sends a configuration to the daemon; it answers with the countdown.
+    fn send_apply(
+        &mut self,
+        network: String,
+        local: String,
+        base_revision: u64,
+        fx: &mut Vec<Effect>,
+    ) {
+        self.apply_when_settled = false;
+        self.busy = Some(Busy::Applying);
         fx.push(Effect::Request(Request::Apply(ApplyParams {
-            config: ConfigInput {
-                network: review.network.clone(),
-                local: review.local.clone(),
-            },
-            base_revision: Some(review.base_revision),
+            config: ConfigInput { network, local },
+            base_revision: Some(base_revision),
             timeout_secs: None,
         })));
+    }
+
+    /// Applies a setting of this host at once (like `wanderlan settings`):
+    /// `new` is the running configuration with that change, the draft keeps
+    /// its own edits. It must be confirmed (c) like every change. False,
+    /// with a message, if it cannot be applied now (the form stays open).
+    fn apply_setting(&mut self, new: &Draft, fx: &mut Vec<Effect>) -> bool {
+        if self.refuse_offline() {
+            return false;
+        }
+        if let Some(p) = self.pending() {
+            let text = format!(
+                "A change is waiting for confirmation ({} s left): confirm it (c) or roll it back (r), then change the setting.",
+                p.remaining_secs
+            );
+            self.say(MessageKind::Error, text);
+            return false;
+        }
+        if self.busy.is_some() {
+            self.say(MessageKind::Info, "Still busy; try again in a moment.");
+            return false;
+        }
+        if self.running.as_ref().is_some_and(|r| !new.differs_from(r)) {
+            self.say(MessageKind::Info, "Unchanged.");
+            return true;
+        }
+        self.send_apply(new.network_text(), new.local_text(), new.base_revision, fx);
+        true
     }
 
     fn on_answer(&mut self, action: AskAction, fx: &mut Vec<Effect>) {
@@ -3500,11 +3597,15 @@ impl App {
                             self.open_ports(PortTarget::Default, fx);
                             return;
                         }
-                        let Some(draft) = &self.draft else { return };
-                        // This host only: local.toml or its own ports.
+                        // This host only: local.toml or its own ports, as
+                        // they run (applied when saved, see `apply_setting`).
+                        let Some(running) = self.running.as_ref().and_then(Draft::from_running)
+                        else {
+                            return;
+                        };
                         let mut form = match row.scope {
-                            Scope::Local => Form::local(draft, row.key),
-                            Scope::OwnSite => Form::own_ports(draft),
+                            Scope::Local => Form::local(&running, row.key),
+                            Scope::OwnSite => Form::own_ports(&running),
                         };
                         form.focus_on(row.key);
                         self.modal = Some(Modal::Form(form));
@@ -3577,10 +3678,17 @@ impl App {
             .as_ref()
             .and_then(|d| d.network.sites.get(self.sites_selected))
             .map(|s| s.id);
-        let edits = matches!(key.code, KeyCode::Char('e' | 'd') | KeyCode::Delete);
-        if edits
+        // Removing it is for its server; editing for whoever may change
+        // something of it (the form offers only that).
+        if matches!(key.code, KeyCode::Char('d') | KeyCode::Delete)
             && let Some(id) = selected_site
-            && !self.may_change(id)
+            && !self.may_manage(id)
+        {
+            return;
+        }
+        if key.code == KeyCode::Char('e')
+            && let Some(id) = selected_site
+            && !self.may_edit(id)
         {
             return;
         }

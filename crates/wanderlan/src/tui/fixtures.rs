@@ -41,8 +41,8 @@ address = "10.8.0.15"
 name = "haus6"
 address = "10.8.0.16"
 online = false
-managed_by = "buero"
 uplink = "heim"
+changes = "server"
 
 [[map]]
 site = "haus3"
@@ -338,6 +338,7 @@ fn mac(mac: &str, vlan: Option<u16>, port: &str, age: Option<u64>) -> MacEntry {
         vlan,
         port: port.into(),
         age_secs: age,
+        peer: port.strip_prefix("vx-").map(str::to_string),
     }
 }
 

@@ -61,7 +61,7 @@ client_vlan c-site4 20 10.20.0.12/24
 site4_entry() { entry_of site1 site4; }
 check "site4 moves its control port" x site4 "wanderlan settings control-port 52821 --confirm"
 check "and its tunnel port" x site4 "wanderlan settings tunnel-port 52833 --confirm"
-wait_for 90 "site1 learned the ports of site4 (from site4, at its new port)" \
+wait_for 30 "site1 learned the ports of site4 (from site4, at its new port)" \
   eval 'site4_entry | grep -q "^control_port = 52821" && site4_entry | grep -q "^tunnel_port = 52833"'
 wait_for 30 "site1 sends to the new tunnel port of site4" \
   x site1 "bridge fdb show dev \$(tun site4) | grep -q 'port 52833'"

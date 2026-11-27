@@ -1150,8 +1150,11 @@ pub async fn apply<N: System>(net: &N, actual: &Actual, change: &Change) -> Resu
             net.update_link(index_of(name)?, &update).await?;
         }
         Change::Detach { name } => {
+            // Up again: a trunk port is up while it is one, unless the loop
+            // guard shut it (which no longer applies off the bridge).
             let update = LinkUpdate {
                 master: Some(None),
+                up: Some(true),
                 ..LinkUpdate::default()
             };
             net.update_link(index_of(name)?, &update).await?;

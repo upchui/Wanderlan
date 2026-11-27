@@ -1,6 +1,5 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 520
 expression: render(&app)
 ---
 " 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Breakout  8 Settings   "
@@ -10,7 +9,7 @@ expression: render(&app)
 "│ Ports        control 51821 (UDP/TCP), tunnel 51822 (UDP)                     │"
 "│ Identity     none yet: no box has joined as it                               │"
 "│ VLANs        10-50   own VLANs none                                          │"
-"│ Changes      every site that is not managed by another                       │"
+"│ Changes      every server                                                    │"
 "│ Renamed by   only "heim" itself                                              │"
 "│ Clients      haus6                                                           │"
 "│                                                                              │"

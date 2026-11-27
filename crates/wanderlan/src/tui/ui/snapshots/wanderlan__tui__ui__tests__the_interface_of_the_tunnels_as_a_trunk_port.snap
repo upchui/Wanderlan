@@ -1,11 +1,12 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
+assertion_line: 637
 expression: render(&app)
 ---
 " 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Breakout  8 Settings   "
 "┌ Sites (draft): 6 ────────────────────────────────────────────────────────────┐"
-"│ NAME    ADDRESS   VLANS                  ROLE           MANAGED BY TUNNEL    │"
-"│ heim    10.8.0.1  10-50                  server         nobody     this site │"
+"│ NAME    ADDRESS   VLANS                     ROLE           CHANGES TUNNEL    │"
+"│ heim    10.8.0.1  10-50                     server         -       this site │"
 "│                                                                              │"
 "│ ┌ Trunk ports of this host ────────────────────────────────────────────────┐ │"
 "│ │    #  INTERFACE       KIND      STATE MTU   NOTE                         │ │"
@@ -25,4 +26,4 @@ expression: render(&app)
 "                                                                                "
 "                                                                                "
 "                          1 blocked, 1 down (see 1)  draft: no changes  heim r7 "
-" Space  choose   m  main port   Enter  save to draft   Esc  cancel              "
+" Space  choose   m  main port   Enter  apply   Esc  cancel                      "

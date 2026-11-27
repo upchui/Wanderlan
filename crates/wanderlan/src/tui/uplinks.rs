@@ -46,8 +46,9 @@ pub struct UplinkPicker {
     pub site_name: String,
     /// The breakout is at this box: its interfaces are listed.
     pub own: bool,
-    /// The row under the cursor; one past the rows is "other:".
-    pub cursor: usize,
+    /// The value of the row under the cursor (the rows change with every
+    /// status: its place may too); `None`: "other:".
+    pub selected: Option<String>,
     /// A name typed for "other:".
     pub manual: TextInput,
     /// Why the last choice was not taken.
@@ -160,20 +161,34 @@ impl UplinkPicker {
         let site_name = site.map(|s| draft.network.label(s)).unwrap_or_default();
         let current = form.field_value("uplink");
         let rows = rows(draft, status, own, &site_name);
-        let (cursor, manual) = match rows.iter().position(|r| r.value() == current.trim()) {
-            Some(i) => (i, TextInput::new("")),
+        let (selected, manual) = match rows.iter().find(|r| r.value() == current.trim()) {
+            Some(row) => (Some(row.value().to_string()), TextInput::new("")),
             // Typed before: in "other:".
-            None => (rows.len(), TextInput::new(current.trim())),
+            None => (None, TextInput::new(current.trim())),
         };
         Self {
             form: Box::new(form),
             site,
             site_name,
             own,
-            cursor,
+            selected,
             manual,
             error: None,
         }
+    }
+
+    /// The place of the cursor in `rows` (`rows.len()`: "other:", also for
+    /// an interface that is no longer listed).
+    pub fn cursor(&self, rows: &[UplinkRow]) -> usize {
+        self.selected
+            .as_deref()
+            .and_then(|v| rows.iter().position(|r| r.value() == v))
+            .unwrap_or(rows.len())
+    }
+
+    /// Puts the cursor on row `index` of `rows` ("other:" past them).
+    pub fn select(&mut self, rows: &[UplinkRow], index: usize) {
+        self.selected = rows.get(index).map(|r| r.value().to_string());
     }
 
     /// The rows now.
@@ -200,7 +215,7 @@ impl UplinkPicker {
     /// The value chosen with Enter: the row under the cursor, or the name
     /// typed for "other:" (checked).
     pub fn chosen(&self, rows: &[UplinkRow], draft: &Draft) -> Result<String, String> {
-        if let Some(row) = rows.get(self.cursor) {
+        if let Some(row) = rows.get(self.cursor(rows)) {
             return Ok(row.value().to_string());
         }
         let name = self.manual.value().trim();

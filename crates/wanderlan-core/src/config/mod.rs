@@ -146,7 +146,21 @@ pub fn load(network_text: &str, local_text: &str) -> Result<LoadOutcome, Vec<Dia
         }
     };
 
-    let local = parsed_local.local;
+    let mut local = parsed_local.local;
+    // A site without a box renamed by hand: what this site says about it
+    // follows its placeholder (all at once, like in the network).
+    for (i, (old, _)) in parsed_network.rekeyed.iter().enumerate() {
+        local.rekey(
+            *old,
+            crate::identity::SiteId::provisional(&format!("\0{i}")),
+        );
+    }
+    for (i, (_, new)) in parsed_network.rekeyed.iter().enumerate() {
+        local.rekey(
+            crate::identity::SiteId::provisional(&format!("\0{i}")),
+            *new,
+        );
+    }
     let mut diags = match (&parsed_network.network, local.is_configured()) {
         (None, false) => Vec::new(),
         (None, true) => vec![Diagnostic::error(

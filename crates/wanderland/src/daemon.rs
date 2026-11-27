@@ -32,6 +32,7 @@ use wanderlan_core::identity::{Identity, Keyring, PeerIdentity, SiteId};
 use wanderlan_core::join::{self, JoinReply, JoinRequest};
 use wanderlan_core::loopguard::format_mac;
 use wanderlan_core::mtu::wire::Announce;
+use wanderlan_core::mtu::wire2;
 use wanderlan_core::policy;
 use wanderlan_core::reconcile::{self, Change};
 use wanderlan_core::sync::{self, Version};
@@ -65,6 +66,8 @@ use crate::sync_net::{self, Offer};
 const FOLLOW_UP_FLUSHES: [Duration; 2] = [Duration::from_secs(10), Duration::from_secs(30)];
 /// How long a removed peer may still fetch the configuration from us.
 const GRACE: Duration = Duration::from_secs(300);
+/// Former control ports that answer on at most (after several changes).
+const MAX_FORMER: usize = 4;
 /// Wait time after a failed fetch before trying the same peer again.
 const FETCH_BACKOFF: Duration = Duration::from_secs(30);
 /// How long a rejected configuration is not fetched again.
@@ -282,6 +285,12 @@ struct Controller {
     bridges: Vec<String>,
     /// What this network lost to another one on the box.
     conflicts: Vec<String>,
+    /// The box did nothing at the last reconcile (another network had not
+    /// said what it wants yet): reconciled again when the box changes.
+    waiting: bool,
+    /// This network has its ports on the box (else its sockets stay closed:
+    /// another network has one of them).
+    has_ports: bool,
     paths: Paths,
     events: Arc<EventLog>,
     /// The confirmed configuration (on disk, announced to peers).
@@ -374,6 +383,11 @@ struct Controller {
     pushed: Option<String>,
     /// The tunnels this site sends keepalives through.
     keepalive: watch::Sender<keepalive::Keepalives>,
+    /// Former addresses of the probes and the sync (another control port
+    /// before) and since when: they answer until every peer uses the new.
+    former_binds: Vec<(SocketAddrV4, Instant)>,
+    /// The address the probes and the sync were given last.
+    last_bind: Option<SocketAddrV4>,
 }
 
 /// A network of the daemon: its controller and how to reach it.
@@ -424,7 +438,10 @@ pub async fn run(args: Args) -> Result<()> {
         config_dir: args.config_dir.clone(),
         state_dir: args.state_dir.clone(),
     };
-    let found = layout.scan();
+    let (found, problems) = layout.scan_report();
+    for problem in problems {
+        warn!("{problem}");
+    }
     let names: Vec<String> = found.iter().map(|(n, _)| n.clone()).collect();
     let host = Host::new(sys.clone(), names);
     let shared = Shared {
@@ -557,6 +574,8 @@ impl Controller {
             site_name: site_name.clone(),
             bridges: Vec::new(),
             conflicts: Vec::new(),
+            waiting: false,
+            has_ports: true,
             paths,
             events: events.clone(),
             confirmed: None,
@@ -607,6 +626,8 @@ impl Controller {
             push_retry_at: Instant::now(),
             pushed: None,
             keepalive: keepalive_tx,
+            former_binds: Vec::new(),
+            last_bind: None,
         };
         let interval = shared.reconcile_interval;
         let task = tokio::spawn(ctl.run(inputs, probe_events, services, interval));
@@ -644,11 +665,19 @@ impl Controller {
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut second = tokio::time::interval(Duration::from_secs(1));
         second.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut applied = self.host.subscribe();
         loop {
             let next_flush = self.flushes.first().copied();
             let deadline = self.pending.as_ref().map(|p| p.deadline);
             tokio::select! {
                 _ = ticker.tick() => self.reconcile().await,
+                // Another network changed the box: one that only waited
+                // does now what follows a reconcile (port map, keepalives).
+                Ok(()) = applied.changed() => {
+                    if self.waiting {
+                        self.reconcile().await;
+                    }
+                }
                 _ = second.tick() => self.every_second().await,
                 Some(input) = inputs.recv() => self.handle(input).await,
                 Some(event) = probe_events.recv() => self.handle(Input::Probe(event)).await,
@@ -1024,7 +1053,10 @@ impl Controller {
             if let Some(saved) = &saved {
                 keep_ids(saved, &mut cfg.network, &mut cfg.local);
             }
-            let written = if *cfg == before {
+            // As written by the daemon: else the identities that were
+            // found again (the file names sites by their names) are lost
+            // with the next start.
+            let written = if *cfg == before && self.files_hold(cfg) {
                 self.paths.save_copy()
             } else {
                 self.paths.write_confirmed(cfg)
@@ -1205,12 +1237,8 @@ impl Controller {
         self.publish();
     }
 
-    /// Loads and validates the files; logs problems.
-    fn load_files(&self) -> Option<Config> {
-        self.load_files_with(self.confirmed.as_ref().map(|c| &c.network))
-    }
-
-    /// [`Self::load_files`] with the identities of `known` for files
+    /// Loads and validates the files (logs problems), with the identities
+    /// of `known` for files
     /// written without them.
     fn load_files_with(&self, known: Option<&Network>) -> Option<Config> {
         let (network, local) = match self.paths.read() {
@@ -1260,6 +1288,14 @@ impl Controller {
         }
     }
 
+    /// True if the files hold `cfg` as the daemon writes it.
+    fn files_hold(&self, cfg: &Config) -> bool {
+        self.paths.read().is_ok_and(|(network, local)| {
+            network == render_network(&cfg.network)
+                && local == render_local(&cfg.local, Some(&cfg.network))
+        })
+    }
+
     /// SIGHUP: the files were changed by hand. Without a pending change the
     /// files are taken as confirmed (like a restart would).
     async fn reload_files(&mut self) {
@@ -1273,18 +1309,28 @@ impl Controller {
             Ok(moved) => moved.into_iter().for_each(|m| self.events.info(m)),
             Err(e) => self.events.error(format!("{e:#}")),
         }
-        if let Some(mut cfg) = self.load_files() {
+        // The identities come from the configuration in effect, or (none
+        // is: the files were invalid at the start) from the confirmed copy.
+        let known: Option<Network> = self
+            .confirmed
+            .as_ref()
+            .map(|c| c.network.clone())
+            .or_else(|| self.paths.confirmed_network());
+        if let Some(mut cfg) = self.load_files_with(known.as_ref()) {
             // Files written without the `id` lines keep the identities.
-            if let Some(old) = &self.confirmed {
-                let before = cfg.network.clone();
-                keep_ids(&old.network, &mut cfg.network, &mut cfg.local);
-                if cfg.network != before
-                    && let Err(e) = self.paths.write_confirmed(&cfg)
-                {
-                    warn!("{e:#}");
-                }
+            if let Some(old) = &known {
+                keep_ids(old, &mut cfg.network, &mut cfg.local);
             }
-            let _ = self.paths.save_copy();
+            // Written back as the daemon writes them (with the identities
+            // found again), else kept as they are.
+            let written = if self.files_hold(&cfg) {
+                self.paths.save_copy()
+            } else {
+                self.paths.write_confirmed(&cfg)
+            };
+            if let Err(e) = written {
+                warn!("{e:#}");
+            }
             self.confirmed = Some(cfg.clone());
             self.set_config(Some(cfg));
             self.claim_identity();
@@ -1300,6 +1346,7 @@ impl Controller {
             *site = cfg.as_ref().map(|c| c.self_name().to_string());
         }
         let old_peers = self.direct_peers();
+        let old_tunnel_ports = self.tunnel_ports();
         self.grace_added.clear();
         let old_uplink = self
             .config
@@ -1340,6 +1387,10 @@ impl Controller {
         self.runtime
             .direct
             .retain(|peer, _| new_peers.contains_key(peer));
+        self.runtime
+            .peer_ports
+            .retain(|peer, _| new_peers.contains_key(peer));
+        self.retest_moved(&old_tunnel_ports);
         // Another uplink is tested anew (a renamed one is the same).
         let uplink = self
             .config
@@ -1459,17 +1510,24 @@ impl Controller {
             .map(|(n, (a, _))| (*n, *a))
             .collect();
         // A client listens on every address: behind NAT the address in the
-        // network (its NAT's) is not its own. A server on its address.
-        let bind = self.config.as_ref().and_then(|cfg| {
-            cfg.self_site().map(|s| {
-                let ip = if s.uplink.is_some() {
-                    Ipv4Addr::UNSPECIFIED
-                } else {
-                    s.address
-                };
-                SocketAddrV4::new(ip, cfg.control_port())
-            })
-        });
+        // network (its NAT's) is not its own. A server on its address. Not
+        // while another network of the box has the ports of this one.
+        let bind = self
+            .config
+            .as_ref()
+            .filter(|_| self.has_ports)
+            .and_then(|cfg| {
+                cfg.self_site().map(|s| {
+                    let ip = if s.uplink.is_some() {
+                        Ipv4Addr::UNSPECIFIED
+                    } else {
+                        s.address
+                    };
+                    SocketAddrV4::new(ip, cfg.control_port())
+                })
+            });
+        self.follow_bind(bind);
+        let former: Vec<SocketAddrV4> = self.former_binds.iter().map(|(a, _)| *a).collect();
         // The clients with a key are never contacted first: they come.
         let passive: BTreeSet<SiteId> = self.config.as_ref().map_or_else(BTreeSet::new, |cfg| {
             topology::tunnels_for(&cfg.network, cfg.self_id())
@@ -1542,7 +1600,12 @@ impl Controller {
                 .vnis
                 .iter()
                 .filter(|(peer, _)| passive.contains(*peer))
-                .map(|(peer, vni)| (*peer, (*vni, cfg.network.tunnel_port_of(*peer))))
+                .map(|(peer, vni)| {
+                    (
+                        *peer,
+                        (*vni, self.runtime.tunnel_port_of(&cfg.network, *peer)),
+                    )
+                })
                 .collect()
         });
         let uplink = self.config.as_ref().and_then(|cfg| {
@@ -1554,6 +1617,7 @@ impl Controller {
                 interface: topology::tunnel_name(self.tag, cfg.network.site(peer)?),
                 peer,
                 direct: self.runtime.uplink_direct,
+                port: cfg.tunnel_port(),
             })
         });
         let probe_peers = self.config.as_ref().map_or_else(BTreeMap::new, |cfg| {
@@ -1562,7 +1626,7 @@ impl Controller {
                 .map(|(name, addr)| {
                     (
                         *name,
-                        SocketAddrV4::new(*addr, cfg.network.control_port_of(*name)),
+                        SocketAddrV4::new(*addr, self.runtime.control_port_of(&cfg.network, *name)),
                     )
                 })
                 .collect()
@@ -1570,10 +1634,12 @@ impl Controller {
         self.probe_config.send_replace(ProbeConfig {
             other_ports: self.host.ports_of_others(&self.network),
             bind,
-            tunnel_port: self
-                .config
-                .as_ref()
-                .map(|cfg| cfg.network.tunnel_port_of(cfg.self_id())),
+            former: former.clone(),
+            // In every request: the peers follow a change at once.
+            ports: self.config.as_ref().map(|cfg| wire2::Ports {
+                control: cfg.control_port(),
+                tunnel: cfg.tunnel_port(),
+            }),
             peers: probe_peers,
             responders: responders.clone(),
             generation: self.generation,
@@ -1644,6 +1710,7 @@ impl Controller {
             .collect();
         self.offer.send_replace(Offer {
             bind,
+            former,
             views: Arc::new(views),
             me: self.own_id(),
             keyed: Arc::new(keyed),
@@ -1712,6 +1779,7 @@ impl Controller {
                 self.peer_identity(peer, state).await;
             }
             Input::Probe(ProbeEvent::Direct { peer, at }) => self.tunnel_direct(peer, at).await,
+            Input::Probe(ProbeEvent::Ports { peer, ports }) => self.peer_ports(peer, ports).await,
             Input::Probe(ProbeEvent::Restarted { peer }) => {
                 // The uplink started again: it learns at once where this
                 // site's tunnel packets come from (not with the next
@@ -1811,7 +1879,10 @@ impl Controller {
     /// reaches the client at `at`) or through NAT.
     async fn tunnel_direct(&mut self, id: SiteId, at: Option<Ipv4Addr>) {
         let Some(cfg) = &self.config else { return };
-        let (port, own_port) = (cfg.network.tunnel_port_of(id), cfg.tunnel_port());
+        let (port, own_port) = (
+            self.runtime.tunnel_port_of(&cfg.network, id),
+            cfg.tunnel_port(),
+        );
         let kind = topology::tunnels_for(&cfg.network, cfg.self_id())
             .into_iter()
             .find(|t| t.peer.id == id)
@@ -1846,6 +1917,152 @@ impl Controller {
         self.events.emit(Level::Info, Some(&peer), message);
         self.publish();
         self.reconcile().await;
+    }
+
+    /// The tunnel port of this site and those of its clients, as in effect.
+    fn tunnel_ports(&self) -> (Option<u16>, BTreeMap<SiteId, u16>) {
+        let Some(cfg) = &self.config else {
+            return (None, BTreeMap::new());
+        };
+        let clients = topology::tunnels_for(&cfg.network, cfg.self_id())
+            .into_iter()
+            .filter(|t| t.kind == TunnelKind::Client)
+            .map(|t| {
+                let id = t.peer.id;
+                (id, self.runtime.tunnel_port_of(&cfg.network, id))
+            })
+            .collect();
+        (Some(cfg.tunnel_port()), clients)
+    }
+
+    /// After another tunnel port (of this site, or of a client) the test
+    /// whether a client tunnel runs direct starts anew: through NAT until
+    /// then, which always works (the old result was for the old port).
+    fn retest_moved(&mut self, before: &(Option<u16>, BTreeMap<SiteId, u16>)) {
+        let (own, clients) = self.tunnel_ports();
+        if before.0.is_some() && own != before.0 && self.runtime.uplink_direct {
+            self.runtime.uplink_direct = false;
+            self.events.info(
+                "The tunnel port of this site changed: the tunnel to its server runs through NAT until the test finds it reached directly again",
+            );
+        }
+        for (id, port) in clients {
+            if before.1.get(&id).is_some_and(|p| *p != port)
+                && self.runtime.direct.remove(&id).is_some()
+            {
+                let label = self.peer_label(id);
+                self.events.emit(
+                    Level::Info,
+                    Some(&label),
+                    format!(
+                        "Client \"{label}\" uses tunnel port {port} now: its tunnel runs through NAT until its test finds it reached directly again"
+                    ),
+                );
+            }
+        }
+    }
+
+    /// A direct peer says in its probes which ports it uses now: they count
+    /// at once (its entry in the network follows with the sync, after the
+    /// change is confirmed there).
+    async fn peer_ports(&mut self, peer: SiteId, ports: wire2::Ports) {
+        let Some(cfg) = &self.config else { return };
+        if !self.direct_peers().contains_key(&peer) {
+            return;
+        }
+        let effective = |r: &Runtime| {
+            (
+                r.control_port_of(&cfg.network, peer),
+                r.tunnel_port_of(&cfg.network, peer),
+            )
+        };
+        let listed = (
+            cfg.network.control_port_of(peer),
+            cfg.network.tunnel_port_of(peer),
+        );
+        let now = (ports.control, ports.tunnel);
+        let before = effective(&self.runtime);
+        let old_tunnel_ports = self.tunnel_ports();
+        self.runtime.peer_ports.insert(peer, now);
+        if before == now {
+            return;
+        }
+        let label = self.peer_label(peer);
+        if now != listed {
+            self.events.emit(
+                Level::Info,
+                Some(&label),
+                format!(
+                    "Site \"{label}\" uses control port {} and tunnel port {} now; this site follows at once",
+                    now.0, now.1
+                ),
+            );
+        } else {
+            debug!("\"{label}\" uses the ports of its entry again");
+        }
+        self.retest_moved(&old_tunnel_ports);
+        self.publish();
+        self.reconcile().await;
+    }
+
+    /// Notes the address given to the probes and the sync: after another
+    /// control port the old one answers on (see [`Self::retire_former_binds`]).
+    fn follow_bind(&mut self, bind: Option<SocketAddrV4>) {
+        let Some(new) = bind else {
+            self.former_binds.clear();
+            self.last_bind = None;
+            return;
+        };
+        if let Some(old) = self.last_bind
+            && old.port() != new.port()
+        {
+            self.former_binds.retain(|(a, _)| *a != old);
+            self.former_binds.push((old, Instant::now()));
+            if self.former_binds.len() > MAX_FORMER {
+                self.former_binds.remove(0);
+            }
+            self.events.info(format!(
+                "The control port of this site is {} now; the old one ({}) answers until every peer uses the new one",
+                new.port(),
+                old.port()
+            ));
+        }
+        // Never on a port this site takes now: its control port, its tunnel
+        // port and the one above (an address change keeps the port).
+        let tunnel = self.config.as_ref().map(Config::tunnel_port);
+        let taken = |port: u16| {
+            port == new.port() || tunnel.is_some_and(|t| port == t || port == t.saturating_add(1))
+        };
+        self.former_binds.retain(|(a, _)| !taken(a.port()));
+        self.last_bind = Some(new);
+    }
+
+    /// A former control port is closed once every direct peer has sent a
+    /// request to the new one since: no peer probes it any more. One that
+    /// is off keeps it open (it finds this site there when it comes back).
+    fn retire_former_binds(&mut self) {
+        if self.former_binds.is_empty() {
+            return;
+        }
+        let peers: Vec<SiteId> = self.direct_peers().into_keys().collect();
+        let Ok(table) = self.probes.read() else {
+            return;
+        };
+        let moved = |since: Instant| {
+            peers.iter().all(|p| {
+                table
+                    .get(p)
+                    .and_then(|e| e.requested_at)
+                    .is_some_and(|at| at > since.into_std())
+            })
+        };
+        let before = self.former_binds.len();
+        self.former_binds.retain(|(_, since)| !moved(*since));
+        drop(table);
+        if self.former_binds.len() != before {
+            debug!("Every peer uses the control port of this site now");
+            self.publish();
+        }
     }
 
     /// Reads where the tunnel packets of the clients come from (the sets of
@@ -1942,6 +2159,7 @@ impl Controller {
     /// Housekeeping: automatic confirmation of synced changes, sync retries.
     async fn every_second(&mut self) {
         self.learn_endpoints().await;
+        self.retire_former_binds();
         if let Some(p) = &self.pending
             && let ChangeSource::Sync { peer } = &p.source
         {
@@ -2035,8 +2253,11 @@ impl Controller {
             let Some(announce) = probe.announce else {
                 continue;
             };
-            // A revision that no network.toml can hold is not adopted.
-            if announce.revision > config::MAX_REVISION {
+            // A revision that no network.toml can hold, or a jump far
+            // ahead (written by hand somewhere), is not adopted.
+            if announce.revision > config::MAX_REVISION
+                || announce.revision > ours.revision.saturating_add(config::MAX_REVISION_STEP)
+            {
                 continue;
             }
             let theirs = Version {
@@ -2183,12 +2404,16 @@ impl Controller {
         });
     }
 
-    /// Where the daemon of `peer` listens: where its authenticated probes
-    /// come from (it may just have moved to another port, which this site
-    /// learns only with its network), else its control port in the network.
+    /// Where the daemon of `peer` listens: the control port its probes say
+    /// it uses now, else where its authenticated probes come from (it may
+    /// just have moved to another port, which this site learns only with
+    /// its network), else its control port in the network.
     fn control_target(&self, peer: SiteId) -> Option<SocketAddrV4> {
         let cfg = self.confirmed.as_ref()?;
         let addr = *self.direct_peers().get(&peer)?;
+        if let Some((control, _)) = self.runtime.peer_ports.get(&peer) {
+            return Some(SocketAddrV4::new(addr, *control));
+        }
         let seen = self
             .probes
             .read()
@@ -3174,6 +3399,9 @@ impl Controller {
         self.pending = None;
         self.confirmed = None;
         self.set_config(None);
+        // Nothing of the box is this network's any more.
+        self.bridges.clear();
+        self.conflicts.clear();
         self.runtime = Runtime::default();
         self.applied_key = None;
         self.last_error = None;
@@ -3391,13 +3619,7 @@ impl Controller {
             // here does not take it (a synced one is applied, and the
             // status tells what it lost).
             let wanted = desired::derive_in(&self.scope(), &cfg, &self.runtime);
-            let lost: Vec<String> = self
-                .host
-                .check(&self.network, &wanted)
-                .await
-                .into_iter()
-                .filter(|c| !self.conflicts.contains(c))
-                .collect();
+            let lost = self.host.check(&self.network, &wanted).await;
             if !lost.is_empty() {
                 return Err(ApiError::new(format!(
                     "another network of this box has it: {}",
@@ -3539,8 +3761,14 @@ impl Controller {
                 .is_none_or(|v| v.fingerprint != config::fingerprint(&cfg.network));
             if changed {
                 let base = previous_version.map_or(0, |v| v.revision);
-                // The files hold at most an i64.
-                cfg.network.revision = config::next_revision(base.max(cfg.network.revision));
+                // A revision written by hand counts, within a step: one near
+                // the end of the range would leave the sync only the
+                // fingerprint (the files hold at most an i64).
+                let wanted = cfg
+                    .network
+                    .revision
+                    .min(base.saturating_add(config::MAX_REVISION_STEP));
+                cfg.network.revision = config::next_revision(base.max(wanted));
             }
             self.rejected.clear();
             // A change of its own: the last refusal is history.
@@ -3660,8 +3888,14 @@ impl Controller {
         self.set_config(pending.previous);
         if had_previous {
             self.reconcile().await;
-        } else if let Err(e) = reconcile::teardown(&self.sys, |c| info!("{c}")).await {
-            self.events.error(format!("cleanup failed: {e}"));
+        } else {
+            // Nothing before: what this network built goes, not what the
+            // other networks of the box have.
+            self.bridges.clear();
+            self.conflicts.clear();
+            if let Err(e) = self.host.reset(&self.network, |c| info!("{c}")).await {
+                self.events.error(format!("cleanup failed: {e}"));
+            }
         }
         if pending.from_files {
             match self.paths.restore_confirmed() {
@@ -3724,6 +3958,11 @@ impl Controller {
                 events.info(c.to_string());
             })
             .await?;
+        // The box waits for another network: nothing was applied.
+        self.waiting = applied.waiting;
+        if applied.waiting {
+            return Ok(Vec::new());
+        }
         let changes = applied.changes;
         for conflict in &applied.conflicts {
             self.error_once(format!(
@@ -3731,9 +3970,8 @@ impl Controller {
             ));
         }
         self.conflicts = applied.conflicts;
-        if !applied.bridges.is_empty() {
-            self.bridges = applied.bridges;
-        }
+        self.bridges = applied.bridges;
+        self.has_ports = applied.ports;
         // A tunnel was built or now sends elsewhere: a keepalive through
         // NAT at once, so that the uplink learns where this site is now
         // (instead of with the next one, up to 15 s later).
@@ -4186,11 +4424,18 @@ impl Controller {
         let mut out: Vec<MacEntry> = fdb
             .into_iter()
             .filter(|e| !e.permanent && e.bridge.is_some_and(|b| bridges.contains(&b)))
-            .map(|e| MacEntry {
-                mac: format_mac(&e.mac),
-                vlan: e.vlan,
-                port: name_of(e.port),
-                age_secs: e.updated_secs,
+            .map(|e| {
+                let port = name_of(e.port);
+                MacEntry {
+                    peer: self.config.as_ref().and_then(|c| {
+                        topology::peer_of(&c.network, self.tag, &port)
+                            .map(|s| c.network.label(s.id))
+                    }),
+                    mac: format_mac(&e.mac),
+                    vlan: e.vlan,
+                    port,
+                    age_secs: e.updated_secs,
+                }
             })
             .collect();
         out.sort_by(|a, b| a.port.cmp(&b.port).then(a.mac.cmp(&b.mac)));
@@ -4244,7 +4489,7 @@ impl Controller {
                 uplinks: Vec::new(),
                 network: self.network.clone(),
                 tag: self.tag,
-                networks: self.host.networks().await,
+                networks: self.host.networks(),
                 conflicts: Vec::new(),
             };
         };
@@ -4355,7 +4600,7 @@ impl Controller {
                         probe.and_then(|p| p.direct_test),
                         // A client is tested at its port, this site at its own.
                         if t.kind == TunnelKind::Client {
-                            cfg.network.tunnel_port_of(id)
+                            self.runtime.tunnel_port_of(&cfg.network, id)
                         } else {
                             desired.tunnel_port
                         },
@@ -4454,6 +4699,8 @@ impl Controller {
             })
             .collect();
         let trunk_names: BTreeSet<&str> = desired.trunks.iter().map(|t| t.name.as_str()).collect();
+        // The trunk ports of the other networks of the box are none either.
+        let box_trunks = self.host.trunk_ports();
         let uplinks = &self.runtime.uplinks;
         let uplinks: Vec<UplinkStatus> = uplinks
             .by_name
@@ -4461,6 +4708,7 @@ impl Controller {
             .filter(|(name, _)| {
                 name.as_str() != "lo"
                     && !trunk_names.contains(name.as_str())
+                    && !box_trunks.contains(name.as_str())
                     && !links
                         .iter()
                         .any(|l| l.name == **name && reconcile::is_owned(l))
@@ -4521,7 +4769,7 @@ impl Controller {
             uplinks,
             network: self.network.clone(),
             tag: self.tag,
-            networks: self.host.networks().await,
+            networks: self.host.networks(),
             conflicts: self.conflicts.clone(),
         }
     }

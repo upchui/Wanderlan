@@ -53,6 +53,7 @@ fn table_row(current: &str, row: &UplinkRow) -> Row<'static> {
 pub fn draw(frame: &mut Frame, app: &App, picker: &UplinkPicker, area: Rect) {
     let Some(draft) = &app.draft else { return };
     let rows = picker.rows(draft, app.status.as_ref());
+    let cursor = picker.cursor(&rows);
     let current = picker.current();
     let width = area.width.min(WIDTH);
     let text_width = usize::from(width.saturating_sub(4));
@@ -70,14 +71,9 @@ pub fn draw(frame: &mut Frame, app: &App, picker: &UplinkPicker, area: Rect) {
         info.push(Line::styled(format!(" {part}"), theme::dim()));
     }
     let problem = picker.error.clone().or_else(|| {
-        rows.get(picker.cursor)
+        rows.get(cursor)
             .and_then(|r| r.problem.clone())
-            .map(|p| {
-                format!(
-                    "{}: {p} (it can still be chosen)",
-                    r_name(&rows, picker.cursor)
-                )
-            })
+            .map(|p| format!("{}: {p} (it can still be chosen)", r_name(&rows, cursor)))
     });
     if let Some(problem) = problem {
         let style = if picker.error.is_some() {
@@ -159,7 +155,7 @@ pub fn draw(frame: &mut Frame, app: &App, picker: &UplinkPicker, area: Rect) {
         .row_highlight_style(theme::selected()),
         table_area,
         &app.scrolls.uplinks,
-        (picker.cursor < rows.len()).then_some(picker.cursor),
+        (cursor < rows.len()).then_some(cursor),
         total,
         list::Chrome {
             bordered: false,
@@ -167,7 +163,7 @@ pub fn draw(frame: &mut Frame, app: &App, picker: &UplinkPicker, area: Rect) {
         },
     );
     // A name that is not (yet) on the box.
-    let focused = picker.cursor >= rows.len();
+    let focused = cursor >= rows.len();
     let (shown, col) = picker.manual.window(OTHER_WIDTH - 1);
     let field_style = if focused {
         theme::focused()

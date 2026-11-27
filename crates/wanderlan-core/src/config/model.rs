@@ -29,6 +29,11 @@ pub const DEFAULT_COMMIT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Largest network revision (network.toml holds an i64).
 pub const MAX_REVISION: u64 = i64::MAX as u64;
 
+/// The largest step of the revision a site takes from another site or from
+/// a file written by hand: a revision near [`MAX_REVISION`] would leave the
+/// sync only the fingerprint to tell versions apart.
+pub const MAX_REVISION_STEP: u64 = 1 << 20;
+
 /// The revision after `revision`, at most [`MAX_REVISION`].
 pub fn next_revision(revision: u64) -> u64 {
     revision.saturating_add(1).min(MAX_REVISION)
@@ -278,9 +283,6 @@ impl Network {
             if let Some(up) = &mut site.uplink {
                 follow(up);
             }
-            if let Some(by) = &mut site.managed_by {
-                follow(by);
-            }
         }
         for map in &mut self.maps {
             follow(&mut map.site);
@@ -333,11 +335,10 @@ pub struct Site {
     /// control channel still works). New sites joining with an invitation
     /// start offline until a user takes them online.
     pub online: bool,
-    /// The site that invited this one; only it may change the rules of this
-    /// site (VLANs, mappings, online). `None`: every site may.
-    pub managed_by: Option<SiteId>,
-    /// The site may also change its own rules.
-    pub self_managed: bool,
+    /// For a client: who changes its tunnel to its server (its VLANs,
+    /// mappings, the VLANs of that tunnel, breakouts, online state). A
+    /// server has no such option: every server may change it.
+    pub changes: Changes,
     /// The site this one is plugged into (a client of it): its only tunnel
     /// leads there. `None`: a server, connected with all other servers.
     pub uplink: Option<SiteId>,
@@ -361,8 +362,7 @@ impl Site {
             vlans: None,
             own_vlans: None,
             online: true,
-            managed_by: None,
-            self_managed: false,
+            changes: Changes::default(),
             uplink: None,
             breakout: Breakouts::new(),
             ports: SitePorts::default(),
@@ -377,6 +377,70 @@ impl Site {
     /// Its own identity; `None` while it has a provisional one.
     pub fn own_id(&self) -> Option<SiteId> {
         self.has_identity().then_some(self.id)
+    }
+}
+
+/// Who changes the tunnel between a client and its server: its VLANs,
+/// mappings, the VLANs of that tunnel, breakouts and online state. Its
+/// address, its server and whether it stays in the network are always for
+/// the server; the option itself for whoever may change the tunnel now.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Changes {
+    /// Only its server.
+    Server,
+    /// Only the client itself.
+    Client,
+    /// Both (a file that does not say: as before, anyone may).
+    #[default]
+    Both,
+}
+
+impl Changes {
+    /// All options, in the order they are offered.
+    pub const ALL: [Self; 3] = [Self::Server, Self::Client, Self::Both];
+
+    /// Its value in `network.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Server => "server",
+            Self::Client => "client",
+            Self::Both => "both",
+        }
+    }
+
+    /// For displays: `only the server`, `only the client`, `both`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Server => "only the server",
+            Self::Client => "only the client",
+            Self::Both => "both",
+        }
+    }
+
+    /// True if the server of the tunnel may change it.
+    pub fn server(self) -> bool {
+        matches!(self, Self::Server | Self::Both)
+    }
+
+    /// True if the client may change it.
+    pub fn client(self) -> bool {
+        matches!(self, Self::Client | Self::Both)
+    }
+}
+
+impl std::str::FromStr for Changes {
+    type Err = String;
+
+    /// `server`, `client` or `both` (also the labels of [`Changes::label`]).
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let text = text.trim();
+        Self::ALL
+            .into_iter()
+            .find(|c| c.as_str() == text || c.label() == text)
+            .ok_or_else(|| format!("\"{text}\" is not server, client or both"))
     }
 }
 

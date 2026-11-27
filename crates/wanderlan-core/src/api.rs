@@ -9,7 +9,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::Diagnostic;
+use crate::config::{Changes, Diagnostic};
 
 /// Default socket path.
 pub const SOCKET_PATH: &str = "/run/wanderlan/wanderlan.sock";
@@ -167,9 +167,13 @@ pub struct SiteRules {
     /// network (`shared`, the source VLAN).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub translations: Vec<Translation>,
-    /// The new site may change its own rules too; otherwise only the
-    /// inviting site may.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// Who changes the tunnel of the new site to the inviting site later;
+    /// none: only the inviting site (its server).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<Changes>,
+    /// Invitations of earlier versions: the new site may change itself too
+    /// (both). Read, never written.
+    #[serde(default, skip_serializing)]
     pub allow_self: bool,
 }
 
@@ -188,6 +192,16 @@ impl SiteRules {
         *self == Self::default()
     }
 
+    /// Who changes the tunnel of the new site: only its server unless the
+    /// invitation says otherwise.
+    pub fn changes(&self) -> Changes {
+        match (self.changes, self.allow_self) {
+            (Some(c), _) => c,
+            (None, true) => Changes::Both,
+            (None, false) => Changes::Server,
+        }
+    }
+
     /// Short description, e.g. `name site5, VLANs native,10-50, source VLAN 20 =
     /// untagged, source VLAN 30 = VLAN 130`.
     pub fn summary(&self) -> String {
@@ -204,8 +218,10 @@ impl SiteRules {
         for t in &self.translations {
             parts.push(format!("source VLAN {} = VLAN {}", t.shared, t.local));
         }
-        if self.allow_self {
-            parts.push("may change itself".into());
+        match self.changes() {
+            Changes::Server => {}
+            Changes::Client => parts.push("changes its tunnel itself (only the client)".into()),
+            Changes::Both => parts.push("may change itself too".into()),
         }
         if parts.is_empty() {
             "defaults of the network".into()
@@ -985,6 +1001,9 @@ pub struct MacEntry {
     pub port: String,
     /// Seconds since the entry was last updated.
     pub age_secs: Option<u64>,
+    /// The site behind a tunnel port; `None` for a port of this site.
+    #[serde(default)]
+    pub peer: Option<String>,
 }
 
 #[cfg(test)]

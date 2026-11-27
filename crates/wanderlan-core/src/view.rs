@@ -20,7 +20,7 @@ use crate::identity::SiteId;
 use crate::{policy, topology};
 
 /// How far a client's view may count the revision on past its uplink's.
-const MAX_REVISION_STEP: u64 = 1 << 20;
+use crate::config::MAX_REVISION_STEP;
 
 /// The part of `network` the site `site` knows: everything for a server; for a
 /// client itself, its uplink (without the uplink's own uplink) and the sites
@@ -48,6 +48,7 @@ pub fn view_for(network: &Network, site: SiteId) -> Network {
                 // client + server, towards its own server) is its own matter.
                 s.uplink = None;
                 s.breakout.clear();
+                s.changes = crate::config::Changes::default();
             }
             s
         })
@@ -273,7 +274,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
-    use crate::config::{LocalVid, VlanSet};
+    use crate::config::{Changes, LocalVid, VlanSet};
 
     fn id(name: &str) -> SiteId {
         SiteId::provisional(name)
@@ -281,8 +282,7 @@ mod tests {
 
     fn site(name: &str, last: u8, uplink: Option<&str>) -> Site {
         Site {
-            managed_by: uplink.map(id),
-            self_managed: true,
+            changes: Changes::Both,
             uplink: uplink.map(id),
             ..Site::new(name, Ipv4Addr::new(10, 0, 0, last))
         }
@@ -512,7 +512,7 @@ mod tests {
             n.sites.iter().position(|s| s.name == name).unwrap()
         };
         let m = site(&mut network, "marcel");
-        network.sites[m].self_managed = false;
+        network.sites[m].changes = Changes::Server;
         let mut view = view_for(&network, id("marcel"));
         view.revision = 8;
         view.vlans = VlanSet::from_range(10, 40);
@@ -553,13 +553,13 @@ mod tests {
     #[test]
     fn the_rights_of_the_client_apply() {
         let mut network = full();
-        // site2 is managed by alex and may not change itself.
+        // Only alex, its server, changes the tunnel of site2.
         network
             .sites
             .iter_mut()
             .find(|s| s.name == "site2")
             .unwrap()
-            .self_managed = false;
+            .changes = Changes::Server;
         let mut view = view_for(&network, id("site2"));
         view.revision = 8;
         view.sites
@@ -579,7 +579,7 @@ mod tests {
             .iter_mut()
             .find(|s| s.name == "site2")
             .unwrap()
-            .self_managed = false;
+            .changes = Changes::Server;
         let mut view = view_for(&network, id("site2"));
         view.revision = 8;
         view.sites
@@ -633,9 +633,7 @@ mod tests {
 
     #[test]
     fn a_client_renames_itself_and_the_whole_network_follows() {
-        let mut network = full();
-        // y (a client of dc) was invited by marcel: outside marcel's view.
-        network.sites[5].managed_by = Some(id("marcel"));
+        let network = full();
         let mut view = view_for(&network, id("marcel"));
         view.rename_site(id("marcel"), "marcel2");
         view.revision += 1;
@@ -645,7 +643,6 @@ mod tests {
         assert!(n.by_name("marcel").is_none());
         assert_eq!(n.by_name("marcel2").unwrap().uplink, Some(id("alex")));
         assert_eq!(n.by_name("x").unwrap().uplink, Some(id("marcel2")));
-        assert_eq!(n.by_name("y").unwrap().managed_by, Some(id("marcel2")));
         assert!(n.maps.iter().any(|m| m.site == id("marcel2")));
         assert_eq!(n.revision, view.revision);
         // Merged again: nothing more to do.
@@ -655,25 +652,14 @@ mod tests {
     }
 
     #[test]
-    fn a_client_renames_its_own_client_if_it_manages_it() {
-        // x is a client of marcel and managed by it.
+    fn a_client_renames_its_own_client() {
+        // x is a client of marcel: marcel is its server.
         let network = full();
         let mut view = view_for(&network, id("marcel"));
         view.rename_site(id("x"), "x2");
         view.revision += 1;
         let merged = merge(&network, &view, id("marcel")).unwrap();
         assert!(merged.network.by_name("x2").is_some());
-        // Managed by another site: marcel itself may not (its daemon says
-        // so); x renamed itself, its change comes through marcel.
-        let mut other = network.clone();
-        other.sites[4].managed_by = Some(id("alex"));
-        let mut view = view_for(&other, id("marcel"));
-        view.rename_site(id("x"), "x2");
-        view.revision += 1;
-        let err =
-            policy::check_edit(&view_for(&other, id("marcel")), &view, id("marcel")).unwrap_err();
-        assert!(err.contains("may not rename site \"x\""), "{err}");
-        assert!(merge(&other, &view, id("marcel")).is_ok());
     }
 
     #[test]

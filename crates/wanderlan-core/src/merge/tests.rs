@@ -119,3 +119,70 @@ fn networks_add_up_and_the_later_one_gives_way() {
     assert!(lost[0].contains("maps VLANs"), "{lost:?}");
     assert!(lost[1].contains("tunnels vxla"), "{lost:?}");
 }
+
+/// A breakout of VLAN `vid` in `bridge` (which way it leaves does not
+/// matter here).
+fn breakout(bridge: &str, vid: u16) -> crate::sys::breakout::BreakoutSpec {
+    crate::sys::breakout::BreakoutSpec {
+        bridge: bridge.into(),
+        vid,
+        id: vid,
+        router: format!("wlbo{vid}"),
+        port: format!("wlbp{vid}"),
+        mac: [2, 0, 0, 0, 0, 1],
+        trunks: Vec::new(),
+        except: BTreeSet::new(),
+        v4: Err("test".into()),
+        v6: Err("test".into()),
+        sysctls: BTreeMap::new(),
+    }
+}
+
+#[test]
+fn a_later_network_needs_no_trunk_and_keeps_no_breakout_without_one() {
+    let home = network(51822, "trunk0", "br0", &[10, 20], &["a"]);
+    let mut lab = network(51840, "trunk0", "wl-trunk0", &[20, 60], &["la"]);
+    let mut iso = network(51830, "trunk1", "wl-trunk1", &[20], &["xa"]);
+    iso.breakout = vec![breakout("wl-trunk1", 20)];
+    let merged = merge(&[("default", &home), ("lab", &lab), ("iso", &iso)]).unwrap();
+    // A missing trunk1 leaves iso's segment out, it does not stop the box.
+    let trunk1 = merged
+        .desired
+        .trunks
+        .iter()
+        .find(|t| t.name == "trunk1")
+        .unwrap();
+    assert!(!trunk1.required);
+    assert!(
+        merged.desired.trunks[0].required,
+        "the main port of the first"
+    );
+    // Where the segments of each network are.
+    assert_eq!(merged.bridges["lab"], ["br0"]);
+    assert_eq!(merged.bridges["iso"], ["wl-trunk1"]);
+    assert!(merged.has_ports("lab"));
+    assert_eq!(merged.lost["lab"][0].what(), (4, "br0".to_string(), 20));
+    // Its trunk port mapped by the default network: lab loses the port,
+    // and with it its tunnels and its breakout (no segment left).
+    let mut mapped = home.clone();
+    mapped.trunks[0].tc = vec![TcRule {
+        direction: Direction::Ingress,
+        vid: 30,
+        action: TcAction::Translate(130),
+    }];
+    lab.breakout = vec![breakout("wl-trunk0", 60)];
+    let merged = merge(&[("default", &mapped), ("lab", &lab), ("iso", &iso)]).unwrap();
+    assert!(
+        merged
+            .desired
+            .breakout
+            .iter()
+            .all(|b| b.bridge != "wl-trunk0")
+    );
+    assert_eq!(merged.desired.breakout.len(), 1, "iso breaks out");
+    assert!(merged.bridges["lab"].is_empty());
+    // Same ports: nothing, and its sockets stay closed.
+    let twin = network(51822, "trunk2", "wl-trunk2", &[30], &["ta"]);
+    let merged = merge(&[("default", &home), ("twin", &twin)]).unwrap();
+    assert!(!merged.has_ports("twin"));
+}

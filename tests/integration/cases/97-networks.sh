@@ -109,6 +109,34 @@ wait_for 60 "VLAN 60 (lab): c-site1 reaches c-site2 again" ping_once c-site1 10.
 wait_for 60 "VLAN 20 (iso): site1 reaches site2 again" x site1 "ping -c 2 -i 0.2 -W 1 10.21.0.2"
 wait_for 60 "VLAN 20 (default network) works again" ping_once c-site1 10.20.0.2
 
+begin "Networks: what goes wrong in one network stays there"
+
+# A first configuration that is not confirmed is rolled back: only what
+# that network built goes.
+before=$(x site1 "ip -o link show | grep -c ' vx'")
+check "site1 adds network tmp" x site1 "wanderlan networks add tmp >/dev/null"
+printf '[network]\nrevision = 1\nvlans = "80"\n\n[site.site1]\naddress = "10.100.1.10"\n' |
+  put site1 /tmp/tmp.toml
+printf 'self = "site1"\ntrunk = "trunk0"\n' | put site1 /tmp/tmp-local.toml
+check "site1 configures tmp without confirming it" \
+  x site1 "wanderlan --net tmp apply --network /tmp/tmp.toml --local /tmp/tmp-local.toml --timeout 5s >/dev/null"
+wait_eq 30 "tmp is rolled back" "unconfigured" jqn site1 tmp .state
+check "the default network kept its tunnels and br0" \
+  x site1 "[ \"\$(ip -o link show | grep -c ' vx')\" = $before ] && ip link show br0 >/dev/null"
+wait_for 30 "VLAN 20 (default network) still works" ping_once c-site1 10.20.0.2
+check "site1 removes tmp" x site1 "wanderlan networks remove tmp --yes >/dev/null"
+
+# The trunk port of iso is gone (an unplugged adapter): iso misses it, the
+# default network goes on.
+x site1 "ip link del trunk1"
+wait_for 30 "iso misses its trunk port" \
+  eval "jqn site1 iso '.missing_ports | join(\" \")' | grep -qx trunk1"
+check "the default network still applies (no error)" \
+  test "$(jqs site1 .state)" = running
+check "a change of the default network still works" \
+  x site1 "wanderlan vlans 10-51 --confirm >/dev/null && wanderlan vlans 10-50 --confirm >/dev/null"
+wait_for 30 "VLAN 20 (default network) still works" ping_once c-site1 10.20.0.2
+
 begin "Networks: removed again, the default network is as before"
 
 for s in site1 site2; do

@@ -22,7 +22,8 @@ const NETWORK_HEADER: &str = "\
 #
 # [site.\"<identity>\"]: a site, `name` is what it is called (several sites
 # may have the same name); every other site is referred to by its identity.
-# `server` is the site it is a client of (none: a server);
+# `server` is the site it is a client of (none: a server); changes = who
+# changes the tunnel to it (\"server\", \"client\" or \"both\");
 # map = { <source VLAN> = <VLAN on its trunk, or \"native\"> };
 # tunnel_vlans = { \"<other site>\" = <the most that tunnel carries> };
 # breakout = { <VLAN> = { uplink = <interface>, except = [<networks>] } }:
@@ -115,13 +116,9 @@ fn render_form(network: &Network, with_revision: bool) -> String {
                     comment(&network.label(up))
                 );
             }
-            if let Some(by) = site.managed_by {
-                let _ = writeln!(
-                    out,
-                    "managed_by = {}  # {}",
-                    quote(&by.to_string()),
-                    comment(&network.label(by))
-                );
+            // Who changes the tunnel to its server: only a client has one.
+            if site.uplink.is_some() {
+                let _ = writeln!(out, "changes = {}", quote(site.changes.as_str()));
             }
             site_rules(&mut out, network, site);
         }
@@ -184,9 +181,6 @@ fn network_section(out: &mut String, network: &Network, with_revision: bool) {
 /// The rules of a site, after its references.
 fn site_rules(out: &mut String, network: &Network, site: &super::model::Site) {
     let _ = network;
-    if site.self_managed {
-        out.push_str("self_managed = true\n");
-    }
     if !site.online {
         out.push_str("online = false\n");
     }

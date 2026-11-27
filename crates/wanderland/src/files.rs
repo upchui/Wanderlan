@@ -46,6 +46,16 @@ pub struct Paths {
     keep: &'static [&'static str],
 }
 
+/// A network found in the state directory.
+struct Found {
+    name: String,
+    tag: char,
+    /// Its number: the order the networks were added in.
+    seq: Option<u64>,
+    added: std::time::SystemTime,
+    file: PathBuf,
+}
+
 /// Where the networks of the box are.
 #[derive(Debug, Clone)]
 pub struct Layout {
@@ -71,7 +81,15 @@ impl Layout {
     /// The networks of the box with their tags: the default network first,
     /// then the others in the order they were added.
     pub fn scan(&self) -> Vec<(String, char)> {
-        let mut found: Vec<(std::time::SystemTime, String, char)> = Vec::new();
+        self.scan_report().0
+    }
+
+    /// [`Layout::scan`], and what is wrong with the files of the networks
+    /// (a second network with the tag of another one is left out). A tag
+    /// file of an older version (without the number of the network) gets
+    /// one, in the order of the times of the files.
+    pub fn scan_report(&self) -> (Vec<(String, char)>, Vec<String>) {
+        let mut found: Vec<Found> = Vec::new();
         let dir = self.state_dir.join(NETWORKS_DIR);
         for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
@@ -82,25 +100,78 @@ impl Layout {
             let Ok(text) = std::fs::read_to_string(&file) else {
                 continue;
             };
-            let Some(tag) = text.trim().chars().next().filter(|c| TAGS.contains(*c)) else {
+            let mut words = text.split_whitespace();
+            let Some(tag) = words
+                .next()
+                .and_then(|w| w.chars().next())
+                .filter(|c| TAGS.contains(*c))
+            else {
                 continue;
             };
-            // The tag file is never written again: its time is when the
-            // network was added.
+            let seq = words.next().and_then(|w| w.parse::<u64>().ok());
             let added = std::fs::metadata(&file)
                 .and_then(|m| m.modified())
                 .unwrap_or(std::time::UNIX_EPOCH);
-            if found.iter().all(|(_, _, t)| *t != tag) {
-                found.push((added, name, tag));
+            found.push(Found {
+                name,
+                tag,
+                seq,
+                added,
+                file,
+            });
+        }
+        // Numbered ones in their order, the others after them by time.
+        found.sort_by(|a, b| {
+            (a.seq.unwrap_or(u64::MAX), a.added, &a.name).cmp(&(
+                b.seq.unwrap_or(u64::MAX),
+                b.added,
+                &b.name,
+            ))
+        });
+        let mut warnings = Vec::new();
+        let mut kept: Vec<Found> = Vec::new();
+        for f in found {
+            if let Some(first) = kept.iter().find(|k| k.tag == f.tag) {
+                warnings.push(format!(
+                    "network \"{}\" has the tag {} of network \"{}\" ({}); it is left out until it has a tag of its own",
+                    f.name,
+                    f.tag,
+                    first.name,
+                    f.file.display()
+                ));
+                continue;
+            }
+            kept.push(f);
+        }
+        let mut next = kept.iter().filter_map(|f| f.seq).max().unwrap_or(0);
+        for f in &mut kept {
+            if f.seq.is_none() {
+                next += 1;
+                f.seq = Some(next);
+                if let Err(e) = write_atomic(&f.file, &format!("{} {next}\n", f.tag)) {
+                    warnings.push(format!("{e:#}"));
+                }
             }
         }
-        found.sort();
         let mut out = vec![(
             wanderlan_core::api::DEFAULT_NETWORK.to_string(),
             wanderlan_core::topology::DEFAULT_TAG,
         )];
-        out.extend(found.into_iter().map(|(_, name, tag)| (name, tag)));
-        out
+        out.extend(kept.into_iter().map(|f| (f.name, f.tag)));
+        (out, warnings)
+    }
+
+    /// The highest number of a network of the box.
+    fn last_seq(&self) -> u64 {
+        let dir = self.state_dir.join(NETWORKS_DIR);
+        std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.path().join(TAG_FILE)).ok())
+            .filter_map(|t| t.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0)
     }
 
     /// Adds network `name` (unconfigured) and gives it a tag.
@@ -116,13 +187,21 @@ impl Layout {
             anyhow::bail!("this box has as many networks as it can have");
         };
         let paths = self.paths(name);
+        // Files of a network of that name (left behind, or copied): kept.
+        if paths.config_dir.exists() {
+            anyhow::bail!(
+                "{} exists already; remove it first, or name the network otherwise",
+                paths.config_dir.display()
+            );
+        }
+        let seq = self.last_seq() + 1;
         for dir in [&paths.config_dir, &paths.state_dir] {
             std::fs::create_dir_all(dir)
                 .with_context(|| format!("cannot create {}", dir.display()))?;
         }
         write_atomic(&paths.network(), TEMPLATE_NETWORK)?;
         write_atomic(&paths.local(), TEMPLATE_LOCAL)?;
-        write_atomic(&paths.state_dir.join(TAG_FILE), &format!("{tag}\n"))?;
+        write_atomic(&paths.state_dir.join(TAG_FILE), &format!("{tag} {seq}\n"))?;
         Ok(tag)
     }
 
@@ -573,7 +652,7 @@ mod tests {
         let hq = wanderlan_core::identity::SiteId::provisional("hq");
         assert!(
             new.contains(&format!(
-                "name = \"lab\"\naddress = \"10.0.0.2\"\nserver = \"{hq}\"  # hq\nmap = {{ 30 = 130 }}\n"
+                "name = \"lab\"\naddress = \"10.0.0.2\"\nserver = \"{hq}\"  # hq\nchanges = \"both\"\nmap = {{ 30 = 130 }}\n"
             )),
             "{new}"
         );
@@ -756,6 +835,42 @@ mod tests {
         result.unwrap();
         assert!(paths.state_dir.exists());
         assert_eq!(std::fs::read_dir(&paths.state_dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn networks_keep_their_order_and_tags() {
+        let base = std::env::temp_dir().join(format!("wl-layout-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let layout = Layout {
+            config_dir: base.join("etc"),
+            state_dir: base.join("lib"),
+        };
+        assert_eq!(layout.add("zeta").unwrap(), 'a');
+        assert_eq!(layout.add("alpha").unwrap(), 'b');
+        // In the order they were added, whatever the times of the files.
+        let names = |l: &Layout| -> Vec<String> { l.scan().into_iter().map(|(n, _)| n).collect() };
+        assert_eq!(names(&layout), ["default", "zeta", "alpha"]);
+        // A tag file of an older version: numbered after the others.
+        std::fs::create_dir_all(layout.paths("old").state_dir).unwrap();
+        std::fs::write(layout.paths("old").state_dir.join(TAG_FILE), "c\n").unwrap();
+        assert_eq!(names(&layout), ["default", "zeta", "alpha", "old"]);
+        assert_eq!(
+            std::fs::read_to_string(layout.paths("old").state_dir.join(TAG_FILE)).unwrap(),
+            "c 3\n"
+        );
+        // A copied network with the tag of another: left out, and said so.
+        std::fs::create_dir_all(layout.paths("copy").state_dir).unwrap();
+        std::fs::write(layout.paths("copy").state_dir.join(TAG_FILE), "a 9\n").unwrap();
+        let (networks, problems) = layout.scan_report();
+        assert_eq!(networks.len(), 4, "{networks:?}");
+        assert!(
+            problems[0].contains("has the tag a of network \"zeta\""),
+            "{problems:?}"
+        );
+        // Files of a network of that name left behind are not overwritten.
+        std::fs::create_dir_all(layout.paths("left").config_dir).unwrap();
+        assert!(layout.add("left").is_err());
         std::fs::remove_dir_all(base).unwrap();
     }
 }
