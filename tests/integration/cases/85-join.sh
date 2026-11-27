@@ -207,8 +207,12 @@ check "then site5 makes site4 a server" x site5 "wanderlan role site4 server --c
 wait_for 60 "site4 has its tunnels to the servers again" \
   x site4 "[ -n \"\$(tun site1)\" ] && [ -n \"\$(tun site2)\" ] && [ -n \"\$(tun site3)\" ]"
 wait_eq 30 "site2 knows site4 as a server" null uplink_at site2 site4
-# A server: every server may change it.
-wait_eq 30 "site2 has the network of site1" "$(jqs site1 .revision)" jqs site2 .revision
+# A server: every server may change it. (With the change of site5 first:
+# site1 may get it after site2.)
+fp=$(jqs site5 .fingerprint)
+for s in site1 site2; do
+  wait_eq 30 "$s has the network of site5" "$fp" jqs "$s" .fingerprint
+done
 check "and site2 makes site5 a client of site1 again" x site2 "wanderlan role site5 client site1 --confirm"
 wait_for 60 "site5's only tunnel leads to site1 again" only_tunnel site5 site1
 keyed site4 site5

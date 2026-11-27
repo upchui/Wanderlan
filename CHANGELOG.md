@@ -56,6 +56,10 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
   warning (they were overwritten). `wanderlan apply` refuses a
   `network.toml` with a revision below the current one (an editor that
   saved an older state would undo the changes since).
+- `systemctl reload` while a change waits for confirmation (one from
+  another site, confirmed in a moment) is no longer ignored: it waits for
+  that change, and the edit is put onto it (kept as `*.edited` only where
+  both changed the same).
 - Sync: a client no longer takes back its uplink's older network right
   after its uplink took its change (the change was undone for a moment,
   and a refusal could go unnoticed). A fetch that ends while a change made

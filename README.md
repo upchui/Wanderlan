@@ -942,7 +942,9 @@ a countdown and rollback. A file edited by hand with the revision it had gets
 the next one, so that it reaches the other sites; a file with a lower
 revision (an old copy put back) takes the network of the peers instead.
 Invalid files change nothing; the log and the journal say why. While a change
-waits for confirmation a reload is ignored.
+waits for confirmation a reload waits too: once the change is confirmed, the
+edit is put onto it (if both changed the same, the edit is kept as
+`*.edited` instead), or after a rollback the files are read as they are.
 
 ### MTU and MSS
 

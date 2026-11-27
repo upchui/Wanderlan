@@ -65,6 +65,8 @@ expect_ping c-site4 10.20.0.13 "VLAN 20: site4 reaches site5"
 
 begin "A file written by hand with names keeps the identities"
 
+# Not while a change from a peer waits (just after the restart above).
+wait_eq 30 "site4 has no change waiting" null jqs site4 .pending
 id4=$(jqs site4 .site_id)
 rev4=$(jqs site4 .revision)
 # The sites by their names, without identities (as a person writes it).

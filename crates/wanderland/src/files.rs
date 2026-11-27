@@ -338,11 +338,16 @@ impl Paths {
     /// Writes a confirmed configuration to the configuration directory and
     /// keeps a copy in the state directory.
     pub fn write_confirmed(&self, cfg: &Config) -> Result<()> {
+        self.write_files(cfg)?;
+        self.save_copy()
+    }
+
+    /// Writes `cfg` to the files only (not confirmed: no copy).
+    pub fn write_files(&self, cfg: &Config) -> Result<()> {
         let network = render_network(&cfg.network);
         let local = render_local(&cfg.local, Some(&cfg.network));
         write_atomic(&self.network(), &network)?;
-        write_atomic(&self.local(), &local)?;
-        self.save_copy()
+        write_atomic(&self.local(), &local)
     }
 
     /// Copies the current files into the state directory as the confirmed

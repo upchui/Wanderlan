@@ -422,6 +422,9 @@ struct Controller {
     /// and when: until it confirms the change it still announces that one,
     /// which would undo the change here (for a while).
     push_taken: Option<(String, Instant)>,
+    /// A SIGHUP came while a change waited for confirmation: the files are
+    /// read once it is confirmed or rolled back.
+    reload_wanted: bool,
     /// The networks confirmed here last: the bases of a three-way merge.
     known: merge3::Known,
     /// What the confirmed network was made from.
@@ -697,6 +700,7 @@ impl Controller {
             own_change_up: false,
             push_first_since: None,
             push_taken: None,
+            reload_wanted: false,
             known: merge3::Known::default(),
             ancestry: Ancestry::default(),
             own_change: None,
@@ -1479,8 +1483,10 @@ impl Controller {
     /// files are taken as confirmed (like a restart would).
     async fn reload_files(&mut self) {
         if self.pending.is_some() {
-            self.events
-                .warn("Ignoring SIGHUP while a change is waiting for confirmation");
+            self.reload_wanted = true;
+            self.events.info(
+                "SIGHUP: the files are read once the change waiting for confirmation is confirmed or rolled back",
+            );
             return;
         }
         // Written with names (by hand): with the identities at once.
@@ -2365,6 +2371,10 @@ impl Controller {
 
     /// Housekeeping: automatic confirmation of synced changes, sync retries.
     async fn every_second(&mut self) {
+        if self.reload_wanted && self.pending.is_none() {
+            self.reload_wanted = false;
+            self.reload_files().await;
+        }
         match self.invites.expire(now_secs()) {
             Ok(gone) => {
                 for code in gone {
@@ -2435,7 +2445,7 @@ impl Controller {
     /// or the uplink (replacing the own network), otherwise the changes of a
     /// client (merged into the own network).
     fn maybe_sync(&mut self) {
-        if self.pending.is_some() || self.fetching {
+        if self.pending.is_some() || self.fetching || self.reload_wanted {
             return;
         }
         let Some(confirmed) = &self.confirmed else {
@@ -2768,6 +2778,39 @@ impl Controller {
             }
             Err(e) => self.events.error(format!("{e:#}")),
         }
+    }
+
+    /// The files as edited by hand while a change waited (made from
+    /// `previous`, the SIGHUP waits): that edit put onto the change `now`,
+    /// what the files are to hold for that SIGHUP. `now` itself if they
+    /// hold `previous` (in another form); `None` if the edit does not go
+    /// together with the change (it is kept aside then).
+    fn edit_onto(&self, previous: Option<&Config>, now: &Config) -> Option<Config> {
+        let previous = previous?;
+        let (network, local) = self.paths.read().ok()?;
+        let Ok((Loaded::Configured(mut edit), _)) =
+            self.load_input(&network, &local, Some(&previous.network))
+        else {
+            return None;
+        };
+        keep_ids(&previous.network, &mut edit.network, &mut edit.local);
+        let mut out = now.clone();
+        if config::fingerprint(&edit.network) != config::fingerprint(&previous.network) {
+            let m = merge3::merge3(&previous.network, &edit.network, &now.network);
+            if !m.conflicts.is_empty() {
+                return None;
+            }
+            out.network = m.network;
+            out.network.revision = now.network.revision;
+        }
+        if edit.local != previous.local {
+            wanderlan_core::rename::follow_rekeys(&previous.network, &now.network, &mut edit.local);
+            out.local = edit.local;
+        }
+        let valid = !config::validate(&out.network, Some(&out.local))
+            .iter()
+            .any(Diagnostic::is_error);
+        valid.then_some(out)
     }
 
     /// Takes over a newer revision number with the same content, without a
@@ -4393,7 +4436,16 @@ impl Controller {
                 Err(e) => self.events.error(format!("{e:#}")),
             }
         }
-        self.keep_edits();
+        // Edited by hand meanwhile (a SIGHUP waits): the edit goes onto this
+        // change, read with that SIGHUP; else it is kept aside.
+        let carried = if self.reload_wanted && !pending.from_files {
+            self.edit_onto(pending.previous.as_ref(), &cfg)
+        } else {
+            None
+        };
+        if carried.is_none() {
+            self.keep_edits();
+        }
         if let Err(e) = self.paths.write_confirmed(&cfg) {
             // /etc does not run ahead of what is in effect (written in part).
             if let Some(previous) = &self.confirmed
@@ -4407,6 +4459,11 @@ impl Controller {
             )));
         }
         self.paths.clear_marker();
+        if let Some(edit) = carried.filter(|e| *e != cfg)
+            && let Err(e) = self.paths.write_files(&edit)
+        {
+            self.events.error(format!("{e:#}"));
+        }
         self.follow_lineage(&cfg.network, pending.lineage.clone());
         // Peers it removed get the new network only from now on (until now
         // the confirmed one was offered): their grace starts here.

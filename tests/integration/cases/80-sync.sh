@@ -144,6 +144,12 @@ wait_eq 90 "site5 is back at VLANs 10-50" "10-19,20:pu,21-50" vlan_summary site5
 
 begin "Sync: a server made a client while it was away fetches its view"
 
+# All have the last changes of site1 (else the change of site2 is made at
+# the same time as one of them and put together: another revision).
+fp=$(jqs site1 .fingerprint)
+for s in site2 site3 site4 site5; do
+  wait_eq 60 "$s has the network of site1" "$fp" jqs "$s" .fingerprint
+done
 x site5 "wl-daemon stop"
 check "site2 makes site5 a client of its own" x site2 "wanderlan role site5 client site2 --confirm"
 rev=$(jqs site2 .revision)
