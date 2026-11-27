@@ -65,7 +65,11 @@ expect_ping c-site4 10.20.0.13 "VLAN 20: site4 reaches site5"
 
 begin "A file written by hand with names keeps the identities"
 
-# Not while a change from a peer waits (just after the restart above).
+# Settled after the restart above: its peers known by their keys (a change
+# from a peer is confirmed once one answers), the network of the others,
+# nothing waiting.
+keyed site4
+wait_eq 60 "site4 has the network of site1" "$(jqs site1 .fingerprint)" jqs site4 .fingerprint
 wait_eq 30 "site4 has no change waiting" null jqs site4 .pending
 id4=$(jqs site4 .site_id)
 rev4=$(jqs site4 .revision)
@@ -80,8 +84,9 @@ put site4 /etc/wanderlan/network.toml <"$RUN_DIR/site4-names.toml"
 check "the file names the sites by their names only" \
   x site4 "! grep -q '^\[site\.\"' /etc/wanderlan/network.toml && grep -q '^name = \"site4\"' /etc/wanderlan/network.toml"
 x site4 "wl-daemon reload"
+# (The identity is read before: `jqs` in the pipe would eat the line.)
 wait_for 30 "site4 wrote it back with its identity" \
-  eval "x site4 'site-entry site4' | head -n 1 | grep -qF \"\$(jqs site4 .site_id)\""
+  eval "x site4 'site-entry site4' | head -n 1 | grep -qF '$id4'"
 for i in 1 2; do
   x site4 "wl-daemon stop; wl-daemon start"
   wait_for 30 "restart $i: site4 runs" x site4 "wanderlan status --json | jq -e '.state == \"running\"'"
