@@ -193,25 +193,36 @@ pub fn address_warning(address: Ipv4Addr, known: &[HostAddress]) -> Option<Strin
     })
 }
 
-/// Interfaces that can be the trunk, without the one carrying the transport
+/// The interfaces the traffic to the other sites leaves by: `via` (the one
+/// of this site's address or of the route to its server) and the one of the
+/// default route, which a VPN on this host runs over. As the trunk, either
+/// would cut this host off.
+pub fn transport_interfaces(via: Option<String>) -> Vec<String> {
+    let mut out: Vec<String> = via.into_iter().collect();
+    if let Some(way_out) = default_interface()
+        && !out.contains(&way_out)
+    {
+        out.push(way_out);
+    }
+    out
+}
+
+/// Interfaces that can be the trunk, without those carrying the transport
 /// traffic (`transport`).
 pub fn trunk_candidates<'a>(
     interfaces: &'a [Interface],
-    transport: Option<&str>,
+    transport: &[String],
 ) -> Vec<&'a Interface> {
     let mut list: Vec<&Interface> = interfaces
         .iter()
-        .filter(|i| i.is_trunk_candidate() && Some(i.name.as_str()) != transport)
+        .filter(|i| i.is_trunk_candidate() && !transport.contains(&i.name))
         .collect();
     list.sort_by(|a, b| a.name.cmp(&b.name));
     list
 }
 
 /// The trunk if there is exactly one candidate, otherwise all candidates.
-pub fn choose_trunk(
-    interfaces: &[Interface],
-    transport: Option<&str>,
-) -> Result<String, Vec<String>> {
+pub fn choose_trunk(interfaces: &[Interface], transport: &[String]) -> Result<String, Vec<String>> {
     let list = trunk_candidates(interfaces, transport);
     match list.as_slice() {
         [only] => Ok(only.name.clone()),
@@ -298,14 +309,18 @@ dead0\t0000090A\t00000000\t0000\t0\t0\t0\t0000FFFF\t0\t0\t0\n";
             iface("docker0", "bridge", None),
             iface("vx-a", "vxlan", Some("br0")),
         ];
-        assert_eq!(choose_trunk(&interfaces, Some("ens18")), Ok("ens19".into()));
+        let ens18 = ["ens18".to_string()];
+        assert_eq!(choose_trunk(&interfaces, &ens18), Ok("ens19".into()));
         assert_eq!(
-            choose_trunk(&interfaces, None),
+            choose_trunk(&interfaces, &[]),
             Err(vec!["ens18".into(), "ens19".into()])
         );
+        // The address is on wg0, which runs over ens18 (the default route).
+        let both = ["wg0".to_string(), "ens18".to_string()];
+        assert_eq!(choose_trunk(&interfaces, &both), Ok("ens19".into()));
         let attached = vec![iface("ens18", "", None), iface("ens19", "", Some("br0"))];
-        assert_eq!(choose_trunk(&attached, Some("ens18")), Ok("ens19".into()));
+        assert_eq!(choose_trunk(&attached, &ens18), Ok("ens19".into()));
         let foreign = vec![iface("ens18", "", None), iface("ens19", "", Some("vmbr0"))];
-        assert_eq!(choose_trunk(&foreign, Some("ens18")), Err(vec![]));
+        assert_eq!(choose_trunk(&foreign, &ens18), Err(vec![]));
     }
 }

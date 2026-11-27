@@ -295,7 +295,7 @@ fn trunk(page: &mut Page, app: &App) {
         if chosen {
             page.focus = Some(page.lines.len());
         }
-        let transport = w.transport.as_deref() == Some(iface.name.as_str());
+        let transport = w.transport.contains(&iface.name);
         page.lines.push(Line::from(vec![
             Span::raw(format!("   {marker} ")),
             Span::styled(interface_line(iface, transport), style),

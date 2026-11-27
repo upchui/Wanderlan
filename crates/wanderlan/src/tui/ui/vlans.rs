@@ -304,10 +304,9 @@ fn draw_maps(frame: &mut Frame, app: &App, draft: &Draft, area: Rect) {
             let marker = match running {
                 Some(old) if old.maps.contains(map) => Span::raw(" "),
                 Some(old)
-                    if old
-                        .maps
-                        .iter()
-                        .any(|m| m.site == map.site && m.local == map.local) =>
+                    if old.maps.iter().any(|m| {
+                        m.site == map.site && (m.local == map.local || m.shared == map.shared)
+                    }) =>
                 {
                     Span::styled("*", theme::warn())
                 }

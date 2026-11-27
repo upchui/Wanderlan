@@ -624,16 +624,25 @@ impl BreakoutOps for LinuxSystem {
     }
 
     async fn delete_breakout(&self) -> SysResult<()> {
+        // Every step even if one fails (also one that reads): what is left
+        // of the breakout must not stay after wanderlan.
         let mut errors = Vec::new();
-        // The tables first: no frame goes to a router any more.
-        if nft_hash().await?.is_some()
+        // The tables first: no frame goes to a router any more. Deleting
+        // them is harmless without them.
+        if !matches!(nft_hash().await, Ok(None))
             && let Err(e) =
                 apply_script("delete nftables tables of the breakout", &delete_script()).await
         {
             errors.push(e.to_string());
         }
-        let names = self.net.link_flags().await?;
-        let (rules, routes) = self.net.ours(&names).await?;
+        let ours = match self.net.link_flags().await {
+            Ok(names) => self.net.ours(&names).await,
+            Err(e) => Err(e),
+        };
+        let (rules, routes) = ours.unwrap_or_else(|e| {
+            errors.push(e.to_string());
+            Default::default()
+        });
         for (_, msg) in rules {
             if let Err(e) = self.net.del_rule(msg).await {
                 errors.push(e.to_string());

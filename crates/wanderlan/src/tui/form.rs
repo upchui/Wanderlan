@@ -212,9 +212,6 @@ impl Form {
         };
         let me = draft.local.self_id;
         let my_name = me.map(|id| network.label(id)).unwrap_or_default();
-        let site_name =
-            existing.map_or_else(|| "the new site".to_string(), |s| network.label(s.id));
-        let _ = site_name;
         let choices: Vec<String> = Changes::ALL.iter().map(|c| c.label().to_string()).collect();
         // A new site: like an invitation, only its server.
         let current = existing.map_or(Changes::Server, |s| s.changes).label();
@@ -234,14 +231,19 @@ impl Form {
             None => my_name.clone(),
         };
         // Where it is, only its server decides; its tunnel as its option
-        // says.
-        let (may_manage, may_change) = match (existing, me) {
-            (Some(s), Some(me)) => (
-                policy::may_manage(network, s, me),
-                policy::may_change(network, s, me),
-            ),
-            _ => (true, true),
-        };
+        // says. By the rights of the network the draft's edits are checked
+        // against, not by edits in the draft.
+        let rights = draft.base.as_deref().unwrap_or(network);
+        let (may_manage, may_change, may_rename) =
+            match (existing.and_then(|s| rights.site(s.id)), me) {
+                (Some(s), Some(me)) => (
+                    policy::may_manage(rights, s, me),
+                    policy::may_change(rights, s, me),
+                    policy::may_rename(rights, s.id, me),
+                ),
+                _ => (true, true, true),
+            };
+        let itself = existing.is_some_and(|s| Some(s.id) == me);
         let mut fields = vec![
             Field::text(
                 "name",
@@ -284,6 +286,11 @@ impl Form {
             let (allowed, who) = match f.key {
                 "address" | "server" => (may_manage, "its server decides this"),
                 "vlans" | "changes" => (may_change, "only as its option Changes says"),
+                "name" => (may_rename, "only the site itself or its server renames it"),
+                "own_vlans" => (
+                    itself || may_change,
+                    "the site itself, or as its option Changes says",
+                ),
                 _ => (true, ""),
             };
             if !allowed {
@@ -939,6 +946,32 @@ impl Form {
                     self.set_error("name", policy::why_not_rename(&draft.network, old, me));
                     return None;
                 }
+                // Known by its name until its box has an identity: a name of
+                // its own (as in the rename form).
+                if let Some(old) = id.and_then(|id| draft.network.site(id))
+                    && old.name != site.name
+                    && !old.has_identity()
+                    && draft.network.named(&site.name).next().is_some()
+                {
+                    self.set_error(
+                        "name",
+                        format!(
+                            "\"{}\" is already a site of the network, and this one is known by its name until its box has an identity",
+                            site.name
+                        ),
+                    );
+                    return None;
+                }
+                // What was not touched stays as it is now: a sync may have
+                // changed it since the form was opened.
+                let touched = |key: &str| self.field(key).is_some_and(|f| f.touched);
+                let kept = |key: &str| !touched(key);
+                let (keep_name, keep_address, keep_vlans, keep_own) = (
+                    kept("name"),
+                    kept("address"),
+                    kept("vlans"),
+                    kept("own_vlans"),
+                );
                 match index.and_then(|i| candidate.network.sites.get_mut(i)) {
                     Some(slot) => {
                         let mut site = site;
@@ -964,8 +997,22 @@ impl Form {
                         } else {
                             Default::default()
                         };
-                        site.own_vlans = own_vlans;
-                        let name = site.name.clone();
+                        site.own_vlans = if keep_own {
+                            slot.own_vlans.clone()
+                        } else {
+                            own_vlans
+                        };
+                        if keep_address {
+                            site.address = slot.address;
+                        }
+                        if keep_vlans {
+                            site.vlans.clone_from(&slot.vlans);
+                        }
+                        let name = if keep_name {
+                            slot.name.clone()
+                        } else {
+                            site.name.clone()
+                        };
                         site.name.clone_from(&slot.name);
                         let old = std::mem::replace(slot, site);
                         if old.name != name {

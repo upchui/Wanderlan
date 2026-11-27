@@ -663,7 +663,8 @@ client. If the site leaves for good, delete it on its server (Sites, `d`).
 check with `wanderlan validate /etc/wanderlan/network.toml --local
 /etc/wanderlan/local.toml`, then `sudo wanderlan apply` and
 `sudo wanderlan confirm`. Edits that are not confirmed are restored and kept
-as `*.rejected`.
+as `*.rejected`; edits not applied yet when another change is confirmed (one
+from another site, or one made with `wanderlan`) are kept as `*.edited`.
 
 ## Configuration
 
@@ -790,7 +791,7 @@ was not restarted in between.
 | `site.<id>.map` | none | VLAN mappings: `{ <source VLAN> = <mapped VLAN> }`. The source VLAN is the VLAN in the network (one of the VLANs of the site, not 1), the mapped VLAN its ID on the site's trunk or `"native"` (untagged), e.g. `{ 30 = "native", 40 = 140 }`. |
 | `site.<id>.tunnel_vlans` | none | The most the tunnel to another site (its identity) carries (on top of the VLANs of both sites), e.g. `{ "Hq7pR2mT…=" = "30-40" }`; `"none"`: no VLAN at all. At one of the two sites. |
 | `site.<id>.control_port` | `network.control_port` | UDP and TCP port of this site's daemon. Only the site itself changes it (`wanderlan settings control-port`). |
-| `site.<id>.tunnel_port` | its control port + 1 | UDP port of this site's tunnels; a tunnel through NAT also sends from the one above. Only the site itself changes it. |
+| `site.<id>.tunnel_port` | its own control port + 1; without one, `network.tunnel_port` | UDP port of this site's tunnels; a tunnel through NAT also sends from the one above. Only the site itself changes it. |
 | `site.<id>.breakout` | none | [Local breakout](#local-breakout) per VLAN of a client (not of a server; its ID in the network; untagged: 1): `{ <VLAN> = { uplink = "<interface>", except = [<networks>] } }`, both optional, e.g. `{ 10 = {}, 20 = { uplink = "ens20", except = ["203.0.113.0/24"] } }`. Older sites do not read a network with it: update all sites first. |
 | `self` (local) | | Which site of `network.toml` this host is (its identity). |
 | `trunk` (local) | | The interface carrying the VLANs, or several (`["ens19", "ens22"]`, bridged like switch ports, the first is the main port). |

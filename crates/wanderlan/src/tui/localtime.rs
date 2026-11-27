@@ -94,8 +94,9 @@ pub fn parse(bytes: &[u8]) -> Option<Zone> {
     };
     let [_, _, _, times, type_count, chars] = counts;
     let mut at = start;
-    let mut transitions = Vec::with_capacity(times);
-    let mut stamps = Vec::with_capacity(times);
+    // (Never more than the file holds: a broken header may say anything.)
+    let mut transitions = Vec::with_capacity(times.min(bytes.len()));
+    let mut stamps = Vec::with_capacity(times.min(bytes.len()));
     for _ in 0..times {
         let b = bytes.get(at..at + time_size)?;
         stamps.push(if time_size == 8 {
@@ -109,7 +110,7 @@ pub fn parse(bytes: &[u8]) -> Option<Zone> {
         transitions.push((stamp, usize::from(*bytes.get(at)?)));
         at += 1;
     }
-    let mut raw_types = Vec::with_capacity(type_count);
+    let mut raw_types = Vec::with_capacity(type_count.min(bytes.len()));
     for _ in 0..type_count {
         let b = bytes.get(at..at + 6)?;
         let offset = i32::from_be_bytes(b[..4].try_into().ok()?);

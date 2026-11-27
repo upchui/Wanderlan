@@ -111,8 +111,8 @@ pub struct Wizard {
     pub trunk_selected: usize,
     /// The user moved the selection (otherwise the suggestion is used).
     pub trunk_touched: bool,
-    /// Interface that carries the transport traffic; not suggested as trunk.
-    pub transport: Option<String>,
+    /// Interfaces that carry the transport traffic; not suggested as trunk.
+    pub transport: Vec<String>,
     /// Manually entered trunk name.
     pub trunk_manual: TextInput,
     /// Transport address of this site.
@@ -145,7 +145,7 @@ impl Wizard {
             default_name: String::new(),
             trunk_selected: 0,
             trunk_touched: false,
-            transport: None,
+            transport: Vec::new(),
             trunk_manual: TextInput::default(),
             address: TextInput::default(),
             addresses: Vec::new(),
@@ -206,7 +206,7 @@ impl Wizard {
             return self.trunk_selected;
         }
         let list = trunk_candidates(interfaces);
-        let usable = |i: &&Interface| Some(i.name.as_str()) != self.transport.as_deref();
+        let usable = |i: &&Interface| !self.transport.contains(&i.name);
         list.iter()
             .position(|i| usable(i) && i.is_trunk_candidate())
             .or_else(|| list.iter().position(usable))
@@ -447,7 +447,7 @@ impl Wizard {
         if is_tunnel_name(&trunk) || trunk == BRIDGE_NAME {
             return Err(format!("\"{trunk}\" is an interface managed by wanderlan"));
         }
-        if self.transport.as_deref() == Some(trunk.as_str()) {
+        if self.transport.contains(&trunk) {
             return Err(format!(
                 "{trunk} carries the traffic to the other sites; as trunk it would cut this host off. Choose the interface that carries the VLANs."
             ));
@@ -512,14 +512,21 @@ fn parse_address(text: &str) -> Result<Ipv4Addr, String> {
     Ok(ip)
 }
 
-/// `wanderlan join <address> <code>` (or just the two): address and code.
+/// `wanderlan join <address> <code>` (or just the two; with `sudo`, with
+/// `--net <name>` for another network than the default one): address and
+/// code. The network is the one this window is for.
 fn split_join_line(text: &str) -> Option<(String, String)> {
-    let mut words: Vec<&str> = text.split_whitespace().collect();
-    if words.first() == Some(&"wanderlan") {
-        words.remove(0);
-    }
-    if words.first() == Some(&"join") {
-        words.remove(0);
+    let mut all = text.split_whitespace();
+    let mut words: Vec<&str> = Vec::new();
+    while let Some(word) = all.next() {
+        match word {
+            "sudo" | "wanderlan" | "join" => {}
+            "--net" => {
+                all.next();
+            }
+            w if w.starts_with("--net=") => {}
+            w => words.push(w),
+        }
     }
     match words.as_slice() {
         [target, code] if join::normalize_code(code).len() == join::CODE_LEN => {
@@ -563,7 +570,7 @@ mod tests {
                 default_route: false,
             }],
         );
-        w.transport = Some("ens18".into());
+        w.transport = vec!["ens18".into()];
         press(&mut w, KeyCode::Enter);
         assert_eq!(w.step, Step::Name);
         assert_eq!(w.name.value(), "heim", "name from the host name");
@@ -624,7 +631,7 @@ mod tests {
         type_text(&mut w, "-9qx2m");
         press(&mut w, KeyCode::Enter);
         assert_eq!(w.step, Step::Trunk);
-        w.transport = Some("ens18".into());
+        w.transport = vec!["ens18".into()];
         press(&mut w, KeyCode::Enter);
         assert_eq!(w.step, Step::Name);
         press(&mut w, KeyCode::Enter);
@@ -648,6 +655,11 @@ mod tests {
         assert_eq!(
             (w.target.value(), w.code.value()),
             ("10.13.0.103", "K7F3Q-9QX2M")
+        );
+        // That of another network, with sudo.
+        assert_eq!(
+            split_join_line("sudo wanderlan --net lab join 10.0.0.1:51831 ABCDE-FGHIJ"),
+            Some(("10.0.0.1:51831".into(), "ABCDE-FGHIJ".into()))
         );
     }
 

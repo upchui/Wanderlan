@@ -81,7 +81,7 @@ pub const ROWS: [SettingRow; 7] = [
         key: "tunnel_port",
         label: "Tunnel port",
         scope: Scope::OwnSite,
-        help: "UDP port of this site's VXLAN tunnels (a tunnel through NAT also sends from the one above). Empty: control port + 1. The other sites send there; open it towards them.",
+        help: "UDP port of this site's VXLAN tunnels (a tunnel through NAT also sends from the one above). Empty: its own control port + 1, without one the network's tunnel port. The other sites send there; open it towards them.",
     },
 ];
 

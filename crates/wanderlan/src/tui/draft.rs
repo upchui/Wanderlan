@@ -148,15 +148,21 @@ impl Draft {
             .iter()
             .filter_map(|n| match (base.site(n.id), mine.site(n.id)) {
                 (Some(b), Some(d)) if d != b => {
-                    if n != b && n != d {
+                    // (Without the ports: they are taken as they run.)
+                    let differs = |x: &Site, y: &Site| {
+                        Site {
+                            ports: y.ports,
+                            ..x.clone()
+                        } != *y
+                    };
+                    if differs(n, b) && differs(n, d) {
                         both.push(format!("site {}", now.label(n.id)));
                     }
-                    // The ports of another site are its own: always as they
-                    // run now.
+                    // The ports of another site are its own, and this site's
+                    // are applied at once, never kept in the draft: always
+                    // as they run now.
                     let mut site = d.clone();
-                    if Some(n.id) != self.local.self_id {
-                        site.ports = n.ports;
-                    }
+                    site.ports = n.ports;
                     Some(site)
                 }
                 // Removed in the draft.

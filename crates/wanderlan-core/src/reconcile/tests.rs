@@ -970,6 +970,10 @@ async fn a_blocked_trunk_port_goes_down() {
     run(&net, &derive(&cfg, &runtime)).await;
     assert!(!net.link("ens20").unwrap().admin_up);
     assert!(net.link("ens19").unwrap().admin_up, "never the main port");
+    // Up again when wanderlan stops: nothing else would bring it up.
+    teardown(&net, |_| {}).await.unwrap();
+    let ens20 = net.link("ens20").unwrap();
+    assert!(ens20.admin_up && ens20.master.is_none());
 }
 
 #[test]

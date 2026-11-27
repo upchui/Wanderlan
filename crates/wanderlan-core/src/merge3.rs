@@ -393,6 +393,11 @@ pub fn rebase_view(
         .find_map(|f| views.iter().find(|(vf, _)| vf == f).map(|(_, v)| v))?;
     let mut m = merge3(base, pushed, &current);
     m.network.revision = m.network.revision.max(pushed.revision);
+    // Not what the client has: above its revision, else it keeps its own
+    // (it takes only a higher one from its uplink).
+    if fingerprint(&m.network) != fingerprint(pushed) {
+        m.network.revision = crate::config::next_revision(m.network.revision);
+    }
     Some(m)
 }
 

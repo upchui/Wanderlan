@@ -7,6 +7,100 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
+### Fixes, fourth review
+
+- A copy of a client's probe sent again from elsewhere no longer counts:
+  what a request of a client says (the test of its tunnel, its ports)
+  counts only from the address where it answered a challenge. Before, a
+  copy sent from another address could point the client's tunnel there.
+- The direct test of a client tunnel: a test the server did not answer
+  (the line was down) no longer counts as failed, and the pause between
+  tests, which doubles after each fall back to NAT, is short again once
+  the tunnel ran direct for as long as that pause (it grew up to a day).
+- The old control port after a port change sends its requests with the
+  nonce in use (a peer took every one of them for a restart), and closes
+  when another network of the box takes its port.
+- Several networks: if the first network cannot be applied on its own
+  (its trunk port is missing), the others are applied without it instead
+  of not at all. A network whose ports another network took, or that gets
+  them back, closes or opens its sockets at once (not only after the next
+  change). The VLAN window and the MAC table of a network no longer show
+  the tunnels of another network in a bridge both share as trunk ports.
+- Stop and reset: a trunk port the loop guard shut comes up again; the
+  breakout is removed also when its state cannot be read (the sysctls of
+  the uplink are restored), and an error reading nftables is reported
+  instead of leaving its table behind silently. A breakout being removed
+  whose state cannot be read is reported instead of waiting silently.
+- Clients behind NAT that serve clients of their own: all packets of
+  their uplink tunnel skip connection tracking (some were still tracked).
+- Several networks: sites without an identity of their own (placeholders,
+  sites of older versions) in a further network got the same tunnel
+  interface name; each has its own now.
+- A server can make a client that changes its own tunnel ("only the
+  client") a server, and remove it also when its tunnel has a VLAN limit
+  (both were refused on either side).
+- A client that changed an older state of the network gets back the
+  merged one with a revision above its own (before, it kept what it sent
+  until the next change).
+- A box that was reset and joins through a client again stays below the
+  client it hung off where moving it would be refused by the server
+  (the join seemed to work, then the site was out).
+- Invitations: one used through a client whose server already took the
+  new site is used up at once, also if the client restarts before the
+  new site is up (before, it could be used a second time). A client
+  waits at most 20 s for its server to take a joining site.
+- Hand edits: a crash or restart while edited files are applied starts
+  from the confirmed files again (before, the edit counted as confirmed
+  and was passed on). Edits not applied yet when another change is
+  confirmed are kept as `network.toml.edited` / `local.toml.edited` with a
+  warning (they were overwritten). `wanderlan apply` refuses a
+  `network.toml` with a revision below the current one (an editor that
+  saved an older state would undo the changes since).
+- Sync: a client no longer takes back its uplink's older network right
+  after its uplink took its change (the change was undone for a moment,
+  and a refusal could go unnoticed). A fetch that ends while a change made
+  here waits for confirmation is left for later (it reported that it
+  replaced that change).
+- Validation: a breakout on a VLAN number that a mapping takes at the
+  site's trunk does nothing, which is now warned about; a tunnel listed
+  twice in `local.toml` (by name and by identity) is an error.
+- `wanderlan new`, `wanderlan join` and the setup wizard no longer choose
+  the interface of the default route as the trunk when the address is that
+  of a VPN running over it (the only network port was bridged and the box
+  cut off).
+- The commands the CLI suggests next (`wanderlan confirm`, `online ...
+  --confirm`, `invite delete`, `status`, ...) carry `--net <name>` when
+  another network was chosen; before, following them acted on the default
+  network (and confirmed or missed the wrong change).
+- The CLI no longer waits forever when the daemon cannot read a request
+  (an older version that does not know it): the error is shown.
+- `wanderlan breakout <site> on` with the VLANs missing is an error instead
+  of showing the breakouts and succeeding; `init --dir` writes neither file
+  if one of them exists; `reset` names the clients also when names repeat.
+- Invitations of older versions that let the new site change itself keep
+  that when the invitations are saved again, and `invite list` shows it.
+- Terminal UI, site form:
+  - The fields follow the rights in the running network, not edits in the
+    draft. The name and the own VLANs are greyed out like the others where
+    this site may not change them.
+  - Fields that were not touched keep what a sync brought in the meantime.
+    Before, saving put back the values from when the form was opened.
+  - A rename there no longer gives two sites known only by their name the
+    same identity.
+  - `e` in a site's details window opens the form where Sites does.
+- Terminal UI, elsewhere:
+  - Editing a mapping or a breakout offers only sites this site may change
+    (for a breakout only clients).
+  - A sync merged into the draft keeps this site's own ports as they run.
+  - The details window from the overview finds a site renamed in the
+    draft.
+  - Messages name sites, not their identities.
+  - The wizard takes a pasted join line with `sudo` and `--net`.
+  - The event log shows the oldest events at the top.
+  - Changed mappings are marked as changed, not as new.
+  - The VLAN window lists the tunnels by site.
+  - A broken time zone file can no longer crash the terminal UI.
+
 ### Changes made at the same time are kept
 
 - Every network the sites exchange carries the fingerprints it was made

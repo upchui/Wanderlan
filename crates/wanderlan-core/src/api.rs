@@ -172,8 +172,9 @@ pub struct SiteRules {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub changes: Option<Changes>,
     /// Invitations of earlier versions: the new site may change itself too
-    /// (both). Read, never written.
-    #[serde(default, skip_serializing)]
+    /// (both). Kept as read, so that saving the invitations again (or the
+    /// list over the API) does not drop it; new ones use `changes`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_self: bool,
     /// How long the invitation is valid, in seconds (asked for with the
     /// rules, kept with the invitation); 0: until it is used or deleted;

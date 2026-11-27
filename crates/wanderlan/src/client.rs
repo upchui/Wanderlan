@@ -100,7 +100,15 @@ impl Client {
                         let _ = events_tx.send(event);
                     }
                     Ok(ServerMessage::Response(resp)) => {
-                        if let Some(tx) = reader_pending.lock().await.remove(&resp.id) {
+                        let mut pending = reader_pending.lock().await;
+                        if resp.id == 0 {
+                            // The daemon could not read a request (an older
+                            // version, say, that does not know it) and cannot
+                            // tell which one: every waiting request gets it.
+                            for (_, tx) in pending.drain() {
+                                let _ = tx.send(resp.clone());
+                            }
+                        } else if let Some(tx) = pending.remove(&resp.id) {
                             let _ = tx.send(resp);
                         }
                     }

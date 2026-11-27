@@ -1326,6 +1326,17 @@ breakout = { 10 = {}, 20 = { uplink = "ens20", except = ["203.0.113.9/24", "2001
         "{err}"
     );
     assert_eq!(err.line, Some(line_of(&wrong, "[site.site2]", "breakout")));
+    // Source VLAN 10 carried as 20 at the trunk: VLAN 20 is not there.
+    let mapped = text.replace("breakout =", "map = { 10 = 20 }\nbreakout =");
+    let outcome = load(&mapped, local).unwrap();
+    assert!(
+        outcome
+            .warnings
+            .iter()
+            .any(|w| w.message.contains("breakout 20 does nothing")),
+        "{:#?}",
+        outcome.warnings
+    );
     // A trunk port is no uplink.
     let err = single_error(text, "self = \"site2\"\ntrunk = \"ens20\"\n");
     assert!(

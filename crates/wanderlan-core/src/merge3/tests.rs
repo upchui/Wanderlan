@@ -224,6 +224,7 @@ fn a_view_changed_from_an_older_one_keeps_the_newer_changes() {
     let m = rebase_view(&history, &now, real(3), &pushed, &anc).unwrap();
     assert_eq!(m.network.mss, Some(1300), "the change of hq stays");
     assert_eq!(m.network.site(real(3)).unwrap().vlans, Some(vlans("10")));
+    assert_eq!(m.network.revision, 9, "above the client's: it takes it");
     // Made from the current view, or an unknown one: as it is.
     let current = Ancestry::default().child(&fp(&crate::view::view_for(&now, real(3))));
     assert!(rebase_view(&history, &now, real(3), &pushed, &current).is_none());

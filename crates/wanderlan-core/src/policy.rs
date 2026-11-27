@@ -375,7 +375,16 @@ fn check_site(old: &Network, new: &Network, site: &Site, editor: SiteId) -> Resu
             "change the address or the server of",
         ));
     }
-    if rules(new, now) != rules(old, site) && !may_change(old, site, editor) {
+    let (before, mut after) = (rules(old, site), rules(new, now));
+    // Made a server by its server: the option `changes` and the breakout
+    // of a client go with that.
+    if site.uplink.is_some() && now.uplink.is_none() && may_manage(old, site, editor) {
+        after.changes = before.changes;
+        if now.breakout.is_empty() {
+            after.breakout = before.breakout;
+        }
+    }
+    if after != before && !may_change(old, site, editor) {
         return Err(why_not(old, site, editor, "change"));
     }
     // Its own VLANs: the site itself, or whoever may change its tunnel.
@@ -447,7 +456,15 @@ fn check_changes(
         .map(|t| t.sites)
         .collect();
     for [a, b] in pairs {
-        if old.tunnel_limit(a, b) != new.tunnel_limit(a, b)
+        // A site removed takes its tunnels with it (whoever may remove it).
+        let removed = [a, b].into_iter().any(|id| {
+            new.site(id).is_none()
+                && old
+                    .site(id)
+                    .is_some_and(|s| editors.iter().any(|e| may_manage(old, s, *e)))
+        });
+        if !removed
+            && old.tunnel_limit(a, b) != new.tunnel_limit(a, b)
             && !editors.iter().any(|e| may_change_tunnel(old, a, b, *e))
         {
             return Err(why_not_tunnel(old, a, b, first));
@@ -604,6 +621,19 @@ mod tests {
         assert!(check_edit(&own, &gone, id("a")).is_ok());
         let err = check_edit(&own, &gone, id("b")).unwrap_err();
         assert!(err.contains("may not remove"), "{err}");
+        // Also with a limit on its tunnel (it goes with it).
+        let mut limited = own.clone();
+        limited.set_tunnel_limit(id("a"), id("c"), Some(VlanSet::from_range(10, 20)));
+        let mut gone = limited.clone();
+        gone.sites.retain(|s| s.name != "c");
+        gone.set_tunnel_limit(id("a"), id("c"), None);
+        assert!(check_edit(&limited, &gone, id("a")).is_ok());
+        // Made a server by its server: the option goes with it.
+        let mut promoted = own.clone();
+        promoted.sites[2].uplink = None;
+        promoted.sites[2].changes = Changes::default();
+        assert!(check_edit(&own, &promoted, id("a")).is_ok());
+        assert!(check_edit(&own, &promoted, id("c")).is_err());
         // A server: every server, no client.
         let mut new = old.clone();
         new.sites[1].vlans = Some(VlanSet::from_range(30, 30));

@@ -50,6 +50,10 @@ pub struct Invites {
     path: PathBuf,
     list: Vec<Invite>,
     reserved: Option<String>,
+    /// The reserved invitation, used up before the join is confirmed (the
+    /// server of this site has the new site already): back if it is rolled
+    /// back.
+    taken: Option<Invite>,
 }
 
 impl Invites {
@@ -63,6 +67,7 @@ impl Invites {
             path,
             list,
             reserved: None,
+            taken: None,
         }
     }
 
@@ -123,9 +128,32 @@ impl Invites {
         self.reserved = Some(normalize_code(code));
     }
 
+    /// The reserved invitation is used up already, before the join is
+    /// confirmed: the server of this site has the new site (a restart here
+    /// must not let another one in with it). Back with [`Self::release`].
+    pub fn take_reserved(&mut self) -> Result<()> {
+        let Some(code) = &self.reserved else {
+            return Ok(());
+        };
+        let Some(pos) = self
+            .list
+            .iter()
+            .position(|i| normalize_code(&i.code) == *code)
+        else {
+            return Ok(());
+        };
+        self.taken = Some(self.list.remove(pos));
+        self.save()
+    }
+
     /// The join was rolled back: the reserved invitation can be used again.
-    pub fn release(&mut self) {
+    pub fn release(&mut self) -> Result<()> {
         self.reserved = None;
+        if let Some(invite) = self.taken.take() {
+            self.list.push(invite);
+            self.save()?;
+        }
+        Ok(())
     }
 
     /// The join succeeded: the reserved invitation is used up.
@@ -133,6 +161,9 @@ impl Invites {
         let Some(code) = self.reserved.take() else {
             return Ok(None);
         };
+        if let Some(invite) = self.taken.take() {
+            return Ok(Some(invite.code));
+        }
         self.remove(&code)
     }
 
@@ -159,6 +190,7 @@ impl Invites {
     pub fn clear(&mut self) {
         self.list.clear();
         self.reserved = None;
+        self.taken = None;
     }
 
     fn save(&self) -> Result<()> {
@@ -209,12 +241,20 @@ mod tests {
             inv.find_free(&a.code, 3).is_none(),
             "reserved while joining"
         );
-        inv.release();
+        inv.release().unwrap();
         assert!(
             inv.find_free(&a.code, 3).is_some(),
             "usable again after rollback"
         );
+        // Used up before the confirmation (the server has the site), back
+        // with a rollback.
         inv.reserve(&a.code);
+        inv.take_reserved().unwrap();
+        assert_eq!(Invites::load(path.clone()).list().len(), 1);
+        inv.release().unwrap();
+        assert_eq!(Invites::load(path.clone()).list().len(), 2);
+        inv.reserve(&a.code);
+        inv.take_reserved().unwrap();
         assert_eq!(inv.consume_reserved().unwrap(), Some(a.code.clone()));
         assert!(inv.find_free(&a.code, 3).is_none());
         assert_eq!(Invites::load(path.clone()).list().len(), 1);
@@ -240,7 +280,7 @@ mod tests {
         // One a site is joining with stays until the join is over.
         inv.reserve(&hour.code);
         assert!(inv.expire(4000).unwrap().is_empty());
-        inv.release();
+        inv.release().unwrap();
         assert_eq!(inv.expire(4000).unwrap(), vec![hour.code.clone()]);
         assert_eq!(inv.expire(100 + INVITE_VALID_SECS).unwrap(), vec![day.code]);
         assert!(inv.find_free(&never.code, u64::MAX / 2).is_some());

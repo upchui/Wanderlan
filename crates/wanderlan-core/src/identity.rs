@@ -111,12 +111,18 @@ impl SiteId {
 
     /// The part of interface names that stands for this identity:
     /// [`IFNAME_PART_LEN`] characters of lowercase base32 (65 bits), which
-    /// never contain `-`.
+    /// never contain `-`. A provisional identity begins like every other
+    /// one: its part is taken from a hash of it.
     pub fn ifname_part(&self) -> String {
         const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
+        let bytes: [u8; KEY_LEN] = if self.is_provisional() {
+            <Sha256 as sha2::Digest>::digest(self.0).into()
+        } else {
+            self.0
+        };
         let mut out = String::with_capacity(IFNAME_PART_LEN);
         let (mut acc, mut bits) = (0u32, 0u32);
-        for &byte in &self.0 {
+        for &byte in &bytes {
             acc = (acc << 8) | u32::from(byte);
             bits += 8;
             while bits >= 5 && out.len() < IFNAME_PART_LEN {
@@ -504,6 +510,10 @@ mod tests {
         assert!(SiteId::provisional(&long).is_provisional());
         assert_eq!(SiteId::provisional(&long).provisional_name(), None);
         assert_eq!(SiteId::from_bytes([0; 32]).ifname_part(), "aaaaaaaaaaaaa");
+        assert_ne!(
+            SiteId::provisional("a").ifname_part(),
+            SiteId::provisional("b").ifname_part()
+        );
         let part = identity(1).id().ifname_part();
         assert_eq!(part.len(), IFNAME_PART_LEN);
         assert!(

@@ -32,6 +32,7 @@ pub fn vlan_ports(traffic: &VlanTraffic, vid: u16) -> Vec<&VlanPortTraffic> {
         a.peer
             .is_none()
             .cmp(&b.peer.is_none())
+            .then(a.peer.cmp(&b.peer))
             .then(a.port.cmp(&b.port))
     });
     list

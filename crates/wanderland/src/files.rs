@@ -390,6 +390,26 @@ impl Paths {
         Ok(true)
     }
 
+    /// Keeps edits of the files that were not applied (they differ from the
+    /// confirmed copy) as `<file>.edited`, before the daemon writes the
+    /// files again; returns the files kept.
+    pub fn keep_edits(&self) -> Result<Vec<PathBuf>> {
+        let dir = self.confirmed_dir();
+        let mut kept = Vec::new();
+        if !dir.join("network.toml").exists() {
+            return Ok(kept);
+        }
+        for name in ["network.toml", "local.toml"] {
+            let now = read_optional(&self.config_dir.join(name))?;
+            if now != read_optional(&dir.join(name))? {
+                let aside = self.config_dir.join(format!("{name}.edited"));
+                write_atomic(&aside, &now)?;
+                kept.push(aside);
+            }
+        }
+        Ok(kept)
+    }
+
     /// Marks that the files contain an unconfirmed change.
     pub fn set_marker(&self) -> Result<()> {
         std::fs::create_dir_all(&self.state_dir)

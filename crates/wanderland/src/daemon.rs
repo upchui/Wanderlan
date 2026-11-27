@@ -190,6 +190,9 @@ impl Rejected {
 }
 /// Shortest accepted confirmation timeout.
 const MIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a client that admits a new site waits for its server to take it
+/// (the joining site waits 30 s for the answer).
+const JOIN_UPLINK_TIMEOUT: Duration = Duration::from_secs(20);
 /// Name of the netlink connection among the background tasks.
 const NETLINK_TASK: &str = "netlink connection";
 
@@ -415,6 +418,10 @@ struct Controller {
     /// Since when the uplink has a newer network while this site sends it
     /// its change first (else the newer network replaces it).
     push_first_since: Option<Instant>,
+    /// What the uplink announced when it took over the push of this site,
+    /// and when: until it confirms the change it still announces that one,
+    /// which would undo the change here (for a while).
+    push_taken: Option<(String, Instant)>,
     /// The networks confirmed here last: the bases of a three-way merge.
     known: merge3::Known,
     /// What the confirmed network was made from.
@@ -689,6 +696,7 @@ impl Controller {
             relayed: BTreeMap::new(),
             own_change_up: false,
             push_first_since: None,
+            push_taken: None,
             known: merge3::Known::default(),
             ancestry: Ancestry::default(),
             own_change: None,
@@ -2252,8 +2260,11 @@ impl Controller {
                     .is_some_and(|at| at > since.into_std())
             })
         };
+        // A port another network of this box takes now is its own.
+        let others = self.host.ports_of_others(&self.network);
         let before = self.former_binds.len();
-        self.former_binds.retain(|(_, since)| !moved(*since));
+        self.former_binds
+            .retain(|(addr, since)| !moved(*since) && !others.contains(&addr.port()));
         drop(table);
         if self.former_binds.len() != before {
             debug!("Every peer uses the control port of this site now");
@@ -2500,7 +2511,12 @@ impl Controller {
                         && probe.reachable
                         && now.duration_since(since) < RESYNC_AFTER;
                     if !first || self.pushed.as_deref() == Some(ours.fingerprint.as_str()) {
-                        if !self.pushing {
+                        // Taken over there a moment ago: what it announces
+                        // is from before (it confirms the change soon).
+                        let taken = self.push_taken.as_ref().is_some_and(|(fp, at)| {
+                            *fp == theirs.fingerprint && now.duration_since(*at) < RESYNC_AFTER
+                        });
+                        if !self.pushing && !taken {
                             upstream.push((*name, theirs));
                         }
                     } else {
@@ -2734,6 +2750,26 @@ impl Controller {
         })
     }
 
+    /// Edits of the files not applied yet are kept aside before the daemon
+    /// writes them again (not those of a change from the files waiting for
+    /// confirmation: they are what is written).
+    fn keep_edits(&mut self) {
+        if self.paths.marker_exists() {
+            return;
+        }
+        match self.paths.keep_edits() {
+            Ok(kept) if kept.is_empty() => {}
+            Ok(kept) => {
+                let kept: Vec<String> = kept.iter().map(|p| p.display().to_string()).collect();
+                self.events.warn(format!(
+                    "The configuration files were edited, but the edit was not applied; a confirmed change replaces them, the edit is kept in {} (to apply it, merge it into the files and run `wanderlan apply`)",
+                    kept.join(", ")
+                ));
+            }
+            Err(e) => self.events.error(format!("{e:#}")),
+        }
+    }
+
     /// Takes over a newer revision number with the same content, without a
     /// fetch, an apply or a countdown.
     fn adopt_revision(&mut self, peer: SiteId, revision: u64) {
@@ -2741,6 +2777,7 @@ impl Controller {
             return;
         };
         cfg.network.revision = revision;
+        self.keep_edits();
         if let Err(e) = self.paths.write_confirmed(&cfg) {
             let message = format!("cannot write the configuration files: {e:#}");
             if self.last_repeated.as_deref() != Some(message.as_str()) {
@@ -2774,6 +2811,12 @@ impl Controller {
                 return;
             }
         };
+        // A change was applied here meanwhile: fetched again once it is
+        // confirmed or rolled back (taking it over now would only fail, after
+        // telling that it replaces that change).
+        if self.pending.is_some() {
+            return;
+        }
         self.take_over(peer, mode, text).await;
     }
 
@@ -2855,10 +2898,16 @@ impl Controller {
     /// The uplink answered the push of this site's network.
     fn push_answered(&mut self, peer: SiteId, result: Result<sync_net::PushAnswer, String>) {
         self.pushing = false;
+        let id = peer;
         let peer = self.peer_label(peer);
         match result {
             Ok(sync_net::PushAnswer::Ok) => {
                 debug!("\"{peer}\" took over the change of this site");
+                let announced = self.probes.read().ok().and_then(|t| {
+                    let a = t.get(&id)?.announce?;
+                    Some(fingerprint_hex(&a.fingerprint))
+                });
+                self.push_taken = announced.map(|fp| (fp, Instant::now()));
             }
             // Pushed again soon.
             // Pushed again in a moment (not every second while it is busy).
@@ -3263,6 +3312,16 @@ impl Controller {
             Request::ApplyFiles(params) => {
                 let (network, local) = self.paths.read().map_err(api_err)?;
                 let cfg = self.candidate(&ConfigInput { network, local })?;
+                // An older file (an editor saved what it had open before a
+                // change arrived, a backup) would undo the changes since.
+                if let Some(c) = &self.confirmed
+                    && cfg.network.revision < c.network.revision
+                {
+                    return Err(ApiError::new(format!(
+                        "network.toml has revision {}, the network is at revision {} now (it changed since the file was read, e.g. by another site); edit the current file, or set `revision = {}` in it to apply it anyway",
+                        cfg.network.revision, c.network.revision, c.network.revision
+                    )));
+                }
                 let timeout = params.timeout_secs.map(Duration::from_secs);
                 let applied = self
                     .apply(cfg, ChangeSource::Local, None, timeout, None, true)
@@ -3656,9 +3715,20 @@ impl Controller {
             self.ancestry.child(&config::fingerprint(&c.network))
         });
         let text = with_base(render_network_wire(&cfg.network), &ancestry);
-        match sync_net::push_sync(target, me, k.id, &k.keys, &text).await {
+        // Answered well within the time the joining site waits (and this
+        // network waits meanwhile).
+        let push = sync_net::push_sync(target, me, k.id, &k.keys, &text);
+        let answer = tokio::time::timeout(JOIN_UPLINK_TIMEOUT, push)
+            .await
+            .unwrap_or_else(|_| Err(anyhow::anyhow!("it did not answer in time")));
+        match answer {
             Ok(sync_net::PushAnswer::Ok) => {
                 self.pushed = Some(config::fingerprint(&cfg.network));
+                // The server has the new site: its code is used up from now
+                // on, also if this site restarts before it confirms.
+                if let Err(e) = self.invites.take_reserved() {
+                    self.events.error(format!("{e:#}"));
+                }
                 Ok(())
             }
             Ok(sync_net::PushAnswer::Busy) => Err(JoinReply::Busy),
@@ -4168,6 +4238,11 @@ impl Controller {
             .clamp(MIN_TIMEOUT, config::COMMIT_TIMEOUT_RANGE.1);
         let fingerprint = config::fingerprint(&cfg.network);
         let previous = self.config.clone();
+        // Before it is applied: a restart while it is (even one it causes)
+        // starts from the confirmed copy, not from the edit.
+        if from_files && let Err(e) = self.paths.set_marker() {
+            warn!("{e:#}");
+        }
         self.set_config(Some(cfg));
         let changes = match self.reconcile_once().await {
             Ok(c) => c,
@@ -4182,9 +4257,6 @@ impl Controller {
                 )));
             }
         };
-        if from_files && let Err(e) = self.paths.set_marker() {
-            warn!("{e:#}");
-        }
         let (who, label) = match &source {
             ChangeSource::Local => ("A local change".to_string(), None),
             ChangeSource::Sync { peer } => (
@@ -4321,6 +4393,7 @@ impl Controller {
                 Err(e) => self.events.error(format!("{e:#}")),
             }
         }
+        self.keep_edits();
         if let Err(e) = self.paths.write_confirmed(&cfg) {
             // /etc does not run ahead of what is in effect (written in part).
             if let Some(previous) = &self.confirmed
@@ -4399,7 +4472,9 @@ impl Controller {
                 Some(peer.clone())
             }
             ChangeSource::Join { site } => {
-                self.invites.release();
+                if let Err(e) = self.invites.release() {
+                    self.events.error(format!("{e:#}"));
+                }
                 // The uplink took the new site already (it was asked before
                 // the site was answered): it learns that the site goes again,
                 // else it gives it back with its next network.
@@ -4519,7 +4594,14 @@ impl Controller {
         }
         self.conflicts = applied.conflicts;
         self.bridges = applied.bridges;
-        self.has_ports = applied.ports;
+        // Its ports lost to another network of the box, or back: the
+        // sockets follow (closed, or opened again) now, as do the ports the
+        // tests keep off.
+        let others = self.host.ports_of_others(&self.network);
+        if self.has_ports != applied.ports || self.probe_config.borrow().other_ports != others {
+            self.has_ports = applied.ports;
+            self.publish();
+        }
         // A tunnel was built or now sends elsewhere: a keepalive through
         // NAT at once, so that the uplink learns where this site is now
         // (instead of with the next one, up to 15 s later).
@@ -4651,6 +4733,12 @@ impl Controller {
         topology::tunnel_tag(name) == Some(self.tag)
             || (self.tag == topology::DEFAULT_TAG
                 && name.starts_with(topology::LEGACY_TUNNEL_PREFIX))
+    }
+
+    /// True for a tunnel interface of another network of the box (in a
+    /// bridge both share: not a port of this network).
+    fn is_foreign_tunnel(&self, name: &str) -> bool {
+        topology::is_tunnel_name(name) && !self.is_own_tunnel(name)
     }
 
     /// Tells the loop guard which interfaces are bridges and tunnel ports.
@@ -4837,6 +4925,7 @@ impl Controller {
             .filter(|l| {
                 l.master
                     .is_some_and(|m| bridges.iter().any(|(i, _)| *i == m))
+                    && !self.is_foreign_tunnel(&l.name)
             })
             .map(|l| l.name.as_str())
             .collect();
@@ -4972,18 +5061,16 @@ impl Controller {
         let mut out: Vec<MacEntry> = fdb
             .into_iter()
             .filter(|e| !e.permanent && e.bridge.is_some_and(|b| bridges.contains(&b)))
-            .map(|e| {
-                let port = name_of(e.port);
-                MacEntry {
-                    peer: self.config.as_ref().and_then(|c| {
-                        topology::peer_of(&c.network, self.tag, &port)
-                            .map(|s| c.network.label(s.id))
-                    }),
-                    mac: format_mac(&e.mac),
-                    vlan: e.vlan,
-                    port,
-                    age_secs: e.updated_secs,
-                }
+            .map(|e| (name_of(e.port), e))
+            .filter(|(port, _)| !self.is_foreign_tunnel(port))
+            .map(|(port, e)| MacEntry {
+                peer: self.config.as_ref().and_then(|c| {
+                    topology::peer_of(&c.network, self.tag, &port).map(|s| c.network.label(s.id))
+                }),
+                mac: format_mac(&e.mac),
+                vlan: e.vlan,
+                port,
+                age_secs: e.updated_secs,
             })
             .collect();
         out.sort_by(|a, b| a.port.cmp(&b.port).then(a.mac.cmp(&b.mac)));

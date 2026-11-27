@@ -1409,8 +1409,19 @@ pub fn parse_local(text: &str, network: Option<&Network>) -> Result<ParsedLocal,
         };
         // The validation names the entry by the identity.
         let path = FieldPath::local(&format!("tunnels.{id}.trunk"));
-        if let Some(t) = lw.take(&path, tunnel.trunk) {
-            tunnel_trunks.insert(id, t.into_vec());
+        if let Some(t) = lw.take(&path, tunnel.trunk)
+            && tunnel_trunks.insert(id, t.into_vec()).is_some()
+        {
+            let name = sites
+                .iter()
+                .find(|s| s.id == id)
+                .map_or_else(|| id.to_string(), |s| s.name.clone());
+            lw.error(
+                path,
+                format!(
+                    "the tunnel to \"{name}\" is listed twice (by its name and by its identity)"
+                ),
+            );
         }
     }
     let path = FieldPath::local("commit_timeout");

@@ -3205,18 +3205,18 @@ impl App {
                 self.clamp_selection();
             }
             AskAction::DeleteMap(map) => {
-                let index = self
-                    .draft
-                    .as_ref()
-                    .and_then(|d| d.network.maps.iter().position(|m| *m == map));
-                if let Some(index) = index
+                let found = self.draft.as_ref().and_then(|d| {
+                    let index = d.network.maps.iter().position(|m| *m == map)?;
+                    Some((index, d.network.label(map.site)))
+                });
+                if let Some((index, name)) = found
                     && self.draft.as_mut().is_some_and(|d| d.remove_map(index))
                 {
                     self.say(
                         MessageKind::Info,
                         format!(
-                            "The mapping of {} (source VLAN {} = mapped VLAN {}) is removed from the draft.",
-                            map.site, map.shared, map.local
+                            "The mapping of {name} (source VLAN {} = mapped VLAN {}) is removed from the draft.",
+                            map.shared, map.local
                         ),
                     );
                 }
@@ -3228,10 +3228,11 @@ impl App {
                     && entry.breakout.remove(&vid).is_some()
                 {
                     draft.revalidate();
+                    let name = draft.network.label(site);
                     self.say(
                         MessageKind::Info,
                         format!(
-                            "{site}: VLAN {vid} goes through the tunnel again (in the draft; a applies)."
+                            "{name}: VLAN {vid} goes through the tunnel again (in the draft; a applies)."
                         ),
                     );
                 }
@@ -3263,13 +3264,16 @@ impl App {
                 self.say(MessageKind::Info, "Setup left. Press 6 to return to it.");
             }
             wizard::Action::LoadInterfaces => {
-                self.wizard.transport = match self.wizard.mode {
+                // The way to the inviting site (join; a new network's address
+                // comes after the trunk) and the default route.
+                let via = match self.wizard.mode {
                     Mode::Join => self
                         .wizard
                         .target_address()
                         .and_then(hostinfo::route_interface),
-                    Mode::New => hostinfo::default_interface(),
+                    Mode::New => None,
                 };
+                self.wizard.transport = hostinfo::transport_interfaces(via);
                 self.request_interfaces(fx);
             }
             wizard::Action::Review => self.open_wizard_review(),
@@ -3489,6 +3493,13 @@ impl App {
                     .get(self.overview_selected.saturating_sub(peers))
                     .map(|s| s.name.clone())
                 {
+                    // The overview names it as it runs; the window looks it
+                    // up in the draft (renamed there, say).
+                    let name = self
+                        .draft_site(&name)
+                        .zip(self.draft.as_ref())
+                        .and_then(|(id, d)| d.network.site(id).map(|_| d.network.label(id)))
+                        .unwrap_or(name);
                     self.modal = Some(Modal::Site { name, scroll: 0 });
                 }
             }
@@ -3536,7 +3547,8 @@ impl App {
             KeyCode::Char('e') => {
                 let index = index_of(self, site);
                 match (index, site) {
-                    (Some(i), Some(id)) if self.may_change(id) => {
+                    // As `e` in Sites: where it is, or its tunnel.
+                    (Some(i), Some(id)) if self.may_edit(id) => {
                         self.sites_selected = i;
                         let draft = self.draft.as_ref()?;
                         Some(Modal::Form(Form::site(draft, Some(i))))
@@ -3890,7 +3902,15 @@ impl App {
                 }
             }
             KeyCode::Enter | KeyCode::Char('e') if selected < count => {
-                self.modal = Some(Modal::Form(Form::map(draft, Some(selected), None)));
+                let mut form = Form::map(draft, Some(selected), None);
+                // Moved only to a site this site may change (as with `n`).
+                let draft = draft.clone();
+                form.limit_sites(
+                    "site",
+                    |s| Some(s) == selected_map_site || self.may_change_quietly(s),
+                    &draft,
+                );
+                self.modal = Some(Modal::Form(form));
             }
             KeyCode::Char('d') | KeyCode::Delete if selected < count => {
                 if let Some(map) = draft.network.maps.get(selected) {
@@ -3994,8 +4014,22 @@ impl App {
                 }
             }
             KeyCode::Enter | KeyCode::Char('e') => {
-                if let (Some(draft), Some(selected)) = (&self.draft, selected) {
-                    self.modal = Some(Modal::Form(Form::breakout(draft, Some(selected), None)));
+                if let (Some(draft), Some(selected)) = (self.draft.clone(), selected) {
+                    let mut form = Form::breakout(&draft, Some(selected), None);
+                    // Moved only to a client this site may change (as with
+                    // `n`).
+                    let client = |s: SiteId| {
+                        draft
+                            .network
+                            .site(s)
+                            .is_some_and(|s| !wanderlan_core::topology::is_server(s))
+                    };
+                    form.limit_sites(
+                        "site",
+                        |s| s == selected.0 || (client(s) && self.may_change_quietly(s)),
+                        &draft,
+                    );
+                    self.modal = Some(Modal::Form(form));
                 }
             }
             KeyCode::Char('d') | KeyCode::Delete => {

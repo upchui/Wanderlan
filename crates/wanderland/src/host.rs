@@ -16,7 +16,7 @@ use std::time::Duration;
 use tokio::sync::{Mutex, watch};
 use wanderlan_core::desired::Desired;
 use wanderlan_core::merge::{self, Merged};
-use wanderlan_core::reconcile::{self, Change, ReconcileError};
+use wanderlan_core::reconcile::{self, Change, PlanError, ReconcileError};
 use wanderlan_core::sys::SysError;
 use wanderlan_core::sys::linux::LinuxSystem;
 
@@ -252,8 +252,9 @@ impl Host {
     /// Reconciles the box to `wants`. A plan that cannot be reached because
     /// of a later network (its trunk port is in a bridge of someone else,
     /// say) is tried again without the later networks, one after the
-    /// other: one network does not stop the others. `network` gets the
-    /// error only if it is one that was left out.
+    /// other; if the first one alone cannot be reached, the others are
+    /// tried without it: one network does not stop the others. `network`
+    /// gets the error only if it is one that was left out.
     async fn apply(
         &self,
         wants: &BTreeMap<String, Option<Arc<Desired>>>,
@@ -262,12 +263,19 @@ impl Host {
         on_change: impl Fn(&Change) + Send + Sync,
     ) -> Result<Applied, ReconcileError> {
         let order = self.order();
+        let all = wants.clone();
         let mut wants = wants.clone();
         let mut left_out: Vec<String> = Vec::new();
+        let mut first_out = false;
+        // Why `network` was left out (the rest is applied all the same).
+        let mut own_error: Option<PlanError> = None;
         loop {
             // No network is configured: nothing is changed (as by a daemon
             // without configuration).
             let Some(merged) = self.merged(&wants, None) else {
+                if let Some(e) = own_error {
+                    return Err(ReconcileError::Plan(e));
+                }
                 return Ok(Applied {
                     waiting: false,
                     ..Applied::waiting()
@@ -293,6 +301,9 @@ impl Host {
             match result {
                 Ok(changes) => {
                     self.applied.send_modify(|g| *g += 1);
+                    if let Some(e) = own_error {
+                        return Err(ReconcileError::Plan(e));
+                    }
                     let left = left_out.iter().any(|n| n == network);
                     return Ok(Applied {
                         changes,
@@ -312,46 +323,29 @@ impl Host {
                     let later = later.unwrap_or_default();
                     tracing::warn!("Network \"{later}\" is left out on this box for now: {e}");
                     if later == network {
-                        // Applied without it, then its error.
-                        wants.insert(later.clone(), None);
-                        left_out.push(later);
-                        let without = Box::pin(self.apply_quiet(&wants, &on_change)).await;
-                        if let Err(again) = without {
-                            tracing::warn!("{again}");
-                        }
-                        return Err(ReconcileError::Plan(e));
+                        // The others are applied without it, then its error.
+                        own_error = Some(e);
                     }
                     wants.insert(later.clone(), None);
                     left_out.push(later);
                 }
+                // The first network alone cannot be reached: the others
+                // (back again) without it.
+                Err(ReconcileError::Plan(e)) if !first_out && !left_out.is_empty() => {
+                    let first = order.first().cloned().unwrap_or_default();
+                    tracing::warn!("Network \"{first}\" is left out on this box for now: {e}");
+                    first_out = true;
+                    wants = all.clone();
+                    wants.insert(first.clone(), None);
+                    left_out = vec![first.clone()];
+                    own_error = (first == network).then_some(e);
+                }
+                Err(ReconcileError::Plan(e)) => {
+                    return Err(ReconcileError::Plan(own_error.unwrap_or(e)));
+                }
                 Err(e) => return Err(e),
             }
         }
-    }
-
-    /// Reconciles the box to `wants`, as far as it goes (for the networks
-    /// that are not left out).
-    async fn apply_quiet(
-        &self,
-        wants: &BTreeMap<String, Option<Arc<Desired>>>,
-        on_change: impl Fn(&Change) + Send + Sync,
-    ) -> Result<(), ReconcileError> {
-        let Some(merged) = self.merged(wants, None) else {
-            return Ok(());
-        };
-        tokio::time::timeout(
-            RECONCILE_TIMEOUT,
-            reconcile::reconcile(&self.sys, &merged.desired, on_change),
-        )
-        .await
-        .map_err(|_| {
-            ReconcileError::Sys(SysError::new(
-                "apply the configuration",
-                format!("no answer within {} s", RECONCILE_TIMEOUT.as_secs()),
-            ))
-        })??;
-        self.applied.send_modify(|g| *g += 1);
-        Ok(())
     }
 
     /// The networks of the box, in their order.

@@ -325,6 +325,15 @@ impl Validator {
             .iter()
             .chain(network.own_vlans(site).iter())
             .collect();
+        // A VLAN number a mapping takes at the trunk (source S carried as
+        // L there) is not on the trunk as VLAN L, unless L is mapped too.
+        let (mut locals, mut sources) = (BTreeSet::new(), BTreeSet::new());
+        for m in network.maps_of(site.id) {
+            if let LocalVid::Vid(local) = m.local {
+                locals.insert(local);
+                sources.insert(m.shared);
+            }
+        }
         for (vid, b) in &site.breakout {
             let path = FieldPath::site_field(i, &format!("breakout.{vid}"));
             if !vlans.contains(*vid) {
@@ -332,6 +341,13 @@ impl Validator {
                     path.clone(),
                     format!(
                         "site \"{name}\": breakout: VLAN {vid} is not one of the VLANs of the site ({vlans})"
+                    ),
+                );
+            } else if locals.contains(vid) && !sources.contains(vid) {
+                self.warning(
+                    path.clone(),
+                    format!(
+                        "site \"{name}\": breakout {vid} does nothing: at this site VLAN {vid} carries a mapped source VLAN, so VLAN {vid} of the network is not on its trunk"
                     ),
                 );
             }

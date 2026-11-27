@@ -1063,9 +1063,26 @@ pub fn plan_teardown(actual: &Actual) -> Vec<Change> {
     let (tunnels, bridges): (Vec<Change>, Vec<Change>) = links
         .into_iter()
         .partition(|c| matches!(c, Change::DeleteLink { name, .. } if is_tunnel_name(name)));
+    // A trunk port the loop guard shut comes up again, as when it leaves
+    // the bridge in a reconcile: after wanderlan nothing would.
+    let detach = actual
+        .links
+        .values()
+        .filter(|l| {
+            !is_owned(l)
+                && !l.admin_up
+                && l.master
+                    .and_then(|m| actual.by_index(m))
+                    .is_some_and(is_owned)
+        })
+        .map(|l| Change::Detach {
+            name: l.name.clone(),
+        });
     // No frame goes to a router any more before anything else.
     let mut out = Vec::new();
-    if !actual.breakout.is_empty() {
+    // Not read: removed all the same (what can be removed without it is,
+    // the sysctls of the uplinks above all).
+    if !actual.breakout.is_empty() || actual.breakout_error.is_some() {
         out.push(Change::DeleteBreakout);
     }
     out.extend(tunnels);
@@ -1076,6 +1093,7 @@ pub fn plan_teardown(actual: &Actual) -> Vec<Change> {
         out.push(Change::DeleteLearn);
     }
     out.extend(tc);
+    out.extend(detach);
     out.extend(bridges);
     out
 }
@@ -1274,8 +1292,15 @@ pub async fn reconcile<N: System>(
         }
         changes.sort_by_key(going);
         if changes.is_empty() {
+            // Not read: a problem while there is a breakout, wanted or one
+            // that waits to be removed (its pairs stay until it is read).
+            let has_breakout = !desired.breakout.is_empty()
+                || actual
+                    .links
+                    .values()
+                    .any(|l| is_owned(l) && is_breakout_name(&l.name));
             let breakout_error = breakout_failed.or_else(|| {
-                (!desired.breakout.is_empty())
+                has_breakout
                     .then_some(())
                     .and(actual.breakout_error.clone())
                     .map(|e| SysError::new("read the local breakout", e))
@@ -1453,6 +1478,11 @@ async fn observe_for_teardown<N: System>(net: &N) -> Result<(Actual, Vec<String>
         Ok(nft) => (nft, None),
         Err(e) => (None, Some(e.to_string())),
     };
+    // Not read: table bridge wanderlan may stay (its split horizon, its
+    // MSS rules), so the teardown is not done.
+    if let Some(e) = &nft_error {
+        problems.push(e.clone());
+    }
     let (learn, nat_error) = match net.learn_state().await {
         Ok(learn) => (learn, None),
         Err(e) => (None, Some(e.to_string())),

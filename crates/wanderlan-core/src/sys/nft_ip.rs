@@ -229,6 +229,15 @@ pub fn learn_script(table: &LearnTable, stale_sets: &BTreeSet<String>) -> String
             rule.set()
         );
     }
+    // The source port of the tunnels through NAT (see the module doc):
+    // before the notrack rules, which then see the tunnel port.
+    for FixedRule { port, vni } in &table.fixed {
+        let upper = port.saturating_add(1);
+        let _ = writeln!(
+            out,
+            "add rule {t} {OUT_CHAIN} udp sport {upper} @th,{OFFSET_FLAGS},8 {VXLAN_FLAGS:#04x} @th,{OFFSET_VNI},24 {vni} udp sport set {port} comment \"{FIXED_PREFIX}{port} {vni}\""
+        );
+    }
     for port in table.notrack.iter().filter(|p| **p != 0) {
         let _ = writeln!(
             out,
@@ -237,14 +246,6 @@ pub fn learn_script(table: &LearnTable, stale_sets: &BTreeSet<String>) -> String
         let _ = writeln!(
             out,
             "add rule {t} {OUT_CHAIN} udp sport {port} notrack comment \"{NOTRACK} {port}\""
-        );
-    }
-    // The source port of the tunnels through NAT (see the module doc).
-    for FixedRule { port, vni } in &table.fixed {
-        let upper = port.saturating_add(1);
-        let _ = writeln!(
-            out,
-            "add rule {t} {OUT_CHAIN} udp sport {upper} @th,{OFFSET_FLAGS},8 {VXLAN_FLAGS:#04x} @th,{OFFSET_VNI},24 {vni} udp sport set {port} comment \"{FIXED_PREFIX}{port} {vni}\""
         );
     }
     // The gates: tunnel packets to a port whose inner frame is a keepalive.

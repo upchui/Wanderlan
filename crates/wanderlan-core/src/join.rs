@@ -206,6 +206,12 @@ fn rejoin(network: &Network, inviter: SiteId, site: SiteId) -> Option<Network> {
     let mut new = network.clone();
     new.revision = next_revision(network.revision);
     new.site_mut(site)?.uplink = Some(inviter);
+    // A client passes the move on to its server, which refuses taking a
+    // site away from under another client: it stays where it is then.
+    if network.site(inviter)?.uplink.is_some() && crate::topology::stranded(network, &new).is_some()
+    {
+        return None;
+    }
     Some(new)
 }
 

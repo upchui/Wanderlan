@@ -40,6 +40,14 @@ fn chosen_network() -> Option<String> {
         .filter(|n| n != api::DEFAULT_NETWORK)
 }
 
+/// A command for the user to run next, in quotes: with `--net` when another
+/// network than the default one was chosen.
+fn wl(rest: &str) -> String {
+    let net = chosen_network().map_or_else(String::new, |n| format!(" --net {n}"));
+    let sep = if rest.is_empty() { "" } else { " " };
+    format!("`wanderlan{net}{sep}{rest}`")
+}
+
 /// Command line of `wanderlan`. Without a subcommand the interactive
 /// terminal UI starts.
 #[derive(Debug, Parser)]
@@ -334,11 +342,12 @@ pub enum Command {
         #[arg(long)]
         name: Option<String>,
         /// Its IPv4 address in the transport network (default: that of a
-        /// VPN interface, else that of the default route).
+        /// VPN interface, else another one, the one of the default route
+        /// last).
         #[arg(long)]
         address: Option<Ipv4Addr>,
         /// Interface carrying the VLANs (default: the only interface that
-        /// does not carry the transport network).
+        /// carries neither the transport network nor the default route).
         #[arg(long)]
         trunk: Option<String>,
         /// VLANs of the network, e.g. native,10-50 (default: all of them and
@@ -362,7 +371,7 @@ pub enum Command {
         #[arg(long)]
         name: Option<String>,
         /// Interface carrying the VLANs (default: the only interface that
-        /// does not lead to the inviting site).
+        /// leads neither to the inviting site nor to the default route).
         #[arg(long)]
         trunk: Option<String>,
     },
@@ -644,7 +653,7 @@ pub async fn run(args: Args) -> Result<ExitCode> {
         Some(Command::Probe) => {
             let client = connect(&socket).await?;
             let _: Done = client.call(Request::ProbeNow).await?;
-            println!("Measuring the path MTU to all peers; see `wanderlan status`.");
+            println!("Measuring the path MTU to all peers; see {}.", wl("status"));
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Invite { action, rules }) => invite(&socket, action, rules).await,
@@ -762,8 +771,14 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             except,
             confirm,
         }) => {
-            let (Some(site), Some(vlans), Some(state)) = (site, vlans, state) else {
+            if site.is_none() && uplink.is_none() && except.is_none() && !confirm {
                 return show_breakout(&socket).await;
+            }
+            // Half a command does not fall back to showing them.
+            let (Some(site), Some(vlans), Some(state)) = (site, vlans, state) else {
+                bail!(
+                    "give the site, the VLANs and on or off, e.g. `wanderlan breakout office 10,20 on`"
+                );
             };
             let vlans: config::VlanSet = vlans.parse().map_err(|e| anyhow!("{vlans}: {e}"))?;
             let except = except.map(|text| parse_except(&text)).transpose()?;
@@ -850,8 +865,9 @@ pub async fn run(args: Args) -> Result<ExitCode> {
                 let who = format!("{who} its tunnel (VLANs, mappings, breakouts, online state)");
                 if wanted.is_none() {
                     return Ok(Edit::Nothing(format!(
-                        "{}: {who}. Change it with `wanderlan manage {} server|client|both`.",
-                        entry.name, entry.name
+                        "{}: {who}. Change it with {}.",
+                        entry.name,
+                        wl(&format!("manage {} server|client|both", entry.name))
                     )));
                 }
                 if entry.changes == changes {
@@ -983,11 +999,14 @@ async fn invite(socket: &Path, action: Option<InviteAction>, rules: RuleArgs) ->
             println!("    {}\n", inv.command);
             println!("Rules for the new site: {}.", inv.rules.summary());
             let name = inv.rules.name.as_deref().unwrap_or("<site>");
-            println!("It starts offline; take it online with `wanderlan online {name} --confirm`.");
             println!(
-                "The code works once and is {} (`wanderlan invite delete {}`).",
+                "It starts offline; take it online with {}.",
+                wl(&format!("online {name} --confirm"))
+            );
+            println!(
+                "The code works once and is {} ({}).",
                 validity(&inv),
-                inv.code
+                wl(&format!("invite delete {}", inv.code))
             );
         }
         Some(InviteAction::List) => {
@@ -1037,9 +1056,13 @@ async fn join_network(
         Some(t) => t,
         None => {
             let interfaces: Vec<Interface> = client.call(Request::Interfaces).await?;
-            let transport = hostinfo::route_interface(address);
-            hostinfo::choose_trunk(&interfaces, transport.as_deref()).map_err(|candidates| {
-                let via = transport.map_or_else(String::new, |t| format!(" ({t} leads to {address})"));
+            let transport = hostinfo::transport_interfaces(hostinfo::route_interface(address));
+            hostinfo::choose_trunk(&interfaces, &transport).map_err(|candidates| {
+                let via = if transport.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (not {}: the way to {address})", transport.join(" or "))
+                };
                 if candidates.is_empty() {
                     anyhow!("no interface is left for the trunk{via}; give it with --trunk <interface>")
                 } else {
@@ -1064,7 +1087,10 @@ async fn join_network(
         .map_err(|e| {
             let text = e.to_string();
             if text.contains("choose another name") {
-                anyhow!("{text} (`wanderlan join {target} {code} --name <name>`)")
+                anyhow!(
+                    "{text} ({})",
+                    wl(&format!("join {target} {code} --name <name>"))
+                )
             } else {
                 anyhow!(e)
             }
@@ -1109,8 +1135,10 @@ async fn join_network(
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             println!(
-                "Done: \"{}\" is part of the network (network revision {}). See `wanderlan status`.",
-                joined.site, st.revision
+                "Done: \"{}\" is part of the network (network revision {}). See {}.",
+                joined.site,
+                st.revision,
+                wl("status")
             );
             if !in_sync {
                 println!(
@@ -1130,7 +1158,11 @@ async fn join_network(
             return Ok(ExitCode::SUCCESS);
         }
     }
-    bail!("no confirmation in time; see `wanderlan status` and `wanderlan log`")
+    bail!(
+        "no confirmation in time; see {} and {}",
+        wl("status"),
+        wl("log")
+    )
 }
 
 /// Waits until no automatic change (a site joining, a synchronised change)
@@ -1145,8 +1177,10 @@ async fn settle(client: &Client) -> Result<()> {
         };
         match pending.source {
             ChangeSource::Local => bail!(
-                "a change is waiting for confirmation ({} s left): run `wanderlan confirm` or `wanderlan rollback` first",
-                pending.remaining_secs
+                "a change is waiting for confirmation ({} s left): run {} or {} first",
+                pending.remaining_secs,
+                wl("confirm"),
+                wl("rollback")
             ),
             ChangeSource::Join { site } if !announced => {
                 println!("Waiting until the joining site \"{site}\" is confirmed ...");
@@ -1160,7 +1194,10 @@ async fn settle(client: &Client) -> Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    bail!("the pending change was not confirmed within two minutes; see `wanderlan status`")
+    bail!(
+        "the pending change was not confirmed within two minutes; see {}",
+        wl("status")
+    )
 }
 
 async fn set_online(socket: &Path, site: &str, online: bool, confirm: bool) -> Result<ExitCode> {
@@ -1414,12 +1451,14 @@ async fn set_trunk(socket: &Path, site: &str, interface: &str, confirm: bool) ->
     } else if confirm {
         // Confirming now would keep a change that cuts this site off.
         println!(
-            "{done} now, not confirmed: the tunnels run over it. Check that they stay up, then run `wanderlan confirm` within {} seconds, otherwise it is rolled back.",
+            "{done} now, not confirmed: the tunnels run over it. Check that they stay up, then run {} within {} seconds, otherwise it is rolled back.",
+            wl("confirm"),
             applied.confirm_within_secs
         );
     } else {
         println!(
-            "{done} now. Run `wanderlan confirm` within {} seconds to keep it, otherwise it is rolled back.",
+            "{done} now. Run {} within {} seconds to keep it, otherwise it is rolled back.",
+            wl("confirm"),
             applied.confirm_within_secs
         );
     }
@@ -1498,7 +1537,8 @@ async fn set_tunnel_vlans(
         println!("{done} (network revision {}).", c.revision);
     } else {
         println!(
-            "{done} now. Run `wanderlan confirm` within {} seconds to keep it, otherwise it is rolled back.",
+            "{done} now. Run {} within {} seconds to keep it, otherwise it is rolled back.",
+            wl("confirm"),
             applied.confirm_within_secs
         );
     }
@@ -1647,38 +1687,41 @@ async fn site_command(socket: &Path, action: SiteAction) -> Result<ExitCode> {
             })
             .await
         }
-        SiteAction::Remove { name, confirm } => edit_network(socket, confirm, |network, known| {
-            let id = known.find(&name)?;
-            if id == known.me {
-                bail!(
-                    "\"{name}\" is this site: `wanderlan reset` removes wanderlan from this host"
-                );
-            }
-            let clients: Vec<String> = network
-                .sites
-                .iter()
-                .filter(|s| s.uplink == Some(id))
-                .map(|s| known.label(s.id))
-                .collect();
-            if !clients.is_empty() {
-                bail!(
-                    "\"{name}\" still has clients ({}): remove them first",
-                    clients.join(", ")
-                );
-            }
-            network.sites.retain(|s| s.id != id);
-            let maps = network.maps.len();
-            network.maps.retain(|m| m.site != id);
-            let maps = maps - network.maps.len();
-            network.tunnels.retain(|t| !t.touches(id));
-            let extra = if maps > 0 {
-                format!(" with its {maps} VLAN mapping(s)")
-            } else {
-                String::new()
-            };
-            Ok(Edit::Done(format!("Site \"{name}\" is removed{extra}")))
-        })
-        .await,
+        SiteAction::Remove { name, confirm } => {
+            edit_network(socket, confirm, |network, known| {
+                let id = known.find(&name)?;
+                if id == known.me {
+                    bail!(
+                        "\"{name}\" is this site: {} removes wanderlan from this host",
+                        wl("reset")
+                    );
+                }
+                let clients: Vec<String> = network
+                    .sites
+                    .iter()
+                    .filter(|s| s.uplink == Some(id))
+                    .map(|s| known.label(s.id))
+                    .collect();
+                if !clients.is_empty() {
+                    bail!(
+                        "\"{name}\" still has clients ({}): remove them first",
+                        clients.join(", ")
+                    );
+                }
+                network.sites.retain(|s| s.id != id);
+                let maps = network.maps.len();
+                network.maps.retain(|m| m.site != id);
+                let maps = maps - network.maps.len();
+                network.tunnels.retain(|t| !t.touches(id));
+                let extra = if maps > 0 {
+                    format!(" with its {maps} VLAN mapping(s)")
+                } else {
+                    String::new()
+                };
+                Ok(Edit::Done(format!("Site \"{name}\" is removed{extra}")))
+            })
+            .await
+        }
         SiteAction::Vlans {
             name,
             vlans,
@@ -1827,7 +1870,8 @@ async fn send_edit(
         println!("{done} (network revision {}).", c.revision);
     } else {
         println!(
-            "{done} now. Run `wanderlan confirm` within {} seconds to keep it, otherwise it is rolled back.",
+            "{done} now. Run {} within {} seconds to keep it, otherwise it is rolled back.",
+            wl("confirm"),
             applied.confirm_within_secs
         );
     }
@@ -1901,10 +1945,12 @@ async fn reset(socket: &Path, yes: bool) -> Result<ExitCode> {
              the VLAN and MSS rules, the configuration and the open invitations."
         );
         // Its clients reach the network only through this site.
+        // (By the labels of the overview: names may repeat.)
         let clients: Vec<&str> = st.as_ref().map_or_else(Vec::new, |s| {
+            let me = s.sites.iter().find(|c| c.is_self).map(|c| &c.name);
             s.sites
                 .iter()
-                .filter(|c| s.site.is_some() && c.uplink == s.site)
+                .filter(|c| me.is_some() && c.uplink.as_ref() == me)
                 .map(|c| c.name.as_str())
                 .collect()
         });
@@ -1929,7 +1975,11 @@ async fn reset(socket: &Path, yes: bool) -> Result<ExitCode> {
         for problem in &report.problems {
             eprintln!("  - {problem}");
         }
-        eprintln!("Run `wanderlan reset` again; the log has details (`wanderlan log`).");
+        eprintln!(
+            "Run {} again; the log has details ({}).",
+            wl("reset"),
+            wl("log")
+        );
         return Ok(ExitCode::FAILURE);
     }
     println!(
@@ -1987,13 +2037,15 @@ async fn new_network(
         Some(t) => t,
         None => {
             let interfaces: Vec<Interface> = client.call(Request::Interfaces).await?;
-            // The interface of the address carries the transport network.
-            let transport = addresses
-                .iter()
-                .find(|h| h.address == address)
-                .map(|h| h.interface.clone())
-                .or_else(hostinfo::default_interface);
-            hostinfo::choose_trunk(&interfaces, transport.as_deref()).map_err(|candidates| {
+            // The interface of the address carries the transport network,
+            // and a VPN runs over the one of the default route.
+            let transport = hostinfo::transport_interfaces(
+                addresses
+                    .iter()
+                    .find(|h| h.address == address)
+                    .map(|h| h.interface.clone()),
+            );
+            hostinfo::choose_trunk(&interfaces, &transport).map_err(|candidates| {
                 if candidates.is_empty() {
                     anyhow!("no interface is left for the trunk; give it with --trunk <interface>")
                 } else {
@@ -2018,7 +2070,7 @@ async fn new_network(
         cfg.network.vlans
     );
     let code = send_edit(&client, &cfg.network, local, 0, confirm, &done).await?;
-    println!("The other sites join with an invitation: `wanderlan invite`.");
+    println!("The other sites join with an invitation: {}.", wl("invite"));
     Ok(code)
 }
 
@@ -2103,17 +2155,23 @@ fn init(dir: Option<&Path>, force: bool) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
     std::fs::create_dir_all(dir).with_context(|| format!("cannot create {}", dir.display()))?;
-    for (name, content) in [
+    let files = [
         ("network.toml", EXAMPLE_NETWORK),
         ("local.toml", EXAMPLE_LOCAL),
-    ] {
+    ];
+    // Both or neither: checked before the first is written.
+    if let Some(path) = files
+        .iter()
+        .map(|(name, _)| dir.join(name))
+        .find(|p| p.exists() && !force)
+    {
+        bail!(
+            "{} already exists (use --force to overwrite)",
+            path.display()
+        );
+    }
+    for (name, content) in files {
         let path = dir.join(name);
-        if path.exists() && !force {
-            bail!(
-                "{} already exists (use --force to overwrite)",
-                path.display()
-            );
-        }
         std::fs::write(&path, content)
             .with_context(|| format!("cannot write {}", path.display()))?;
         println!("wrote {}", path.display());
@@ -2168,7 +2226,8 @@ async fn apply(
                 println!("  {change}");
             }
             println!(
-                "Applied. Run `wanderlan confirm` within {} seconds, otherwise the previous configuration is restored.",
+                "Applied. Run {} within {} seconds, otherwise the previous configuration is restored.",
+                wl("confirm"),
                 applied.confirm_within_secs
             );
             Ok(ExitCode::SUCCESS)
@@ -2320,7 +2379,9 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
             st.vlans.as_deref().unwrap_or("?"),
         ),
         None => println!(
-            "This site is not configured yet: run `wanderlan` to start a new network, or `wanderlan join <address> <code>` with an invitation."
+            "This site is not configured yet: run {} to start a new network, or {} with an invitation.",
+            wl(""),
+            wl("join <address> <code>")
         ),
     }
     if st.network != api::DEFAULT_NETWORK {
@@ -2351,8 +2412,9 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
     );
     if let Some(p) = &st.pending {
         println!(
-            "PENDING CHANGE: rolled back in {} s unless confirmed (`wanderlan confirm`)",
-            p.remaining_secs
+            "PENDING CHANGE: rolled back in {} s unless confirmed ({})",
+            p.remaining_secs,
+            wl("confirm")
         );
     }
     if let Some(e) = &st.last_error {
@@ -2362,13 +2424,10 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
         println!("WARNING: {problem}");
     }
     if st.invites > 0 {
-        println!(
-            "{} open invitation(s) (`wanderlan invite list`)",
-            st.invites
-        );
+        println!("{} open invitation(s) ({})", st.invites, wl("invite list"));
     }
     if !st.breakout.is_empty() {
-        println!("Local breakout (`wanderlan breakout`):");
+        println!("Local breakout ({}):", wl("breakout"));
         print_breakouts(&st);
     }
     if !st.sites.is_empty() {

@@ -84,7 +84,13 @@ pub fn draw(frame: &mut Frame, log: &LogState, area: Rect) {
         };
         lines.push(Line::styled(text, theme::dim()));
     }
-    let skip = lines.len().saturating_sub(height);
+    // More lines than rows (dates, wrapped messages): the newest stay in
+    // view, and at the top (Home) the oldest.
+    let skip = if start == 0 && scroll > 0 {
+        0
+    } else {
+        lines.len().saturating_sub(height)
+    };
     let lines: Vec<Line> = lines.into_iter().skip(skip).collect();
     frame.render_widget(Paragraph::new(lines).block(block), list);
     // By events: how many lie above the window and how many it shows.

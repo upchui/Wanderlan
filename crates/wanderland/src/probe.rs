@@ -455,6 +455,10 @@ async fn run(
 ) {
     // The sockets of former control ports, answering on.
     let mut formers: Vec<Former> = Vec::new();
+    // The nonce of the socket in use: the former ones send their requests
+    // with it too (with their own, a peer would take every one of them for
+    // a restart of this daemon).
+    let (nonce_now, _) = watch::channel([0u8; wire2::NONCE_LEN]);
     loop {
         let current = config.borrow_and_update().clone();
         retire_formers(&mut formers, &current).await;
@@ -480,6 +484,7 @@ async fn run(
             warn!("{e:#}; the probes of this run use a fixed nonce");
             [0; wire2::NONCE_LEN]
         });
+        nonce_now.send_replace(nonce);
         let avoid = config.borrow().own_ports();
         let test_socket = match test_socket(&avoid).await {
             Ok(s) => Some(s),
@@ -561,7 +566,7 @@ async fn run(
             );
             formers.push(Former {
                 addr: bind,
-                task: tokio::spawn(answer_former(socket, config.clone(), nonce)),
+                task: tokio::spawn(answer_former(socket, config.clone(), nonce_now.subscribe())),
             });
         }
     }
@@ -605,7 +610,7 @@ const FORMER_NUDGE: Duration = Duration::from_secs(2);
 async fn answer_former(
     socket: Arc<UdpSocket>,
     config: watch::Receiver<ProbeConfig>,
-    nonce: wire2::Nonce,
+    nonce: watch::Receiver<wire2::Nonce>,
 ) {
     let mut buf = vec![0u8; 65536];
     let mut nudged: HashMap<SiteId, Instant> = HashMap::new();
@@ -621,6 +626,7 @@ async fn answer_former(
         };
         let SocketAddr::V4(from) = from else { continue };
         let Some(packet) = buf.get(..n) else { continue };
+        let nonce = *nonce.borrow();
         let answers = former_answer(
             &config.borrow(),
             packet,
@@ -870,8 +876,20 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
                         debug!("probe from {from} with a tag of another key");
                         wire2::FLAG_UNVERIFIED
                     };
+                    // A request carries nothing that tells a copy sent again
+                    // from elsewhere: of a client, what it says (the test of
+                    // its tunnel, its ports) counts only from the address
+                    // where it answered a challenge (or before one).
+                    let at_endpoint = !passive
+                        || shared
+                            .endpoints
+                            .lock()
+                            .ok()
+                            .and_then(|e| e.get(&peer).copied())
+                            .is_none_or(|e| e.ip() == from.ip());
                     if passive
                         && verified
+                        && at_endpoint
                         && serve_direct(&shared, &table, &events, peer, from, &request, &keys).await
                     {
                         flags |= wire2::FLAG_DIRECT;
@@ -880,7 +898,7 @@ async fn receive(shared: Arc<Shared>, table: ProbeTable, events: mpsc::Sender<Pr
                     if let Err(e) = shared.socket.send_to(&reply, from).await {
                         debug!("cannot answer probe from {from}: {e}");
                     }
-                    if direct && verified {
+                    if direct && verified && at_endpoint {
                         note_announce(&table, &events, peer, request.announce);
                         note_request(&table, &events, peer, wire2::ports(packet, &keys));
                         note_nonce(&shared, &events, peer, request.nonce);
@@ -1360,6 +1378,15 @@ async fn probe_peer(
                 None => None,
             };
             let now = Instant::now();
+            // A test frame not seen says nothing if the server did not
+            // answer: it may not have got the request (the line was down).
+            let seen = match seen {
+                Some(false) if !matches!(outcome, Outcome::Answered(..)) => {
+                    t.untestable(format!("\"{}\" did not answer", label(&shared, name)), now);
+                    None
+                }
+                seen => seen,
+            };
             if let Some(seen) = seen {
                 match t.result(seen, now) {
                     Some(true) => info!(
@@ -1542,6 +1569,8 @@ struct UplinkTest {
     last: Option<Instant>,
     /// The pause between tests while not reached.
     pause: Duration,
+    /// Since when the tests reach this site.
+    reached_since: Option<Instant>,
     /// Why the last test could not be made (logged once).
     problem: Option<String>,
 }
@@ -1557,6 +1586,7 @@ impl UplinkTest {
             next: Instant::now(),
             last: None,
             pause: TEST_NAT,
+            reached_since: direct.then(Instant::now),
             problem: None,
         }
     }
@@ -1566,6 +1596,7 @@ impl UplinkTest {
     /// server keeps between two) finds it reached directly again.
     fn restart(&mut self, now: Instant) {
         self.reached = false;
+        self.reached_since = None;
         self.server_direct = false;
         self.failures = 0;
         self.pause = TEST_NAT;
@@ -1611,11 +1642,20 @@ impl UplinkTest {
             self.next = now + TEST_DIRECT;
             let changed = !self.reached;
             self.reached = true;
+            // Reached for as long as the last pause: the pause after the
+            // next fall back starts small again (it doubles for a way that
+            // keeps failing, not for every failure in the life of the
+            // daemon).
+            let since = *self.reached_since.get_or_insert(now);
+            if now.duration_since(since) >= self.pause {
+                self.pause = TEST_NAT;
+            }
             return changed.then_some(true);
         }
         self.failures += 1;
         if self.reached && self.failures >= TEST_FAILURES {
             self.reached = false;
+            self.reached_since = None;
             self.pause = (self.pause * 2).min(TEST_NAT_MAX);
             self.next = now + self.pause;
             return Some(false);
@@ -1897,6 +1937,12 @@ mod tests {
         assert!(!t.direct());
         // The pause doubles after going back.
         assert_eq!(t.next, now + 2 * TEST_NAT);
+        // Reached again for as long as that pause: it is short again.
+        assert_eq!(t.result(true, now), Some(true));
+        assert_eq!(t.result(true, now + TEST_NAT), None);
+        assert_eq!(t.pause, 2 * TEST_NAT);
+        assert_eq!(t.result(true, now + 2 * TEST_NAT), None);
+        assert_eq!(t.pause, TEST_NAT);
         // A server that stops running direct: tested again after the gap.
         let mut t = UplinkTest::new(true);
         t.result(true, now);
