@@ -95,6 +95,104 @@ pub fn default_address() -> Option<Ipv4Addr> {
     source_address(Ipv4Addr::new(192, 0, 2, 1))
 }
 
+/// An IPv4 address of this host, with what it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostAddress {
+    /// The interface that leads there.
+    pub interface: String,
+    /// The address.
+    pub address: Ipv4Addr,
+    /// The interface looks like a VPN (WireGuard, Tailscale, tun/tap,
+    /// ZeroTier, Nebula).
+    pub vpn: bool,
+    /// It is the address of the default route.
+    pub default_route: bool,
+}
+
+impl std::fmt::Display for HostAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = match (self.vpn, self.default_route) {
+            (true, _) => ", VPN",
+            (false, true) => ", default route",
+            _ => "",
+        };
+        write!(f, "{} ({}{what})", self.address, self.interface)
+    }
+}
+
+/// True if an interface of this name looks like a VPN.
+pub fn is_vpn(interface: &str) -> bool {
+    ["wg", "tailscale", "tun", "tap", "zt", "nebula"]
+        .iter()
+        .any(|p| interface.starts_with(p))
+}
+
+/// Interfaces of containers and of wanderlan itself: never the transport.
+fn is_local_bridge(interface: &str) -> bool {
+    ["docker", "br-", "virbr", "veth", "lxc", "cni", "vx", "lo"]
+        .iter()
+        .any(|p| interface.starts_with(p))
+}
+
+/// The addresses this host uses towards the networks of its routes: those
+/// of VPN-like interfaces first, the one of the default route last (no
+/// packet is sent).
+pub fn host_addresses() -> Vec<HostAddress> {
+    let Ok(text) = std::fs::read_to_string("/proc/net/route") else {
+        return Vec::new();
+    };
+    let routes = parse_routes(&text);
+    let default = default_address();
+    let mut out: Vec<HostAddress> = Vec::new();
+    for route in &routes {
+        // A host of the network of the route, or one on the internet.
+        let target = if route.mask.is_unspecified() {
+            Ipv4Addr::new(192, 0, 2, 1)
+        } else {
+            Ipv4Addr::from(u32::from(route.destination).saturating_add(1))
+        };
+        let Some(interface) = route_interface_in(&routes, target) else {
+            continue;
+        };
+        if is_local_bridge(&interface) {
+            continue;
+        }
+        let Some(address) = source_address(target) else {
+            continue;
+        };
+        if address.is_loopback() || out.iter().any(|h| h.address == address) {
+            continue;
+        }
+        out.push(HostAddress {
+            vpn: is_vpn(&interface),
+            default_route: Some(address) == default,
+            interface,
+            address,
+        });
+    }
+    out.sort_by_key(|h| (!h.vpn, h.default_route));
+    out
+}
+
+/// Why `address` may be a poor choice as the address of this site in the
+/// transport network (`known`: the addresses of this host).
+pub fn address_warning(address: Ipv4Addr, known: &[HostAddress]) -> Option<String> {
+    let [a, b, ..] = address.octets();
+    let shared = a == 100 && (64..128).contains(&b);
+    if !address.is_private() && !address.is_link_local() && !shared {
+        return Some(format!(
+            "{address} is a public address: the tunnels would carry the VLANs unencrypted across the internet; use the address of a VPN"
+        ));
+    }
+    let host = known.iter().find(|h| h.address == address)?;
+    (host.default_route && !host.vpn).then(|| {
+        format!(
+            "{address} is the address of the default route ({}), not of a VPN: the tunnels are not encrypted, fine only where the network between the sites is trusted",
+            host.interface
+        )
+    })
+}
+
 /// Interfaces that can be the trunk, without the one carrying the transport
 /// traffic (`transport`).
 pub fn trunk_candidates<'a>(
@@ -163,6 +261,32 @@ dead0\t0000090A\t00000000\t0000\t0\t0\t0\t0000FFFF\t0\t0\t0\n";
             managed: kind == "vxlan",
             carries: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_vpn_address_is_good_a_public_or_default_one_is_warned_about() {
+        let host = |address: [u8; 4], interface: &str, default_route| HostAddress {
+            interface: interface.into(),
+            address: Ipv4Addr::from(address),
+            vpn: is_vpn(interface),
+            default_route,
+        };
+        let known = vec![
+            host([10, 8, 0, 11], "wg0", false),
+            host([192, 168, 1, 5], "ens18", true),
+        ];
+        assert_eq!(known[0].to_string(), "10.8.0.11 (wg0, VPN)");
+        assert_eq!(known[1].to_string(), "192.168.1.5 (ens18, default route)");
+        assert_eq!(address_warning(Ipv4Addr::new(10, 8, 0, 11), &known), None);
+        assert_eq!(address_warning(Ipv4Addr::new(100, 64, 0, 7), &known), None);
+        assert!(
+            address_warning(Ipv4Addr::new(192, 168, 1, 5), &known)
+                .is_some_and(|w| w.contains("default route (ens18)"))
+        );
+        assert!(
+            address_warning(Ipv4Addr::new(203, 0, 113, 9), &known)
+                .is_some_and(|w| w.contains("public address"))
+        );
     }
 
     #[test]

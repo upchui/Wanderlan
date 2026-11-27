@@ -1650,6 +1650,11 @@ impl Controller {
         })
     }
 
+    /// The interface of the tunnel to `site`.
+    fn tunnel_ifname(&self, site: &config::Site) -> String {
+        topology::tunnel_name(self.tag, site)
+    }
+
     /// The tunnel interfaces to the direct peers.
     fn peer_ifnames(&self) -> BTreeSet<String> {
         self.config.as_ref().map_or_else(BTreeSet::new, |cfg| {
@@ -1996,8 +2001,18 @@ impl Controller {
                         topology::peer_of(&c.network, self.tag, &report.port)
                             .map(|s| c.network.label(s.id))
                     });
-                    self.events
-                        .emit(Level::Warn, peer.as_deref(), report.message);
+                    // How to take it up again once the loop is fixed.
+                    let net = if self.network == api::DEFAULT_NETWORK {
+                        String::new()
+                    } else {
+                        format!("--net {} ", self.network)
+                    };
+                    let what = peer.as_deref().unwrap_or(report.port.as_str());
+                    let text = format!(
+                        "{}; once the loop is fixed: `wanderlan {net}unblock {what}` (or confirm a change)",
+                        report.message
+                    );
+                    self.events.emit(Level::Warn, peer.as_deref(), text);
                     self.reconcile().await;
                 }
             }
@@ -2339,6 +2354,15 @@ impl Controller {
 
     /// Housekeeping: automatic confirmation of synced changes, sync retries.
     async fn every_second(&mut self) {
+        match self.invites.expire(now_secs()) {
+            Ok(gone) => {
+                for code in gone {
+                    self.events
+                        .info(format!("Invitation {} expired", api::code_start(&code)));
+                }
+            }
+            Err(e) => self.error_once(format!("{e:#}")),
+        }
         self.learn_endpoints().await;
         self.retire_former_binds();
         if let Some(p) = &self.pending
@@ -3255,14 +3279,45 @@ impl Controller {
             Request::VlanTraffic => to_value(&self.vlan_traffic().await?),
             Request::History(params) => to_value(&self.history(params.since_ms)),
             Request::Unblock(params) => {
-                if !self.runtime.blocked.remove(&params.port) {
+                // A port, or the site its tunnel leads to.
+                let port = if self.runtime.blocked.contains(&params.port) {
+                    params.port.clone()
+                } else {
+                    let site = self
+                        .config
+                        .as_ref()
+                        .map(|c| c.network.find(&params.port).map(|s| self.tunnel_ifname(s)));
+                    match site {
+                        Some(Ok(port)) => port,
+                        Some(Err(_)) | None => {
+                            let blocked: Vec<&String> = self.runtime.blocked.iter().collect();
+                            return Err(ApiError::new(if blocked.is_empty() {
+                                format!(
+                                    "{} is not blocked by the loop guard: nothing is",
+                                    params.port
+                                )
+                            } else {
+                                format!(
+                                    "{} is not blocked by the loop guard (blocked: {})",
+                                    params.port,
+                                    blocked
+                                        .iter()
+                                        .map(|p| p.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )
+                            }));
+                        }
+                    }
+                };
+                if !self.runtime.blocked.remove(&port) {
                     return Err(ApiError::new(format!(
-                        "{} is not blocked by the loop guard",
+                        "the tunnel to {} ({port}) is not blocked by the loop guard",
                         params.port
                     )));
                 }
                 self.events
-                    .info(format!("{} was enabled again on request", params.port));
+                    .info(format!("{port} was enabled again on request"));
                 self.reconcile().await;
                 to_value(&Done {})
             }
@@ -3271,7 +3326,8 @@ impl Controller {
                 self.publish();
                 to_value(&Done {})
             }
-            Request::Invite(rules) => {
+            Request::Invite(mut rules) => {
+                let valid = rules.valid_secs.take().unwrap_or(api::INVITE_VALID_SECS);
                 let Some(confirmed) = &self.confirmed else {
                     return Err(ApiError::new(
                         "this site is not part of a network yet; set it up first (wanderlan)",
@@ -3279,11 +3335,20 @@ impl Controller {
                 };
                 join::check_rules(&confirmed.network, confirmed.self_id(), &rules)
                     .map_err(|e| ApiError::new(format!("the rules cannot be used: {e}")))?;
-                let invite = self.invites.create(now_secs(), rules).map_err(api_err)?;
+                let invite = self
+                    .invites
+                    .create(now_secs(), rules, valid)
+                    .map_err(api_err)?;
                 let invitation = self.invitation(&invite);
+                // The whole code lets a box join: not in the logs.
+                let until = if valid == 0 {
+                    "until it is used or deleted".to_string()
+                } else {
+                    format!("for {}", api::duration_words(valid))
+                };
                 self.events.info(format!(
-                    "Invitation {} created; on the new site run: {}",
-                    invite.code, invitation.command
+                    "Invitation {} created, valid {until}",
+                    api::code_start(&invite.code)
                 ));
                 to_value(&invitation)
             }
@@ -3299,7 +3364,8 @@ impl Controller {
             Request::DeleteInvite(params) => {
                 match self.invites.remove(&params.code).map_err(api_err)? {
                     Some(code) => {
-                        self.events.info(format!("Invitation {code} was deleted"));
+                        self.events
+                            .info(format!("Invitation {} was deleted", api::code_start(&code)));
                         to_value(&Done {})
                     }
                     None => Err(ApiError::new(format!(
@@ -3342,6 +3408,7 @@ impl Controller {
             created_secs: invite.created_secs,
             in_use: self.invites.is_reserved(&invite.code),
             rules: invite.rules.clone(),
+            expires_secs: invite.expires_secs(),
         }
     }
 
@@ -3382,12 +3449,12 @@ impl Controller {
         let Some(confirmed) = self.confirmed.clone() else {
             return error("this site is not part of a network".into());
         };
-        let Some(invite) = self.invites.find_free(&request.code).cloned() else {
+        let Some(invite) = self.invites.find_free(&request.code, now_secs()).cloned() else {
             failures.push_back(now);
             self.events.warn(format!(
                 "Join attempt from {from} with an unknown or used invitation code"
             ));
-            return error("unknown or already used invitation code".into());
+            return error("unknown, expired or already used invitation code".into());
         };
         if self.pending.is_some() {
             return JoinReply::Busy;
@@ -3457,7 +3524,8 @@ impl Controller {
                 Some(&admission.name),
                 format!(
                     "Site \"{}\" at {from} joined again with invitation {}; nothing changed, the invitation stays open",
-                    admission.name, invite.code
+                    admission.name,
+                    api::code_start(&invite.code)
                 ),
             );
             let network = render_network_wire(&view::view_for(&confirmed.network, admission.site));
@@ -3508,7 +3576,7 @@ impl Controller {
                     Some(&site),
                     format!(
                         "Site \"{site}\" at {from} is joining with invitation {}; waiting for it to come up",
-                        invite.code
+                        api::code_start(&invite.code)
                     ),
                 );
                 JoinReply::Ok { site, via, network }
@@ -3630,7 +3698,15 @@ impl Controller {
         reply: oneshot::Sender<Result<serde_json::Value, ApiError>>,
     ) {
         let checked = if self.config.is_some() || self.pending.is_some() {
-            Err("this site is already part of a network; reset it first to join another one (wanderlan reset)".to_string())
+            let net = if self.network == api::DEFAULT_NETWORK {
+                "this box is already part of a network".to_string()
+            } else {
+                format!("this box is already part of network \"{}\"", self.network)
+            };
+            Err(format!(
+                "{net}; to join another one as well, give it a name of its own on this box: `wanderlan --net <name> join {} <code>`; to leave this one first: `wanderlan reset`",
+                params.target
+            ))
         } else if self.joining {
             Err("a join is already in progress".to_string())
         } else if let Some(msg) = config::site_name_error(&params.name) {
@@ -4238,7 +4314,9 @@ impl Controller {
         // crash in between loses the code rather than letting it in twice.
         if matches!(pending.source, ChangeSource::Join { .. }) {
             match self.invites.consume_reserved() {
-                Ok(Some(code)) => self.events.info(format!("Invitation {code} is used up")),
+                Ok(Some(code)) => self
+                    .events
+                    .info(format!("Invitation {} is used up", api::code_start(&code))),
                 Ok(None) => {}
                 Err(e) => self.events.error(format!("{e:#}")),
             }

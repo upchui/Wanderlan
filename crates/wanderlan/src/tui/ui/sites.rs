@@ -199,7 +199,17 @@ fn detail_lines(app: &App, draft: &Draft) -> Vec<Line<'static>> {
             .as_ref()
             .map_or_else(String::new, |o| format!(" +own {o}"));
         // The keys are in the bar; offline only the way back.
-        let keys = if site.online { "" } else { " (o: take online)" };
+        let keys = if site.online {
+            String::new()
+        } else if app.may_change_quietly(site.id) {
+            " (o: take online)".to_string()
+        } else {
+            // Who may: they take it online.
+            format!(
+                " (offline: {} takes it online)",
+                policy::managers(&draft.network, site)
+            )
+        };
         let name = draft.network.label(site.id);
         let text = format!(
             " {name}: {}; VLANs {vlans}{own}; changed by {}{keys}",

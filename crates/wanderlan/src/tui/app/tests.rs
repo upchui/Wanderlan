@@ -1066,6 +1066,7 @@ fn deleting_an_invitation_asks() {
             created_secs: 0,
             in_use: false,
             rules: wanderlan_core::api::SiteRules::default(),
+            expires_secs: None,
         }]),
     ));
     app.update(ch('d'));

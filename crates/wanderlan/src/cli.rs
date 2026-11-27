@@ -114,9 +114,11 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Re-enable a tunnel port shut down by the loop guard.
+    /// Re-enable a port shut down by the loop guard (a confirmed change
+    /// does that too).
     Unblock {
-        /// Tunnel interface, e.g. vx-haus2.
+        /// The site whose tunnel it is, or the port (a tunnel interface or a
+        /// trunk port).
         port: String,
     },
     /// Show the event log.
@@ -129,8 +131,8 @@ pub enum Command {
     Probe,
     /// Invite a new site: prints the command to run there.
     ///
-    /// Works on every site of the network. The code can be used once and
-    /// stays valid until it is used or deleted.
+    /// Works on every site of the network. The code can be used once and is
+    /// valid for a day (see --valid), or until it is deleted.
     Invite {
         #[command(subcommand)]
         action: Option<InviteAction>,
@@ -164,9 +166,9 @@ pub enum Command {
     Manage {
         /// The site (a client).
         site: String,
-        /// "server", "client" or "both".
+        /// "server", "client" or "both"; without it: who does now.
         #[arg(value_parser = ["server", "client", "both"])]
-        changes: String,
+        changes: Option<String>,
         /// Confirm the change right away.
         #[arg(long)]
         confirm: bool,
@@ -194,7 +196,8 @@ pub enum Command {
         /// "server" or "client".
         #[arg(value_parser = ["server", "client"])]
         role: String,
-        /// For "client": the site it is plugged into.
+        /// For "client": its server, the site it is plugged into.
+        #[arg(value_name = "SERVER")]
         uplink: Option<String>,
         /// Confirm the change right away.
         #[arg(long)]
@@ -321,6 +324,30 @@ pub enum Command {
         #[arg(long)]
         confirm: bool,
     },
+    /// Start a new network with this site as its first site, like the
+    /// setup in `wanderlan`; other sites join with `wanderlan invite`.
+    ///
+    /// Example: `wanderlan new --trunk ens19 --confirm`.
+    New {
+        /// Name of this site (default: the host name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Its IPv4 address in the transport network (default: that of a
+        /// VPN interface, else that of the default route).
+        #[arg(long)]
+        address: Option<Ipv4Addr>,
+        /// Interface carrying the VLANs (default: the only interface that
+        /// does not carry the transport network).
+        #[arg(long)]
+        trunk: Option<String>,
+        /// VLANs of the network, e.g. native,10-50 (default: all of them and
+        /// the untagged traffic).
+        #[arg(long)]
+        vlans: Option<String>,
+        /// Confirm the change right away.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Join an existing network with an invitation.
     ///
     /// Run on a new site: `wanderlan join <address> <code>` as printed by
@@ -394,6 +421,10 @@ pub struct RuleArgs {
     /// site, the default), "client" (only the new site) or "both".
     #[arg(long, value_parser = ["server", "client", "both"])]
     changes: Option<String>,
+    /// How long the invitation is valid, e.g. 2h or 7d, or "never" (until
+    /// it is used or deleted). Default: 24h.
+    #[arg(long, value_name = "DURATION", value_parser = parse_validity)]
+    valid: Option<u64>,
 }
 
 impl RuleArgs {
@@ -404,7 +435,38 @@ impl RuleArgs {
             native: self.native,
             translations: self.maps,
             changes: self.changes.as_deref().and_then(|c| c.parse().ok()),
+            valid_secs: self.valid,
             ..SiteRules::default()
+        }
+    }
+}
+
+/// `never` (0) or a duration of at least a minute, in seconds.
+fn parse_validity(text: &str) -> Result<u64, String> {
+    if text.trim() == "never" {
+        return Ok(0);
+    }
+    let d = humantime::parse_duration(text.trim())
+        .map_err(|e| format!("\"{text}\" is not a duration like 2h or 7d, nor \"never\": {e}"))?;
+    if d < Duration::from_secs(60) {
+        return Err(format!("\"{text}\" is shorter than a minute"));
+    }
+    Ok(d.as_secs())
+}
+
+/// How long an invitation is still valid, in words.
+fn validity(inv: &Invitation) -> String {
+    match inv.expires_secs {
+        None => "valid until it is used or deleted".into(),
+        Some(at) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            if at <= now {
+                "expired".into()
+            } else {
+                format!("valid for {}", api::duration_words(at - now))
+            }
         }
     }
 }
@@ -571,7 +633,9 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             let _: Done = client
                 .call(Request::Unblock(UnblockParams { port: port.clone() }))
                 .await?;
-            println!("{port} is enabled again.");
+            println!(
+                "{port} is enabled again; the loop guard shuts it down again if the loop is still there."
+            );
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Log { follow }) => log(&socket, follow).await,
@@ -600,7 +664,7 @@ pub async fn run(args: Args) -> Result<ExitCode> {
                 }
                 (_, Some(up)) => Some(up),
                 (_, None) => {
-                    bail!("name the site it is a client of: wanderlan role {site} client <site>")
+                    bail!("name its server: wanderlan role {site} client <server>")
                 }
             };
             edit_site(&socket, &site, confirm, |entry, known| {
@@ -760,8 +824,11 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             changes,
             confirm,
         }) => {
-            let changes: config::Changes = changes.parse().map_err(|e: String| anyhow!(e))?;
+            let wanted: Option<config::Changes> = changes
+                .map(|c| c.parse().map_err(|e: String| anyhow!(e)))
+                .transpose()?;
             edit_site(&socket, &site, confirm, |entry, known| {
+                let changes = wanted.unwrap_or(entry.changes);
                 let Some(server) = entry.uplink else {
                     bail!(
                         "\"{}\" is a server: it has no such option, every server may change it",
@@ -780,6 +847,12 @@ pub async fn run(args: Args) -> Result<ExitCode> {
                     ),
                 };
                 let who = format!("{who} its tunnel (VLANs, mappings, breakouts, online state)");
+                if wanted.is_none() {
+                    return Ok(Edit::Nothing(format!(
+                        "{}: {who}. Change it with `wanderlan manage {} server|client|both`.",
+                        entry.name, entry.name
+                    )));
+                }
                 if entry.changes == changes {
                     return Ok(Edit::Nothing(format!("Nothing to change: {who}.")));
                 }
@@ -787,6 +860,23 @@ pub async fn run(args: Args) -> Result<ExitCode> {
                 Ok(Edit::Done(format!("{}: {who}", entry.name)))
             })
             .await
+        }
+        Some(Command::New {
+            name,
+            address,
+            trunk,
+            vlans,
+            confirm,
+        }) => {
+            let added = add_chosen_network(&socket).await?;
+            let made = new_network(&socket, name, address, trunk, vlans, confirm).await;
+            // A network added for it goes again if it did not work.
+            if made.is_err()
+                && let Some(name) = added
+            {
+                let _ = remove_added_network(&socket, &name).await;
+            }
+            made
         }
         Some(Command::Join {
             target,
@@ -800,15 +890,7 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             if joined.is_err()
                 && let Some(name) = added
             {
-                let client = Client::connect(&socket).await?.0;
-                let removed: Result<ResetReport, _> = client
-                    .call(Request::RemoveNetwork(api::NetworkParams {
-                        name: name.clone(),
-                    }))
-                    .await;
-                if removed.is_ok() {
-                    eprintln!("Network {name} was removed from this box again.");
-                }
+                let _ = remove_added_network(&socket, &name).await;
             }
             joined
         }
@@ -846,6 +928,13 @@ async fn networks(socket: &Path, action: Option<NetworksAction>) -> Result<ExitC
             Ok(ExitCode::SUCCESS)
         }
         NetworksAction::Remove { name, yes } => {
+            // Its site there, for the hint to the other sites.
+            let site = client
+                .call::<Vec<api::NetworkInfo>>(Request::Networks)
+                .await
+                .ok()
+                .and_then(|list| list.into_iter().find(|n| n.name == name))
+                .and_then(|n| n.site);
             if !yes {
                 println!(
                     "This resets network {name} on this box (its tunnels, rules, configuration,\n\
@@ -867,6 +956,11 @@ async fn networks(socket: &Path, action: Option<NetworksAction>) -> Result<ExitC
                 .await?;
             if report.problems.is_empty() {
                 println!("Network {name} was removed ({} changes).", report.removed);
+                if let Some(site) = site {
+                    println!(
+                        "The other sites of the network still list this box as \"{site}\": remove it there with `wanderlan site remove {site}` (with `--net` if it is not their default network)."
+                    );
+                }
                 Ok(ExitCode::SUCCESS)
             } else {
                 eprintln!(
@@ -887,9 +981,13 @@ async fn invite(socket: &Path, action: Option<InviteAction>, rules: RuleArgs) ->
             println!("Invitation {} created. On the new site run:\n", inv.code);
             println!("    {}\n", inv.command);
             println!("Rules for the new site: {}.", inv.rules.summary());
-            println!("It starts offline; take it online with `wanderlan online <site>`.");
-            println!("The code works once and stays valid until it is used or deleted");
-            println!("(`wanderlan invite delete {}`).", inv.code);
+            let name = inv.rules.name.as_deref().unwrap_or("<site>");
+            println!("It starts offline; take it online with `wanderlan online {name} --confirm`.");
+            println!(
+                "The code works once and is {} (`wanderlan invite delete {}`).",
+                validity(&inv),
+                inv.code
+            );
         }
         Some(InviteAction::List) => {
             let list: Vec<Invitation> = client.call(Request::Invites).await?;
@@ -906,6 +1004,7 @@ async fn invite(socket: &Path, action: Option<InviteAction>, rules: RuleArgs) ->
                     ""
                 };
                 println!("{}  created {created}  {}{state}", inv.code, inv.command);
+                println!("             {}", validity(inv));
                 println!("             rules: {}", inv.rules.summary());
             }
         }
@@ -1016,6 +1115,15 @@ async fn join_network(
                 println!(
                     "\"{}\" has not confirmed the new site yet; check `wanderlan status` there.",
                     joined.via
+                );
+            }
+            // A new site starts offline: its tunnels come up once a site
+            // that may takes it online.
+            if !st.online {
+                let net = chosen_network().map_or_else(String::new, |n| format!("--net {n} "));
+                println!(
+                    "It starts offline: on \"{}\" run `wanderlan {net}online {} --confirm` to bring its tunnels up.",
+                    joined.via, joined.site
                 );
             }
             return Ok(ExitCode::SUCCESS);
@@ -1774,19 +1882,37 @@ async fn rename(socket: &Path, site: &str, new: &str, confirm: bool) -> Result<E
 
 async fn reset(socket: &Path, yes: bool) -> Result<ExitCode> {
     let client = connect(socket).await?;
+    let st = client.call::<Status>(Request::Status).await.ok();
     // Its name, for the hint to the other sites.
-    let name = client
-        .call::<Status>(Request::Status)
-        .await
-        .ok()
-        .and_then(|s| s.site)
+    let name = st
+        .as_ref()
+        .and_then(|s| s.site.clone())
         .unwrap_or_else(|| "<name>".to_string());
     if !yes {
+        let what = match st.as_ref().map(|s| s.network.as_str()) {
+            Some(net) if net != api::DEFAULT_NETWORK => {
+                format!("network {net} on this box (the other networks stay)")
+            }
+            _ => "this site".to_string(),
+        };
         println!(
-            "This removes everything wanderlan set up on this site: the bridge {}, all tunnels,\n\
-             the VLAN and MSS rules, the configuration and the open invitations.",
-            wanderlan_core::BRIDGE_NAME
+            "This removes everything wanderlan set up for {what}: the bridge, all tunnels,\n\
+             the VLAN and MSS rules, the configuration and the open invitations."
         );
+        // Its clients reach the network only through this site.
+        let clients: Vec<&str> = st.as_ref().map_or_else(Vec::new, |s| {
+            s.sites
+                .iter()
+                .filter(|c| s.site.is_some() && c.uplink == s.site)
+                .map(|c| c.name.as_str())
+                .collect()
+        });
+        if !clients.is_empty() {
+            println!(
+                "Its clients lose their way into the network until they get another server: {}.",
+                clients.join(", ")
+            );
+        }
         print!("Type \"reset\" to continue: ");
         std::io::stdout().flush()?;
         let mut answer = String::new();
@@ -1813,6 +1939,86 @@ async fn reset(socket: &Path, yes: bool) -> Result<ExitCode> {
         "Other sites still list it until it is removed there: `wanderlan site remove {name}` (or in `wanderlan`: Sites, d)."
     );
     Ok(ExitCode::SUCCESS)
+}
+
+/// Removes a network added for a join or a new network that did not work.
+async fn remove_added_network(socket: &Path, name: &str) -> Result<()> {
+    let client = Client::connect(socket).await?.0;
+    let _: ResetReport = client
+        .call(Request::RemoveNetwork(api::NetworkParams {
+            name: name.to_string(),
+        }))
+        .await?;
+    eprintln!("Network {name} was removed from this box again.");
+    Ok(())
+}
+
+/// `wanderlan new`: a new network with this site as its only one.
+async fn new_network(
+    socket: &Path,
+    name: Option<String>,
+    address: Option<Ipv4Addr>,
+    trunk: Option<String>,
+    vlans: Option<String>,
+    confirm: bool,
+) -> Result<ExitCode> {
+    let client = connect(socket).await?;
+    let st: Status = client.call(Request::Status).await?;
+    if st.state != SiteState::Unconfigured {
+        bail!(
+            "this box is already part of a network (site \"{}\"); a second one gets a name of its own on this box: `wanderlan --net <name> new ...`",
+            st.site.as_deref().unwrap_or("?")
+        );
+    }
+    let name = name.unwrap_or_else(|| join::site_name_from_hostname(&hostinfo::hostname()));
+    let addresses = hostinfo::host_addresses();
+    let address = match address {
+        Some(a) => a,
+        None => addresses
+            .first()
+            .map(|h| h.address)
+            .ok_or_else(|| anyhow!("no address of this host found; give it with --address <ip>"))?,
+    };
+    if let Some(warning) = hostinfo::address_warning(address, &addresses) {
+        eprintln!("Warning: {warning}.");
+    }
+    let trunk = match trunk {
+        Some(t) => t,
+        None => {
+            let interfaces: Vec<Interface> = client.call(Request::Interfaces).await?;
+            // The interface of the address carries the transport network.
+            let transport = addresses
+                .iter()
+                .find(|h| h.address == address)
+                .map(|h| h.interface.clone())
+                .or_else(hostinfo::default_interface);
+            hostinfo::choose_trunk(&interfaces, transport.as_deref()).map_err(|candidates| {
+                if candidates.is_empty() {
+                    anyhow!("no interface is left for the trunk; give it with --trunk <interface>")
+                } else {
+                    anyhow!(
+                        "more than one interface could be the trunk: {}; choose one with --trunk <interface>",
+                        candidates.join(", ")
+                    )
+                }
+            })?
+        }
+    };
+    let vlans = match vlans.as_deref().map(str::trim) {
+        None | Some("") => config::VlanSet::all(),
+        Some(text) => text
+            .parse()
+            .map_err(|e| anyhow!("--vlans {text}: {e} (e.g. native,10-50)"))?,
+    };
+    let cfg = config::new_network(&name, address, vlans, &trunk).map_err(|e| anyhow!(e))?;
+    let local = config::render_local(&cfg.local, Some(&cfg.network));
+    let done = format!(
+        "Network started: site \"{name}\" at {address}, trunk {trunk}, VLANs {}",
+        cfg.network.vlans
+    );
+    let code = send_edit(&client, &cfg.network, local, 0, confirm, &done).await?;
+    println!("The other sites join with an invitation: `wanderlan invite`.");
+    Ok(code)
 }
 
 /// Adds the chosen network to the box if it does not have it yet (a join
@@ -2199,15 +2405,21 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     println!(
-        "\n{:<12} {:<15} {:<8} {:>7} {:>8} {:>5} {:>5} {:>5} {:>10} {:>10}  VLANS",
-        "PEER", "ADDRESS", "PORT", "REPLY", "RTT", "PMTU", "MSS", "MACS", "RX", "TX"
+        "\n{:<12} {:<15} {:<8} {:<4} {:>7} {:>8} {:>5} {:>5} {:>5} {:>10} {:>10}  VLANS",
+        "PEER", "ADDRESS", "PORT", "SYNC", "REPLY", "RTT", "PMTU", "MSS", "MACS", "RX", "TX"
     );
     for p in &st.peers {
+        let sync = match p.in_sync {
+            Some(true) => "yes",
+            Some(false) => "NO",
+            None => "-",
+        };
         println!(
-            "{:<12} {:<15} {:<8} {:>7} {:>8} {:>5} {:>5} {:>5} {:>10} {:>10}  {}",
+            "{:<12} {:<15} {:<8} {:<4} {:>7} {:>8} {:>5} {:>5} {:>5} {:>10} {:>10}  {}",
             p.name,
             p.address,
             port_state(p.port_state),
+            sync,
             p.last_reply_secs.map_or("-".into(), |s| format!("{s}s")),
             p.rtt_ms.map_or("-".into(), |r| format!("{r:.1}ms")),
             p.pmtu.map_or("-".into(), |v| v.to_string()),
@@ -2233,6 +2445,15 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
             p.tunnel_reason.clone()
         };
         println!("Tunnel to {}: VXLAN {how}", p.name);
+        let sync = match (p.in_sync, p.revision) {
+            (Some(true), _) => "the same network as here".to_string(),
+            (Some(false), Some(r)) => format!(
+                "network revision {r} (here {}): not the same yet",
+                st.revision
+            ),
+            _ => "its network is not known yet".to_string(),
+        };
+        println!("  interface {}; {sync}", p.port);
         if let Some(why) = &p.down_reason {
             println!("  down: {why}");
         }

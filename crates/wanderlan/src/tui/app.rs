@@ -434,6 +434,9 @@ pub enum Reply {
 }
 
 /// Input of [`App::update`].
+// A message is moved once, into `update`: boxing the answers would only add
+// allocations.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 pub enum Msg {
     /// A key press.
@@ -1236,7 +1239,7 @@ impl App {
             if status.state == SiteState::Unconfigured {
                 self.view = View::Setup;
                 self.wizard
-                    .prefill(&hostinfo::hostname(), hostinfo::default_address());
+                    .prefill(&hostinfo::hostname(), hostinfo::host_addresses());
                 self.request_interfaces(fx);
             }
         }
@@ -1928,7 +1931,7 @@ impl App {
         self.modal = None;
         self.wizard = Wizard::new();
         self.wizard
-            .prefill(&hostinfo::hostname(), hostinfo::default_address());
+            .prefill(&hostinfo::hostname(), hostinfo::host_addresses());
         self.invitation = None;
         self.view = View::Setup;
         if report.problems.is_empty() {

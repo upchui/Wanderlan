@@ -32,7 +32,7 @@ done
 begin "Join: a new site joins with nothing but the address and the code"
 
 out=$(x site5 "wanderlan join 10.100.2.10 AAAAA-AAAAA" 2>&1)
-if grep -q 'unknown or already used invitation code' <<<"$out"; then
+if grep -q 'unknown, expired or already used invitation code' <<<"$out"; then
   pass "a wrong code is refused"
 else
   fail "unexpected output for a wrong code: $out"

@@ -23,11 +23,8 @@ before=$(x site1 "ip -o link show | grep -c ' vx'")
 check "site1 adds network lab" x site1 "wanderlan networks add lab | grep -q 'Network lab added'"
 check "the box lists both networks" \
   test "$(x site1 "wanderlan networks list" | awk '{print $1}' | tr '\n' ' ')" = "default lab "
-printf '[network]\nrevision = 1\nvlans = "60-70"\n\n[site.site1]\naddress = "10.100.1.10"\n' |
-  put site1 /tmp/lab.toml
-printf 'self = "site1"\ntrunk = "trunk0"\n' | put site1 /tmp/lab-local.toml
-check "site1 configures lab" \
-  x site1 "wanderlan --net lab apply --network /tmp/lab.toml --local /tmp/lab-local.toml >/dev/null && wanderlan --net lab confirm >/dev/null"
+check "site1 starts lab (wanderlan new)" \
+  x site1 "wanderlan --net lab new --name site1 --address 10.100.1.10 --trunk trunk0 --vlans 60-70 --confirm | grep -q 'Network started: site \"site1\" at 10.100.1.10, trunk trunk0, VLANs 60-70'"
 # The default network has 51821 (and 51822 for its tunnels).
 check "lab took other ports than the default network" \
   x site1 "wanderlan --net lab export | grep -q '^control_port = 51831$'"

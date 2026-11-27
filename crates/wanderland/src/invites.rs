@@ -1,16 +1,17 @@
 //! Open invitations of this site (`/var/lib/wanderlan/invites.json`).
 //!
 //! An invitation is a random code that lets exactly one new site join. It
-//! stays valid until it is used or deleted; it survives restarts. While a
-//! site joins with it (the change waits for the new site to come up), it is
-//! reserved; if the join is rolled back it becomes usable again.
+//! is valid for a while (a day unless asked otherwise, or until it is used
+//! or deleted); it survives restarts. While a site joins with it (the change
+//! waits for the new site to come up), it is reserved; if the join is rolled
+//! back it becomes usable again. Expired ones are removed.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
-use wanderlan_core::api::SiteRules;
+use wanderlan_core::api::{INVITE_VALID_SECS, SiteRules};
 use wanderlan_core::join::{CODE_LEN, code_from_bytes, normalize_code};
 
 /// One stored invitation.
@@ -23,6 +24,24 @@ pub struct Invite {
     /// Rules for the site that joins with it.
     #[serde(default)]
     pub rules: SiteRules,
+    /// How long it is valid in seconds; 0: until it is used or deleted;
+    /// none (an invitation of an earlier version): [`INVITE_VALID_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_secs: Option<u64>,
+}
+
+impl Invite {
+    /// Unix time it expires; none: never.
+    pub fn expires_secs(&self) -> Option<u64> {
+        match self.valid_secs.unwrap_or(INVITE_VALID_SECS) {
+            0 => None,
+            secs => Some(self.created_secs.saturating_add(secs)),
+        }
+    }
+
+    fn expired(&self, now_secs: u64) -> bool {
+        self.expires_secs().is_some_and(|at| at <= now_secs)
+    }
 }
 
 /// The invitations of this site.
@@ -57,27 +76,46 @@ impl Invites {
         self.reserved.as_deref() == Some(normalize_code(code).as_str())
     }
 
-    /// Creates and stores a new invitation.
-    pub fn create(&mut self, now_secs: u64, rules: SiteRules) -> Result<Invite> {
+    /// Creates and stores a new invitation, valid for `valid_secs` (0: until
+    /// it is used or deleted).
+    pub fn create(&mut self, now_secs: u64, rules: SiteRules, valid_secs: u64) -> Result<Invite> {
         let bytes =
             crate::random::bytes::<CODE_LEN>().context("cannot create the invitation code")?;
         let invite = Invite {
             code: code_from_bytes(&bytes),
             created_secs: now_secs,
             rules,
+            valid_secs: Some(valid_secs),
         };
         self.list.push(invite.clone());
         self.save()?;
         Ok(invite)
     }
 
-    /// Finds an open, not reserved invitation by its code as typed.
-    pub fn find_free(&self, code: &str) -> Option<&Invite> {
+    /// Finds an open, not reserved invitation by its code as typed that has
+    /// not expired at `now_secs`.
+    pub fn find_free(&self, code: &str, now_secs: u64) -> Option<&Invite> {
         let wanted = normalize_code(code);
         self.list
             .iter()
             .find(|i| normalize_code(&i.code) == wanted)
-            .filter(|i| !self.is_reserved(&i.code))
+            .filter(|i| !self.is_reserved(&i.code) && !i.expired(now_secs))
+    }
+
+    /// Removes the invitations expired at `now_secs` (not one a site is
+    /// joining with); returns their codes.
+    pub fn expire(&mut self, now_secs: u64) -> Result<Vec<String>> {
+        let gone: Vec<String> = self
+            .list
+            .iter()
+            .filter(|i| i.expired(now_secs) && !self.is_reserved(&i.code))
+            .map(|i| i.code.clone())
+            .collect();
+        if !gone.is_empty() {
+            self.list.retain(|i| !gone.contains(&i.code));
+            self.save()?;
+        }
+        Ok(gone)
     }
 
     /// Reserves an invitation for a site that is joining.
@@ -149,13 +187,13 @@ mod tests {
     fn invitations_survive_a_restart_and_are_used_once() {
         let path = temp("once");
         let mut inv = Invites::load(path.clone());
-        let a = inv.create(1, SiteRules::default()).unwrap();
+        let a = inv.create(1, SiteRules::default(), 0).unwrap();
         let rules = SiteRules {
             name: Some("branch".into()),
             native: Some(14),
             ..SiteRules::default()
         };
-        let b = inv.create(2, rules.clone()).unwrap();
+        let b = inv.create(2, rules.clone(), 0).unwrap();
         assert_ne!(a.code, b.code);
         assert_eq!(a.code.len(), 11);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
@@ -165,22 +203,53 @@ mod tests {
         assert_eq!(inv.list().len(), 2);
         assert_eq!(inv.list()[1].rules, rules, "rules are stored");
         let typed = a.code.to_lowercase().replace('-', "");
-        assert!(inv.find_free(&typed).is_some());
+        assert!(inv.find_free(&typed, 3).is_some());
         inv.reserve(&typed);
-        assert!(inv.find_free(&a.code).is_none(), "reserved while joining");
+        assert!(
+            inv.find_free(&a.code, 3).is_none(),
+            "reserved while joining"
+        );
         inv.release();
         assert!(
-            inv.find_free(&a.code).is_some(),
+            inv.find_free(&a.code, 3).is_some(),
             "usable again after rollback"
         );
         inv.reserve(&a.code);
         assert_eq!(inv.consume_reserved().unwrap(), Some(a.code.clone()));
-        assert!(inv.find_free(&a.code).is_none());
+        assert!(inv.find_free(&a.code, 3).is_none());
         assert_eq!(Invites::load(path.clone()).list().len(), 1);
 
         assert_eq!(inv.remove(&b.code).unwrap(), Some(b.code));
         assert!(Invites::load(path.clone()).list().is_empty());
         assert_eq!(inv.remove("nope").unwrap(), None);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn invitations_expire() {
+        let path = temp("expire");
+        let mut inv = Invites::load(path.clone());
+        let day = inv
+            .create(100, SiteRules::default(), INVITE_VALID_SECS)
+            .unwrap();
+        let hour = inv.create(100, SiteRules::default(), 3600).unwrap();
+        let never = inv.create(100, SiteRules::default(), 0).unwrap();
+        assert_eq!(hour.expires_secs(), Some(3700));
+        assert!(inv.find_free(&hour.code, 3699).is_some());
+        assert!(inv.find_free(&hour.code, 3700).is_none(), "expired");
+        // One a site is joining with stays until the join is over.
+        inv.reserve(&hour.code);
+        assert!(inv.expire(4000).unwrap().is_empty());
+        inv.release();
+        assert_eq!(inv.expire(4000).unwrap(), vec![hour.code.clone()]);
+        assert_eq!(inv.expire(100 + INVITE_VALID_SECS).unwrap(), vec![day.code]);
+        assert!(inv.find_free(&never.code, u64::MAX / 2).is_some());
+        // One of an earlier version (no validity stored): a day.
+        let text = format!(r#"[{{"code": "{}", "created_secs": 10}}]"#, never.code);
+        std::fs::write(&path, text).unwrap();
+        let mut old = Invites::load(path.clone());
+        assert_eq!(old.list()[0].expires_secs(), Some(10 + INVITE_VALID_SECS));
+        assert_eq!(old.expire(10 + INVITE_VALID_SECS).unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

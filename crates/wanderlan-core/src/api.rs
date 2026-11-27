@@ -175,6 +175,37 @@ pub struct SiteRules {
     /// (both). Read, never written.
     #[serde(default, skip_serializing)]
     pub allow_self: bool,
+    /// How long the invitation is valid, in seconds (asked for with the
+    /// rules, kept with the invitation); 0: until it is used or deleted;
+    /// none: [`INVITE_VALID_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_secs: Option<u64>,
+}
+
+/// How long an invitation is valid unless asked otherwise: a day.
+pub const INVITE_VALID_SECS: u64 = 24 * 60 * 60;
+
+/// A duration in words, to the minute: `90 min`, `23 h 10 min`, `7 d`.
+pub fn duration_words(secs: u64) -> String {
+    let (d, h, m) = (secs / 86_400, secs % 86_400 / 3600, secs % 3600 / 60);
+    let part = |n: u64, unit: &str| (n > 0).then(|| format!("{n} {unit}"));
+    let parts: Vec<String> = match (d, h) {
+        (0, 0) if m == 0 => return format!("{secs} s"),
+        (0, 0) => vec![format!("{m} min")],
+        (0, _) => [part(h, "h"), part(m, "min")]
+            .into_iter()
+            .flatten()
+            .collect(),
+        _ => [part(d, "d"), part(h, "h")].into_iter().flatten().collect(),
+    };
+    parts.join(" ")
+}
+
+/// The start of an invitation code, for logs: the whole code lets a box
+/// join.
+pub fn code_start(code: &str) -> String {
+    let start: String = code.chars().take(5).collect();
+    format!("{start}-…")
 }
 
 /// A VLAN translation of [`SiteRules`].
@@ -270,6 +301,9 @@ pub struct Invitation {
     /// Rules for the new site.
     #[serde(default)]
     pub rules: SiteRules,
+    /// Unix time it expires; none: valid until it is used or deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_secs: Option<u64>,
 }
 
 /// Result of [`Request::Join`].
@@ -1009,6 +1043,17 @@ pub struct MacEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durations_and_codes_in_words() {
+        assert_eq!(duration_words(INVITE_VALID_SECS), "1 d");
+        assert_eq!(duration_words(23 * 3600 + 10 * 60 + 5), "23 h 10 min");
+        assert_eq!(duration_words(2 * 3600), "2 h");
+        assert_eq!(duration_words(8 * 86_400 + 3 * 3600), "8 d 3 h");
+        assert_eq!(duration_words(90 * 60), "1 h 30 min");
+        assert_eq!(duration_words(59), "59 s");
+        assert_eq!(code_start("K7F3Q-9QX2M"), "K7F3Q-…");
+    }
 
     #[test]
     fn request_json_shape() {

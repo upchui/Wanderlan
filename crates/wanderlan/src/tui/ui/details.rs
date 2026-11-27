@@ -389,9 +389,17 @@ pub fn site(frame: &mut Frame, app: &App, name: &str, scroll: u16, area: Rect) {
             Span::raw(site.address.to_string()),
             if site.online {
                 dim("   online")
-            } else {
+            } else if app.may_change_quietly(site.id) {
                 Span::styled(
                     "   OFFLINE (o in Sites or the Overview takes it online)",
+                    theme::warn(),
+                )
+            } else {
+                Span::styled(
+                    format!(
+                        "   OFFLINE ({} takes it online)",
+                        wanderlan_core::policy::managers(network, site)
+                    ),
                     theme::warn(),
                 )
             },
@@ -592,7 +600,11 @@ pub fn invites(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
             .iter()
             .map(|inv| {
                 // The state first: the rules may be cut off.
-                let state = if inv.in_use { "JOINING  " } else { "" };
+                let state = if inv.in_use {
+                    "JOINING  ".to_string()
+                } else {
+                    left(inv.expires_secs)
+                };
                 Row::new(vec![
                     Cell::from(inv.code.clone()),
                     Cell::from(format!("{state}{}", inv.rules.summary())),
@@ -627,4 +639,20 @@ pub fn invites(frame: &mut Frame, app: &App, selected: usize, area: Rect) {
     lines.push(Line::styled(" On the new site run:", theme::dim()));
     lines.push(Line::styled(format!(" {cmd}"), theme::bold()));
     frame.render_widget(Paragraph::new(lines), command);
+}
+
+/// How long an invitation that expires at `expires_secs` is still valid
+/// (nothing if it never does).
+fn left(expires_secs: Option<u64>) -> String {
+    let Some(at) = expires_secs else {
+        return String::new();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    if at <= now {
+        "EXPIRED  ".into()
+    } else {
+        format!("{} left  ", wanderlan_core::api::duration_words(at - now))
+    }
 }

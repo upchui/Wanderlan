@@ -213,6 +213,7 @@ fn invitations() {
         created_secs: 1_795_514_400,
         in_use: false,
         rules,
+        expires_secs: None,
     };
     reply(
         &mut app,
@@ -231,6 +232,7 @@ fn invitations() {
                     }],
                     changes: Some(wanderlan_core::config::Changes::Both),
                     allow_self: false,
+                    valid_secs: None,
                 },
             ),
         ]),
@@ -272,6 +274,8 @@ fn overview_with_sync_problem() {
     let mut status = fixtures::status();
     status.sync_problem =
         Some("Your change was not taken over by \"buero\": site \"haus9\" is already used".into());
+    // And what another network of the box has.
+    status.conflicts = vec!["VLANs 20 in bridge br0: network \"lab\" has them there".into()];
     reply(&mut app, Request::Status, Reply::Status(Box::new(status)));
     insta::assert_snapshot!(render(&app));
 }

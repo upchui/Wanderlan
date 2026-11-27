@@ -12,8 +12,7 @@ use std::str::FromStr as _;
 use crossterm::event::{KeyCode, KeyEvent};
 use wanderlan_core::api::{Interface, JoinParams};
 use wanderlan_core::config::{
-    DEFAULT_CONTROL_PORT, Local, Network, Site, VlanSet, has_errors, ifname_error, site_name_error,
-    validate,
+    DEFAULT_CONTROL_PORT, Local, Network, VlanSet, ifname_error, site_name_error,
 };
 use wanderlan_core::join;
 use wanderlan_core::{BRIDGE_NAME, topology::is_tunnel_name};
@@ -118,6 +117,8 @@ pub struct Wizard {
     pub trunk_manual: TextInput,
     /// Transport address of this site.
     pub address: TextInput,
+    /// The addresses of this host, the suggested one first.
+    pub addresses: Vec<crate::hostinfo::HostAddress>,
     /// VLANs of the network.
     pub vlans: TextInput,
     /// Address of the inviting site.
@@ -147,6 +148,7 @@ impl Wizard {
             transport: None,
             trunk_manual: TextInput::default(),
             address: TextInput::default(),
+            addresses: Vec::new(),
             vlans: TextInput::new(DEFAULT_VLANS),
             target: TextInput::default(),
             code: TextInput::default(),
@@ -155,17 +157,25 @@ impl Wizard {
     }
 
     /// Fills in suggestions: the name from the host name, the address of
-    /// the default route. Fields the user already filled are kept.
-    pub fn prefill(&mut self, hostname: &str, address: Option<Ipv4Addr>) {
+    /// this host (`addresses`: a VPN's first). Fields the user already
+    /// filled are kept.
+    pub fn prefill(&mut self, hostname: &str, addresses: Vec<crate::hostinfo::HostAddress>) {
         if self.name.value().is_empty() && !hostname.is_empty() {
             self.default_name = join::site_name_from_hostname(hostname);
             self.name = TextInput::new(self.default_name.clone());
         }
         if self.address.value().is_empty()
-            && let Some(a) = address
+            && let Some(a) = addresses.first()
         {
-            self.address = TextInput::new(a.to_string());
+            self.address = TextInput::new(a.address.to_string());
         }
+        self.addresses = addresses;
+    }
+
+    /// Why the address typed may be a poor choice.
+    pub fn address_warning(&self) -> Option<String> {
+        let address: Ipv4Addr = self.address.value().trim().parse().ok()?;
+        crate::hostinfo::address_warning(address, &self.addresses)
     }
 
     /// Position in "step n of 5", if numbered.
@@ -458,27 +468,10 @@ impl Wizard {
         let name = self.name.value().trim().to_string();
         let vlans = self.parse_vlans()?;
         self.check_trunk(interfaces)?;
-        let mut network = Network::new(vlans);
-        // Known by its name until the daemon gives it the identity of
-        // this box.
-        let site = Site::new(&name, parse_address(self.address.value())?);
-        let id = site.id;
-        network.sites.push(site);
-        let local = Local {
-            self_id: Some(id),
-            trunk: vec![self.trunk(interfaces)],
-            ..Default::default()
-        };
-        let diags = validate(&network, Some(&local));
-        if has_errors(&diags) {
-            let first = diags
-                .iter()
-                .find(|d| d.is_error())
-                .map(|d| d.message.clone())
-                .unwrap_or_default();
-            return Err(first);
-        }
-        Ok((network, local))
+        let address = parse_address(self.address.value())?;
+        let cfg =
+            wanderlan_core::config::new_network(&name, address, vlans, &self.trunk(interfaces))?;
+        Ok((cfg.network, cfg.local))
     }
 
     /// The VLANs of the new network; empty means all VLANs and untagged.
@@ -561,7 +554,15 @@ mod tests {
     /// transport traffic).
     fn new_network() -> Wizard {
         let mut w = Wizard::new();
-        w.prefill("heim.example.org", Some(Ipv4Addr::new(10, 8, 0, 1)));
+        w.prefill(
+            "heim.example.org",
+            vec![crate::hostinfo::HostAddress {
+                interface: "wg0".into(),
+                address: Ipv4Addr::new(10, 8, 0, 1),
+                vpn: true,
+                default_route: false,
+            }],
+        );
         w.transport = Some("ens18".into());
         press(&mut w, KeyCode::Enter);
         assert_eq!(w.step, Step::Name);
@@ -601,7 +602,7 @@ mod tests {
     #[test]
     fn joining_needs_address_code_trunk_and_name() {
         let mut w = Wizard::new();
-        w.prefill("wanderlan", None);
+        w.prefill("wanderlan", Vec::new());
         press(&mut w, KeyCode::Down);
         assert_eq!(w.mode, Mode::Join);
         press(&mut w, KeyCode::Enter);
@@ -653,7 +654,7 @@ mod tests {
     #[test]
     fn a_chosen_name_is_not_the_default() {
         let mut w = Wizard::new();
-        w.prefill("wanderlan", None);
+        w.prefill("wanderlan", Vec::new());
         w.mode = Mode::Join;
         w.step = Step::Name;
         type_text(&mut w, "2");

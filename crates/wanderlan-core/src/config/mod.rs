@@ -187,6 +187,34 @@ pub fn load(network_text: &str, local_text: &str) -> Result<LoadOutcome, Vec<Dia
     })
 }
 
+/// A new network with this site as its only one (a server): `name` at
+/// `address` in the transport network, the VLANs `vlans`, the trunk port
+/// `trunk`. The site is known by its name until the daemon gives it the
+/// identity of the box. The first error if it is not valid.
+pub fn new_network(
+    name: &str,
+    address: std::net::Ipv4Addr,
+    vlans: VlanSet,
+    trunk: &str,
+) -> Result<Config, String> {
+    let mut network = Network::new(vlans);
+    let site = Site::new(name.trim(), address);
+    let id = site.id;
+    network.sites.push(site);
+    let local = Local {
+        self_id: Some(id),
+        trunk: vec![trunk.to_string()],
+        ..Default::default()
+    };
+    if let Some(e) = validate(&network, Some(&local))
+        .into_iter()
+        .find(Diagnostic::is_error)
+    {
+        return Err(e.message);
+    }
+    Ok(Config { network, local })
+}
+
 /// Validates a `network.toml` text on its own, optionally together with a
 /// `local.toml` text. Returns all diagnostics with line numbers; the
 /// configuration is valid if none of them is an error.

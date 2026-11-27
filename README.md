@@ -159,7 +159,10 @@ towards the VPN (VPN addresses `10.8.0.1` at `hq` and `10.8.0.2` at
    * address `10.8.0.1`, its address in the VPN,
    * VLANs empty: everything, the untagged 10.0.0.0/24 included.
 
-   `Enter` shows the change, `c` confirms it.
+   `Enter` shows the change, `c` confirms it. Without the TUI:
+   `sudo wanderlan new --name hq --address 10.8.0.1 --trunk ens19 --confirm`
+   (without `--address` it takes the address of a VPN interface; it warns
+   about a public address or one of the default route).
 3. The invitation for the next site opens: name `office`, `Enter`. It shows
    the command for the new site, e.g. `wanderlan join 10.8.0.1 K7F3Q-9QX2M`
    (later: Sites, `i`).
@@ -539,9 +542,11 @@ Keys refer to the terminal UI (`wanderlan`); every change ends with `a`
 "Changes" (who changes its tunnel later: only this site, only the new site,
 or both). CLI:
 `wanderlan invite --name lab --native 30 --map 130:30`. A code works once and
-stays valid until used or deleted: Sites, `I` (`d` deletes), or
-`wanderlan invite list` / `wanderlan invite delete <code>`. Codes can be
-created on any site; the new site becomes a client of that site.
+is valid for a day (`--valid 2h`, `--valid 7d` or `--valid never`); expired
+codes are removed. Open codes with the time they are still valid: Sites, `I`
+(`d` deletes), or `wanderlan invite list` / `wanderlan invite delete <code>`.
+The logs name only the start of a code. Codes can be created on any site; the
+new site becomes a client of that site.
 
 **Take a site online or offline.** `o` on the site in Sites or in the
 list of sites of the Overview (the Overview goes straight to the review);
@@ -915,9 +920,23 @@ back and shows the reason in its overview and in `wanderlan status`. A
 refused configuration is not fetched again for 10 minutes.
 
 A change that is based on an outdated revision is refused ("wait for the
-sync, reload and try again"), so concurrent edits do not silently overwrite
-each other. `systemctl reload wanderland` (SIGHUP) takes the files as they
-are, without raising the revision.
+sync, reload and try again"). Changes made at two servers at the same time
+(neither knew the other's yet) are put together: every network carries the
+fingerprints it was made from, so a server that gets a newer network lacking
+its own change merges both, setting by setting and site by site; where both
+changed the same, the newer one's is kept, and the log names it. If where
+both started is not known any more (e.g. after a restart), the newer network
+applies and the change made here is kept in `network.toml.lost-<revision>`
+with a warning. A client sends its change to its server before it fetches a
+newer network, and a change made on an older view is put onto the current
+one.
+
+`systemctl reload wanderland` (SIGHUP) takes the files as confirmed, without
+a countdown and rollback. A file edited by hand with the revision it had gets
+the next one, so that it reaches the other sites; a file with a lower
+revision (an old copy put back) takes the network of the peers instead.
+Invalid files change nothing; the log and the journal say why. While a change
+waits for confirmation a reload is ignored.
 
 ### MTU and MSS
 
@@ -1009,11 +1028,12 @@ and keeps trying.
 | `wanderlan status [--json]` | This site, all known sites with role and link, the tunnel neighbours |
 | `wanderlan log [-f]` | Event log |
 | `wanderlan vlan <vid> [--json]` | Traffic of one VLAN on every port of this site now, its counters and MAC addresses |
-| `wanderlan invite [--name N] [--vlans V] [--native VID] [--map MAPPED:SOURCE]... [--changes server\|client\|both]` | Create an invitation with rules; prints `wanderlan join <address> <code>` |
+| `wanderlan invite [--name N] [--vlans V] [--native VID] [--map MAPPED:SOURCE]... [--changes server\|client\|both] [--valid DURATION\|never]` | Create an invitation with rules (valid for a day by default); prints `wanderlan join <address> <code>` |
 | `wanderlan invite list` / `wanderlan invite delete <code>` | Open invitations of this site |
+| `wanderlan new [--name N] [--address IP] [--trunk IF] [--vlans V] [--confirm]` | Start a new network with this site (on an unconfigured site), like the setup wizard |
 | `wanderlan join <address>[:port] <code> [--name N] [--trunk IF]` | Join a network (on an unconfigured site) |
 | `wanderlan online <site>` / `wanderlan offline <site>` | Take a site online or offline |
-| `wanderlan manage <site> server\|client\|both` | Who changes the tunnel of a client to its server |
+| `wanderlan manage <site> [server\|client\|both]` | Who changes the tunnel of a client to its server (without a value: who does now) |
 | `wanderlan rename <site> <new-name>` | Rename a site: this site always, a client of this site too |
 | `wanderlan role <site> server\|client <server>` | Make a site a server or a client |
 | `wanderlan site add <name> <address> [--server S\|none] [--vlans V]` | Add a site by hand (default: a client of this site, changed by it) |
@@ -1030,13 +1050,13 @@ and keeps trying.
 | `wanderlan confirm` / `wanderlan rollback` | Confirm or revert the pending change |
 | `wanderlan validate <network.toml> [--local <local.toml>]` | Check files without applying them |
 | `wanderlan init [--dir D]` / `wanderlan export` | Print or write the example configuration / print the running `network.toml` |
-| `wanderlan probe` / `wanderlan unblock <port>` | Measure the path MTU now / re-enable a port the loop guard shut down |
+| `wanderlan probe` / `wanderlan unblock <site\|port>` | Measure the path MTU now / re-enable a port the loop guard shut down (the tunnel to a site, or a trunk port) |
 | `wanderlan reset [--yes]` | Remove everything wanderlan set up on this site |
 | `wanderlan networks [list\|add <name>\|remove <name> [--yes]]` | The [networks of this box](#several-networks-on-one-box) |
 
-Commands that change the configuration (`online`, `offline`, `manage`,
-`role`, `site`, `vlans`, `map`, `trunk`, `own-vlans`, `tunnel-vlans`,
-`breakout`, `settings`) take `--confirm` to confirm right away; without it, run
+Commands that change the configuration (`new`, `online`, `offline`,
+`manage`, `role`, `rename`, `site`, `vlans`, `map`, `trunk`, `own-vlans`,
+`tunnel-vlans`, `breakout`, `settings`) take `--confirm` to confirm right away; without it, run
 `wanderlan confirm` within the commit timeout. They wait for a change that is
 still being synchronised. The daemon's socket can be chosen with `--socket`
 or `WANDERLAN_SOCKET`, the network of the box with `--net` or

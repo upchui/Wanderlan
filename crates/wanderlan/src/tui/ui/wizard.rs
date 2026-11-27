@@ -128,6 +128,15 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
             );
             page.blank();
             page.input("Address", &w.address, true);
+            if !w.addresses.is_empty() {
+                page.blank();
+                let list: Vec<String> = w.addresses.iter().map(ToString::to_string).collect();
+                page.text(&format!("This host: {}", list.join(", ")), theme::dim());
+            }
+            if let Some(warning) = w.address_warning() {
+                page.blank();
+                page.text(&warning, theme::warn());
+            }
         }
         Step::Vlans => {
             page.text(
@@ -234,6 +243,10 @@ fn configured_page(page: &mut Page, app: &App) {
     );
     page.text(
         "R   reset this site: removes the bridge, the tunnels, all rules, the configuration and the invitations. Afterwards the site is unconfigured, like after the installation.",
+        Style::new(),
+    );
+    page.text(
+        "B   switch to another network of this box. One more network: `wanderlan networks add <name>`, then `wanderlan --net <name>` (its setup opens) or `wanderlan --net <name> join <address> <code>`.",
         Style::new(),
     );
 }

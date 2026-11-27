@@ -19,7 +19,7 @@ use wanderlan_core::api::{
 pub enum ClientError {
     /// The socket does not exist: the daemon is not running.
     #[error(
-        "the wanderlan daemon is not running ({path} does not exist); start it with `systemctl start wanderland`"
+        "the wanderlan daemon is not running ({path} does not exist); start it with `systemctl start wanderland`; why it stopped: `systemctl status wanderland` and `journalctl -u wanderland`"
     )]
     NotRunning {
         /// Socket path.
@@ -34,7 +34,9 @@ pub enum ClientError {
         path: PathBuf,
     },
     /// The socket exists but nobody listens.
-    #[error("cannot connect to {path}: {source}")]
+    #[error(
+        "cannot connect to {path}: {source}; is the daemon running? `systemctl status wanderland`, `journalctl -u wanderland`"
+    )]
     Connect {
         /// Socket path.
         path: PathBuf,

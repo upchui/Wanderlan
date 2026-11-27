@@ -128,8 +128,12 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
         )),
     }
     if status.site.is_some() && !status.online {
+        let how = app.restricted_by().map_or_else(
+            || "Sites (2): o, then a".to_string(),
+            |manager| format!("only its server {manager} takes it online: ask there"),
+        );
         lines.push(Line::styled(
-            " This site is OFFLINE: its tunnels stay down (Sites (2): o, then a).",
+            format!(" This site is OFFLINE: its tunnels stay down ({how})."),
             theme::warn(),
         ));
     }
@@ -263,6 +267,12 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
     }
     if let Some(problem) = &status.sync_problem {
         lines.push(Line::styled(format!(" {problem}"), theme::warn()));
+    }
+    for conflict in &status.conflicts {
+        lines.push(Line::styled(
+            format!(" Left out, another network of this box has it: {conflict}"),
+            theme::warn(),
+        ));
     }
     lines
 }
