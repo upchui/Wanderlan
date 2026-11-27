@@ -292,6 +292,11 @@ async fn perform(client: &Client, request: Request) -> Result<Reply, ClientError
             Reply::Done
         }
         r @ Request::RemoveNetwork(_) => Reply::Reset(client.call(r).await?),
+        // Not asked by the terminal UI (command line only).
+        r @ (Request::Perf(_) | Request::Speedtest(_)) => {
+            let _: serde_json::Value = client.call(r).await?;
+            Reply::Done
+        }
         r @ (Request::Rollback
         | Request::Unblock(_)
         | Request::ProbeNow

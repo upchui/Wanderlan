@@ -524,6 +524,8 @@ struct Controller {
     keepalive: watch::Sender<keepalive::Keepalives>,
     /// What the switch check looks at.
     switch_check: watch::Sender<shared_switch::Targets>,
+    /// The interfaces the tunnel packets leave and come in by.
+    underlay_nics: BTreeSet<String>,
     /// The trunks in one switch network with a peer, by mapped VLAN (see
     /// [`shared_switch`]).
     shared: BTreeMap<(String, u16), SharedState>,
@@ -665,13 +667,16 @@ pub async fn run(args: Args) -> Result<()> {
         if let Err(e) = host.teardown(STOP_TEARDOWN).await {
             warn!("{e:#}");
         }
+        crate::tuning::restore_all();
         if let Some(task) = connection {
             task.abort();
         }
         anyhow::bail!("internal error: {why}; exiting so that systemd restarts wanderland");
     }
     info!("Stopping; removing everything wanderlan created");
-    let removed = host.teardown(STOP_TEARDOWN).await?;
+    let removed = host.teardown(STOP_TEARDOWN).await;
+    crate::tuning::restore_all();
+    let removed = removed?;
     if let Some(task) = connection {
         task.abort();
     }
@@ -785,6 +790,7 @@ impl Controller {
             push_refused: None,
             keepalive: keepalive_tx,
             switch_check: switch_tx,
+            underlay_nics: BTreeSet::new(),
             shared: BTreeMap::new(),
             former_binds: Vec::new(),
             last_bind: None,
@@ -1940,6 +1946,14 @@ impl Controller {
                 .map(|t| t.peer.id)
                 .collect()
         });
+        // The tunnel interface to each peer (for a speed test).
+        let tunnels: BTreeMap<SiteId, String> =
+            self.config.as_ref().map_or_else(BTreeMap::new, |cfg| {
+                topology::tunnels_for(&cfg.network, cfg.self_id())
+                    .into_iter()
+                    .map(|t| (t.peer.id, t.ifname(self.tag)))
+                    .collect()
+            });
         let keyed = self
             .peer_keys
             .iter()
@@ -1953,6 +1967,7 @@ impl Controller {
                         client: clients.contains(name),
                         view: Arc::from(texts.get(name)?.as_str()),
                         keys: k.keys.clone(),
+                        tunnel: tunnels.get(name).cloned(),
                     },
                 ))
             })
@@ -1968,6 +1983,7 @@ impl Controller {
                         client: true,
                         view: Arc::from(texts.get(name)?.as_str()),
                         keys: k.keys.clone(),
+                        tunnel: None,
                     },
                 ))
             }))
@@ -2005,6 +2021,14 @@ impl Controller {
                 request: Request::Join(params),
                 reply,
             } => self.start_join(params, reply),
+            Input::Api {
+                request: Request::Speedtest(params),
+                reply,
+            } => self.start_speedtest(&params, reply),
+            Input::Api {
+                request: Request::Perf(params),
+                reply,
+            } => self.start_perf(&params, reply),
             Input::Api { request, reply } => {
                 let result = self.api(request).await;
                 let _ = reply.send(result);
@@ -3553,7 +3577,9 @@ impl Controller {
                     ))),
                 }
             }
-            Request::Join(_) => Err(ApiError::new("join requests are handled separately")),
+            Request::Join(_) | Request::Speedtest(_) | Request::Perf(_) => {
+                Err(ApiError::new("handled separately"))
+            }
             Request::Reset => to_value(&self.reset().await?),
             Request::Networks | Request::AddNetwork(_) | Request::RemoveNetwork(_) => Err(
                 ApiError::new("the networks of the box are handled by the daemon itself"),
@@ -3882,6 +3908,112 @@ impl Controller {
 
     /// Starts joining a network. The connection to the inviting site runs in
     /// the background; its answer comes back as [`Input::JoinAnswer`].
+    /// A speed test with a peer, in a task of its own (it takes a while).
+    fn start_speedtest(
+        &self,
+        params: &api::SpeedtestParams,
+        reply: oneshot::Sender<Result<serde_json::Value, ApiError>>,
+    ) {
+        let peer = self.speedtest_peer(&params.site);
+        let seconds = params
+            .seconds
+            .unwrap_or(api::SPEEDTEST_SECONDS)
+            .clamp(1, api::SPEEDTEST_MAX_SECONDS);
+        tokio::spawn(async move {
+            let result = match peer {
+                Ok(peer) => crate::speedtest::run(peer, seconds)
+                    .await
+                    .map_err(ApiError::new)
+                    .and_then(|r| to_value(&r)),
+                Err(e) => Err(e),
+            };
+            let _ = reply.send(result);
+        });
+    }
+
+    /// Who a speed test with `site` is with.
+    fn speedtest_peer(&self, site: &str) -> Result<crate::speedtest::Peer, ApiError> {
+        let cfg = self
+            .config
+            .as_ref()
+            .ok_or_else(|| ApiError::new("this site is not part of a network yet"))?;
+        let target = cfg.network.find(site).map_err(ApiError::new)?;
+        let label = cfg.network.label(target.id);
+        let tunnel = topology::tunnels_for(&cfg.network, cfg.self_id())
+            .into_iter()
+            .find(|t| t.peer.id == target.id)
+            .ok_or_else(|| {
+                ApiError::new(format!(
+                    "\"{label}\" is no direct peer of this site (no tunnel to it)"
+                ))
+            })?;
+        if tunnel.kind == TunnelKind::Client
+            && self.runtime.mode(&tunnel) == config::TunnelMode::Nat
+        {
+            return Err(ApiError::new(format!(
+                "\"{label}\" is a client behind NAT: its control port cannot be reached from here; start the speed test there (`wanderlan speedtest {}`)",
+                cfg.self_name()
+            )));
+        }
+        let me = self
+            .own_id()
+            .ok_or_else(|| ApiError::new("this box has no identity yet"))?;
+        let keys = self.peer_keys.get(&target.id).ok_or_else(|| {
+            ApiError::new(format!(
+                "the identity of \"{label}\" is not confirmed yet (see `wanderlan status`)"
+            ))
+        })?;
+        Ok(crate::speedtest::Peer {
+            name: label,
+            control: SocketAddrV4::new(
+                target.address,
+                self.runtime.control_port_of(&cfg.network, target.id),
+            ),
+            me,
+            id: target.id,
+            keys: keys.keys.clone(),
+            tunnel: tunnel.ifname(self.tag),
+            pmtu: self.runtime.pmtu.get(&target.id).copied(),
+        })
+    }
+
+    /// What limits the throughput of this box, in a task of its own (it
+    /// watches for a few seconds).
+    fn start_perf(
+        &self,
+        params: &api::PerfParams,
+        reply: oneshot::Sender<Result<serde_json::Value, ApiError>>,
+    ) {
+        let seconds = params.seconds.unwrap_or(api::PERF_SECONDS).clamp(1, 30);
+        let mut input = crate::perf::Input {
+            underlay: self.underlay_nics.iter().cloned().collect(),
+            conntrack: self.runtime.conntrack,
+            bridge_netfilter: bridge_netfilter_warning(),
+            ..crate::perf::Input::default()
+        };
+        if let Some(cfg) = &self.config {
+            let desired = desired::derive_in(&self.scope(), cfg, &self.runtime);
+            input.trunks = desired
+                .trunks
+                .iter()
+                .filter(|t| self.bridges.contains(&t.bridge))
+                .map(|t| t.name.clone())
+                .collect();
+            input.tunnels = desired.tunnels.iter().map(|t| t.name.clone()).collect();
+            input.notrack = !desired.learn.notrack.is_empty();
+            input.pmtu = self
+                .runtime
+                .pmtu
+                .iter()
+                .map(|(id, pmtu)| (cfg.network.label(*id), *pmtu))
+                .collect();
+        }
+        tokio::spawn(async move {
+            let perf = crate::perf::run(input, seconds).await;
+            let _ = reply.send(to_value(&perf));
+        });
+    }
+
     fn start_join(
         &mut self,
         params: JoinParams,
@@ -4702,7 +4834,9 @@ impl Controller {
                 .await?;
             return Ok(Vec::new());
         };
-        self.runtime.underlay_mtu = self.underlay_mtus(&cfg).await;
+        let (mtus, underlay) = self.underlay(&cfg).await;
+        self.runtime.underlay_mtu = mtus;
+        self.underlay_nics.clone_from(&underlay);
         self.refresh_breakout(&cfg).await;
         let desired = Arc::new(desired::derive_in(&self.scope(), &cfg, &self.runtime));
         for (peer, reason) in &desired.unbuilt {
@@ -4773,6 +4907,16 @@ impl Controller {
         }
         self.update_port_map().await;
         self.update_switch_check(&desired);
+        // The receive work of the trunk ports and of the interfaces the
+        // tunnel packets come in by, over the CPUs (see `tuning`).
+        let mut nics: BTreeSet<String> = desired
+            .trunks
+            .iter()
+            .filter(|t| self.bridges.contains(&t.bridge))
+            .map(|t| t.name.clone())
+            .collect();
+        nics.extend(underlay);
+        crate::tuning::want(&self.network, nics);
         Ok(changes)
     }
 
@@ -5097,31 +5241,33 @@ impl Controller {
     }
 
     /// Peer → MTU of the interface its tunnel leaves by (an upper bound of the
-    /// path MTU, for the MSS until the path is measured).
-    async fn underlay_mtus(&self, cfg: &Config) -> BTreeMap<SiteId, u16> {
+    /// path MTU, for the MSS until the path is measured), and the names of
+    /// these interfaces (the tunnel packets come in by them too).
+    async fn underlay(&self, cfg: &Config) -> (BTreeMap<SiteId, u16>, BTreeSet<String>) {
+        let mut mtus = BTreeMap::new();
+        let mut names = BTreeSet::new();
         let by_index = self.tunnel_interfaces().await;
         if by_index.is_empty() {
-            return BTreeMap::new();
+            return (mtus, names);
         }
         let Ok(links) = self.sys.links().await else {
-            return BTreeMap::new();
+            return (mtus, names);
         };
-        let mut out = BTreeMap::new();
         for (index, peers) in by_index {
-            let Some(mtu) = links
-                .iter()
-                .find(|l| l.index == index)
-                .and_then(|l| u16::try_from(l.mtu).ok())
-            else {
+            let Some(link) = links.iter().find(|l| l.index == index) else {
+                continue;
+            };
+            names.insert(link.name.clone());
+            let Ok(mtu) = u16::try_from(link.mtu) else {
                 continue;
             };
             for peer in peers {
                 if cfg.network.site(peer).is_some() {
-                    out.insert(peer, mtu);
+                    mtus.insert(peer, mtu);
                 }
             }
         }
-        out
+        (mtus, names)
     }
 
     /// Interface index → the peers whose tunnel leaves through it, as the

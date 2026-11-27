@@ -461,12 +461,26 @@ pub fn derive_in(scope: &Scope, cfg: &Config, runtime: &Runtime) -> Desired {
         }
     }
 
-    // The packets of the client tunnels skip connection tracking on their
-    // server (a client may need it: its firewall lets the answers in).
-    let notrack = (runtime.conntrack && has_clients)
+    // Where connection tracking is loaded, the tunnel packets of a server
+    // skip it, both ways: its firewall accepts the tunnel port by port
+    // anyway. So do those of the clients on a site with clients. A client
+    // keeps it for its uplink (its firewall may let the answers in by it).
+    let server = cfg.self_site().is_some_and(topology::is_server);
+    let notrack = (runtime.conntrack && (has_clients || server))
         .then_some(tunnel_port)
         .into_iter()
         .collect();
+    // A server sends to the tunnel port of each direct peer from a port per
+    // flow (through NAT from its own: the rule above).
+    let notrack_out = if runtime.conntrack && server {
+        tunnels
+            .iter()
+            .filter(|t| t.params.source_port.is_none())
+            .filter_map(|t| t.remote.map(|r| r.port()))
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
     let breakout = breakouts(cfg, runtime, &trunks, &tunnels, &trunk_vlans);
     let fixed = tunnels
         .iter()
@@ -495,6 +509,7 @@ pub fn derive_in(scope: &Scope, cfg: &Config, runtime: &Runtime) -> Desired {
         learn: LearnTable {
             rules: learn,
             notrack,
+            notrack_out,
             fixed,
         },
         bridge_options: BRIDGE_OPTIONS,
@@ -1047,6 +1062,33 @@ mod tests {
         let d = derive(&cfg, &runtime);
         let other = d.tunnels.iter().find(|t| t.peer_name == "haus3").unwrap();
         assert_eq!(other.remote.map(|r| r.port()), Some(53001));
+    }
+
+    #[test]
+    fn where_conntrack_is_loaded_a_server_skips_it_for_its_tunnels() {
+        let tracked = Runtime {
+            conntrack: true,
+            ..Runtime::default()
+        };
+        // Servers among each other: in and out.
+        let d = derive(&config("heim"), &tracked);
+        assert_eq!(d.learn.notrack, BTreeSet::from([51822]));
+        assert_eq!(d.learn.notrack_out, BTreeSet::from([51822]));
+        assert!(
+            derive(&config("heim"), &Runtime::default())
+                .learn
+                .is_empty()
+        );
+        // A client keeps it for its uplink.
+        let cfg = match load(NETWORK_CLIENTS, "self = \"nat1\"\ntrunk = \"ens19\"\n")
+            .unwrap()
+            .loaded
+        {
+            Loaded::Configured(cfg) => cfg,
+            Loaded::Unconfigured { .. } => panic!("configured"),
+        };
+        let d = derive(&cfg, &tracked);
+        assert!(d.learn.notrack.is_empty() && d.learn.notrack_out.is_empty());
     }
 
     #[test]

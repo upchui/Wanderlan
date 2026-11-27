@@ -138,6 +138,30 @@ pub enum Command {
     },
     /// Measure the path MTU to all peers now.
     Probe,
+    /// Look at what limits the throughput of this box: the load of the
+    /// cores, the receive queues, the path MTU, connection tracking. Best
+    /// during a transfer (e.g. a speed test from another shell).
+    Perf {
+        /// How long to watch.
+        #[arg(long, default_value_t = wanderlan_core::api::PERF_SECONDS)]
+        seconds: u32,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Measure the throughput to a peer: TCP between the boxes over the
+    /// transport network, and frames through the tunnel, both ways. Towards
+    /// a client behind NAT, start it on the client.
+    Speedtest {
+        /// The peer.
+        site: String,
+        /// Seconds per measurement (at most 10).
+        #[arg(long, default_value_t = wanderlan_core::api::SPEEDTEST_SECONDS)]
+        seconds: u32,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Invite a new site: prints the command to run there.
     ///
     /// Works on every site of the network. The code can be used once and is
@@ -656,6 +680,12 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             println!("Measuring the path MTU to all peers; see {}.", wl("status"));
             Ok(ExitCode::SUCCESS)
         }
+        Some(Command::Perf { seconds, json }) => perf(&socket, seconds, json).await,
+        Some(Command::Speedtest {
+            site,
+            seconds,
+            json,
+        }) => speedtest(&socket, &site, seconds, json).await,
         Some(Command::Invite { action, rules }) => invite(&socket, action, rules).await,
         Some(Command::Online { site, confirm }) => set_online(&socket, &site, true, confirm).await,
         Some(Command::Offline { site, confirm }) => {
@@ -2310,6 +2340,114 @@ fn print_breakouts(st: &Status) {
 /// A rate in bit/s, short.
 fn format_rate(bps: u64) -> String {
     crate::tui::format::rate_unit(bps)
+}
+
+/// `wanderlan perf`.
+async fn perf(socket: &Path, seconds: u32, json: bool) -> Result<ExitCode> {
+    use wanderlan_core::api::{FindingLevel, Perf, PerfParams};
+    let client = connect(socket).await?;
+    if !json {
+        println!("Watching for {seconds} s …");
+    }
+    let perf: Perf = client
+        .call(Request::Perf(PerfParams {
+            seconds: Some(seconds),
+        }))
+        .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&perf)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    for finding in &perf.findings {
+        let mark = match finding.level {
+            FindingLevel::Problem => "PROBLEM",
+            FindingLevel::Hint => "hint   ",
+            FindingLevel::Ok => "ok     ",
+        };
+        println!("{mark} {}", finding.text);
+        if let Some(fix) = &finding.fix {
+            println!("        → {fix}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `wanderlan speedtest <site>`.
+async fn speedtest(socket: &Path, site: &str, seconds: u32, json: bool) -> Result<ExitCode> {
+    use wanderlan_core::api::{SpeedRun, Speedtest, SpeedtestParams};
+    let client = connect(socket).await?;
+    if !json {
+        println!("Measuring for about {} s …", seconds * 6 + 5);
+    }
+    let test: Speedtest = client
+        .call(Request::Speedtest(SpeedtestParams {
+            site: site.to_string(),
+            seconds: Some(seconds),
+        }))
+        .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&test)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let peer = &test.peer;
+    println!(
+        "Speed test with \"{peer}\" ({}), {} s per measurement:",
+        test.address, test.seconds
+    );
+    let cell = |run: Option<&SpeedRun>| -> String {
+        let Some(run) = run else {
+            return String::new();
+        };
+        if let Some(error) = &run.error {
+            return format!("failed: {error}");
+        }
+        let mut text = format_rate(run.bits_per_second);
+        if let (Some(sent), Some(arrived)) = (run.sent, run.arrived)
+            && sent > 0
+        {
+            let lost = sent.saturating_sub(arrived) * 1000 / sent;
+            if lost == 0 {
+                // All arrived: the sender was the limit, not the way.
+                text = format!("≥ {text}");
+            } else {
+                text.push_str(&format!(", {}.{} % lost", lost / 10, lost % 10));
+            }
+        }
+        if let Some((core, share)) = run.busiest_core {
+            text.push_str(&format!(" (core {core}: {share} %)"));
+        }
+        text
+    };
+    let mut rows: Vec<Option<u16>> = Vec::new();
+    for run in &test.runs {
+        if !rows.contains(&run.frame) {
+            rows.push(run.frame);
+        }
+    }
+    let up_head = format!("here → {peer}");
+    let down_head = format!("{peer} → here");
+    println!("  {:<22} {:<42} {down_head}", "", up_head);
+    for frame in rows {
+        let label = frame.map_or_else(
+            || "TCP (transport)".to_string(),
+            |f| format!("tunnel, {f} B frames"),
+        );
+        let find = |up: bool| test.runs.iter().find(|r| r.frame == frame && r.up == up);
+        println!(
+            "  {label:<22} {:<42} {}",
+            cell(find(true)),
+            cell(find(false))
+        );
+    }
+    if let Some(pmtu) = test.pmtu
+        && pmtu < wanderlan_core::mtu::PROBE_MAX
+    {
+        println!("Path MTU {pmtu}: full frames are split in two outside; the smaller frames fit.");
+    }
+    println!(
+        "Frames are sent as fast as the sender can: what arrives per second is what the way takes (\"lost\": what it could not take; ≥: all arrived, the sender was the limit). Core: the busiest core of the receiver and its share of network work."
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `wanderlan breakout` without arguments.

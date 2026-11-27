@@ -44,8 +44,10 @@ StateDirectoryMode=0750
 ProtectSystem=strict
 # The local breakout turns on forwarding (on its interfaces and uplinks, and
 # for IPv6) while it is configured, and puts it back afterwards; the rest of
-# /proc/sys stays read-only (ProtectKernelTunables).
-ReadWritePaths=/etc/wanderlan /proc/sys/net/ipv4/conf /proc/sys/net/ipv6/conf
+# /proc/sys stays read-only (ProtectKernelTunables). A NIC with one receive
+# queue gets its receive work spread over the CPUs (RPS, in
+# /sys/devices/…/queues/rx-0/rps_cpus) and the old value back on stop.
+ReadWritePaths=/etc/wanderlan /proc/sys/net/ipv4/conf /proc/sys/net/ipv6/conf /sys/devices
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

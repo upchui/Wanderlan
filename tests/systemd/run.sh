@@ -215,6 +215,25 @@ x beta "ip route del default via 10.8.0.254"
 wait_for 30 "VLAN 20: the clients still reach each other" ping_ok
 healthy
 
+begin "RPS under the hardened unit: the receive work of a one-queue NIC over the cores"
+rps() { x beta "cat /sys/class/net/trunk0/queues/rx-0/rps_cpus"; }
+no_rps() { grep -Eq '^[0,]+$' <<<"$(rps)"; }
+if [ "$(x beta 'ls -d /sys/class/net/trunk0/queues/rx-* | wc -l')" = 1 ] &&
+  [ "$(x beta 'nproc --all')" -gt 1 ]; then
+  check "beta: trunk0 (one receive queue) spreads its work over the cores (ReadWritePaths=/sys/devices)" \
+    eval '! no_rps'
+  check "beta: the journal says so" \
+    x beta "journalctl -u wanderland --no-pager -o cat | grep -q 'Spreading the receive work of trunk0'"
+  x beta "systemctl stop wanderland"
+  check "beta: after a stop trunk0 has its value before again" no_rps
+  x beta "systemctl start wanderland"
+  wait_for 30 "beta: RPS is back after the start" eval '! no_rps'
+  wait_for 30 "VLAN 20: the clients still reach each other" ping_ok
+else
+  echo "  info  trunk0 has several receive queues or the box one core: no RPS expected"
+fi
+healthy
+
 begin "A crash: the cleanup removes what is left, the restart builds it anew"
 before=$(br0_index)
 cursor=$(journal_cursor alpha)

@@ -23,6 +23,8 @@
 //!
 //!   A client pushes its changes this way: its server never connects to it
 //!   (it may be behind NAT).
+//! * `SPEED <id> <nonce> <measurement>`: one measurement of a speed test,
+//!   authenticated like `SYNC` (see [`crate::speedtest`]).
 
 use std::collections::{BTreeMap, HashMap};
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -42,10 +44,10 @@ use crate::daemon::Input;
 
 /// Largest accepted network.toml.
 const MAX_SIZE: u64 = 1024 * 1024;
-const TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const TIMEOUT: Duration = Duration::from_secs(10);
 /// The time for a line an honest peer sends at once (its request, its tag):
 /// a connection that sits idle holds a slot no longer.
-const LINE_TIMEOUT: Duration = Duration::from_secs(3);
+pub(crate) const LINE_TIMEOUT: Duration = Duration::from_secs(3);
 /// Longest accepted request line.
 const MAX_LINE: u64 = 4096;
 /// Time the controller may take to answer a join request.
@@ -59,7 +61,7 @@ const MAX_PER_ADDRESS: usize = 8;
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Bytes of a sync nonce.
-const NONCE_LEN: usize = 16;
+pub(crate) const NONCE_LEN: usize = 16;
 const LABEL_REQUEST: &[u8] = b"wanderlan sync request";
 const LABEL_REPLY: &[u8] = b"wanderlan sync reply";
 
@@ -95,6 +97,9 @@ pub struct Keyed {
     pub view: Arc<str>,
     /// The keys of the tunnel to it.
     pub keys: Arc<PairKeys>,
+    /// The tunnel interface to it (none for a former peer), for a speed
+    /// test.
+    pub tunnel: Option<String>,
 }
 
 impl PartialEq for Keyed {
@@ -104,6 +109,7 @@ impl PartialEq for Keyed {
             && self.address == other.address
             && self.client == other.client
             && self.view == other.view
+            && self.tunnel == other.tunnel
     }
 }
 
@@ -325,6 +331,9 @@ async fn serve(
     if let Some(args) = line.strip_prefix("SYNC ") {
         return serve_sync(args, from, offer, inputs, &mut reader, &mut write).await;
     }
+    if let Some(args) = line.strip_prefix("SPEED ") {
+        return crate::speedtest::serve(args, from, offer, &mut reader, &mut write).await;
+    }
     if line == "NETWORK" {
         let Some(view) = offer.views.get(from.ip()) else {
             bail!("{from} is not a peer");
@@ -348,7 +357,7 @@ async fn serve(
 }
 
 /// One line of at most [`MAX_LINE`] bytes, within `timeout`.
-async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
+pub(crate) async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
     timeout: Duration,
 ) -> Result<String> {
@@ -360,7 +369,7 @@ async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
 }
 
 /// `<tag> <length>` (within `timeout`) and the body after it.
-async fn read_tagged<R: tokio::io::AsyncBufRead + Unpin>(
+pub(crate) async fn read_tagged<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
     timeout: Duration,
 ) -> Result<([u8; TAG_LEN], Vec<u8>)> {
@@ -462,7 +471,7 @@ async fn push_to_controller(
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     bytes.iter().fold(String::new(), |mut s, b| {
         let _ = write!(s, "{b:02x}");
@@ -470,7 +479,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     })
 }
 
-fn hex_decode<const N: usize>(text: &str) -> Option<[u8; N]> {
+pub(crate) fn hex_decode<const N: usize>(text: &str) -> Option<[u8; N]> {
     if text.len() != 2 * N {
         return None;
     }
@@ -670,6 +679,7 @@ mod tests {
                         client: false,
                         view: Arc::from("the network\n"),
                         keys: Arc::new(b.pair(&a.id()).unwrap()),
+                        tunnel: None,
                     },
                 )]
                 .into(),

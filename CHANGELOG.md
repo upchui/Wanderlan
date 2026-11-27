@@ -7,6 +7,21 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
+### Throughput
+
+- NICs with one receive queue (a VM without multiqueue) no longer do all
+  the network work on one core: wanderlan spreads the receive work of its
+  trunk ports and of the interfaces the tunnel packets come in by over all
+  cores (RPS, only where nobody set it; the old value comes back when it
+  stops).
+- Where connection tracking is loaded, every server skips it for its
+  tunnel packets (before: only a server with clients), also for those it
+  sends to other servers.
+- `wanderlan perf` names what limits the throughput of the box (the load
+  of the cores, receive queues, split packets, connection tracking) and
+  what helps; `wanderlan speedtest <site>` measures TCP over the transport
+  and frames through the tunnel, both ways.
+
 ### Both sites in one switch network
 
 - A site with VLAN mappings checks every 30 s whether its trunk and the

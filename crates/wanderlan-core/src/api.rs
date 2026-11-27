@@ -68,6 +68,12 @@ pub enum Request {
     Unblock(UnblockParams),
     /// Measures the path MTU to all peers again → [`Done`].
     ProbeNow,
+    /// Looks at what limits the throughput of this box, for a few seconds
+    /// → [`Perf`].
+    Perf(PerfParams),
+    /// Measures the throughput to a peer: the transport and the tunnel, in
+    /// both directions → [`Speedtest`].
+    Speedtest(SpeedtestParams),
     /// Creates an invitation for a new site with rules for it →
     /// [`Invitation`].
     Invite(SiteRules),
@@ -370,6 +376,107 @@ pub enum ServerMessage {
 /// Empty result.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Done {}
+
+/// Parameters of [`Request::Perf`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfParams {
+    /// How long to watch (default [`PERF_SECONDS`]).
+    #[serde(default)]
+    pub seconds: Option<u32>,
+}
+
+/// How long `perf` watches by default.
+pub const PERF_SECONDS: u32 = 3;
+
+/// Result of [`Request::Perf`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Perf {
+    /// How long it watched.
+    pub seconds: u32,
+    /// What it found, the problems first.
+    pub findings: Vec<Finding>,
+}
+
+/// One thing `perf` found.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finding {
+    /// How bad.
+    pub level: FindingLevel,
+    /// What it is.
+    pub text: String,
+    /// What helps.
+    #[serde(default)]
+    pub fix: Option<String>,
+}
+
+/// How bad a [`Finding`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingLevel {
+    /// It costs throughput.
+    Problem,
+    /// It may cost throughput, or something to know.
+    Hint,
+    /// Fine.
+    Ok,
+}
+
+/// Parameters of [`Request::Speedtest`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeedtestParams {
+    /// The peer (name or identity).
+    pub site: String,
+    /// Seconds per measurement (default [`SPEEDTEST_SECONDS`]).
+    #[serde(default)]
+    pub seconds: Option<u32>,
+}
+
+/// Seconds per measurement of a speed test by default.
+pub const SPEEDTEST_SECONDS: u32 = 5;
+/// The longest measurement of a speed test.
+pub const SPEEDTEST_MAX_SECONDS: u32 = 10;
+
+/// Result of [`Request::Speedtest`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Speedtest {
+    /// The peer.
+    pub peer: String,
+    /// Its address in the network.
+    pub address: String,
+    /// Seconds per measurement.
+    pub seconds: u32,
+    /// The measured path MTU to it.
+    #[serde(default)]
+    pub pmtu: Option<u16>,
+    /// The measurements.
+    pub runs: Vec<SpeedRun>,
+}
+
+/// One measurement of a speed test.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeedRun {
+    /// TCP between the boxes over the transport network, or frames of
+    /// `frame` bytes through the tunnel.
+    pub frame: Option<u16>,
+    /// From this site to the peer (else back).
+    pub up: bool,
+    /// What arrived, in bit/s (of the frames: their size).
+    pub bits_per_second: u64,
+    /// Frames sent and arrived (tunnel only): the rest was lost on the way,
+    /// or the sender was faster than the way.
+    #[serde(default)]
+    pub sent: Option<u64>,
+    /// Frames that arrived (tunnel only).
+    #[serde(default)]
+    pub arrived: Option<u64>,
+    /// The busiest core of the receiving box: its number and its share of
+    /// network work (softirq) in percent.
+    #[serde(default)]
+    pub busiest_core: Option<(u32, u32)>,
+    /// Why it failed.
+    #[serde(default)]
+    pub error: Option<String>,
+}
 
 /// Result of [`Request::Reset`]. Every step runs even if an earlier one
 /// failed; afterwards the daemon checks that nothing is left.
