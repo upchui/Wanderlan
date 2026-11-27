@@ -802,7 +802,13 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
         }
     }
 
-    let tc_changes = tc_changes(desired, actual);
+    // The rules of a mapping are in place before its VLAN reaches the
+    // trunk (else the trunk takes the VLAN as it is for a moment: where both
+    // sites are in one network, a loop through the tunnel), and go only
+    // after it left (the VLANs that leave go first of all, see below).
+    let (tc_dels, tc_adds): (Vec<Change>, Vec<Change>) = tc_changes(desired, actual)
+        .into_iter()
+        .partition(|c| matches!(c, Change::DelTcRule { .. } | Change::DelClsact { .. }));
     let want = NftState::of(&desired.mss, &desired.split);
     if let Some(error) = &actual.nft_error
         && !desired.split.is_empty()
@@ -853,8 +859,11 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
     out.extend(vlan_dels);
     // The split horizon covers a new VLAN before the VLAN reaches the ports.
     out.extend(nft_changes);
+    // After the VLANs that leave, before those that come (a rule replaced
+    // by another one goes first).
+    out.extend(tc_dels);
+    out.extend(tc_adds);
     out.extend(vlan_adds);
-    out.extend(tc_changes);
     out.extend(unisolate);
     out.extend(ups);
     Ok(out)

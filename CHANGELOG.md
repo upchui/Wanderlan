@@ -9,6 +9,12 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
 ### Fixes, fourth review
 
+- A mapping that comes while the tunnels run has its rules before its VLAN
+  reaches the trunk (and the VLAN leaves before them): the trunk never
+  takes the source VLAN as it is, not even for a moment. Where both sites
+  are in one network (a test with two boxes on one switch), that moment
+  was a loop through the tunnel, after which switches and bridges had
+  devices at the wrong port.
 - A copy of a client's probe sent again from elsewhere no longer counts:
   what a request of a client says (the test of its tunnel, its ports)
   counts only from the address where it answered a challenge. Before, a

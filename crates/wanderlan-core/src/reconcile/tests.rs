@@ -721,6 +721,39 @@ async fn removing_the_mapping_removes_rules_and_qdisc() {
 }
 
 #[tokio::test]
+async fn a_mapped_vlan_reaches_the_trunk_only_after_its_rules() {
+    // haus2 gets VLAN 30, as 130 on its trunk, while it runs: its trunk
+    // never takes a frame tagged 30 as it is (where two sites are in one
+    // network, that is a loop through the tunnel, if only for a moment).
+    let net = fresh();
+    let before = NETWORK.replace("vlans = \"20,30\"", "vlans = \"20\"");
+    let after = format!("{NETWORK}\n[[map]]\nsite = \"haus2\"\nlocal = 130\nshared = 30\n");
+    let derived = |network: &str| derive(&config_from(network, "haus2"), &Runtime::default());
+    run(&net, &derived(&before)).await;
+    let changes = run(&net, &derived(&after)).await;
+    let rules = changes
+        .iter()
+        .position(|c| matches!(c, Change::AddTcRule { .. }))
+        .expect("the rules");
+    let vlan = changes
+        .iter()
+        .position(|c| matches!(c, Change::AddVlans { port, .. } if port == "ens19"))
+        .expect("the VLAN");
+    assert!(rules < vlan, "{changes:#?}");
+    // It goes again: the VLAN leaves the trunk before its rules.
+    let changes = run(&net, &derived(&before)).await;
+    let vlan = changes
+        .iter()
+        .position(|c| matches!(c, Change::DelVlans { port, .. } if port == "ens19"))
+        .expect("the VLAN");
+    let rules = changes
+        .iter()
+        .position(|c| matches!(c, Change::DelTcRule { .. }))
+        .expect("the rules");
+    assert!(vlan < rules, "{changes:#?}");
+}
+
+#[tokio::test]
 async fn foreign_filters_are_kept() {
     let net = fresh();
     net.add_foreign_filter("ens19");
