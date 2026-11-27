@@ -14,6 +14,7 @@ pub mod identity;
 pub mod join;
 pub mod loopguard;
 pub mod merge;
+pub mod merge3;
 pub mod mtu;
 pub mod nat;
 pub mod policy;

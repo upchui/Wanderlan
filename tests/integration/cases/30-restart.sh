@@ -76,7 +76,7 @@ awk '
   >"$RUN_DIR/site4-names.toml"
 put site4 /etc/wanderlan/network.toml <"$RUN_DIR/site4-names.toml"
 check "the file names the sites by their names only" \
-  x site4 "! grep -q '^\[site\.\"' /etc/wanderlan/network.toml"
+  x site4 "! grep -q '^\[site\.\"' /etc/wanderlan/network.toml && grep -q '^name = \"site4\"' /etc/wanderlan/network.toml"
 x site4 "wl-daemon reload"
 wait_for 30 "site4 wrote it back with its identity" \
   eval "x site4 'site-entry site4' | head -n 1 | grep -qF \"\$(jqs site4 .site_id)\""

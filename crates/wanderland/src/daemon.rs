@@ -31,6 +31,7 @@ use wanderlan_core::desired::{self, Runtime};
 use wanderlan_core::identity::{Identity, Keyring, PeerIdentity, SiteId};
 use wanderlan_core::join::{self, JoinReply, JoinRequest};
 use wanderlan_core::loopguard::format_mac;
+use wanderlan_core::merge3::{self, Ancestry};
 use wanderlan_core::mtu::wire::Announce;
 use wanderlan_core::mtu::wire2;
 use wanderlan_core::policy;
@@ -95,37 +96,92 @@ pub enum FetchMode {
     Resync,
 }
 
+/// Line after [`REFUSED_MARKER`]: the fingerprint of the network that was
+/// refused (a client that changed it again since sends the new one).
+const REFUSED_FP_MARKER: &str = "# wanderlan: refused ";
+/// Line of a network text with the fingerprints the network was made from
+/// ([`Ancestry`]); a server that gets a newer one learns whether it holds
+/// its own changes. A comment like [`REFUSED_MARKER`].
+const BASE_MARKER: &str = "# wanderlan: base ";
+/// How long a client with a key may announce another network than its view
+/// without sending it before its server counts its revision on (it does not
+/// know it is a client here: made one while it was away).
+const NUDGE_AFTER: Duration = Duration::from_secs(30);
+
 /// The reason in the first line of a view whose change was refused.
 fn refusal(text: &str) -> Option<&str> {
     text.lines().next()?.strip_prefix(REFUSED_MARKER)
+}
+
+/// The value of a header line of a network text (the `# wanderlan: `
+/// comments at the top).
+fn header<'a>(text: &'a str, marker: &str) -> Option<&'a str> {
+    text.lines()
+        .take_while(|l| l.starts_with("# wanderlan: "))
+        .find_map(|l| l.strip_prefix(marker))
+}
+
+/// What a network text says it was made from.
+fn ancestry_of(text: &str) -> Ancestry {
+    header(text, BASE_MARKER)
+        .map(Ancestry::parse)
+        .unwrap_or_default()
+}
+
+/// A network text with the line of its ancestry.
+fn with_base(text: String, ancestry: &Ancestry) -> String {
+    if ancestry.is_empty() {
+        text
+    } else {
+        format!("{BASE_MARKER}{}\n{text}", ancestry.render())
+    }
+}
+
+/// Where a network taken over from a peer comes from.
+#[derive(Debug, Clone)]
+struct Lineage {
+    /// The fingerprint of what came.
+    source: String,
+    /// What it was made from.
+    ancestry: Ancestry,
+    /// It holds a change of this site (put together here with the peer's).
+    own: bool,
 }
 
 /// Why the last change of a client was refused here, and when.
 #[derive(Debug, Clone)]
 struct Refusal {
     reason: String,
+    /// The fingerprint of the refused network, if known.
+    fingerprint: Option<String>,
     /// On the clock of the probe table (compared with its announces).
     at: std::time::Instant,
 }
 
 /// Fingerprints of configurations that were rejected and are not fetched
-/// again for [`REJECT_TTL`]; after that they get another chance.
+/// again for [`REJECT_TTL`]; after that they get another chance. Those that
+/// did not fit this site (`retry`) get it with the next change made here.
 #[derive(Debug, Default)]
-struct Rejected(BTreeMap<String, Instant>);
+struct Rejected(BTreeMap<String, (Instant, bool)>);
 
 impl Rejected {
-    fn insert(&mut self, fingerprint: String, now: Instant) {
-        self.0.retain(|_, until| *until > now);
-        self.0.insert(fingerprint, now + REJECT_TTL);
+    fn insert(&mut self, fingerprint: String, now: Instant, retry: bool) {
+        self.0.retain(|_, (until, _)| *until > now);
+        self.0.insert(fingerprint, (now + REJECT_TTL, retry));
     }
 
     /// The fingerprints still rejected at `now`.
     fn active(&self, now: Instant) -> BTreeSet<String> {
         self.0
             .iter()
-            .filter(|(_, until)| **until > now)
+            .filter(|(_, (until, _))| *until > now)
             .map(|(fp, _)| fp.clone())
             .collect()
+    }
+
+    /// A change made here may make those fit that did not.
+    fn retry(&mut self) {
+        self.0.retain(|_, (_, retry)| !*retry);
     }
 
     fn clear(&mut self) {
@@ -244,6 +300,8 @@ struct Pending {
     peer: Option<SiteId>,
     from_files: bool,
     fingerprint: String,
+    /// Where a change taken over from a peer comes from (none: made here).
+    lineage: Option<Lineage>,
     /// For changes of a client merged here: the fingerprint the client
     /// announced, rejected too on a rollback (else fetched again at once).
     announced: Option<String>,
@@ -354,6 +412,22 @@ struct Controller {
     /// A change made on this site itself (not passed on from a client) is
     /// in what the uplink has not taken over yet: a refusal may be about it.
     own_change_up: bool,
+    /// Since when the uplink has a newer network while this site sends it
+    /// its change first (else the newer network replaces it).
+    push_first_since: Option<Instant>,
+    /// The networks confirmed here last: the bases of a three-way merge.
+    known: merge3::Known,
+    /// What the confirmed network was made from.
+    ancestry: Ancestry,
+    /// The fingerprint of the confirmed network if it holds a change made
+    /// here (or put together here) that others may not have.
+    own_change: Option<String>,
+    /// Where the next change applied comes from (set by a takeover).
+    next_lineage: Option<Lineage>,
+    /// Clients with a key that announce another network than their view and
+    /// send nothing: that network, since when, and whether this site counted
+    /// its revision on for them.
+    silent_clients: BTreeMap<SiteId, (String, Instant, bool)>,
     generation: u64,
     invites: Invites,
     join_failures: BTreeMap<Ipv4Addr, VecDeque<Instant>>,
@@ -381,6 +455,9 @@ struct Controller {
     push_retry_at: Instant,
     /// The fingerprint of the network last pushed to the uplink.
     pushed: Option<String>,
+    /// The uplink refused that push: the fingerprint and why (its view may
+    /// not say so, e.g. after a restart there).
+    push_refused: Option<(String, String)>,
     /// The tunnels this site sends keepalives through.
     keepalive: watch::Sender<keepalive::Keepalives>,
     /// Former addresses of the probes and the sync (another control port
@@ -611,6 +688,12 @@ impl Controller {
             grace_added: Vec::new(),
             relayed: BTreeMap::new(),
             own_change_up: false,
+            push_first_since: None,
+            known: merge3::Known::default(),
+            ancestry: Ancestry::default(),
+            own_change: None,
+            next_lineage: None,
+            silent_clients: BTreeMap::new(),
             generation: 0,
             invites,
             join_failures: BTreeMap::new(),
@@ -625,6 +708,7 @@ impl Controller {
             pushing: false,
             push_retry_at: Instant::now(),
             pushed: None,
+            push_refused: None,
             keepalive: keepalive_tx,
             former_binds: Vec::new(),
             last_bind: None,
@@ -1048,10 +1132,12 @@ impl Controller {
         // was in effect last (its copy in the state directory).
         let saved = self.paths.confirmed_network();
         let mut cfg = self.load_files_with(saved.as_ref());
+        let mut edit = false;
         if let Some(cfg) = &mut cfg {
             let before = cfg.clone();
             if let Some(saved) = &saved {
                 keep_ids(saved, &mut cfg.network, &mut cfg.local);
+                edit = self.edited_by_hand(saved, &mut cfg.network);
             }
             // As written by the daemon: else the identities that were
             // found again (the file names sites by their names) are lost
@@ -1065,9 +1151,51 @@ impl Controller {
                 warn!("{e:#}");
             }
         }
+        if let Some(cfg) = &cfg {
+            self.files_lineage(saved.as_ref(), &cfg.network, edit);
+        }
         self.confirmed = cfg.clone();
         self.set_config(cfg);
         self.claim_identity();
+    }
+
+    /// True if `network` (the files) is `confirmed` edited by hand: another
+    /// content with its revision (then it gets the next one: else the sync
+    /// takes it for an older one and replaces it) or a higher one. A file
+    /// with a lower revision is an old one (a backup put back): the sync
+    /// replaces it with what the peers have.
+    fn edited_by_hand(&self, confirmed: &Network, network: &mut Network) -> bool {
+        if config::fingerprint(network) == config::fingerprint(confirmed)
+            || network.revision < confirmed.revision
+        {
+            return false;
+        }
+        if network.revision == confirmed.revision {
+            network.revision = config::next_revision(confirmed.revision);
+            self.events.info(format!(
+                "The configuration files were edited by hand; they get network revision {}",
+                network.revision
+            ));
+        }
+        true
+    }
+
+    /// The files hold `now`, read with `before` confirmed: an edit made from
+    /// it (`edit`), else what this site has (an old file: nothing of its
+    /// own).
+    fn files_lineage(&mut self, before: Option<&Network>, now: &Network, edit: bool) {
+        let before = before.map(|old| {
+            let fp = config::fingerprint(old);
+            self.known.remember(&fp, old);
+            fp
+        });
+        if edit {
+            self.follow_lineage_from(before, now, None);
+        } else if before.as_deref() != Some(config::fingerprint(now).as_str()) {
+            self.ancestry = Ancestry::default();
+            self.own_change = None;
+            self.known.remember(&config::fingerprint(now), now);
+        }
     }
 
     /// The identity of this box: the one in the state directory, created
@@ -1100,6 +1228,48 @@ impl Controller {
     /// The identity of this box, if it has one.
     fn own_id(&self) -> Option<SiteId> {
         self.identity.as_ref().map(|i| i.id())
+    }
+
+    /// The confirmed network becomes `now`: taken over as `lineage` says,
+    /// else made here from the one confirmed before (if it differs). Its
+    /// ancestry and the history follow.
+    fn follow_lineage(&mut self, now: &Network, lineage: Option<Lineage>) {
+        let before = self
+            .confirmed
+            .as_ref()
+            .map(|c| config::fingerprint(&c.network));
+        self.follow_lineage_from(before, now, lineage);
+    }
+
+    /// [`Self::follow_lineage`] from the network with the fingerprint
+    /// `before`.
+    fn follow_lineage_from(
+        &mut self,
+        before: Option<String>,
+        now: &Network,
+        lineage: Option<Lineage>,
+    ) {
+        let now_fp = config::fingerprint(now);
+        match lineage {
+            // Taken over as it came.
+            Some(l) if l.source == now_fp => {
+                self.ancestry = l.ancestry;
+                self.own_change = l.own.then(|| now_fp.clone());
+            }
+            // Changed here on the way in (an identity claimed).
+            Some(l) => {
+                self.ancestry = l.ancestry.child(&l.source);
+                self.own_change = Some(now_fp.clone());
+            }
+            None if before.as_deref() == Some(now_fp.as_str()) => {}
+            None => {
+                if let Some(before) = before {
+                    self.ancestry = self.ancestry.child(&before);
+                }
+                self.own_change = Some(now_fp.clone());
+            }
+        }
+        self.known.remember(&now_fp, now);
     }
 
     /// Writes the identity of this box into its entry of the confirmed
@@ -1142,6 +1312,7 @@ impl Controller {
             id.fingerprint(),
             cfg.network.revision
         ));
+        self.follow_lineage(&cfg.network, None);
         self.confirmed = Some(cfg.clone());
         self.set_config(Some(cfg));
     }
@@ -1318,8 +1489,10 @@ impl Controller {
             .or_else(|| self.paths.confirmed_network());
         if let Some(mut cfg) = self.load_files_with(known.as_ref()) {
             // Files written without the `id` lines keep the identities.
+            let mut edit = false;
             if let Some(old) = &known {
                 keep_ids(old, &mut cfg.network, &mut cfg.local);
+                edit = self.edited_by_hand(old, &mut cfg.network);
             }
             // Written back as the daemon writes them (with the identities
             // found again), else kept as they are.
@@ -1331,6 +1504,7 @@ impl Controller {
             if let Err(e) = written {
                 warn!("{e:#}");
             }
+            self.files_lineage(known.as_ref(), &cfg.network, edit);
             self.confirmed = Some(cfg.clone());
             self.set_config(Some(cfg));
             self.claim_identity();
@@ -1550,8 +1724,10 @@ impl Controller {
         let announce = match &self.confirmed {
             None => Announce::default(),
             Some(c) => {
-                // Peers get the network in the form every version reads.
-                let own = render_network_wire(&c.network);
+                // Peers get the network in the form every version reads,
+                // with what it was made from.
+                let own = with_base(render_network_wire(&c.network), &self.ancestry);
+                let view_base = self.ancestry.child(&config::fingerprint(&c.network));
                 let uplink = c.self_site().and_then(|s| s.uplink);
                 for (name, addr) in peers.iter().chain(responders.iter()) {
                     // By address only what no current peer has: a former
@@ -1566,13 +1742,18 @@ impl Controller {
                         announce_to.insert(*name, version(&v));
                         expected.insert(*name, Version::of(&v));
                         // A refused change: the client learns why.
+                        // Made from the whole network: a site that took it for
+                        // a server's sees whether it holds its changes.
+                        let wire = with_base(render_network_wire(&v), &view_base);
                         let text = match self.refused.get(name) {
                             Some(r) => format!(
-                                "{REFUSED_MARKER}{}\n{}",
+                                "{REFUSED_MARKER}{}\n{}{wire}",
                                 r.reason.replace('\n', " "),
-                                render_network_wire(&v)
+                                r.fingerprint.as_ref().map_or_else(String::new, |fp| {
+                                    format!("{REFUSED_FP_MARKER}{fp}\n")
+                                }),
                             ),
-                            None => render_network_wire(&v),
+                            None => wire,
                         };
                         texts.insert(*name, text.clone());
                         if by_address {
@@ -2242,7 +2423,10 @@ impl Controller {
         let mut adopt: Option<(SiteId, u64)> = None;
         let mut resync: Option<SiteId> = None;
         let mut push: Option<SiteId> = None;
+        let mut nudge: Option<(SiteId, u64)> = None;
         let mut in_sync_again: Vec<SiteId> = Vec::new();
+        // A change of this site (or of its clients) the uplink may not have.
+        let unsent = self.own_change_up || !self.relayed.is_empty();
         for (name, kind) in &tunnels {
             if self.fetch_backoff.get(name).is_some_and(|t| *t > now) {
                 continue;
@@ -2281,10 +2465,23 @@ impl Controller {
                 }
                 _ if rejected.contains(&theirs.fingerprint) => {}
                 TunnelKind::Server => upstream.push((*name, theirs)),
-                // The uplink has the last word on what this site knows.
+                // The uplink has the last word on what this site knows, after
+                // it got what this site changed (for a while: one that does
+                // not answer pushes does not hold the sync up).
                 TunnelKind::Uplink if theirs.revision > ours.revision => {
                     self.diverged_since = None;
-                    upstream.push((*name, theirs));
+                    let since = *self.push_first_since.get_or_insert(now);
+                    let first = unsent
+                        && self.peer_keys.contains_key(name)
+                        && probe.reachable
+                        && now.duration_since(since) < RESYNC_AFTER;
+                    if !first || self.pushed.as_deref() == Some(ours.fingerprint.as_str()) {
+                        if !self.pushing {
+                            upstream.push((*name, theirs));
+                        }
+                    } else {
+                        push = Some(*name);
+                    }
                 }
                 TunnelKind::Uplink => {
                     // A change of this site that the uplink has not taken
@@ -2307,6 +2504,7 @@ impl Controller {
                         continue;
                     };
                     if theirs.fingerprint == expected.fingerprint {
+                        self.silent_clients.remove(name);
                         // Back in sync only by an announce made after a
                         // refusal: a pushed change arrives before the
                         // client's next probe announces it.
@@ -2317,12 +2515,31 @@ impl Controller {
                         {
                             in_sync_again.push(*name);
                         }
-                    } else if client_changes.is_none()
-                        && theirs.revision >= expected.revision
-                        // A client with a key sends its changes itself.
-                        && !self.peer_keys.contains_key(name)
-                    {
-                        client_changes = Some((*name, theirs));
+                    } else if theirs.revision < expected.revision {
+                        // It fetches its view.
+                        self.silent_clients.remove(name);
+                    } else if !self.peer_keys.contains_key(name) {
+                        if client_changes.is_none() {
+                            client_changes = Some((*name, theirs));
+                        }
+                    } else {
+                        // A client with a key sends its changes itself. One
+                        // that does not for a while does not know it is a
+                        // client here (made one while it was away, it takes
+                        // this site for a server): with a revision above its
+                        // own it fetches its view (once per network of it).
+                        let entry = self
+                            .silent_clients
+                            .entry(*name)
+                            .or_insert_with(|| (theirs.fingerprint.clone(), now, false));
+                        if entry.0 != theirs.fingerprint {
+                            *entry = (theirs.fingerprint.clone(), now, false);
+                        }
+                        if !entry.2 && now.duration_since(entry.1) >= NUDGE_AFTER && nudge.is_none()
+                        {
+                            entry.2 = true;
+                            nudge = Some((*name, theirs.revision));
+                        }
                     }
                 }
             }
@@ -2338,6 +2555,21 @@ impl Controller {
         if let Some((peer, revision)) = adopt {
             self.adopt_revision(peer, revision);
             return;
+        }
+        if let Some((peer, revision)) = nudge {
+            let label = self.peer_label(peer);
+            self.events.emit(
+                Level::Info,
+                Some(&label),
+                format!(
+                    "Client \"{label}\" has another network (revision {revision}) and does not send it; this site counts its revision on, so that it fetches its view"
+                ),
+            );
+            self.adopt_revision(peer, config::next_revision(revision.max(ours.revision)));
+            return;
+        }
+        if !unsent || !upstream.is_empty() {
+            self.push_first_since = None;
         }
         if let Some(peer) = push.filter(|_| {
             !self.pushing && upstream.is_empty() && Instant::now() >= self.push_retry_at
@@ -2432,7 +2664,7 @@ impl Controller {
         let (Some(me), Some(k)) = (self.own_id(), self.peer_keys.get(&peer).cloned()) else {
             return;
         };
-        let text = render_network_wire(&cfg.network);
+        let text = with_base(render_network_wire(&cfg.network), &self.ancestry);
         self.pushing = true;
         self.pushed = Some(fingerprint.to_string());
         debug!(
@@ -2450,7 +2682,32 @@ impl Controller {
 
     /// Remembers a fingerprint that is not fetched again for a while.
     fn reject(&mut self, fingerprint: String) {
-        self.rejected.insert(fingerprint, Instant::now());
+        self.rejected.insert(fingerprint, Instant::now(), false);
+    }
+
+    /// The highest revision a server peer or the uplink announces (within a
+    /// step of the confirmed one).
+    fn upstream_revision(&self) -> u64 {
+        let Some(cfg) = &self.confirmed else {
+            return 0;
+        };
+        let limit = cfg
+            .network
+            .revision
+            .saturating_add(config::MAX_REVISION_STEP);
+        let upstream: BTreeSet<SiteId> = topology::tunnels_for(&cfg.network, cfg.self_id())
+            .into_iter()
+            .filter(|t| matches!(t.kind, TunnelKind::Server | TunnelKind::Uplink))
+            .map(|t| t.peer.id)
+            .collect();
+        self.probes.read().map_or(0, |t| {
+            t.iter()
+                .filter(|(id, p)| p.reachable && upstream.contains(*id))
+                .filter_map(|(_, p)| p.announce.map(|a| a.revision))
+                .filter(|r| *r <= limit)
+                .max()
+                .unwrap_or(0)
+        })
     }
 
     /// Takes over a newer revision number with the same content, without a
@@ -2472,6 +2729,7 @@ impl Controller {
             "Peer \"{}\" has revision {revision} with the same content; taken over",
             self.peer_label(peer)
         );
+        self.follow_lineage(&cfg.network, None);
         self.confirmed = Some(cfg.clone());
         self.set_config(Some(cfg));
     }
@@ -2528,6 +2786,8 @@ impl Controller {
             Some(&label),
             format!("Client \"{label}\" sent changes"),
         );
+        // It is not silent.
+        self.silent_clients.remove(&peer);
         match self.take_over(peer, FetchMode::Merge, text).await {
             TakeOver::Applied => sync_net::PushAnswer::Ok,
             TakeOver::Refused(reason) => sync_net::PushAnswer::Refused(reason),
@@ -2547,8 +2807,8 @@ impl Controller {
         fingerprint: Option<String>,
         reason: String,
     ) -> TakeOver {
-        if let Some(fingerprint) = fingerprint {
-            self.reject(fingerprint);
+        if let Some(fingerprint) = &fingerprint {
+            self.reject(fingerprint.clone());
         }
         let label = self.peer_label(peer);
         self.events.emit(
@@ -2560,6 +2820,7 @@ impl Controller {
             peer,
             Refusal {
                 reason: reason.clone(),
+                fingerprint: fingerprint.clone(),
                 at: std::time::Instant::now(),
             },
         );
@@ -2585,6 +2846,7 @@ impl Controller {
             // configuration applies again.
             Ok(sync_net::PushAnswer::Refused(reason)) => {
                 debug!("\"{peer}\" refused the change of this site: {reason}");
+                self.push_refused = self.pushed.clone().map(|fp| (fp, reason.clone()));
                 self.diverged_since = Instant::now().checked_sub(RESYNC_AFTER);
             }
             Err(e) => {
@@ -2597,6 +2859,134 @@ impl Controller {
                 );
             }
         }
+    }
+
+    /// True if this site is a client (it has an uplink).
+    fn has_uplink(&self) -> bool {
+        self.confirmed
+            .as_ref()
+            .and_then(Config::self_site)
+            .is_some_and(|s| s.uplink.is_some())
+    }
+
+    /// Why the uplink refused this site's change (its view says so, or its
+    /// answer to the push did): none if it refused another network than
+    /// this site has now (it changed again since, that one is sent).
+    fn refusal_of_ours(&self, text: &str) -> Option<String> {
+        let ours = self
+            .confirmed
+            .as_ref()
+            .map(|c| config::fingerprint(&c.network));
+        // The answer to the push counts too.
+        let answered = || {
+            self.push_refused
+                .as_ref()
+                .filter(|(fp, _)| Some(fp) == ours.as_ref())
+                .map(|(_, reason)| reason.clone())
+        };
+        let Some(reason) = refusal(text) else {
+            return answered();
+        };
+        match header(text, REFUSED_FP_MARKER) {
+            Some(fp) if Some(fp.trim()) != ours.as_deref() => answered(),
+            _ => Some(reason.to_string()),
+        }
+    }
+
+    /// The uplink refused the change of this site: its configuration
+    /// applies again.
+    fn uplink_refused(&mut self, peer: &str, reason: &str) {
+        self.events.emit(
+            Level::Warn,
+            Some(peer),
+            format!(
+                "The change of this site was not taken over by \"{peer}\": {reason}; its configuration applies again"
+            ),
+        );
+        self.sync_problem = Some(format!(
+            "Your change was not taken over by \"{peer}\": {reason}"
+        ));
+        self.diverged_since = None;
+        self.push_refused = None;
+        // Only changes of its clients in it: refused here too, so they are
+        // not merged and passed on again (they learn why). With a change of
+        // its own in it the refusal may be about that one: the clients'
+        // changes are passed on again by themselves.
+        let relayed = std::mem::take(&mut self.relayed);
+        if !std::mem::take(&mut self.own_change_up) {
+            for (client, fingerprint) in relayed {
+                self.refuse_client(
+                    client,
+                    Some(fingerprint),
+                    format!("\"{peer}\" refused it: {reason}"),
+                );
+            }
+        }
+    }
+
+    /// A newer network of a server (`theirs`, made from `ancestry`) and a
+    /// change of this site it lacks: put together (`Some`), or why not
+    /// (`Err`: this site's change is lost). `None`: nothing of this site is
+    /// lost. A client takes what its uplink has (it sent its changes first).
+    fn concurrent(
+        &self,
+        theirs: &Network,
+        ancestry: &Ancestry,
+        local: &config::Local,
+    ) -> Result<Option<merge3::Merge3>, String> {
+        let Some(ours) = &self.confirmed else {
+            return Ok(None);
+        };
+        if self.has_uplink() {
+            return Ok(None);
+        }
+        let own = self.own_change.as_deref() == Some(config::fingerprint(&ours.network).as_str());
+        match merge3::on_replace(
+            (&ours.network, &self.ancestry),
+            own,
+            &self.known,
+            (theirs, ancestry),
+        ) {
+            merge3::Replace::Take => Ok(None),
+            merge3::Replace::Loses => Err(if ancestry.is_empty() {
+                "it does not tell what it was made from".to_string()
+            } else {
+                "where both started from is not known here (any more)".to_string()
+            }),
+            merge3::Replace::Merged(m) => {
+                // The change of this site must be one it may make in theirs
+                // too, and both together must make a network.
+                policy::check_edit(theirs, &m.network, ours.self_id())?;
+                if let Some(e) = config::validate(&m.network, Some(local))
+                    .into_iter()
+                    .find(Diagnostic::is_error)
+                {
+                    return Err(format!("together they are not valid: {}", e.message));
+                }
+                Ok(Some(m))
+            }
+        }
+    }
+
+    /// The change of this site that a newer network replaces: kept in a
+    /// file next to `network.toml`, with a warning.
+    fn keep_lost(&mut self, peer: &str, why: &str) {
+        let Some(ours) = &self.confirmed else { return };
+        let path = self
+            .paths
+            .network()
+            .with_extension(format!("toml.lost-{}", ours.network.revision));
+        let kept = match std::fs::write(&path, render_network(&ours.network)) {
+            Ok(()) => format!("it is kept in {}", path.display()),
+            Err(e) => format!("it could not be kept ({e})"),
+        };
+        self.events.emit(
+            Level::Warn,
+            Some(peer),
+            format!(
+                "The newer configuration from \"{peer}\" replaces a change made here that it does not have ({why}); {kept}"
+            ),
+        );
     }
 
     /// Takes over a network from `peer` (fetched, or pushed by a client).
@@ -2635,10 +3025,35 @@ impl Controller {
             return TakeOver::Failed("empty".into());
         };
         let fingerprint = config::fingerprint(&network);
+        let mut lineage = None;
         let network = match mode {
             FetchMode::Merge => {
                 let Some(own) = self.confirmed.as_ref().map(|c| c.network.clone()) else {
                     return TakeOver::Failed("this site is not configured".into());
+                };
+                // Changed from an older view than the client gets now: its
+                // changes onto the current one.
+                let network = match merge3::rebase_view(
+                    &self.known,
+                    &own,
+                    id,
+                    &network,
+                    &ancestry_of(&text),
+                ) {
+                    Some(m) => {
+                        if !m.conflicts.is_empty() {
+                            self.events.emit(
+                                Level::Warn,
+                                Some(&peer),
+                                format!(
+                                    "Client \"{peer}\" changed an older state of the network; where it changed what was changed here meanwhile, this site's is kept: {}",
+                                    m.conflicts.join(", ")
+                                ),
+                            );
+                        }
+                        m.network
+                    }
+                    None => network,
                 };
                 match view::merge(&own, &network, id) {
                     Ok(merged) => {
@@ -2656,38 +3071,14 @@ impl Controller {
                 }
             }
             FetchMode::Resync => {
-                let Some(reason) = refusal(&text) else {
+                let Some(reason) = self.refusal_of_ours(&text) else {
                     // Not refused: the uplink may still take it over. A
                     // change for an uplink with a key is sent again (it may
                     // have forgotten a refusal, e.g. by a restart).
                     self.pushed = None;
                     return TakeOver::Applied;
                 };
-                self.events.emit(
-                    Level::Warn,
-                    Some(&peer),
-                    format!(
-                        "The change of this site was not taken over by \"{peer}\": {reason}; its configuration applies again"
-                    ),
-                );
-                self.sync_problem = Some(format!(
-                    "Your change was not taken over by \"{peer}\": {reason}"
-                ));
-                self.diverged_since = None;
-                // Only changes of its clients in it: refused here too, so they
-                // are not merged and passed on again (they learn why). With a
-                // change of its own in it the refusal may be about that one:
-                // the clients' changes are passed on again by themselves.
-                let relayed = std::mem::take(&mut self.relayed);
-                if !std::mem::take(&mut self.own_change_up) {
-                    for (client, fingerprint) in relayed {
-                        self.refuse_client(
-                            client,
-                            Some(fingerprint),
-                            format!("\"{peer}\" refused it: {reason}"),
-                        );
-                    }
-                }
+                self.uplink_refused(&peer, &reason);
                 network
             }
             FetchMode::Replace => {
@@ -2699,10 +3090,57 @@ impl Controller {
                         .insert(id, Instant::now() + FETCH_BACKOFF);
                     return TakeOver::Applied;
                 }
+                // The uplink refused what this site sent: it learns why.
+                if self.has_uplink()
+                    && let Some(reason) = self.refusal_of_ours(&text)
+                {
+                    self.uplink_refused(&peer, &reason);
+                }
                 // What the uplink has now replaces what this site passed on.
                 self.relayed.clear();
                 self.own_change_up = false;
-                network
+                self.push_first_since = None;
+                let theirs = ancestry_of(&text);
+                lineage = Some(Lineage {
+                    source: fingerprint.clone(),
+                    ancestry: theirs.clone(),
+                    own: false,
+                });
+                // Another server changed it while this site did: both
+                // changes, else this site's is kept aside.
+                match self.concurrent(&network, &theirs, &local) {
+                    Ok(None) => network,
+                    Ok(Some(m)) => {
+                        let ours_fp = self
+                            .confirmed
+                            .as_ref()
+                            .map(|c| config::fingerprint(&c.network))
+                            .unwrap_or_default();
+                        lineage = Some(Lineage {
+                            source: config::fingerprint(&m.network),
+                            ancestry: Ancestry::joined(
+                                (&fingerprint, &theirs),
+                                (&ours_fp, &self.ancestry),
+                            ),
+                            own: true,
+                        });
+                        let mut text = format!(
+                            "\"{peer}\" and this site changed the network at the same time; both changes are kept"
+                        );
+                        if !m.conflicts.is_empty() {
+                            text.push_str(&format!(
+                                "; where both changed the same, \"{peer}\"'s is kept: {}",
+                                m.conflicts.join(", ")
+                            ));
+                        }
+                        self.events.emit(Level::Warn, Some(&peer), text);
+                        m.network
+                    }
+                    Err(why) => {
+                        self.keep_lost(&peer, &why);
+                        network
+                    }
+                }
             }
         };
         let previous = self.confirmed.as_ref().map(|c| c.network.clone());
@@ -2725,7 +3163,7 @@ impl Controller {
                 self.refuse_client(id, Some(fingerprint), e.to_string())
             }
             Err(e) => {
-                self.reject(fingerprint);
+                self.rejected.insert(fingerprint, Instant::now(), true);
                 self.events.emit(
                     Level::Warn,
                     Some(&peer),
@@ -2738,6 +3176,7 @@ impl Controller {
                     self.refused.remove(&id);
                 }
                 let source = ChangeSource::Sync { peer: peer.clone() };
+                self.next_lineage = lineage;
                 let result = self.apply(cfg, source, Some(id), None, None, false).await;
                 // What was announced is rejected too on a rollback (an
                 // identity claimed here makes the result differ from it).
@@ -3145,7 +3584,10 @@ impl Controller {
         let (Some(me), Some(k)) = (self.own_id(), self.peer_keys.get(&up_id).cloned()) else {
             return Err(unreachable("its identity is not known yet".into()));
         };
-        let text = render_network_wire(&cfg.network);
+        let ancestry = self.confirmed.as_ref().map_or_else(Ancestry::default, |c| {
+            self.ancestry.child(&config::fingerprint(&c.network))
+        });
+        let text = with_base(render_network_wire(&cfg.network), &ancestry);
         match sync_net::push_sync(target, me, k.id, &k.keys, &text).await {
             Ok(sync_net::PushAnswer::Ok) => {
                 self.pushed = Some(config::fingerprint(&cfg.network));
@@ -3325,6 +3767,7 @@ impl Controller {
             trunk: vec![params.trunk.clone()],
             ..Default::default()
         };
+        let (received, ancestry) = (config::fingerprint(&network), ancestry_of(&text));
         let mut cfg = sync::accept(network, &local, None, false, self.own_id()).map_err(|e| {
             ApiError::new(format!(
                 "the configuration from \"{via}\" cannot be used: {e}"
@@ -3339,6 +3782,11 @@ impl Controller {
         let sites = cfg.network.sites.len();
         let inviter = cfg.self_site().and_then(|s| s.uplink);
         let source = ChangeSource::Sync { peer: via.clone() };
+        self.next_lineage = Some(Lineage {
+            source: received,
+            ancestry,
+            own: false,
+        });
         self.apply(cfg, source, inviter, None, None, false).await?;
         self.events.info(format!(
             "Joining the network via \"{via}\" as \"{site}\" ({sites} sites); confirmed automatically as soon as \"{via}\" answers"
@@ -3398,6 +3846,10 @@ impl Controller {
         }
         self.pending = None;
         self.confirmed = None;
+        self.known.clear();
+        self.ancestry = Ancestry::default();
+        self.own_change = None;
+        self.silent_clients.clear();
         self.set_config(None);
         // Nothing of the box is this network's any more.
         self.bridges.clear();
@@ -3584,6 +4036,7 @@ impl Controller {
         base_revision: Option<u64>,
         from_files: bool,
     ) -> Result<Applied, ApiError> {
+        let lineage = self.next_lineage.take();
         if self.pending.is_some() {
             return Err(ApiError::new(
                 "another change is waiting for confirmation; confirm or roll it back first",
@@ -3672,6 +4125,7 @@ impl Controller {
             peer,
             from_files,
             fingerprint,
+            lineage,
             announced: None,
             graced: std::mem::take(&mut self.grace_added),
         });
@@ -3763,14 +4217,19 @@ impl Controller {
                 let base = previous_version.map_or(0, |v| v.revision);
                 // A revision written by hand counts, within a step: one near
                 // the end of the range would leave the sync only the
-                // fingerprint (the files hold at most an i64).
+                // fingerprint (the files hold at most an i64). Above what a
+                // server or the uplink announces: a change made there
+                // meanwhile does not get the same revision.
                 let wanted = cfg
                     .network
                     .revision
+                    .max(self.upstream_revision())
                     .min(base.saturating_add(config::MAX_REVISION_STEP));
                 cfg.network.revision = config::next_revision(base.max(wanted));
             }
-            self.rejected.clear();
+            // What did not fit before may fit now; what was rolled back or
+            // refused stays so.
+            self.rejected.retry();
             // A change of its own: the last refusal is history.
             self.sync_problem = None;
             self.own_change_up = true;
@@ -3797,6 +4256,7 @@ impl Controller {
             )));
         }
         self.paths.clear_marker();
+        self.follow_lineage(&cfg.network, pending.lineage.clone());
         // Peers it removed get the new network only from now on (until now
         // the confirmed one was offered): their grace starts here.
         let until = Instant::now() + GRACE;
@@ -3853,6 +4313,7 @@ impl Controller {
                                 "it was rolled back at \"{}\": {reason}",
                                 name.unwrap_or_default()
                             ),
+                            fingerprint: pending.announced.clone(),
                             at: std::time::Instant::now(),
                         },
                     );
@@ -3861,6 +4322,15 @@ impl Controller {
             }
             ChangeSource::Join { site } => {
                 self.invites.release();
+                // The uplink took the new site already (it was asked before
+                // the site was answered): it learns that the site goes again,
+                // else it gives it back with its next network.
+                if self.has_uplink() && self.pushed.as_deref() == Some(pending.fingerprint.as_str())
+                {
+                    self.ancestry = self.ancestry.child(&pending.fingerprint);
+                    self.own_change_up = true;
+                    self.pushed = None;
+                }
                 // A site that was there before only wanted to hang off this
                 // site after joining again here.
                 let before = pending
@@ -4812,12 +5282,32 @@ mod tests {
     fn a_rejected_configuration_gets_another_chance_later() {
         let start = Instant::now();
         let mut rejected = Rejected::default();
-        rejected.insert("aa".into(), start);
+        rejected.insert("aa".into(), start, false);
         assert!(rejected.active(start).contains("aa"));
         assert!(rejected.active(start + REJECT_TTL / 2).contains("aa"));
         assert!(rejected.active(start + REJECT_TTL).is_empty());
         // Expired entries are dropped when the next one is added.
-        rejected.insert("bb".into(), start + REJECT_TTL * 2);
+        rejected.insert("bb".into(), start + REJECT_TTL * 2, true);
         assert_eq!(rejected.0.len(), 1);
+        // One that did not fit gets its chance with a change made here.
+        rejected.insert("cc".into(), start + REJECT_TTL * 2, false);
+        rejected.retry();
+        assert_eq!(rejected.active(start + REJECT_TTL * 2).len(), 1);
+    }
+
+    #[test]
+    fn the_header_lines_are_read_before_the_network() {
+        let fp = "ab".repeat(32);
+        let text = format!(
+            "{REFUSED_MARKER}no\n{REFUSED_FP_MARKER}{fp}\n{BASE_MARKER}{fp} {fp}\n[network]\nrevision = 4\n# wanderlan: base x\n"
+        );
+        assert_eq!(refusal(&text), Some("no"));
+        assert_eq!(header(&text, REFUSED_FP_MARKER), Some(fp.as_str()));
+        assert_eq!(ancestry_of(&text).render(), fp, "once, in its place");
+        assert!(ancestry_of("[network]\n# wanderlan: base x\n").is_empty());
+        assert_eq!(
+            ancestry_of(&with_base("[network]\n".into(), &ancestry_of(&text))).render(),
+            fp
+        );
     }
 }

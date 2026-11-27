@@ -125,8 +125,13 @@ pub fn merge(full: &Network, view: &Network, from: SiteId) -> Result<Merged, Str
         full.revision.max(view.revision)
     } else {
         view.revision.max(next_revision(full.revision))
+    };
+    // The client gets back another view than it sent (it lacked a change
+    // made here): with a revision above its own, else it keeps what it sent.
+    if fingerprint(&view_for(&merged, from_now)) != fingerprint(view) {
+        merged.revision = merged.revision.max(next_revision(view.revision));
     }
-    .min(MAX_REVISION);
+    merged.revision = merged.revision.min(MAX_REVISION);
     policy::check_relayed(full, &merged, from)?;
     if let Some(error) = validate(&merged, None).into_iter().find(|d| d.is_error()) {
         return Err(error.message);
