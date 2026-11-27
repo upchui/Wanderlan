@@ -75,7 +75,7 @@ impl LoopGuard {
     }
 
     /// Records that `mac` in `vlan` is now learned on `port`. `is_tunnel`
-    /// tells whether a port is a GRETAP tunnel; moves count if at least one
+    /// tells whether a port is a tunnel; moves count if at least one
     /// of the two ports is a tunnel (trunk to tunnel, tunnel to tunnel).
     /// Returns a detection when the threshold is hit.
     pub fn learned(

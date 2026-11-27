@@ -1,7 +1,7 @@
 //! `wanderland`, the wanderlan daemon.
 //!
 //! It reads `/etc/wanderlan/{network,local}.toml`, derives the desired layer-2
-//! setup of this site (bridge, GRETAP tunnels, VLANs) and keeps the system in
+//! setup of this site (bridge, VXLAN tunnels, VLANs) and keeps the system in
 //! that state. On SIGTERM/SIGINT it removes everything it created;
 //! `wanderland --cleanup` (systemd runs it after every end of the service
 //! and before every start) removes whatever a crashed or killed daemon left.

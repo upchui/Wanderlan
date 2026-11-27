@@ -4,7 +4,7 @@
 # `wanderlan` ("Start a new network"), then add every further site with an
 # invitation: `wanderlan invite` on any site that is already part of the
 # network, `wanderlan join <address> <code>` on the new one. The daemons keep
-# this file identical on all sites.
+# this file in sync: the servers hold the whole network, a client its part.
 #
 # wanderlan does not build a VPN. Every site must already be reachable at its
 # `address` through an existing transport network, usually a VPN set up
@@ -21,6 +21,8 @@
 
 [network]
 vlans = "10-50"               # VLANs of every site that does not list its own
+# The defaults of the sites that set none of their own (each site sets its
+# own with `wanderlan settings`, in its local.toml):
 mtu_probe_interval = "5m"     # how often the path MTU to each peer is measured
 # mss = 1300                  # optional: fixed TCP MSS instead of measuring
 commit_timeout = "60s"        # changes are rolled back unless confirmed in time

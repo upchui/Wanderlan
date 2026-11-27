@@ -159,7 +159,8 @@ towards the VPN (VPN addresses `10.8.0.1` at `hq` and `10.8.0.2` at
    * address `10.8.0.1`, its address in the VPN,
    * VLANs empty: everything, the untagged 10.0.0.0/24 included.
 
-   `Enter` shows the change, `c` confirms it. Without the TUI:
+   `Enter` shows the change, `Enter` (or `y`) applies it, `c` confirms it.
+   Without the TUI:
    `sudo wanderlan new --name hq --address 10.8.0.1 --trunk ens19 --confirm`
    (without `--address` it takes the address of a VPN interface; it warns
    about a public address or one of the default route).
@@ -183,7 +184,7 @@ towards the VPN (VPN addresses `10.8.0.1` at `hq` and `10.8.0.2` at
    sudo wanderlan online office --confirm
    ```
 
-   (or in the TUI: Sites `2`, select it, `o`, `a`, `c`).
+   (or in the TUI: Sites `2`, select it, `o`, `a`, `Enter`, `c`).
 6. Plug a laptop into the switch at `office`: it gets a 10.0.0.x address
    from the firewall at `hq`, and `ping 10.0.0.1` answers. In the TUI,
    `Enter` on `office` in the overview shows the tunnel, its traffic and the
@@ -315,7 +316,7 @@ A tunnel carries the VLANs that **both** of its ends take part in. So two
 clients exchange traffic only in a VLAN that they and their server all have;
 a VLAN the server does not take part in does not pass it.
 
-A single tunnel can be limited further (`[[tunnel]]`): e.g. `dc – hq` carries
+A single tunnel can be limited further (`tunnel_vlans`): e.g. `dc – hq` carries
 only 10-20 and `dc – lab` only 30-40, although all three take part in more.
 Together with a trunk of its own for a tunnel, the same VLAN IDs on another
 interface of a site are a network of their own and still reach another site.
@@ -344,8 +345,11 @@ one site's trunk, the **mapped VLAN**:
   else.
 
 The VLAN mapping views (Site, Source VLAN, Mapped VLAN) show next to each
-site whether it is a server or a client. In `network.toml` a mapping keeps
-its keys: `shared` is the source VLAN, `local` the mapped VLAN.
+site whether it is a server or a client. In `network.toml` the mappings are
+in the table of their site, source first: `map = { 30 = "native", 40 = 140 }`.
+On the command line `wanderlan map add <site> <source> <mapped>` names the
+source VLAN first too; an invitation's `--map MAPPED:SOURCE` (e.g. `130:30`)
+names the VLAN on the new site's trunk first, as the new site sees it.
 
 ### Local breakout
 
@@ -536,7 +540,7 @@ in one network and `lab` in another.
 ## Everyday tasks
 
 Keys refer to the terminal UI (`wanderlan`); every change ends with `a`
-(review and apply) and `c` (confirm).
+(review: the difference), `Enter` or `y` (apply) and `c` (confirm).
 
 **Invite a site.** Sites, `i`: name, VLANs, untagged VLAN, translations and
 "Changes" (who changes its tunnel later: only this site, only the new site,
@@ -693,6 +697,7 @@ VLANs, its mappings and the limits of its tunnels.
 ```toml
 [network]
 # vlans = "all"               # VLANs of every site without its own list
+# The defaults of the sites without their own (`wanderlan settings`):
 commit_timeout = "60s"        # changes are rolled back unless confirmed in time
 # mtu_probe_interval = "5m"   # how often the path MTU to each peer is measured
 # mss = 1300                  # fixed TCP MSS instead of measuring
@@ -963,10 +968,12 @@ passes VLANs on between servers uses nftables rules (`wl split` in table
 `bridge wanderlan`, checked on every reconcile) and only then drops
 `isolated`. The LANs of two sites may still be connected by another path.
 The loop guard watches the forwarding database of every bridge: if a MAC
-address keeps moving between the trunk and a tunnel, or between two tunnels
-(5 times within 10 s), it shuts the tunnel port down (never the trunk),
-logs it and shows it in the TUI until `wanderlan unblock <tunnel>` (`u` on
-the peer in the TUI; a blocked trunk port: `U`) or the configuration changes.
+address keeps moving between the trunk and a tunnel, between two tunnels or
+between two trunk ports (5 times within 10 s), it shuts a port down: the
+tunnel; between trunk ports only the further one, never the main trunk
+port. It logs it with the command that takes the port up again and shows it
+in the TUI until `wanderlan unblock <site|port>` (`u` on the peer in the TUI;
+a blocked trunk port: `U`) or a confirmed change.
 
 ### Operation
 
@@ -978,7 +985,9 @@ one builds the network again within seconds. An update restarts it the
 same way. Only one daemon
 runs at a time: `wanderland` started from a shell only explains that it is
 the daemon. Logs go to the journal (`journalctl -u wanderland`) and to the
-event log (`wanderlan log`).
+event log (`wanderlan log`: the last 1000 events of a network, `--net` for
+another one, kept while the daemon runs); both name only the start of an
+invitation code.
 
 ## Terminal UI
 
@@ -1087,9 +1096,10 @@ or `WANDERLAN_SOCKET`, the network of the box with `--net` or
   with a mapping. On Proxmox, switch off the firewall (or its MAC filter) on
   the trunk NIC of the wanderlan VM: it drops frames with foreign source MAC
   addresses, which is all bridged traffic.
-* **`wanderlan join` fails**: the code is used up or wrong, or TCP on the
-  control port of the inviting site is not reachable. A site that does not
-  come up within the commit timeout is removed again; its code works again.
+* **`wanderlan join` fails**: the code is used up, expired (after a day
+  unless created with `--valid`) or wrong, or TCP on the control port of the
+  inviting site is not reachable. A site that does not come up within the
+  commit timeout is removed again; its code works again.
 * **A neighbour "does not answer control probes"**: allow UDP and TCP on the
   control port between the site addresses.
 * **"waiting for client … to connect"** on a server: no keepalive of the
@@ -1118,8 +1128,14 @@ or `WANDERLAN_SOCKET`, the network of the box with `--net` or
 * **Large transfers stall**: compare the path MTU in `wanderlan status` with
   the MTU of the VPN; set `mss` if probes are filtered.
 * **A port is BLOCKED**: the loop guard found a loop through another layer-2
-  path between sites; remove it, then `wanderlan unblock <tunnel>` (`u` on
-  the peer in the terminal UI).
+  path between sites; remove it, then `wanderlan unblock <site>` (or the
+  port; `u` on the peer in the terminal UI, `U` for a trunk port).
+* **A file `network.toml.lost-<revision>`** next to `network.toml`: this
+  site and another server changed the network at the same time, and the two
+  could not be put together (where both started was not known any more, e.g.
+  after a restart, or together they were not valid); the log says why. The
+  file is the network as it was here: make the change again if it is still
+  needed, then delete the file.
 * **A change was rolled back**: confirm within the commit timeout (`c`,
   `wanderlan confirm`).
 * **A change did not arrive at a site**: `wanderlan log` there and on its

@@ -1008,7 +1008,7 @@ pub struct VlanPortTraffic {
     pub port: String,
     /// The peer behind a tunnel port; `None` for a trunk port.
     pub peer: Option<String>,
-    /// VLAN (shared ID).
+    /// The VLAN of the network (the source VLAN).
     pub vid: u16,
     /// Receive rate in bit/s.
     pub rx_bps: u64,

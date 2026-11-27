@@ -7,6 +7,63 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
+### Changes made at the same time are kept
+
+- Every network the sites exchange carries the fingerprints it was made
+  from (a comment line, not part of its fingerprint; older versions ignore
+  it). A server that gets a newer network lacking a change of its own puts
+  both together: each setting, each field of each site, each mapping and
+  tunnel limit; where both changed the same, the newer one's is kept and
+  the log names it. If where both started is not known any more (e.g. after
+  a restart), the newer network applies and the change made here is kept in
+  `network.toml.lost-<revision>` with a warning.
+- A client sends its change to its server before it fetches a newer
+  network, and a change made on an older view is put onto the current one
+  instead of replacing what changed meanwhile. A client always gets back a
+  revision above its own when its view differs from what it sent.
+- A server made a client while it was away (it takes its new server for a
+  server and sends nothing) gets a revision above its own from its server
+  after 30 s, so that it fetches its view; no more hanging there.
+- A refusal names the network it is about (a client that changed again
+  since sends the new one); a refused push counts at the next resync; a
+  newer network from the server tells why a change was refused. What was
+  rolled back or refused is no longer fetched again after every change made
+  here, what did not fit still is.
+- A join that is rolled back after the server took it is sent to the server
+  again (it no longer comes back with the server's next network).
+- `network.toml` edited by hand with the revision it had gets the next one,
+  so the edit reaches the other sites instead of being replaced; a file
+  with a lower revision (an old copy put back) still takes the peers'
+  network. A change made here gets a revision above what the servers
+  announce.
+
+### Admin flows
+
+- `wanderlan new [--name] [--address] [--trunk] [--vlans] [--confirm]`
+  starts a network from the command line (also with `--net`), as the
+  wizard does. Both suggest the address of a VPN interface, list the
+  addresses of the box and warn about a public one or the default route's.
+- Invitations are valid for a day (`--valid 2h|7d|never`) and are removed
+  when they expire; the logs name only the start of a code; `invite list`
+  and the TUI show how long a code is still valid.
+- `wanderlan unblock <site>` (or a port); the loop guard's warning names
+  the command. `wanderlan status` has a SYNC column and names the interface
+  of every tunnel and whether the peer has the same network.
+- The TUI shows what another network of the box has (overview and status
+  line) and who takes an offline site online where this site may not.
+- Hints where they help: a join on a configured box points to `--net`; the
+  join output names the site that takes the new one online; the reset
+  prompt names the network and the clients that lose their way in;
+  `networks remove` reminds of the other sites; "daemon not running" points
+  to `systemctl status` and `journalctl`.
+- `wanderlan role <site> client <server>`; `wanderlan manage <site>` without
+  a value shows who changes the tunnel.
+- Texts: VXLAN instead of GRETAP in the package descriptions; the key
+  sequence `a`, `Enter`, `c`; the loop guard also shuts further trunk
+  ports; mappings as `map = { <source> = <mapped> }`; settings of
+  `[network]` are defaults; `apt purge` also removes `*.rejected`,
+  `network.toml.v1`/`.v2` and `network.toml.lost-*`.
+
 ### Terminal UI
 
 - Breakout: `Enter` on the uplink of a breakout lists the interfaces of

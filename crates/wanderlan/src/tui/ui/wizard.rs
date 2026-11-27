@@ -114,7 +114,7 @@ pub fn draw(frame: &mut Frame, app: &App, area: Rect) {
         }
         Step::Name => {
             page.text(
-                "The name identifies this site in the network. It becomes part of the tunnel interface names on the other sites (vx-<name>): a-z, 0-9 and '-', at most 12 characters.",
+                "The name is what this site is called in the network, for people: the other sites show it, e.g. in the alias of its tunnel interface (ip link). a-z, 0-9 and '-', at most 12 characters; another site may have the same name.",
                 Style::new(),
             );
             page.blank();

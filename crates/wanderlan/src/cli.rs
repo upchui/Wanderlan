@@ -108,7 +108,8 @@ pub enum Command {
     /// Show the live traffic of one VLAN on every port of this site and
     /// the MAC addresses in it.
     Vlan {
-        /// The VLAN (shared ID), e.g. 20, or `native` (the untagged traffic).
+        /// The VLAN of the network (the source VLAN), e.g. 20, or `native`
+        /// (the untagged traffic).
         vid: String,
         /// Print JSON.
         #[arg(long)]

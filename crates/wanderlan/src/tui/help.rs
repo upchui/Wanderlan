@@ -25,7 +25,7 @@ pub const SECTIONS: &[Section] = &[
         title: "Everywhere",
         keys: &[
             ("1-8, Tab", "switch view (Shift-Tab: previous)"),
-            ("a", "review the draft (diff) and apply it"),
+            ("a", "review the draft (diff); Enter or y there applies it"),
             ("x", "discard the draft"),
             ("c", "confirm a pending change"),
             ("r", "roll a pending change back now (asks first)"),

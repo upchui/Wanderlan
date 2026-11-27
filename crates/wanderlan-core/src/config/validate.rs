@@ -48,7 +48,7 @@ pub fn site_name_error(name: &str) -> Option<String> {
     }
     if name.len() > MAX_SITE_NAME_LEN {
         return Some(format!(
-            "site name \"{name}\" is longer than {MAX_SITE_NAME_LEN} characters (it becomes part of the interface name {TUNNEL_PREFIX}{name})"
+            "site name \"{name}\" is longer than {MAX_SITE_NAME_LEN} characters (it names its tunnels on sites of older versions: {TUNNEL_PREFIX}{name})"
         ));
     }
     let valid_chars = name

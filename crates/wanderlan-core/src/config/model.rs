@@ -317,7 +317,7 @@ pub struct Site {
     /// they are told apart by their identity.
     pub name: String,
     /// Address of the site in the existing transport network (e.g. its VPN
-    /// address). GRETAP tunnels run between these addresses.
+    /// address). The tunnels (VXLAN) run between these addresses.
     pub address: Ipv4Addr,
     /// Identity of the box (its public key, see [`crate::identity`]): every
     /// other part of the configuration refers to the site by it, and the

@@ -367,7 +367,7 @@ pub enum Modal {
     },
     /// The live traffic of one VLAN on every port of this site.
     Vlan {
-        /// The VLAN (shared ID).
+        /// The VLAN of the network (the source VLAN).
         vid: u16,
         /// The peer whose details Esc goes back to.
         back: Option<String>,

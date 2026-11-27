@@ -5,6 +5,10 @@ if [ "$1" = "purge" ]; then
     rm -rf /var/lib/wanderlan
     # The further networks of the box (not conffiles of the package).
     rm -rf /etc/wanderlan/networks
+    # What the daemon kept next to the files: rejected files, the forms of
+    # older versions, changes that could not be put together.
+    rm -f /etc/wanderlan/*.rejected /etc/wanderlan/network.toml.v1 \
+        /etc/wanderlan/network.toml.v2 /etc/wanderlan/network.toml.lost-*
 fi
 
 #DEBHELPER#

@@ -1,6 +1,6 @@
 [package]
 name = "wanderlan"
-description = "Your LAN at other sites, as if a long network cable ran there: layer 2 over an existing connection (GRETAP, VLAN-aware bridge)"
+description = "Your LAN at other sites, as if a long network cable ran there: layer 2 over an existing connection (VXLAN, VLAN-aware bridge)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -36,7 +36,7 @@ extended-description = """\
 wanderlan puts other sites into your network, as if a long network cable \
 ran there: the devices at a second office, a second apartment or a holiday \
 house are in the LAN of the main office or of your home, with its DHCP, \
-gateway and VLANs. One GRETAP tunnel per peer \
+gateway and VLANs. One VXLAN tunnel per peer \
 site, a Linux bridge with VLAN filtering, VLAN mappings, MSS clamping and \
 loop protection. It builds no VPN; the sites must already reach \
 each other through an existing transport network such as a VPN."""
