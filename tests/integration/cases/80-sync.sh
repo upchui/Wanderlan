@@ -161,7 +161,7 @@ check "site2 counted its revision on, so that site5 fetched its view" \
 wait_eq 60 "site5 knows only site2 and itself" "site2 site5" jqs site5 '[.sites[].name] | sort | join(" ")'
 # Nothing of its own was lost: a copy kept aside is only reported.
 if x site5 "ls /etc/wanderlan/network.toml.lost-*" >/dev/null 2>&1; then
-  info "site5 kept a copy aside: $(x site5 "wanderlan log | grep 'replaces a change made here' | tail -n 1")"
+  info "site5 kept a copy aside: $(x site5 "ls /etc/wanderlan/network.toml.lost-*; grep 'replaces a change made here' /var/log/wanderland.log | tail -n 2")"
   x site5 "rm -f /etc/wanderlan/network.toml.lost-*"
 fi
 check "site2 makes site5 a server again" x site2 "wanderlan role site5 server --confirm"
