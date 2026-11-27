@@ -264,8 +264,24 @@ pub enum Input {
         trunk: String,
         /// The VLAN of the network.
         vid: u16,
+        /// The VLAN on the trunk (`None`: untagged).
+        local: Option<u16>,
         /// In one switch network with a peer.
         shared: bool,
+    },
+    /// The DHCP watch of a shared trunk found a client whose requests go
+    /// unanswered, or that recovered.
+    Dhcp {
+        /// The trunk.
+        trunk: String,
+        /// The VLAN of the network.
+        vid: u16,
+        /// The VLAN on the trunk (`None`: untagged).
+        local: Option<u16>,
+        /// The client (MAC address).
+        client: String,
+        /// What happened.
+        event: shared_switch::DhcpEvent,
     },
     /// SIGHUP: the files were changed by hand.
     Reload,
@@ -338,6 +354,31 @@ struct Derived {
     fingerprint: String,
     /// Version of the confirmed configuration.
     confirmed: Option<Version>,
+}
+
+/// A mapped VLAN that also arrives as it is at its trunk (see
+/// [`shared_switch`]).
+#[derive(Debug, Clone)]
+struct SharedState {
+    /// The VLAN on the trunk (`None`: untagged).
+    local: Option<u16>,
+    /// Since when (ms since the Unix epoch).
+    since_ms: u64,
+    /// Clients whose DHCP replies get lost even as broadcasts.
+    lost: BTreeSet<String>,
+}
+
+impl SharedState {
+    fn status(&self, (trunk, vid): &(String, u16), broadcast: bool) -> api::SharedSwitch {
+        api::SharedSwitch {
+            trunk: trunk.clone(),
+            vid: *vid,
+            local: self.local,
+            since_ms: self.since_ms,
+            broadcast,
+            lost: self.lost.iter().cloned().collect(),
+        }
+    }
 }
 
 /// State of one network of the daemon.
@@ -483,9 +524,9 @@ struct Controller {
     keepalive: watch::Sender<keepalive::Keepalives>,
     /// What the switch check looks at.
     switch_check: watch::Sender<shared_switch::Targets>,
-    /// Since when (ms since the Unix epoch) the trunks in
-    /// [`Runtime::shared_switch`] are in one switch network with a peer.
-    shared_since: BTreeMap<(String, u16), u64>,
+    /// The trunks in one switch network with a peer, by mapped VLAN (see
+    /// [`shared_switch`]).
+    shared: BTreeMap<(String, u16), SharedState>,
     /// Former addresses of the probes and the sync (another control port
     /// before) and since when: they answer until every peer uses the new.
     former_binds: Vec<(SocketAddrV4, Instant)>,
@@ -744,7 +785,7 @@ impl Controller {
             push_refused: None,
             keepalive: keepalive_tx,
             switch_check: switch_tx,
-            shared_since: BTreeMap::new(),
+            shared: BTreeMap::new(),
             former_binds: Vec::new(),
             last_bind: None,
         };
@@ -2032,9 +2073,19 @@ impl Controller {
                 let _ = reply.send(answer);
             }
             Input::Pushed { peer, result } => self.push_answered(peer, result),
-            Input::SharedSwitch { trunk, vid, shared } => {
-                self.shared_switch(trunk, vid, shared).await;
-            }
+            Input::SharedSwitch {
+                trunk,
+                vid,
+                local,
+                shared,
+            } => self.shared_switch(trunk, vid, local, shared).await,
+            Input::Dhcp {
+                trunk,
+                vid,
+                local,
+                client,
+                event,
+            } => self.dhcp_event((trunk, vid), local, client, event).await,
             Input::Loop(report) => {
                 if self.runtime.blocked.insert(report.port.clone()) {
                     let peer = self.config.as_ref().and_then(|c| {
@@ -4729,6 +4780,7 @@ impl Controller {
     /// through which tunnels. A trunk (or VLAN) that is no longer mapped is
     /// no longer in one switch network with a peer either.
     fn update_switch_check(&mut self, desired: &desired::Desired) {
+        let broadcast = &self.runtime.dhcp_broadcast;
         let list: Vec<shared_switch::Target> = desired
             .trunks
             .iter()
@@ -4739,6 +4791,8 @@ impl Controller {
                     .map(move |m| shared_switch::Target {
                         trunk: trunk.name.clone(),
                         vid: m.shared,
+                        local: m.local,
+                        broadcast: broadcast.contains(&(trunk.name.clone(), m.shared)),
                         tunnels: desired
                             .tunnels
                             .iter()
@@ -4753,15 +4807,15 @@ impl Controller {
             })
             .collect();
         let gone: Vec<(String, u16)> = self
-            .runtime
-            .shared_switch
-            .iter()
+            .shared
+            .keys()
             .filter(|(trunk, vid)| !list.iter().any(|t| t.trunk == *trunk && t.vid == *vid))
             .cloned()
             .collect();
         for key in &gone {
-            self.runtime.shared_switch.remove(key);
-            self.shared_since.remove(key);
+            self.shared.remove(key);
+            // Taken out with the next reconcile.
+            self.runtime.dhcp_broadcast.remove(key);
         }
         let source = shared_switch::marker_source(
             &self.own_id().map(|id| id.fingerprint()).unwrap_or_else(|| {
@@ -4780,73 +4834,102 @@ impl Controller {
     }
 
     /// The switch check found `trunk` in one switch network with a peer for
-    /// VLAN `vid` (or no longer): warns, and the DHCP requests from there
-    /// ask for broadcast replies (or no longer).
-    async fn shared_switch(&mut self, trunk: String, vid: u16, shared: bool) {
+    /// VLAN `vid` (or no longer). Harmless as such: noted, and the DHCP
+    /// there is watched. When it ends, so does the broadcast rule.
+    async fn shared_switch(&mut self, trunk: String, vid: u16, local: Option<u16>, shared: bool) {
         let key = (trunk, vid);
-        let changed = if shared {
-            self.runtime.shared_switch.insert(key.clone())
-        } else {
-            self.runtime.shared_switch.remove(&key)
-        };
-        if !changed {
-            return;
-        }
         if shared {
-            self.shared_since.insert(key.clone(), history::now_ms());
+            if self.shared.contains_key(&key) {
+                return;
+            }
+            let state = SharedState {
+                local,
+                since_ms: history::now_ms(),
+                lost: BTreeSet::new(),
+            };
+            let note = api::SharedSwitch::notes(&[state.status(&key, false)]).join("");
+            self.shared.insert(key, state);
+            self.events
+                .emit(Level::Info, None, format!("{note}; watching its DHCP"));
         } else {
-            self.shared_since.remove(&key);
+            if self.shared.remove(&key).is_none() {
+                return;
+            }
+            let (trunk, vid) = &key;
+            self.events.emit(
+                Level::Info,
+                None,
+                format!(
+                    "VLAN {vid} no longer arrives unmapped at trunk {trunk}: no longer in one switch network with a peer"
+                ),
+            );
+            if self.runtime.dhcp_broadcast.remove(&key) {
+                self.reconcile().await;
+            }
         }
-        let (trunk, vid) = key;
-        let message = if shared {
-            let desired = self
-                .config
-                .as_ref()
-                .map(|cfg| desired::derive_in(&self.scope(), cfg, &self.runtime));
-            desired
-                .and_then(|d| {
-                    self.shared_switch_status(&d)
-                        .into_iter()
-                        .find(|s| s.trunk == trunk && s.vid == vid)
-                })
-                .map_or_else(
-                    || format!("VLAN {vid} also arrives unmapped at trunk {trunk}"),
-                    |s| s.warning(),
-                )
-        } else {
-            format!(
-                "VLAN {vid} no longer arrives unmapped at trunk {trunk}: no longer in one switch network with a peer"
-            )
+    }
+
+    /// The DHCP watch of a shared trunk: unanswered requests ask for
+    /// broadcast replies from now on; if they stay unanswered, a warning
+    /// (until the client gets a reply).
+    async fn dhcp_event(
+        &mut self,
+        key: (String, u16),
+        local: Option<u16>,
+        client: String,
+        event: shared_switch::DhcpEvent,
+    ) {
+        let broadcast = self.runtime.dhcp_broadcast.contains(&key);
+        let Some(state) = self.shared.get_mut(&key) else {
+            return;
         };
-        let level = if shared { Level::Warn } else { Level::Info };
-        self.events.emit(level, None, message);
-        self.reconcile().await;
+        state.local = local;
+        let status = state.status(&key, broadcast);
+        let here = status.here();
+        let (trunk, vid) = &key;
+        match event {
+            shared_switch::DhcpEvent::Unanswered { broadcast: false } => {
+                if !broadcast {
+                    self.runtime.dhcp_broadcast.insert(key.clone());
+                    self.events.emit(
+                        Level::Info,
+                        None,
+                        format!(
+                            "DHCP requests of {client} in {here} at trunk {trunk} went unanswered {} times in a row; the trunk is in one switch network with a peer: DHCP requests from {here} ask for broadcast replies from now on",
+                            shared_switch::UNANSWERED
+                        ),
+                    );
+                    self.reconcile().await;
+                }
+            }
+            shared_switch::DhcpEvent::Unanswered { broadcast: true } => {
+                let first = state.lost.is_empty();
+                if state.lost.insert(client) && first {
+                    let status = state.status(&key, broadcast);
+                    if let Some(warning) = status.warning() {
+                        self.events.emit(Level::Warn, None, warning);
+                    }
+                }
+            }
+            shared_switch::DhcpEvent::Recovered => {
+                if state.lost.remove(&client) && state.lost.is_empty() {
+                    self.events.emit(
+                        Level::Info,
+                        None,
+                        format!(
+                            "DHCP replies for {here} (VLAN {vid}) arrive at trunk {trunk} again"
+                        ),
+                    );
+                }
+            }
+        }
     }
 
     /// The trunks in one switch network with a peer, for the status.
-    fn shared_switch_status(&self, desired: &desired::Desired) -> Vec<api::SharedSwitch> {
-        self.runtime
-            .shared_switch
+    fn shared_switch_status(&self) -> Vec<api::SharedSwitch> {
+        self.shared
             .iter()
-            .map(|(trunk, vid)| api::SharedSwitch {
-                trunk: trunk.clone(),
-                vid: *vid,
-                local: desired
-                    .trunks
-                    .iter()
-                    .find(|t| t.name == *trunk)
-                    .and_then(|t| {
-                        desired::dropped_mappings(&t.tc)
-                            .into_iter()
-                            .find(|m| m.shared == *vid)
-                    })
-                    .and_then(|m| m.local),
-                since_ms: self
-                    .shared_since
-                    .get(&(trunk.clone(), *vid))
-                    .copied()
-                    .unwrap_or_default(),
-            })
+            .map(|(key, state)| state.status(key, self.runtime.dhcp_broadcast.contains(key)))
             .collect()
     }
 
@@ -5616,7 +5699,7 @@ impl Controller {
             tag: self.tag,
             networks: self.host.networks(),
             conflicts: self.conflicts.clone(),
-            shared_switch: self.shared_switch_status(&desired),
+            shared_switch: self.shared_switch_status(),
         }
     }
 }

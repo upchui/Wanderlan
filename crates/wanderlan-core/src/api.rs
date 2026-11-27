@@ -751,8 +751,9 @@ pub struct Status {
 }
 
 /// A mapped VLAN that also arrives as it is at its trunk: the trunk is in
-/// one switch network with a peer (see `desired::Runtime::shared_switch`).
-/// DHCP requests from there ask for broadcast replies.
+/// one switch network with a peer. Harmless, unless the switch binds
+/// devices to ports (DHCP snooping, port security): then DHCP replies get
+/// lost. Once requests went unanswered, they ask for broadcast replies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SharedSwitch {
     /// The trunk.
@@ -763,18 +764,68 @@ pub struct SharedSwitch {
     pub local: Option<u16>,
     /// Since when (ms since the Unix epoch).
     pub since_ms: u64,
+    /// DHCP requests from there ask for broadcast replies (some went
+    /// unanswered).
+    #[serde(default)]
+    pub broadcast: bool,
+    /// Clients (MAC addresses) whose DHCP requests go unanswered even so.
+    #[serde(default)]
+    pub lost: Vec<String>,
 }
 
 impl SharedSwitch {
-    /// The warning about it, for the status.
-    pub fn warning(&self) -> String {
-        let here = self
-            .local
-            .map_or_else(|| "untagged".to_string(), |l| format!("VLAN {l}"));
-        format!(
-            "VLAN {} ({here} here) also arrives unmapped at trunk {}: this site and a peer are in one switch network. Switch features that bind a device to one port (DHCP snooping, UniFi \"Rogue DHCP Server Detection\", port security) see every device of {here} twice; turn them off for these VLANs. DHCP requests from {here} ask for broadcast replies.",
-            self.vid, self.trunk
-        )
+    /// The VLAN on the trunk in words ("VLAN 114", "untagged").
+    pub fn here(&self) -> String {
+        self.local
+            .map_or_else(|| "untagged".to_string(), |l| format!("VLAN {l}"))
+    }
+
+    /// The warning, while DHCP replies get lost.
+    pub fn warning(&self) -> Option<String> {
+        let first = self.lost.first()?;
+        let more = match self.lost.len() {
+            1 => String::new(),
+            n => format!(" and {} more", n - 1),
+        };
+        Some(format!(
+            "DHCP replies for {} (VLAN {} of the network) at trunk {} get lost, also as broadcasts (requests of {first}{more} unanswered): this trunk and a peer's are in one switch network, and the switch sends the replies elsewhere (DHCP snooping, UniFi \"Rogue DHCP Server Detection\", port security). Turn that off for these VLANs.",
+            self.here(),
+            self.vid,
+            self.trunk
+        ))
+    }
+
+    /// One note per trunk in `list` (harmless as such).
+    pub fn notes(list: &[Self]) -> Vec<String> {
+        let mut trunks: Vec<&str> = list.iter().map(|s| s.trunk.as_str()).collect();
+        trunks.dedup();
+        trunks
+            .into_iter()
+            .map(|trunk| {
+                let of: Vec<&Self> = list.iter().filter(|s| s.trunk == trunk).collect();
+                let vlans: Vec<String> = of
+                    .iter()
+                    .map(|s| match s.local {
+                        Some(l) => format!("{} ({l} here)", s.vid),
+                        None => format!("{} (untagged here)", s.vid),
+                    })
+                    .collect();
+                let mut note = format!(
+                    "Trunk {trunk} is in one switch network with a peer: VLAN {} also arrive{} unmapped (harmless without DHCP snooping or port security)",
+                    vlans.join(", "),
+                    if vlans.len() == 1 { "s" } else { "" }
+                );
+                let broadcast: Vec<String> =
+                    of.iter().filter(|s| s.broadcast).map(|s| s.here()).collect();
+                if !broadcast.is_empty() {
+                    note.push_str(&format!(
+                        "; DHCP from {} asks for broadcast replies (requests went unanswered)",
+                        broadcast.join(", ")
+                    ));
+                }
+                note
+            })
+            .collect()
     }
 }
 

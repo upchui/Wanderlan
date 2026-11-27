@@ -274,17 +274,11 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
             theme::warn(),
         ));
     }
-    for shared in &status.shared_switch {
-        let here = shared
-            .local
-            .map_or_else(|| "untagged".to_string(), |l| format!("VLAN {l}"));
-        lines.push(Line::styled(
-            format!(
-                " In one switch network with a peer: VLAN {} also arrives unmapped at {}. Turn off DHCP snooping and port security for {here}; its DHCP requests ask for broadcast replies.",
-                shared.vid, shared.trunk
-            ),
-            theme::warn(),
-        ));
+    for warning in status.shared_switch.iter().filter_map(|s| s.warning()) {
+        lines.push(Line::styled(format!(" {warning}"), theme::warn()));
+    }
+    for note in wanderlan_core::api::SharedSwitch::notes(&status.shared_switch) {
+        lines.push(Line::styled(format!(" {note}"), theme::dim()));
     }
     lines
 }

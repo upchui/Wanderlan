@@ -11,13 +11,15 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
 - A site with VLAN mappings checks every 30 s whether its trunk and the
   trunk of a peer are in one switch network: a marker frame in the source
-  VLAN through its tunnels that comes back at the trunk. The switch there
-  sees every device of the mapped VLAN twice; switch features that bind a
-  device to one port (DHCP snooping, UniFi "Rogue DHCP Server Detection",
-  port security) then send its traffic to the wrong port, and devices lose
-  their address one by one. The status, the TUI and the log warn, and
-  while it lasts DHCP requests from the mapped VLAN ask for broadcast
-  replies (nftables rule `wl dhcp-bcast`).
+  VLAN through its tunnels that comes back at the trunk. Harmless as such
+  (the status notes it), but a switch that binds devices to ports (DHCP
+  snooping, UniFi "Rogue DHCP Server Detection", port security) then sends
+  DHCP replies to the wrong port, and devices lose their address one by
+  one. While a trunk is shared, wanderlan watches the DHCP of the mapped
+  VLAN: requests of a device that go unanswered 3 times in a row make the
+  requests from there ask for broadcast replies (nftables rule
+  `wl dhcp-bcast`); if they stay unanswered, the status, the TUI and the
+  log warn.
 
 ### Fixes, fourth review
 

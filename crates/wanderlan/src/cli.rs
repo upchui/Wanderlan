@@ -2423,8 +2423,11 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
     if let Some(problem) = &st.sync_problem {
         println!("WARNING: {problem}");
     }
-    for shared in &st.shared_switch {
-        println!("WARNING: {}", shared.warning());
+    for warning in st.shared_switch.iter().filter_map(|s| s.warning()) {
+        println!("WARNING: {warning}");
+    }
+    for note in wanderlan_core::api::SharedSwitch::notes(&st.shared_switch) {
+        println!("Note: {note}");
     }
     if st.invites > 0 {
         println!("{} open invitation(s) ({})", st.invites, wl("invite list"));

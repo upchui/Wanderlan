@@ -121,8 +121,8 @@ pub struct Desired {
     /// Split horizon in nftables instead of `isolated` ports, where this
     /// site passes VLANs on between server tunnels (see [`forwarding`]).
     pub split: BTreeSet<SplitRule>,
-    /// Broadcast DHCP replies for the mapped VLANs of the trunks in one
-    /// switch network with a peer (see [`Runtime::shared_switch`]).
+    /// Broadcast DHCP replies for the mapped VLANs whose DHCP replies went
+    /// missing (see [`Runtime::dhcp_broadcast`]).
     pub dhcp: BTreeSet<DhcpRule>,
     /// The UDP port of the tunnels.
     pub tunnel_port: u16,
@@ -227,10 +227,11 @@ pub struct Runtime {
     /// their probes: they win over their entries in the network, which
     /// learn a change only with the sync.
     pub peer_ports: BTreeMap<SiteId, (u16, u16)>,
-    /// (trunk, VLAN of the network) where a mapped VLAN also arrives as it
-    /// is: the trunk is in one switch network with a peer (see
-    /// [`dropped_mappings`]).
-    pub shared_switch: BTreeSet<(String, u16)>,
+    /// (trunk, VLAN of the network) whose DHCP requests ask for broadcast
+    /// replies: the mapped VLAN also arrives as it is at the trunk (it is
+    /// in one switch network with a peer, see [`dropped_mappings`]) and
+    /// DHCP requests from there went unanswered.
+    pub dhcp_broadcast: BTreeSet<(String, u16)>,
 }
 
 impl Runtime {
@@ -480,7 +481,7 @@ pub fn derive_in(scope: &Scope, cfg: &Config, runtime: &Runtime) -> Desired {
         .flat_map(|t| {
             dropped_mappings(&t.tc)
                 .into_iter()
-                .filter(|m| runtime.shared_switch.contains(&(t.name.clone(), m.shared)))
+                .filter(|m| runtime.dhcp_broadcast.contains(&(t.name.clone(), m.shared)))
                 .map(|m| DhcpRule {
                     port: t.name.clone(),
                     vid: m.shared,
@@ -1259,7 +1260,7 @@ mod tests {
     }
 
     #[test]
-    fn a_trunk_in_one_switch_network_with_a_peer_asks_for_broadcast_dhcp() {
+    fn a_mapped_vlan_whose_dhcp_replies_went_missing_asks_for_broadcast() {
         let d = derive(&config("haus3"), &Runtime::default());
         assert_eq!(
             dropped_mappings(&d.trunk().tc),
@@ -1276,7 +1277,7 @@ mod tests {
         );
         assert!(d.dhcp.is_empty());
         let runtime = Runtime {
-            shared_switch: BTreeSet::from([("ens19".to_string(), 30), ("ens20".to_string(), 20)]),
+            dhcp_broadcast: BTreeSet::from([("ens19".to_string(), 30), ("ens20".to_string(), 20)]),
             ..Runtime::default()
         };
         let d = derive(&config("haus3"), &runtime);

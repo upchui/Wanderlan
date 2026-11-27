@@ -1,6 +1,7 @@
 //! Ethernet frames through an interface (AF_PACKET): sending the keepalives
 //! of the client tunnels and the marker of the switch check, receiving the
-//! test frame of the server and the marker.
+//! test frame of the server, the marker and DHCP (while a trunk is in one
+//! switch network with a peer).
 //!
 //! The sending socket has protocol 0: the kernel never copies a received
 //! frame to it. The receiving one ([`Tap`]) is open only for a test (a few
@@ -90,44 +91,112 @@ pub fn send(ifname: &str, frame: &[u8]) -> io::Result<()> {
 const PACKET_IGNORE_OUTGOING: libc::c_int = 23;
 
 /// Classic BPF: the VLAN tag of the frame (`SKF_AD_OFF + SKF_AD_VLAN_TAG`).
-/// The kernel moves the tag out of the frame before a tap sees it, so the
-/// ethertype is at offset 12 also in a tagged frame.
+/// The kernel moves the tag out of a received frame before a tap sees it,
+/// so the ethertype is at offset 12 also in a tagged frame.
 const ANCILLARY_VLAN_TAG: u32 = 0xFFFF_F000 + 44;
+/// Classic BPF: 1 if the frame has a VLAN tag (`SKF_AD_VLAN_TAG_PRESENT`).
+const ANCILLARY_VLAN_PRESENT: u32 = 0xFFFF_F000 + 48;
 
-/// `ldh [12]; jeq ethertype; ld [14]; jeq magic;` with `vid` also
-/// `ld vlan_tag; and 0xfff; jeq vid;` then `ret 256; ret 0`.
-fn filter_program(ethertype: u16, magic: [u8; 4], vid: Option<u16>) -> Vec<libc::sock_filter> {
-    let op = |code: u16, k: u32| libc::sock_filter {
+/// Classic BPF opcodes used here.
+mod bpf {
+    pub const LD_W_ABS: u16 = 0x20;
+    pub const LD_H_ABS: u16 = 0x28;
+    pub const LD_B_ABS: u16 = 0x30;
+    pub const LD_H_IND: u16 = 0x48;
+    pub const LDX_B_MSH: u16 = 0xb1;
+    pub const AND_K: u16 = 0x54;
+    pub const JEQ_K: u16 = 0x15;
+    pub const JSET_K: u16 = 0x45;
+    pub const RET_K: u16 = 0x06;
+}
+
+/// One BPF instruction without jumps.
+fn op(code: u16, k: u32) -> libc::sock_filter {
+    libc::sock_filter {
         code,
         jt: 0,
         jf: 0,
         k,
-    };
-    let mut program = vec![
-        op(0x28, 12),
-        op(0x15, u32::from(ethertype)),
-        op(0x20, 14),
-        op(0x15, u32::from_be_bytes(magic)),
-    ];
-    if let Some(vid) = vid {
-        program.push(op(0x20, ANCILLARY_VLAN_TAG));
-        program.push(op(0x54, 0x0fff));
-        program.push(op(0x15, u32::from(vid)));
     }
-    program.push(op(0x06, 256));
-    program.push(op(0x06, 0));
-    // Every failed comparison jumps to the final `ret 0`.
+}
+
+/// Ends `program` with `ret 0` and points every test that fails there: a
+/// `jeq` without jumps of its own when false, a `jset` when true.
+fn with_reject(mut program: Vec<libc::sock_filter>) -> Vec<libc::sock_filter> {
+    program.push(op(bpf::RET_K, 0));
     let reject = program.len() - 1;
     for (i, ins) in program.iter_mut().enumerate() {
-        if ins.code == 0x15 {
-            ins.jf = u8::try_from(reject - i - 1).unwrap_or(u8::MAX);
+        let to_reject = u8::try_from(reject - i - 1).unwrap_or(u8::MAX);
+        match ins.code {
+            // A plain test (no jump of its own): it must hold.
+            bpf::JEQ_K if ins.jt == 0 && ins.jf == 0 => ins.jf = to_reject,
+            bpf::JSET_K => ins.jt = to_reject,
+            _ => {}
         }
     }
     program
 }
 
-/// Receives the frames with one ethertype and four magic bytes after it
-/// that come in at one interface, while it is open.
+/// `vid`: tagged with that VLAN; `None`: untagged.
+fn vlan_check(vid: Option<u16>) -> Vec<libc::sock_filter> {
+    match vid {
+        Some(vid) => vec![
+            op(bpf::LD_W_ABS, ANCILLARY_VLAN_PRESENT),
+            op(bpf::JEQ_K, 1),
+            op(bpf::LD_W_ABS, ANCILLARY_VLAN_TAG),
+            op(bpf::AND_K, 0x0fff),
+            op(bpf::JEQ_K, u32::from(vid)),
+        ],
+        None => vec![op(bpf::LD_W_ABS, ANCILLARY_VLAN_PRESENT), op(bpf::JEQ_K, 0)],
+    }
+}
+
+/// DHCP (IPv4, UDP to port 67 or 68, no fragment) in VLAN `vid` (`None`:
+/// untagged), the first 350 bytes.
+fn dhcp_program(vid: Option<u16>) -> Vec<libc::sock_filter> {
+    let mut program = vlan_check(vid);
+    program.extend([
+        op(bpf::LD_H_ABS, 12),
+        op(bpf::JEQ_K, 0x0800),
+        op(bpf::LD_B_ABS, 23),
+        op(bpf::JEQ_K, 17),
+        op(bpf::LD_H_ABS, 20),
+        op(bpf::JSET_K, 0x1fff),
+        // X = length of the IP header.
+        op(bpf::LDX_B_MSH, 14),
+        op(bpf::LD_H_IND, 14 + 2),
+    ]);
+    // dport 67 or 68: accept (the first jumps over the second test).
+    let mut first = op(bpf::JEQ_K, 67);
+    first.jt = 1;
+    first.jf = 0;
+    program.push(first);
+    // `jf` is set by `with_reject`; true falls through to the accept.
+    program.push(op(bpf::JEQ_K, 68));
+    program.push(op(bpf::RET_K, 350));
+    with_reject(program)
+}
+
+/// `ldh [12]; jeq ethertype; ld [14]; jeq magic;` with `vid` also
+/// `ld vlan_tag; and 0xfff; jeq vid;` then `ret 256; ret 0`.
+fn filter_program(ethertype: u16, magic: [u8; 4], vid: Option<u16>) -> Vec<libc::sock_filter> {
+    let mut program = vec![
+        op(bpf::LD_H_ABS, 12),
+        op(bpf::JEQ_K, u32::from(ethertype)),
+        op(bpf::LD_W_ABS, 14),
+        op(bpf::JEQ_K, u32::from_be_bytes(magic)),
+    ];
+    if let Some(vid) = vid {
+        program.push(op(bpf::LD_W_ABS, ANCILLARY_VLAN_TAG));
+        program.push(op(bpf::AND_K, 0x0fff));
+        program.push(op(bpf::JEQ_K, u32::from(vid)));
+    }
+    program.push(op(bpf::RET_K, 256));
+    with_reject(program)
+}
+
+/// Receives the frames a filter lets through that come in at one
+/// interface, while it is open.
 pub struct Tap {
     socket: OwnedFd,
 }
@@ -138,16 +207,25 @@ impl Tap {
     /// filter runs in the kernel before the socket sees anything; frames sent
     /// by this box are not copied. The tap sees the frames before tc and the
     /// bridge: also those a tc rule drops.
-    #[allow(unsafe_code)]
     pub fn open(
         ifname: &str,
         ethertype: u16,
         magic: [u8; 4],
         vid: Option<u16>,
     ) -> io::Result<Self> {
+        Self::open_with(ifname, filter_program(ethertype, magic, vid))
+    }
+
+    /// Opens the tap on `ifname` for the DHCP frames (IPv4) that arrive in
+    /// VLAN `vid` (`None`: untagged).
+    pub fn open_dhcp(ifname: &str, vid: Option<u16>) -> io::Result<Self> {
+        Self::open_with(ifname, dhcp_program(vid))
+    }
+
+    #[allow(unsafe_code)]
+    fn open_with(ifname: &str, mut program: Vec<libc::sock_filter>) -> io::Result<Self> {
         let index = index_of(ifname)?;
         let socket = packet_socket()?;
-        let mut program = filter_program(ethertype, magic, vid);
         let filter = libc::sock_fprog {
             len: libc::c_ushort::try_from(program.len()).map_err(invalid)?,
             filter: program.as_mut_ptr(),
@@ -198,6 +276,42 @@ impl Tap {
             return Err(io::Error::last_os_error());
         }
         Ok(Self { socket })
+    }
+
+    /// A frame that is waiting, without blocking: its length in `buf`.
+    #[allow(unsafe_code)]
+    pub fn try_recv(&self, buf: &mut [u8]) -> Option<usize> {
+        // SAFETY: the buffer lives for the call; its length is exact.
+        let n = unsafe {
+            libc::recv(
+                self.socket.as_raw_fd(),
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        usize::try_from(n).ok()
+    }
+
+    /// Waits up to `timeout` until one of `taps` has a frame; true if one
+    /// has (or on an error, so that the caller reads and finds nothing).
+    #[allow(unsafe_code)]
+    pub fn poll(taps: &[&Self], timeout: Duration) -> bool {
+        let mut fds: Vec<libc::pollfd> = taps
+            .iter()
+            .map(|t| libc::pollfd {
+                fd: t.socket.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        let ms = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+        let Ok(n) = libc::nfds_t::try_from(fds.len()) else {
+            return false;
+        };
+        // SAFETY: `fds` is a valid array of `n` pollfds for the call.
+        let ready = unsafe { libc::poll(fds.as_mut_ptr(), n, ms) };
+        ready != 0
     }
 
     /// Waits up to `timeout` for a frame for which `accept` is true.

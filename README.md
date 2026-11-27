@@ -353,10 +353,10 @@ names the VLAN on the new site's trunk first, as the new site sees it.
 
 A site with mappings checks every 30 s whether its trunk and the trunk of a
 peer are in one switch network: a marker frame in the source VLAN through
-its tunnels that comes back at its trunk. There every device of the mapped
-VLAN appears twice to the switch (in the mapped VLAN at its own port, in the
-source VLAN at the port of the peer's trunk); see Troubleshooting, "Both
-sites in one switch network".
+its tunnels that comes back at its trunk. There the switch sees every device
+of the mapped VLAN twice (in the mapped VLAN at its own port, in the source
+VLAN at the port of the peer's trunk). That is harmless, and the status
+only notes it; see Troubleshooting, "DHCP replies get lost".
 
 ### Local breakout
 
@@ -1137,20 +1137,23 @@ or `WANDERLAN_SOCKET`, the network of the box with `--net` or
   Two segments of one box with a breakout must not use the same addresses.
 * **Large transfers stall**: compare the path MTU in `wanderlan status` with
   the MTU of the VPN; set `mss` if probes are filtered.
-* **Both sites in one switch network** (`WARNING: VLAN 14 (VLAN 114 here)
-  also arrives unmapped at trunk …`): the trunk of this site and that of a
-  peer hang in one switch network, e.g. in a test setup. No loop (the trunk
-  drops the source VLAN as it is), but the switch sees every device of the
-  mapped VLAN twice: in the mapped VLAN at its own port, in the source VLAN
-  at the port of the peer's trunk. Switch features that bind a device to one
-  port may then send its traffic to the wrong port; devices lose their
-  address one by one when they renew it. Turn off DHCP snooping (UniFi:
-  "Rogue DHCP Server Detection"), DHCP guarding, port security and the like
-  for these VLANs, or keep the trunks in separate networks. Until then DHCP
-  requests from the mapped VLAN ask for broadcast replies (nftables rule
-  `wl dhcp-bcast`); a renewal (sent to the server directly) is still
-  answered by unicast and may get lost, the device then asks anew. The
-  warning goes when the marker has not come back three times in a row.
+* **DHCP replies get lost** (`WARNING: DHCP replies for VLAN 114 … get
+  lost`): the trunk of this site and that of a peer hang in one switch
+  network (the status notes that much: `Note: Trunk ens19 is in one switch
+  network with a peer`, harmless as such). The switch sees every device of
+  the mapped VLAN twice: in the mapped VLAN at its own port, in the source
+  VLAN at the port of the peer's trunk. A switch that binds a device to one
+  port (DHCP snooping, UniFi "Rogue DHCP Server Detection", DHCP guarding,
+  port security) may send its DHCP replies to the wrong port; devices lose
+  their address one by one. While a trunk is shared, wanderlan watches the
+  DHCP of the mapped VLAN: once a device's requests go unanswered 3 times in
+  a row, the requests from there ask for broadcast replies (nftables rule
+  `wl dhcp-bcast`, until the trunk is alone again); only if they stay
+  unanswered all the same, it warns. Turn those features off for these
+  VLANs, or keep the trunks in separate networks. A DHCP server on this
+  site's own LAN that answers by unicast is invisible to wanderlan: there,
+  requests may count as unanswered although they are not (no harm beyond
+  the broadcast replies and the warning).
 * **A port is BLOCKED**: the loop guard found a loop through another layer-2
   path between sites; remove it, then `wanderlan unblock <site>` (or the
   port; `u` on the peer in the terminal UI, `U` for a trunk port).

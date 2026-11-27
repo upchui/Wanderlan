@@ -1,10 +1,11 @@
 # shellcheck shell=bash
 # The switch check, after case 40 (site5 maps local 130 to VLAN 30 and
 # untagged to VLAN 20). A "switch" joins VLAN 30 of the trunk networks of
-# site2 and site5, like one switch network both trunks hang in: site5 finds
-# its trunk shared with a peer for VLAN 30 (not for 20), warns, and its DHCP
-# requests from VLAN 130 ask for broadcast replies. Without the switch both
-# go again.
+# site2 and site5, like one switch network both trunks hang in: site5 notes
+# it (no warning: harmless as such). DHCP requests from VLAN 130 that go
+# unanswered (VLAN 30 has no DHCP server here) make them ask for broadcast
+# replies; if those stay unanswered too, site5 warns. Without the switch
+# all of it goes again.
 
 begin "Switch check: both sites in one switch network"
 
@@ -29,30 +30,48 @@ docker exec "$SWITCH" bash -c '
   for p in "$a" "$b"; do ip link set "$p" master sw0; bridge vlan add dev "$p" vid 30; done
   ip link set sw0 up'
 
-# "<trunk> <vid> <local>" of every trunk site5 finds shared.
+# "<trunk> <vid> <local> <broadcast> <lost>" of every trunk site5 finds shared.
 shared_switch_is() {
-  [ "$(jqs site5 '[.shared_switch[] | "\(.trunk) \(.vid) \(.local)"] | join(",")')" = "$1" ]
+  [ "$(jqs site5 '[.shared_switch[] | "\(.trunk) \(.vid) \(.local) \(.broadcast) \(.lost | join(","))"] | join(";")')" = "$1" ]
 }
-wait_for 60 "site5 finds trunk0 in one switch network with a peer for VLAN 30 (130 there), not for 20" \
-  shared_switch_is "trunk0 30 130"
-check "site5 warns in its status" \
-  x site5 "wanderlan status | grep -q 'WARNING: VLAN 30 (VLAN 130 here) also arrives unmapped at trunk trunk0: this site and a peer are in one switch network'"
-check "site5: DHCP requests from VLAN 130 ask for broadcast replies" \
-  x site5 "nft list chain bridge wanderlan forward | grep -q 'iifname \"trunk0\" vlan id 30 meta protocol ip udp dport 67 @th,144,16 set 0x8000 udp checksum set 0'"
+no_warning() { ! x site5 "wanderlan status | grep -q WARNING"; }
+dhcp_rule() { x site5 "nft list chain bridge wanderlan forward | grep -q 'iifname \"trunk0\" vlan id 30 meta protocol ip udp dport 67 @th,144,16 set 0x8000 udp checksum set 0'"; }
+# bootp_request <xid byte>: a DHCP request of client 02:00:00:00:13:30 from
+# VLAN 130 at site5 (an address of its own: the switch learns no address of
+# c-site5 in two places). From a file: nc sends what it reads at once as
+# one packet.
+bootp_request() {
+  x c-site5 "{ printf '\x01\x01\x06\x00\x12\x34\x56\x$1'; head -c 20 /dev/zero; printf '\x02\x00\x00\x00\x13\x30';
+              head -c 202 /dev/zero; printf '\x63\x82\x53\x63\xff'; head -c 59 /dev/zero; } > /tmp/bootp
+             nc -u -w1 -p 68 -s 10.99.0.2 10.99.0.1 67 < /tmp/bootp" >/dev/null 2>&1
+}
 
-# A BOOTP request from VLAN 130 at site5 (its own address, so the switch
-# learns no address of c-site5 in two places), seen leaving site2's trunk.
+wait_for 60 "site5 finds trunk0 in one switch network with a peer for VLAN 30 (130 there), not for 20" \
+  shared_switch_is "trunk0 30 130 false "
+check "site5 notes it in its status, no warning" \
+  x site5 "wanderlan status | grep -q 'Note: Trunk trunk0 is in one switch network with a peer: VLAN 30 (130 here) also arrives unmapped' && ! wanderlan status | grep -q WARNING"
+check "site5 leaves DHCP alone" x site5 "! nft list chain bridge wanderlan forward | grep -q 'udp dport 67'"
+
 x c-site5 "ip link add link trunk0.130 name dh0 type macvlan mode bridge; ip addr add 10.99.0.2/24 dev dh0; ip link set dh0 up
-           ip neigh replace 10.99.0.1 lladdr ff:ff:ff:ff:ff:ff dev dh0 nud permanent
-           { printf '\x01\x01\x06\x00\x12\x34\x56\x78'; head -c 228 /dev/zero; printf '\x63\x82\x53\x63\xff'; head -c 59 /dev/zero; } > /tmp/bootp"
-x site2 "rm -f /tmp/dhcp.txt; (timeout 20 tcpdump -nvvli trunk0 -c 1 'vlan 30 and udp dst port 67' > /tmp/dhcp.txt 2>/dev/null) & sleep 1"
-x c-site5 "nc -u -w1 -p 68 -s 10.99.0.2 10.99.0.1 67 < /tmp/bootp" >/dev/null 2>&1
-wait_for 20 "site2 gets the request with the broadcast flag (and without a UDP checksum)" \
+           ip neigh replace 10.99.0.1 lladdr ff:ff:ff:ff:ff:ff dev dh0 nud permanent"
+for xid in 01 02 03; do bootp_request "$xid"; done
+wait_for 30 "three unanswered DHCP requests from VLAN 130: they ask for broadcast replies" dhcp_rule
+check "still no warning (the broadcast replies may arrive)" no_warning
+check "the status says so" shared_switch_is "trunk0 30 130 true "
+
+# The watch learns of the rule after the reconcile: then three more.
+sleep 6
+x site2 "rm -f /tmp/dhcp.txt; (timeout 30 tcpdump -nvvli trunk0 -c 1 'vlan 30 and udp dst port 67' > /tmp/dhcp.txt 2>/dev/null) & sleep 1"
+for xid in 04 05 06; do bootp_request "$xid"; done
+wait_for 30 "unanswered as broadcasts too: site5 warns" \
+  x site5 "wanderlan status | grep -q 'WARNING: DHCP replies for VLAN 130 (VLAN 30 of the network) at trunk trunk0 get lost, also as broadcasts (requests of 02:00:00:00:13:30 unanswered)'"
+check "the status names the client" shared_switch_is "trunk0 30 130 true 02:00:00:00:13:30"
+check "site2 got the requests with the broadcast flag (and without a UDP checksum)" \
   x site2 "grep -q 'Flags \[Broadcast\]' /tmp/dhcp.txt && grep -q 'no cksum' /tmp/dhcp.txt"
 x c-site5 "ip link del dh0 2>/dev/null; rm -f /tmp/bootp"
 
 docker rm -f "$SWITCH" >/dev/null 2>&1
 wait_for 150 "without the switch, site5 is alone again (three checks without the marker)" \
   shared_switch_is ""
-check "and its DHCP requests go as they are" \
-  x site5 "! nft list chain bridge wanderlan forward | grep -q 'udp dport 67'"
+check "no warning, and DHCP goes as it is" \
+  x site5 "! wanderlan status | grep -q WARNING && ! nft list chain bridge wanderlan forward | grep -q 'udp dport 67'"
