@@ -343,6 +343,9 @@ fn problems(app: &App) -> Option<(String, Style)> {
     if !s.conflicts.is_empty() {
         warn.push(format!("{} left out", s.conflicts.len()));
     }
+    if !s.shared_switch.is_empty() {
+        warn.push("one switch network".to_string());
+    }
     let refused = s.peers.iter().filter(|p| p.refused.is_some()).count();
     if refused > 0 {
         warn.push(format!("{refused} refused"));

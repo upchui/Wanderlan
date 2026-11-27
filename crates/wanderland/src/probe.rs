@@ -1702,6 +1702,7 @@ fn open_test_tap(
         interface,
         wanderlan_core::sys::nft_ip::KEEPALIVE_ETHERTYPE,
         *nat::DIRECT_MAGIC,
+        None,
     )
     .map_err(|e| format!("cannot listen on {interface}: {e}"))?;
     let nonce = shared.nonce;

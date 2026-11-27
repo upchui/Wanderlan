@@ -19,6 +19,7 @@ mod logging;
 mod probe;
 mod random;
 mod rawframe;
+mod shared_switch;
 mod sockopt;
 mod stats;
 mod sync_net;

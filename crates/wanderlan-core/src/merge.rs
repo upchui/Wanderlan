@@ -18,13 +18,15 @@
 //!   missing (an unplugged adapter) leaves its segment out, it does not stop
 //!   the box.
 //!
-//! The rest (tunnels, MSS clamping, split horizon, the learn table) only
-//! adds up: the names of the tunnels differ between the networks.
+//! The rest (tunnels, MSS clamping, split horizon, broadcast DHCP replies,
+//! the learn table) only adds up: the names of the tunnels differ between
+//! the networks.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::config::VlanSet;
 use crate::desired::{Desired, TrunkSpec};
+use crate::sys::nft::DhcpRule;
 
 /// Something a network lost to an earlier network of the box.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -331,6 +333,13 @@ pub fn merge(parts: &[(&str, &Desired)]) -> Option<Merged> {
                 .into_iter()
                 .collect(),
         );
+        // Broadcast DHCP replies only for the trunks (and VLANs) it kept.
+        let kept = |r: &DhcpRule| {
+            part.trunks
+                .iter()
+                .any(|t| t.name == r.port && t.vlans.contains_key(&r.vid))
+        };
+        part.dhcp = part.dhcp.iter().filter(|r| kept(r)).cloned().collect();
         for trunk in part.trunks {
             match out.trunks.iter_mut().find(|t| t.name == trunk.name) {
                 Some(theirs) => add_vlans(theirs, &trunk),
@@ -344,6 +353,7 @@ pub fn merge(parts: &[(&str, &Desired)]) -> Option<Merged> {
         out.tunnels.sort_by(|a, b| a.name.cmp(&b.name));
         out.mss.extend(part.mss);
         out.split.extend(part.split);
+        out.dhcp.extend(part.dhcp);
         out.learn.extend(&part.learn);
         out.breakout.extend(part.breakout);
         if !lost.is_empty() {

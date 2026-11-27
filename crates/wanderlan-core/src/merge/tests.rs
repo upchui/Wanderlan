@@ -58,6 +58,7 @@ fn network(port: u16, trunk: &str, bridge: &str, vlans: &[u16], peers: &[&str]) 
         local_address: Ipv4Addr::new(10, 0, 0, 1),
         mss: BTreeSet::new(),
         split: BTreeSet::new(),
+        dhcp: BTreeSet::new(),
         tunnel_port: port,
         control_port: port - 1,
         unbuilt: BTreeMap::new(),

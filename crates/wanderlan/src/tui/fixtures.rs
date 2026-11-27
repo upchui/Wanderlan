@@ -179,6 +179,7 @@ pub fn status() -> Status {
         tag: 'x',
         networks: vec!["default".into()],
         conflicts: Vec::new(),
+        shared_switch: Vec::new(),
         peers: vec![
             PeerStatus {
                 macs: 12,
@@ -264,6 +265,7 @@ pub fn unconfigured_status() -> Status {
         tag: 'x',
         networks: vec!["default".into()],
         conflicts: Vec::new(),
+        shared_switch: Vec::new(),
         peers: Vec::new(),
         sites: Vec::new(),
         blocked: Vec::new(),

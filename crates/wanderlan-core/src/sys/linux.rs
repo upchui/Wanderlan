@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddrV4;
 
 use super::netlink::Netlink;
-use super::nft::{CachedNft, MssRule, NftCli, NftOps, NftState, SplitRule};
+use super::nft::{CachedNft, DhcpRule, MssRule, NftCli, NftOps, NftState, SplitRule};
 use super::nft_ip::{LearnCli, LearnOps, LearnState, LearnTable, Learned};
 
 /// How long the MSS rules read from nftables are trusted.
@@ -134,8 +134,9 @@ impl NftOps for LinuxSystem {
         &self,
         rules: &BTreeSet<MssRule>,
         split: &BTreeSet<SplitRule>,
+        dhcp: &BTreeSet<DhcpRule>,
     ) -> SysResult<()> {
-        self.nft.set_nft_rules(rules, split).await
+        self.nft.set_nft_rules(rules, split, dhcp).await
     }
     async fn delete_table(&self) -> SysResult<()> {
         self.nft.delete_table().await

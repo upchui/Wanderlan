@@ -351,6 +351,13 @@ On the command line `wanderlan map add <site> <source> <mapped>` names the
 source VLAN first too; an invitation's `--map MAPPED:SOURCE` (e.g. `130:30`)
 names the VLAN on the new site's trunk first, as the new site sees it.
 
+A site with mappings checks every 30 s whether its trunk and the trunk of a
+peer are in one switch network: a marker frame in the source VLAN through
+its tunnels that comes back at its trunk. There every device of the mapped
+VLAN appears twice to the switch (in the mapped VLAN at its own port, in the
+source VLAN at the port of the peer's trunk); see Troubleshooting, "Both
+sites in one switch network".
+
 ### Local breakout
 
 Normally the devices of a site reach the internet like everything else:
@@ -1130,6 +1137,20 @@ or `WANDERLAN_SOCKET`, the network of the box with `--net` or
   Two segments of one box with a breakout must not use the same addresses.
 * **Large transfers stall**: compare the path MTU in `wanderlan status` with
   the MTU of the VPN; set `mss` if probes are filtered.
+* **Both sites in one switch network** (`WARNING: VLAN 14 (VLAN 114 here)
+  also arrives unmapped at trunk …`): the trunk of this site and that of a
+  peer hang in one switch network, e.g. in a test setup. No loop (the trunk
+  drops the source VLAN as it is), but the switch sees every device of the
+  mapped VLAN twice: in the mapped VLAN at its own port, in the source VLAN
+  at the port of the peer's trunk. Switch features that bind a device to one
+  port may then send its traffic to the wrong port; devices lose their
+  address one by one when they renew it. Turn off DHCP snooping (UniFi:
+  "Rogue DHCP Server Detection"), DHCP guarding, port security and the like
+  for these VLANs, or keep the trunks in separate networks. Until then DHCP
+  requests from the mapped VLAN ask for broadcast replies (nftables rule
+  `wl dhcp-bcast`); a renewal (sent to the server directly) is still
+  answered by unicast and may get lost, the device then asks anew. The
+  warning goes when the marker has not come back three times in a row.
 * **A port is BLOCKED**: the loop guard found a loop through another layer-2
   path between sites; remove it, then `wanderlan unblock <site>` (or the
   port; `u` on the peer in the terminal UI, `U` for a trunk port).

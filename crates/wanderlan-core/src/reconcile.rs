@@ -15,7 +15,7 @@ use crate::breakout::{PORT_PREFIX, ROUTER_PREFIX, is_breakout_name, is_port_name
 use crate::config::VlanSet;
 use crate::desired::{Desired, OWNER_ALIAS, TUNNEL_MTU};
 use crate::sys::breakout::{BreakoutSpec, BreakoutState};
-use crate::sys::nft::{MssRule, NftState, SplitRule};
+use crate::sys::nft::{DhcpRule, MssRule, NftState, SplitRule};
 use crate::sys::nft_ip::{LearnState, LearnTable};
 use crate::sys::tc::{IfTc, TcRule};
 use crate::sys::{
@@ -218,10 +218,11 @@ pub enum Change {
     /// Remove a VLAN translation rule.
     DelTcRule { dev: String, rule: TcRule },
     /// Replace the rules of the nftables table `bridge wanderlan`: MSS
-    /// clamping and split horizon.
+    /// clamping, split horizon and broadcast DHCP replies.
     SetNft {
         mss: BTreeSet<MssRule>,
         split: BTreeSet<SplitRule>,
+        dhcp: BTreeSet<DhcpRule>,
     },
     /// Delete the nftables table.
     DeleteNftTable,
@@ -323,31 +324,32 @@ impl fmt::Display for Change {
             Self::DelClsact { dev } => write!(f, "Removing the clsact qdisc from {dev}"),
             Self::AddTcRule { dev, rule } => write!(f, "On {dev}: {rule}"),
             Self::DelTcRule { dev, rule } => write!(f, "On {dev}: no longer {rule}"),
-            Self::SetNft { mss, split } => {
+            Self::SetNft { mss, split, dhcp } => {
                 let mut per_port: BTreeMap<&str, u16> = BTreeMap::new();
                 for r in mss.iter().filter(|r| !r.ipv6) {
                     per_port.insert(r.port.as_str(), r.mss);
                 }
-                let parts: Vec<String> = per_port.iter().map(|(p, m)| format!("{p} {m}")).collect();
-                let split: Vec<String> = split.iter().map(ToString::to_string).collect();
-                match (parts.is_empty(), split.is_empty()) {
-                    (false, true) => write!(
-                        f,
-                        "Setting TCP MSS clamping in nftables table bridge wanderlan ({})",
-                        parts.join(", ")
-                    ),
-                    (true, _) => write!(
-                        f,
-                        "Setting the split horizon in nftables table bridge wanderlan ({})",
-                        split.join("; ")
-                    ),
-                    (false, false) => write!(
-                        f,
-                        "Setting TCP MSS clamping ({}) and the split horizon ({}) in nftables table bridge wanderlan",
-                        parts.join(", "),
-                        split.join("; ")
-                    ),
+                let mut parts = Vec::new();
+                if !per_port.is_empty() {
+                    let ports: Vec<String> =
+                        per_port.iter().map(|(p, m)| format!("{p} {m}")).collect();
+                    parts.push(format!("TCP MSS clamping ({})", ports.join(", ")));
                 }
+                if !split.is_empty() {
+                    let split: Vec<String> = split.iter().map(ToString::to_string).collect();
+                    parts.push(format!("the split horizon ({})", split.join("; ")));
+                }
+                for rule in dhcp {
+                    parts.push(format!(
+                        "broadcast DHCP replies for VLAN {} from {} (both sites in one switch network)",
+                        rule.vid, rule.port
+                    ));
+                }
+                write!(
+                    f,
+                    "Setting {} in nftables table bridge wanderlan",
+                    parts.join(" and ")
+                )
             }
             Self::DeleteNftTable => write!(f, "Deleting nftables table bridge wanderlan"),
             Self::SetLearn { table } => {
@@ -809,7 +811,7 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
     let (tc_dels, tc_adds): (Vec<Change>, Vec<Change>) = tc_changes(desired, actual)
         .into_iter()
         .partition(|c| matches!(c, Change::DelTcRule { .. } | Change::DelClsact { .. }));
-    let want = NftState::of(&desired.mss, &desired.split);
+    let want = NftState::of(&desired.mss, &desired.split, &desired.dhcp);
     if let Some(error) = &actual.nft_error
         && !desired.split.is_empty()
     {
@@ -823,6 +825,7 @@ pub fn plan(desired: &Desired, actual: &Actual) -> Result<Vec<Change>, PlanError
         _ => vec![Change::SetNft {
             mss: desired.mss.clone(),
             split: desired.split.clone(),
+            dhcp: desired.dhcp.clone(),
         }],
     };
     // A port loses `isolated` only once the split horizon in nftables is in
@@ -1216,7 +1219,7 @@ pub async fn apply<N: System>(net: &N, actual: &Actual, change: &Change) -> Resu
         Change::DelClsact { dev } => net.del_clsact(index_of(dev)?).await?,
         Change::AddTcRule { dev, rule } => net.add_tc_rule(index_of(dev)?, rule).await?,
         Change::DelTcRule { dev, rule } => net.del_tc_rule(index_of(dev)?, rule).await?,
-        Change::SetNft { mss, split } => net.set_nft_rules(mss, split).await?,
+        Change::SetNft { mss, split, dhcp } => net.set_nft_rules(mss, split, dhcp).await?,
         Change::DeleteNftTable => net.delete_table().await?,
         Change::SetLearn { table } => net.set_learn(table).await?,
         Change::DeleteLearn => net.delete_learn().await?,

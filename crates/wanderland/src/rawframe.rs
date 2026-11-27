@@ -1,5 +1,6 @@
 //! Ethernet frames through an interface (AF_PACKET): sending the keepalives
-//! of the client tunnels, receiving the test frame of the server.
+//! of the client tunnels and the marker of the switch check, receiving the
+//! test frame of the server and the marker.
 //!
 //! The sending socket has protocol 0: the kernel never copies a received
 //! frame to it. The receiving one ([`Tap`]) is open only for a test (a few
@@ -88,6 +89,43 @@ pub fn send(ifname: &str, frame: &[u8]) -> io::Result<()> {
 /// box sends (`linux/if_packet.h`).
 const PACKET_IGNORE_OUTGOING: libc::c_int = 23;
 
+/// Classic BPF: the VLAN tag of the frame (`SKF_AD_OFF + SKF_AD_VLAN_TAG`).
+/// The kernel moves the tag out of the frame before a tap sees it, so the
+/// ethertype is at offset 12 also in a tagged frame.
+const ANCILLARY_VLAN_TAG: u32 = 0xFFFF_F000 + 44;
+
+/// `ldh [12]; jeq ethertype; ld [14]; jeq magic;` with `vid` also
+/// `ld vlan_tag; and 0xfff; jeq vid;` then `ret 256; ret 0`.
+fn filter_program(ethertype: u16, magic: [u8; 4], vid: Option<u16>) -> Vec<libc::sock_filter> {
+    let op = |code: u16, k: u32| libc::sock_filter {
+        code,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let mut program = vec![
+        op(0x28, 12),
+        op(0x15, u32::from(ethertype)),
+        op(0x20, 14),
+        op(0x15, u32::from_be_bytes(magic)),
+    ];
+    if let Some(vid) = vid {
+        program.push(op(0x20, ANCILLARY_VLAN_TAG));
+        program.push(op(0x54, 0x0fff));
+        program.push(op(0x15, u32::from(vid)));
+    }
+    program.push(op(0x06, 256));
+    program.push(op(0x06, 0));
+    // Every failed comparison jumps to the final `ret 0`.
+    let reject = program.len() - 1;
+    for (i, ins) in program.iter_mut().enumerate() {
+        if ins.code == 0x15 {
+            ins.jf = u8::try_from(reject - i - 1).unwrap_or(u8::MAX);
+        }
+    }
+    program
+}
+
 /// Receives the frames with one ethertype and four magic bytes after it
 /// that come in at one interface, while it is open.
 pub struct Tap {
@@ -96,51 +134,20 @@ pub struct Tap {
 
 impl Tap {
     /// Opens the tap on `ifname` for frames of `ethertype` that start with
-    /// `magic` after it. The filter runs in the kernel before the socket
-    /// sees anything; frames sent by this box are not copied.
+    /// `magic` after it and, with `vid`, arrive tagged with that VLAN. The
+    /// filter runs in the kernel before the socket sees anything; frames sent
+    /// by this box are not copied. The tap sees the frames before tc and the
+    /// bridge: also those a tc rule drops.
     #[allow(unsafe_code)]
-    pub fn open(ifname: &str, ethertype: u16, magic: [u8; 4]) -> io::Result<Self> {
+    pub fn open(
+        ifname: &str,
+        ethertype: u16,
+        magic: [u8; 4],
+        vid: Option<u16>,
+    ) -> io::Result<Self> {
         let index = index_of(ifname)?;
         let socket = packet_socket()?;
-        // ldh [12]; jeq ethertype; ld [14]; jeq magic; ret 256; ret 0
-        let mut program = [
-            libc::sock_filter {
-                code: 0x28,
-                jt: 0,
-                jf: 0,
-                k: 12,
-            },
-            libc::sock_filter {
-                code: 0x15,
-                jt: 0,
-                jf: 3,
-                k: u32::from(ethertype),
-            },
-            libc::sock_filter {
-                code: 0x20,
-                jt: 0,
-                jf: 0,
-                k: 14,
-            },
-            libc::sock_filter {
-                code: 0x15,
-                jt: 0,
-                jf: 1,
-                k: u32::from_be_bytes(magic),
-            },
-            libc::sock_filter {
-                code: 0x06,
-                jt: 0,
-                jf: 0,
-                k: 256,
-            },
-            libc::sock_filter {
-                code: 0x06,
-                jt: 0,
-                jf: 0,
-                k: 0,
-            },
-        ];
+        let mut program = filter_program(ethertype, magic, vid);
         let filter = libc::sock_fprog {
             len: libc::c_ushort::try_from(program.len()).map_err(invalid)?,
             filter: program.as_mut_ptr(),

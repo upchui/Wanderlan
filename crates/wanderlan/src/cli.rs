@@ -2423,6 +2423,9 @@ async fn status(socket: &Path, json: bool) -> Result<ExitCode> {
     if let Some(problem) = &st.sync_problem {
         println!("WARNING: {problem}");
     }
+    for shared in &st.shared_switch {
+        println!("WARNING: {}", shared.warning());
+    }
     if st.invites > 0 {
         println!("{} open invitation(s) ({})", st.invites, wl("invite list"));
     }

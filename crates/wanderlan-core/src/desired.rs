@@ -9,7 +9,7 @@ use crate::forwarding;
 use crate::identity::{PeerIdentity, SiteId};
 use crate::mtu;
 use crate::sys::breakout::{BreakoutSpec, Egress, Uplinks, conf};
-use crate::sys::nft::{MssRule, PortDir, SplitRule};
+use crate::sys::nft::{DhcpRule, MssRule, PortDir, SplitRule};
 use crate::sys::nft_ip::{FixedRule, LearnRule, LearnTable};
 use crate::sys::tc::{Direction, TcAction, TcRule};
 use crate::sys::{BridgeOptions, PortVlans, VlanFlags, VxlanParams};
@@ -121,6 +121,9 @@ pub struct Desired {
     /// Split horizon in nftables instead of `isolated` ports, where this
     /// site passes VLANs on between server tunnels (see [`forwarding`]).
     pub split: BTreeSet<SplitRule>,
+    /// Broadcast DHCP replies for the mapped VLANs of the trunks in one
+    /// switch network with a peer (see [`Runtime::shared_switch`]).
+    pub dhcp: BTreeSet<DhcpRule>,
     /// The UDP port of the tunnels.
     pub tunnel_port: u16,
     /// The control port (UDP probes, TCP sync) of the site.
@@ -224,6 +227,10 @@ pub struct Runtime {
     /// their probes: they win over their entries in the network, which
     /// learn a change only with the sync.
     pub peer_ports: BTreeMap<SiteId, (u16, u16)>,
+    /// (trunk, VLAN of the network) where a mapped VLAN also arrives as it
+    /// is: the trunk is in one switch network with a peer (see
+    /// [`dropped_mappings`]).
+    pub shared_switch: BTreeSet<(String, u16)>,
 }
 
 impl Runtime {
@@ -468,6 +475,18 @@ pub fn derive_in(scope: &Scope, cfg: &Config, runtime: &Runtime) -> Desired {
             vni: t.params.vni,
         })
         .collect();
+    let dhcp = trunks
+        .iter()
+        .flat_map(|t| {
+            dropped_mappings(&t.tc)
+                .into_iter()
+                .filter(|m| runtime.shared_switch.contains(&(t.name.clone(), m.shared)))
+                .map(|m| DhcpRule {
+                    port: t.name.clone(),
+                    vid: m.shared,
+                })
+        })
+        .collect();
     Desired {
         tunnel_port,
         control_port: cfg.control_port(),
@@ -480,6 +499,7 @@ pub fn derive_in(scope: &Scope, cfg: &Config, runtime: &Runtime) -> Desired {
         bridge_options: BRIDGE_OPTIONS,
         trunks,
         mss: mss_rules(cfg, &tunnels, runtime),
+        dhcp,
         split: passing
             .split
             .iter()
@@ -903,6 +923,36 @@ fn trunk_mapping(cfg: &Config, shared: &PortVlans) -> (PortVlans, Vec<TcRule>) {
     (vlans, rules)
 }
 
+/// A VLAN mapping of a trunk: VLAN `shared` of the network is VLAN `local`
+/// on the trunk (`None`: untagged).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Mapped {
+    /// The VLAN in the network (and in the bridge).
+    pub shared: u16,
+    /// The VLAN on the trunk; `None` for untagged frames.
+    pub local: Option<u16>,
+}
+
+/// The mappings of a trunk (from its tc rules) whose VLAN of the network
+/// the trunk drops as it is: where it still arrives so, it came through
+/// the tunnel and a switch network the trunk shares with the peer.
+pub fn dropped_mappings(tc: &[TcRule]) -> Vec<Mapped> {
+    tc.iter()
+        .filter(|r| r.direction == Direction::Ingress && r.action == TcAction::Drop)
+        .map(|drop| Mapped {
+            shared: drop.vid,
+            local: tc.iter().find_map(|r| match r.action {
+                TcAction::Translate(local)
+                    if r.direction == Direction::Egress && r.vid == drop.vid =>
+                {
+                    Some(local)
+                }
+                _ => None,
+            }),
+        })
+        .collect()
+}
+
 #[cfg(test)]
 impl Desired {
     /// The default trunk (tests only).
@@ -1205,6 +1255,37 @@ mod tests {
                 .trunk()
                 .tc
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_trunk_in_one_switch_network_with_a_peer_asks_for_broadcast_dhcp() {
+        let d = derive(&config("haus3"), &Runtime::default());
+        assert_eq!(
+            dropped_mappings(&d.trunk().tc),
+            [
+                Mapped {
+                    shared: 20,
+                    local: None
+                },
+                Mapped {
+                    shared: 30,
+                    local: Some(130)
+                }
+            ]
+        );
+        assert!(d.dhcp.is_empty());
+        let runtime = Runtime {
+            shared_switch: BTreeSet::from([("ens19".to_string(), 30), ("ens20".to_string(), 20)]),
+            ..Runtime::default()
+        };
+        let d = derive(&config("haus3"), &runtime);
+        assert_eq!(
+            d.dhcp,
+            BTreeSet::from([DhcpRule {
+                port: "ens19".into(),
+                vid: 30
+            }])
         );
     }
 

@@ -58,6 +58,7 @@ use crate::host::Host;
 use crate::invites::{Invite, Invites};
 use crate::keepalive;
 use crate::probe::{self, Me, PeerKeys, ProbeConfig, ProbeEvent, ProbeTable};
+use crate::shared_switch;
 use crate::stats::{self, Rates, VlanRates};
 use crate::sync_net::{self, Offer};
 
@@ -255,6 +256,16 @@ pub enum Input {
         peer: SiteId,
         /// The answer, or why there is none.
         result: Result<sync_net::PushAnswer, String>,
+    },
+    /// The switch check found a trunk in one switch network with a peer
+    /// for one of its mapped VLANs, or no longer.
+    SharedSwitch {
+        /// The trunk.
+        trunk: String,
+        /// The VLAN of the network.
+        vid: u16,
+        /// In one switch network with a peer.
+        shared: bool,
     },
     /// SIGHUP: the files were changed by hand.
     Reload,
@@ -470,6 +481,11 @@ struct Controller {
     push_refused: Option<(String, String)>,
     /// The tunnels this site sends keepalives through.
     keepalive: watch::Sender<keepalive::Keepalives>,
+    /// What the switch check looks at.
+    switch_check: watch::Sender<shared_switch::Targets>,
+    /// Since when (ms since the Unix epoch) the trunks in
+    /// [`Runtime::shared_switch`] are in one switch network with a peer.
+    shared_since: BTreeMap<(String, u16), u64>,
     /// Former addresses of the probes and the sync (another control port
     /// before) and since when: they answer until every peer uses the new.
     former_binds: Vec<(SocketAddrV4, Instant)>,
@@ -635,6 +651,7 @@ impl Controller {
         let (offer_tx, offer_rx) = watch::channel(Offer::default());
         let (ports_tx, ports_rx) = watch::channel(PortMap::default());
         let (keepalive_tx, keepalive_rx) = watch::channel(keepalive::Keepalives::default());
+        let (switch_tx, switch_rx) = watch::channel(shared_switch::Targets::default());
         let services = vec![
             (
                 "probes",
@@ -650,6 +667,10 @@ impl Controller {
             (
                 "loop guard",
                 fdb_guard::spawn(&shared.sys, ports_rx, inputs_tx.clone()),
+            ),
+            (
+                "switch check",
+                shared_switch::spawn(switch_rx, inputs_tx.clone()),
             ),
         ];
         let invites = Invites::load(paths.invites());
@@ -722,6 +743,8 @@ impl Controller {
             pushed: None,
             push_refused: None,
             keepalive: keepalive_tx,
+            switch_check: switch_tx,
+            shared_since: BTreeMap::new(),
             former_binds: Vec::new(),
             last_bind: None,
         };
@@ -2009,6 +2032,9 @@ impl Controller {
                 let _ = reply.send(answer);
             }
             Input::Pushed { peer, result } => self.push_answered(peer, result),
+            Input::SharedSwitch { trunk, vid, shared } => {
+                self.shared_switch(trunk, vid, shared).await;
+            }
             Input::Loop(report) => {
                 if self.runtime.blocked.insert(report.port.clone()) {
                     let peer = self.config.as_ref().and_then(|c| {
@@ -4695,7 +4721,133 @@ impl Controller {
             );
         }
         self.update_port_map().await;
+        self.update_switch_check(&desired);
         Ok(changes)
+    }
+
+    /// Tells the switch check which mapped VLANs of the trunks to look at,
+    /// through which tunnels. A trunk (or VLAN) that is no longer mapped is
+    /// no longer in one switch network with a peer either.
+    fn update_switch_check(&mut self, desired: &desired::Desired) {
+        let list: Vec<shared_switch::Target> = desired
+            .trunks
+            .iter()
+            .filter(|t| self.bridges.contains(&t.bridge))
+            .flat_map(|trunk| {
+                desired::dropped_mappings(&trunk.tc)
+                    .into_iter()
+                    .map(move |m| shared_switch::Target {
+                        trunk: trunk.name.clone(),
+                        vid: m.shared,
+                        tunnels: desired
+                            .tunnels
+                            .iter()
+                            .filter(|t| {
+                                t.bridge == trunk.bridge
+                                    && t.enabled
+                                    && t.vlans.contains_key(&m.shared)
+                            })
+                            .map(|t| t.name.clone())
+                            .collect(),
+                    })
+            })
+            .collect();
+        let gone: Vec<(String, u16)> = self
+            .runtime
+            .shared_switch
+            .iter()
+            .filter(|(trunk, vid)| !list.iter().any(|t| t.trunk == *trunk && t.vid == *vid))
+            .cloned()
+            .collect();
+        for key in &gone {
+            self.runtime.shared_switch.remove(key);
+            self.shared_since.remove(key);
+        }
+        let source = shared_switch::marker_source(
+            &self.own_id().map(|id| id.fingerprint()).unwrap_or_else(|| {
+                self.config
+                    .as_ref()
+                    .map(|c| c.self_name().to_string())
+                    .unwrap_or_default()
+            }),
+        );
+        self.switch_check.send_if_modified(|t| {
+            let changed = t.list != list || t.source != source;
+            t.list = list;
+            t.source = source;
+            changed
+        });
+    }
+
+    /// The switch check found `trunk` in one switch network with a peer for
+    /// VLAN `vid` (or no longer): warns, and the DHCP requests from there
+    /// ask for broadcast replies (or no longer).
+    async fn shared_switch(&mut self, trunk: String, vid: u16, shared: bool) {
+        let key = (trunk, vid);
+        let changed = if shared {
+            self.runtime.shared_switch.insert(key.clone())
+        } else {
+            self.runtime.shared_switch.remove(&key)
+        };
+        if !changed {
+            return;
+        }
+        if shared {
+            self.shared_since.insert(key.clone(), history::now_ms());
+        } else {
+            self.shared_since.remove(&key);
+        }
+        let (trunk, vid) = key;
+        let message = if shared {
+            let desired = self
+                .config
+                .as_ref()
+                .map(|cfg| desired::derive_in(&self.scope(), cfg, &self.runtime));
+            desired
+                .and_then(|d| {
+                    self.shared_switch_status(&d)
+                        .into_iter()
+                        .find(|s| s.trunk == trunk && s.vid == vid)
+                })
+                .map_or_else(
+                    || format!("VLAN {vid} also arrives unmapped at trunk {trunk}"),
+                    |s| s.warning(),
+                )
+        } else {
+            format!(
+                "VLAN {vid} no longer arrives unmapped at trunk {trunk}: no longer in one switch network with a peer"
+            )
+        };
+        let level = if shared { Level::Warn } else { Level::Info };
+        self.events.emit(level, None, message);
+        self.reconcile().await;
+    }
+
+    /// The trunks in one switch network with a peer, for the status.
+    fn shared_switch_status(&self, desired: &desired::Desired) -> Vec<api::SharedSwitch> {
+        self.runtime
+            .shared_switch
+            .iter()
+            .map(|(trunk, vid)| api::SharedSwitch {
+                trunk: trunk.clone(),
+                vid: *vid,
+                local: desired
+                    .trunks
+                    .iter()
+                    .find(|t| t.name == *trunk)
+                    .and_then(|t| {
+                        desired::dropped_mappings(&t.tc)
+                            .into_iter()
+                            .find(|m| m.shared == *vid)
+                    })
+                    .and_then(|m| m.local),
+                since_ms: self
+                    .shared_since
+                    .get(&(trunk.clone(), *vid))
+                    .copied()
+                    .unwrap_or_default(),
+            })
+            .collect()
     }
 
     /// What the local breakouts depend on besides the configuration: the
@@ -5183,6 +5335,7 @@ impl Controller {
                 tag: self.tag,
                 networks: self.host.networks(),
                 conflicts: Vec::new(),
+                shared_switch: Vec::new(),
             };
         };
         let desired = derived
@@ -5463,6 +5616,7 @@ impl Controller {
             tag: self.tag,
             networks: self.host.networks(),
             conflicts: self.conflicts.clone(),
+            shared_switch: self.shared_switch_status(&desired),
         }
     }
 }

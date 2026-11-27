@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use std::collections::BTreeSet;
 
-use super::nft::{MssRule, NftOps, NftState, SplitRule};
+use super::nft::{DhcpRule, MssRule, NftOps, NftState, SplitRule};
 use super::observe::{FdbEntry, FdbEvent, ObserveOps, VlanCounters};
 use super::tc::{IfTc, TcOps, TcRule};
 use super::{
@@ -30,6 +30,8 @@ pub struct FakeState {
     pub mss: Option<BTreeSet<MssRule>>,
     /// Split horizon rules (in the same table).
     pub split: BTreeSet<SplitRule>,
+    /// Broadcast DHCP rules (in the same table).
+    pub dhcp: BTreeSet<DhcpRule>,
     /// Bridge FDB entries.
     pub fdb: Vec<FdbEntry>,
     /// Log of all mutating calls, e.g. `create_bridge br0`.
@@ -651,22 +653,30 @@ impl NftOps for FakeNet {
         if s.no_nft {
             return Err(err("list nftables tables", "nft: command not found"));
         }
-        Ok(s.mss.as_ref().map(|mss| NftState::of(mss, &s.split)))
+        Ok(s.mss
+            .as_ref()
+            .map(|mss| NftState::of(mss, &s.split, &s.dhcp)))
     }
 
     async fn set_nft_rules(
         &self,
         rules: &BTreeSet<MssRule>,
         split: &BTreeSet<SplitRule>,
+        dhcp: &BTreeSet<DhcpRule>,
     ) -> SysResult<()> {
         let mut s = self.lock();
         if s.no_nft {
             return Err(err("apply nftables table", "nft: command not found"));
         }
-        s.calls
-            .push(format!("set_nft_rules {} {}", rules.len(), split.len()));
+        s.calls.push(format!(
+            "set_nft_rules {} {} {}",
+            rules.len(),
+            split.len(),
+            dhcp.len()
+        ));
         s.mss = Some(rules.clone());
         s.split = split.clone();
+        s.dhcp = dhcp.clone();
         Ok(())
     }
 
@@ -680,6 +690,7 @@ impl NftOps for FakeNet {
             ));
         }
         s.split.clear();
+        s.dhcp.clear();
         if s.mss.take().is_none() {
             return Err(err("delete table", "No such file or directory"));
         }

@@ -1,5 +1,7 @@
-//! TCP MSS clamping and, where a site passes VLANs on between server
-//! tunnels, the split horizon with nftables (table `bridge wanderlan`).
+//! TCP MSS clamping, where a site passes VLANs on between server tunnels
+//! the split horizon, and where both sites of a VLAN mapping are in one
+//! switch network broadcast DHCP replies, with nftables (table `bridge
+//! wanderlan`).
 //!
 //! The rules are applied through the JSON interface of nftables (`nft -j`),
 //! using the `nftables` crate. Every rule carries a comment that encodes it,
@@ -19,7 +21,8 @@ use std::time::{Duration, Instant};
 
 use nftables::batch::Batch;
 use nftables::expr::{
-    Expression, Meta, MetaKey, NamedExpression, Payload, PayloadField, Range, SetItem, TcpOption,
+    Expression, Meta, MetaKey, NamedExpression, Payload, PayloadBase, PayloadField, PayloadRaw,
+    Range, SetItem, TcpOption,
 };
 use nftables::helper;
 use nftables::schema::{Chain, NfListObject, NfObject, Rule, Table};
@@ -261,28 +264,140 @@ impl fmt::Display for SplitRule {
     }
 }
 
-/// The table as read back: the MSS rules and the comments of the split
-/// horizon rules.
+/// Broadcast DHCP replies: DHCP requests (IPv4) that enter through `port`
+/// in VLAN `vid` ask for a broadcast reply (the broadcast flag of BOOTP).
+///
+/// Where both sites of a VLAN mapping are in one switch network, the switch
+/// sees a device twice: in the mapped VLAN at the port it is at, in the
+/// source VLAN at the port of the site the tunnel leads to. A switch that
+/// binds a device to one port (DHCP snooping) may then send a reply meant
+/// for it to the wrong port; a broadcast reaches every port.
+///
+/// The rule sets the flags field and clears the UDP checksum: a raw change
+/// of the payload keeps the old checksum, and zero means none (IPv4).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DhcpRule {
+    /// Trunk interface the requests enter through.
+    pub port: String,
+    /// The VLAN in the bridge (the source VLAN of the mapping).
+    pub vid: u16,
+}
+
+/// Offset of the BOOTP flags in bits from the UDP header (8 bytes UDP header,
+/// then op, htype, hlen, hops, xid, secs: 10 bytes).
+const BOOTP_FLAGS_BITS: u32 = (8 + 10) * 8;
+/// The broadcast flag (the other bits must be zero, RFC 2131).
+const BOOTP_BROADCAST: u32 = 0x8000;
+
+impl DhcpRule {
+    /// The comment that identifies the rule.
+    pub fn comment(&self) -> String {
+        format!("wl dhcp-bcast iif {} vlan {}", self.port, self.vid)
+    }
+
+    /// Parses a comment produced by [`DhcpRule::comment`].
+    pub fn from_comment(comment: &str) -> Option<Self> {
+        let mut parts = comment.split_whitespace();
+        if parts.next() != Some("wl") || parts.next() != Some("dhcp-bcast") {
+            return None;
+        }
+        if parts.next() != Some("iif") {
+            return None;
+        }
+        let port = parts.next()?.to_string();
+        if parts.next() != Some("vlan") {
+            return None;
+        }
+        let vid = parts.next()?.parse().ok()?;
+        if parts.next().is_some() {
+            return None;
+        }
+        Some(Self { port, vid })
+    }
+
+    fn statements(&self) -> Vec<Statement<'static>> {
+        let field = |protocol: &'static str, field: &'static str| {
+            Expression::Named(NamedExpression::Payload(Payload::PayloadField(
+                PayloadField {
+                    protocol: Cow::Borrowed(protocol),
+                    field: Cow::Borrowed(field),
+                },
+            )))
+        };
+        let is = |left: Expression<'static>, right: Expression<'static>| {
+            Statement::Match(Match {
+                left,
+                right,
+                op: Operator::EQ,
+            })
+        };
+        let meta = |key| Expression::Named(NamedExpression::Meta(Meta { key }));
+        vec![
+            is(
+                meta(MetaKey::Iifname),
+                Expression::String(Cow::Owned(self.port.clone())),
+            ),
+            is(field("vlan", "id"), Expression::Number(u32::from(self.vid))),
+            is(
+                meta(MetaKey::Protocol),
+                Expression::String(Cow::Borrowed("ip")),
+            ),
+            is(field("udp", "dport"), Expression::Number(67)),
+            Statement::Mangle(Mangle {
+                key: Expression::Named(NamedExpression::Payload(Payload::PayloadRaw(PayloadRaw {
+                    base: PayloadBase::TH,
+                    offset: BOOTP_FLAGS_BITS,
+                    len: 16,
+                }))),
+                value: Expression::Number(BOOTP_BROADCAST),
+            }),
+            Statement::Mangle(Mangle {
+                key: field("udp", "checksum"),
+                value: Expression::Number(0),
+            }),
+        ]
+    }
+}
+
+impl fmt::Display for DhcpRule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "DHCP requests from {} in VLAN {} ask for broadcast replies",
+            self.port, self.vid
+        )
+    }
+}
+
+/// The table as read back: the MSS rules, the comments of the split horizon
+/// rules and the DHCP rules.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NftState {
     /// MSS clamping.
     pub mss: BTreeSet<MssRule>,
     /// [`SplitRule::comment`] of every split horizon rule.
     pub split: BTreeSet<String>,
+    /// Broadcast DHCP replies.
+    pub dhcp: BTreeSet<DhcpRule>,
 }
 
 impl NftState {
     /// The state the given rules produce.
-    pub fn of(mss: &BTreeSet<MssRule>, split: &BTreeSet<SplitRule>) -> Self {
+    pub fn of(
+        mss: &BTreeSet<MssRule>,
+        split: &BTreeSet<SplitRule>,
+        dhcp: &BTreeSet<DhcpRule>,
+    ) -> Self {
         Self {
             mss: mss.clone(),
             split: split.iter().map(SplitRule::comment).collect(),
+            dhcp: dhcp.clone(),
         }
     }
 
     /// True if nothing is in it.
     pub fn is_empty(&self) -> bool {
-        self.mss.is_empty() && self.split.is_empty()
+        self.mss.is_empty() && self.split.is_empty() && self.dhcp.is_empty()
     }
 }
 
@@ -296,6 +411,7 @@ pub trait NftOps: Send + Sync {
         &self,
         mss: &BTreeSet<MssRule>,
         split: &BTreeSet<SplitRule>,
+        dhcp: &BTreeSet<DhcpRule>,
     ) -> impl Future<Output = SysResult<()>> + Send;
 
     /// Deletes the table.
@@ -318,6 +434,7 @@ fn table() -> Table<'static> {
 pub fn replace_batch(
     rules: &BTreeSet<MssRule>,
     split: &BTreeSet<SplitRule>,
+    dhcp: &BTreeSet<DhcpRule>,
 ) -> nftables::schema::Nftables<'static> {
     let mut batch = Batch::new();
     batch.add(NfListObject::Table(table()));
@@ -342,6 +459,18 @@ pub fn replace_batch(
     }));
     // The split horizon first: what is dropped needs no clamping.
     for rule in split {
+        batch.add(NfListObject::Rule(Rule {
+            family: NfFamily::Bridge,
+            table: Cow::Borrowed(TABLE),
+            chain: Cow::Borrowed(CHAIN),
+            expr: Cow::Owned(rule.statements()),
+            comment: Some(Cow::Owned(rule.comment())),
+            ..Rule::default()
+        }));
+    }
+    // DHCP requests ask for broadcast replies (a frame matches no verdict
+    // here and goes on).
+    for rule in dhcp {
         batch.add(NfListObject::Rule(Rule {
             family: NfFamily::Bridge,
             table: Cow::Borrowed(TABLE),
@@ -459,10 +588,11 @@ impl NftOps for NftCli {
         &self,
         rules: &BTreeSet<MssRule>,
         split: &BTreeSet<SplitRule>,
+        dhcp: &BTreeSet<DhcpRule>,
     ) -> SysResult<()> {
         timed(
             "apply nftables table bridge wanderlan",
-            helper::apply_ruleset_async(&replace_batch(rules, split)),
+            helper::apply_ruleset_async(&replace_batch(rules, split, dhcp)),
         )
         .await
     }
@@ -485,12 +615,16 @@ impl NftOps for NftCli {
 fn parse_rules(rules: &[(&str, &str)]) -> NftState {
     let mut mss = BTreeSet::new();
     let mut split = BTreeSet::new();
+    let mut dhcp = BTreeSet::new();
     let mut gate = false;
     let mut misplaced = false;
     for &(chain, comment) in rules {
         match (chain, MssRule::from_comment(comment)) {
             (CHAIN, _) if comment.starts_with("wl split ") => {
                 split.insert(comment.to_string());
+            }
+            (CHAIN, _) if DhcpRule::from_comment(comment).is_some() => {
+                dhcp.extend(DhcpRule::from_comment(comment));
             }
             (CHAIN, _) if comment == GATE => gate = true,
             (MSS_CHAIN, Some(rule)) => {
@@ -507,7 +641,7 @@ fn parse_rules(rules: &[(&str, &str)]) -> NftState {
             mss: 0,
         });
     }
-    NftState { mss, split }
+    NftState { mss, split, dhcp }
 }
 
 /// The rules as last read or written (`None`: no table), and when.
@@ -571,9 +705,14 @@ impl<N: NftOps + Sync> NftOps for CachedNft<N> {
         &self,
         rules: &BTreeSet<MssRule>,
         split: &BTreeSet<SplitRule>,
+        dhcp: &BTreeSet<DhcpRule>,
     ) -> SysResult<()> {
-        let result = self.inner.set_nft_rules(rules, split).await;
-        self.store(result.is_ok().then(|| Some(NftState::of(rules, split))));
+        let result = self.inner.set_nft_rules(rules, split, dhcp).await;
+        self.store(
+            result
+                .is_ok()
+                .then(|| Some(NftState::of(rules, split, dhcp))),
+        );
         result
     }
 
@@ -610,7 +749,9 @@ mod tests {
             ipv6: false,
             mss: 1318,
         }]);
-        let json = serde_json::to_string(&replace_batch(&rules, &BTreeSet::new())).unwrap();
+        let json =
+            serde_json::to_string(&replace_batch(&rules, &BTreeSet::new(), &BTreeSet::new()))
+                .unwrap();
         for needle in [
             r#""family":"bridge""#,
             r#""flush":{"table""#,
@@ -628,8 +769,12 @@ mod tests {
             assert!(json.contains(needle), "{needle} missing in {json}");
         }
         // No gate without MSS rules.
-        let json =
-            serde_json::to_string(&replace_batch(&BTreeSet::new(), &BTreeSet::new())).unwrap();
+        let json = serde_json::to_string(&replace_batch(
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+        ))
+        .unwrap();
         assert!(!json.contains("wl mss gate"), "{json}");
     }
 
@@ -642,7 +787,7 @@ mod tests {
             mss: 1318,
         };
         let comment = rule.comment();
-        let want = NftState::of(&BTreeSet::from([rule]), &BTreeSet::new());
+        let want = NftState::of(&BTreeSet::from([rule]), &BTreeSet::new(), &BTreeSet::new());
         // This version: the gate in the base chain, the rule behind it.
         let now = parse_rules(&[(CHAIN, GATE), (MSS_CHAIN, &comment)]);
         assert_eq!(now, want);
@@ -671,6 +816,7 @@ mod tests {
             &self,
             _: &BTreeSet<MssRule>,
             _: &BTreeSet<SplitRule>,
+            _: &BTreeSet<DhcpRule>,
         ) -> SysResult<()> {
             Ok(())
         }
@@ -698,11 +844,13 @@ mod tests {
             ipv6: false,
             mss: 1318,
         }]);
-        let none = BTreeSet::new();
-        cached.set_nft_rules(&rules, &none).await.unwrap();
+        cached
+            .set_nft_rules(&rules, &BTreeSet::new(), &BTreeSet::new())
+            .await
+            .unwrap();
         assert_eq!(
             cached.nft_state().await.unwrap(),
-            Some(NftState::of(&rules, &none))
+            Some(NftState::of(&rules, &BTreeSet::new(), &BTreeSet::new()))
         );
         cached.delete_table().await.unwrap();
         assert_eq!(cached.nft_state().await.unwrap(), None);
@@ -732,9 +880,12 @@ mod tests {
 
     #[test]
     fn split_horizon_rules_drop_between_their_ports() {
-        let json =
-            serde_json::to_string(&replace_batch(&BTreeSet::new(), &BTreeSet::from([split()])))
-                .unwrap();
+        let json = serde_json::to_string(&replace_batch(
+            &BTreeSet::new(),
+            &BTreeSet::from([split()]),
+            &BTreeSet::new(),
+        ))
+        .unwrap();
         for needle in [
             r#"{"match":{"left":{"meta":{"key":"iifname"}},"right":{"set":["vx-a","vx-b"]},"op":"=="}}"#,
             r#"{"match":{"left":{"meta":{"key":"oifname"}},"right":{"set":["vx-a","vx-b"]},"op":"=="}}"#,
@@ -762,7 +913,11 @@ mod tests {
     async fn split_horizon_rules_are_read_back_every_time() {
         let cached = CachedNft::new(Counting::default(), Duration::from_secs(60));
         cached
-            .set_nft_rules(&BTreeSet::new(), &BTreeSet::from([split()]))
+            .set_nft_rules(
+                &BTreeSet::new(),
+                &BTreeSet::from([split()]),
+                &BTreeSet::new(),
+            )
             .await
             .unwrap();
         // The write is remembered, but with split horizon rules the next
@@ -774,6 +929,44 @@ mod tests {
                 .reads
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
+        );
+    }
+
+    #[test]
+    fn dhcp_rules_set_the_broadcast_flag_and_are_read_back() {
+        let rule = DhcpRule {
+            port: "ens19".into(),
+            vid: 14,
+        };
+        assert_eq!(rule.comment(), "wl dhcp-bcast iif ens19 vlan 14");
+        assert_eq!(DhcpRule::from_comment(&rule.comment()), Some(rule.clone()));
+        assert_eq!(
+            DhcpRule::from_comment("wl dhcp-bcast iif ens19 vlan x"),
+            None
+        );
+        let (mss, split) = (BTreeSet::new(), BTreeSet::new());
+        let dhcp = BTreeSet::from([rule.clone()]);
+        let json = serde_json::to_string(&replace_batch(&mss, &split, &dhcp)).unwrap();
+        for needle in [
+            r#"{"match":{"left":{"meta":{"key":"iifname"}},"right":"ens19","op":"=="}}"#,
+            r#"{"match":{"left":{"payload":{"protocol":"vlan","field":"id"}},"right":14,"op":"=="}}"#,
+            r#"{"match":{"left":{"payload":{"protocol":"udp","field":"dport"}},"right":67,"op":"=="}}"#,
+            r#"{"mangle":{"key":{"payload":{"base":"th","offset":144,"len":16}},"value":32768}}"#,
+            r#"{"mangle":{"key":{"payload":{"protocol":"udp","field":"checksum"}},"value":0}}"#,
+            r#""comment":"wl dhcp-bcast iif ens19 vlan 14""#,
+        ] {
+            assert!(json.contains(needle), "{needle} missing in {json}");
+        }
+        // Read back from the base chain; anywhere else the table is written
+        // anew.
+        let comment = rule.comment();
+        assert_eq!(
+            parse_rules(&[(CHAIN, &comment)]),
+            NftState::of(&mss, &split, &dhcp)
+        );
+        assert_ne!(
+            parse_rules(&[(MSS_CHAIN, &comment)]),
+            NftState::of(&mss, &split, &dhcp)
         );
     }
 }

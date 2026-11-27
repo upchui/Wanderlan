@@ -745,6 +745,37 @@ pub struct Status {
     /// What this network lost to an earlier network on the box.
     #[serde(default)]
     pub conflicts: Vec<String>,
+    /// Trunks in one switch network with a peer, by mapped VLAN.
+    #[serde(default)]
+    pub shared_switch: Vec<SharedSwitch>,
+}
+
+/// A mapped VLAN that also arrives as it is at its trunk: the trunk is in
+/// one switch network with a peer (see `desired::Runtime::shared_switch`).
+/// DHCP requests from there ask for broadcast replies.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SharedSwitch {
+    /// The trunk.
+    pub trunk: String,
+    /// The VLAN of the network.
+    pub vid: u16,
+    /// The VLAN on the trunk; `None` for untagged.
+    pub local: Option<u16>,
+    /// Since when (ms since the Unix epoch).
+    pub since_ms: u64,
+}
+
+impl SharedSwitch {
+    /// The warning about it, for the status.
+    pub fn warning(&self) -> String {
+        let here = self
+            .local
+            .map_or_else(|| "untagged".to_string(), |l| format!("VLAN {l}"));
+        format!(
+            "VLAN {} ({here} here) also arrives unmapped at trunk {}: this site and a peer are in one switch network. Switch features that bind a device to one port (DHCP snooping, UniFi \"Rogue DHCP Server Detection\", port security) see every device of {here} twice; turn them off for these VLANs. DHCP requests from {here} ask for broadcast replies.",
+            self.vid, self.trunk
+        )
+    }
 }
 
 /// The name of the network in `/etc/wanderlan` itself.
