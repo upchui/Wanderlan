@@ -46,13 +46,18 @@ pub const SECTIONS: &[Section] = &[
             ("u", "unblock the port of the peer (loop guard)"),
             ("U", "unblock a trunk port (loop guard)"),
             ("p", "measure the path MTU to all peers now"),
+            ("t", "optimize the selected tunnel (RPS transport auto)"),
             ("z", "the graphs: the last 2 min, 10 min or 1 h"),
         ],
         text: "Green: reachable and up. Yellow: degraded (port down or offline, \
                config differs, late replies). Red: unreachable or blocked by the loop guard. \
                The graphs show what came in above the line (green) and what went out \
                below it (magenta), each on its own scale; the daemon records the last hour, \
-               LOAD compares the tunnels.",
+               LOAD compares the tunnels. With RPS transport auto (Settings 8), optimizing \
+               a tunnel (by itself when it comes up, or t) measures for about 30 s with the \
+               peer whether spreading the receive work over the cores (RPS) helps, with full \
+               load on the transport meanwhile: a line above the peers, \"tuning…\" in its \
+               row and the status line show it; its details (Enter) what was kept.",
     },
     Section {
         title: "2 Sites",
@@ -306,6 +311,7 @@ pub fn bar(app: &App) -> Vec<Binding> {
                 ("Up/Down", "VLAN"),
                 ("Enter", "open VLAN"),
                 ("Left/Right", "other peer"),
+                ("t", "optimize"),
                 ("z", "range"),
                 ("Esc", "close"),
             ],
@@ -380,6 +386,7 @@ pub fn bar(app: &App) -> Vec<Binding> {
                 ("Enter", "details"),
                 ("o", "on/offline"),
                 ("u", "unblock"),
+                ("t", "optimize"),
                 ("p", "probe MTU"),
                 ("Up/Down", "choose"),
             ],

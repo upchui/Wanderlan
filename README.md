@@ -296,7 +296,9 @@ Between servers the tunnels always run `direct`. Where connection tracking
 is loaded (a firewall), a server with clients exempts the tunnel packets
 from it (`notrack`, table `ip wanderlan`): tracking them would cost every
 packet. A stateful firewall on such a server must therefore accept UDP to
-the tunnel port by its port, not only as an established connection.
+the tunnel port by its port, not only as an established connection. The
+setting `skip_conntrack` changes it per site: `all` exempts on a server
+every tunnel packet, both ways (also to other servers), `off` none.
 
 A site with clients of its own must be reachable for them, so it cannot sit
 behind NAT itself. A carrier-grade NAT that gives the control traffic and the
@@ -806,6 +808,9 @@ was not restarted in between.
 | `commit_timeout` (local) | `network.commit_timeout` | Time to confirm a change on this site (10 s to 1 h). |
 | `mtu_probe_interval` (local) | `network.mtu_probe_interval` | How often this site measures the path MTU (at least 10 s). |
 | `mss` (local) | `network.mss` | Fixed TCP MSS (536 to 1460) on this site's tunnels instead of the measured value. |
+| `rps_transport` (local) | `"off"` | Spread the receive work of the interfaces the tunnel packets come in by over the cores (RPS): `"off"`, `"on"`, `"auto"` (measured with the peers, see [Performance](#performance)). |
+| `rps_trunk` (local) | `"off"` | The same for the trunk ports: `"off"` or `"on"`. |
+| `skip_conntrack` (local) | `"clients"` | Which tunnel packets skip connection tracking where it is loaded: `"clients"` (those of the client tunnels of a site with clients), `"all"` (on a server every tunnel packet, both ways), `"off"`. |
 
 Every file is checked when it is loaded or applied; problems are reported
 with file and line:
@@ -966,6 +971,60 @@ tunnel port are clamped to
 path). Larger packets still arrive, also with DF set: the tunnel packets are
 fragmented on the way (no DF outside) and put together at the other end.
 
+### Performance
+
+What limits the throughput is mostly the box, not the tunnel. Three
+settings of each site (`wanderlan settings`, Settings `8`) tune it; all of
+them only change the box itself:
+
+* **`rps_transport`** (`off`, `on`, `auto`; default `off`): a network card
+  with one receive queue (a Proxmox VM without "Multiqueue", many small
+  boxes) does all the work of what it receives on one core: unpacking the
+  tunnel packets, the bridge, filters. RPS spreads that over the cores. On
+  real hardware it can double the throughput; in a VM every hand-off
+  between cores is an expensive interrupt, and with two vCPUs it cost a
+  third (measured: 450-520 instead of 750 Mbit/s, many retransmits). `on`
+  spreads it on the interfaces the tunnel packets come in by. `auto`
+  measures it: whenever a tunnel comes up (the client towards its uplink,
+  between servers the one with the smaller identity starts; each tunnel at
+  most every 10 minutes by itself), both boxes measure their receive rate
+  through it with RPS off and on, three times each (about 30 s of full load
+  on the transport). A card carries the tunnels to several peers and RPS is
+  one setting of the card: each tunnel's measurement is kept, and the card
+  keeps RPS on only if it brings at least 10 % more over all its tunnels
+  and no tunnel loses more than 10 %; a tunnel that goes drops out. Each
+  box decides for itself from what it received; a box not on `auto` is not
+  switched by the measurement of a peer. `wanderlan tune <site>` (or `t` on
+  the peer in the terminal UI) measures again; the status and the terminal
+  UI show while it runs and what it kept.
+* **`rps_trunk`** (`off`, `on`; default `off`): the same for the trunk
+  ports. A measurement between the boxes does not show their part, so
+  there is no `auto`: compare with `wanderlan speedtest`.
+* **`skip_conntrack`** (`clients`, `all`, `off`; default `clients`): see
+  "Clients behind NAT".
+
+RPS only touches cards with one receive queue, on a box with more than one
+core, where nobody set it before; the old value comes back when the
+setting goes back to `off` and when wanderlan stops or resets. More queues
+are better than RPS: in a Proxmox VM "Multiqueue" = number of vCPUs on the
+network devices.
+
+Packets are also split outside: a full Ethernet frame needs a path MTU of
+1554 bytes (1500 + 18 Ethernet and VLAN + 8 VXLAN + 8 UDP + 20 IP); on a
+smaller path every such frame becomes two packets. TCP is clamped below
+that, UDP (streaming, games) is not. Where the transport can take it (a
+LAN: jumbo frames on the switch, the Proxmox bridge and the VM network
+device), an MTU of at least 1554 avoids it.
+
+`wanderlan perf` watches the box for a few seconds (best during a transfer)
+and names what limits it, with what helps. `wanderlan speedtest <site>`
+measures the throughput to a peer both ways: TCP between the boxes over
+the transport network, and frames through the tunnel (full ones and,
+where they are split, ones that fit), with the busiest core of the
+receiver. The frames are untagged IPv4/UDP in 64 flows, like real traffic:
+the bridge of the peer drops them at the tunnel port, they never reach a
+LAN. Towards a client behind NAT, start it on the client.
+
 ### Loops
 
 The network itself is loop-free: split horizon between the servers, a tree
@@ -1015,7 +1074,7 @@ clicked.
 
 | Key | View |
 |-----|------|
-| `1` | Overview: this site with its role, the tunnel neighbours live (reply, round trip, path MTU, MSS, port state, MAC addresses, throughput, config in sync or `refused`), traffic of the tunnels and of every trunk, a graph of all tunnels and the LOAD of each over time (`z`: 2 min, 10 min, 1 h), and all known sites with role and link (`via hq` for sites without a tunnel from here), each server with its clients indented below. One cursor runs through the neighbours and the sites. `Enter` on a neighbour: traffic graph, the VLANs of the tunnel with their live traffic (Up/Down, `Enter` opens one: every port, MACs, graph; `m` its MAC table, PgUp/PgDn scroll its ports), round-trip graph with the lost probes, min/avg/max round trip, jitter, probe loss, counters, where it is probed (its address and ports) and, without answers, what to check (Left/Right: the next neighbour); on a site: its details. `o` on a site takes it online or offline (to the review), `u` / `U` unblock the port of a neighbour / a trunk port, `p` measures the path MTU. |
+| `1` | Overview: this site with its role, the tunnel neighbours live (reply, round trip, path MTU, MSS, port state, MAC addresses, throughput, config in sync or `refused`), traffic of the tunnels and of every trunk, a graph of all tunnels and the LOAD of each over time (`z`: 2 min, 10 min, 1 h), and all known sites with role and link (`via hq` for sites without a tunnel from here), each server with its clients indented below. One cursor runs through the neighbours and the sites. `Enter` on a neighbour: traffic graph, the VLANs of the tunnel with their live traffic (Up/Down, `Enter` opens one: every port, MACs, graph; `m` its MAC table, PgUp/PgDn scroll its ports), round-trip graph with the lost probes, min/avg/max round trip, jitter, probe loss, counters, where it is probed (its address and ports) and, without answers, what to check (Left/Right: the next neighbour); on a site: its details. `o` on a site takes it online or offline (to the review), `u` / `U` unblock the port of a neighbour / a trunk port, `p` measures the path MTU, `t` optimizes the tunnel to the selected neighbour again (with `rps_transport = "auto"`; also in its details). While a tunnel is optimized (about 30 s), a line above the neighbours, `tuning…` in its row and the status line of every view show it; its details show what was measured and kept, or the setting. |
 | `2` | Sites: name, address, VLANs, role, who changes it ("Changes"), tunnel; clients indented below their server. `Enter`: details (role, address and ports, VLANs, every tunnel with what it carries, mappings, who may change it; Up/Down: the next site). Invite (`i`), open invitations (`I`), online/offline (`o`), new (`n`), edit (`e`: name, address, VLANs, "Server", "Changes"), rename (`N`), delete (`d`), the VLANs of the network (`m`), trunk ports of this host (`l`). |
 | `3` | VLANs: the VLANs of the network (`v`), the own VLANs of this site (`o`) and the mappings (`n`, `Enter`, `d`) with their site and its role; conflicts are marked right away. `t` switches to the tunnels: what each carries, its limit (`Enter`, `d`). |
 | `4` | MAC addresses: filter (`/`; `vlan:20` for one VLAN), sort (`s`, `o`). |
@@ -1069,6 +1128,9 @@ and keeps trying.
 | `wanderlan confirm` / `wanderlan rollback` | Confirm or revert the pending change |
 | `wanderlan validate <network.toml> [--local <local.toml>]` | Check files without applying them |
 | `wanderlan init [--dir D]` / `wanderlan export` | Print or write the example configuration / print the running `network.toml` |
+| `wanderlan perf [--seconds N] [--json]` | What limits the throughput of this box: the load of the cores, receive queues and the RPS settings, split packets, connection tracking, with what helps |
+| `wanderlan speedtest <site> [--seconds N] [--json]` | Throughput to a peer both ways: TCP over the transport network and frames through the tunnel |
+| `wanderlan tune <site> [--json]` | With `rps_transport = "auto"`: measure with a peer whether RPS helps, both cards keep what all their tunnels speak for (about 30 s) |
 | `wanderlan probe` / `wanderlan unblock <site\|port>` | Measure the path MTU now / re-enable a port the loop guard shut down (the tunnel to a site, or a trunk port) |
 | `wanderlan reset [--yes]` | Remove everything wanderlan set up on this site |
 | `wanderlan networks [list\|add <name>\|remove <name> [--yes]]` | The [networks of this box](#several-networks-on-one-box) |
@@ -1137,6 +1199,10 @@ or `WANDERLAN_SOCKET`, the network of the box with `--net` or
   Two segments of one box with a breakout must not use the same addresses.
 * **Large transfers stall**: compare the path MTU in `wanderlan status` with
   the MTU of the VPN; set `mss` if probes are filtered.
+* **Slower than expected**: `wanderlan speedtest <site>` compares the
+  transport with the tunnel; `wanderlan perf` during a transfer names what
+  limits the box (see "Performance"). In a VM, RPS (`rps_transport`,
+  `rps_trunk`) often costs more than it gives: Multiqueue is better.
 * **DHCP replies get lost** (`WARNING: DHCP replies for VLAN 114 … get
   lost`): the trunk of this site and that of a peer hang in one switch
   network (the status notes that much: `Note: Trunk ens19 is in one switch

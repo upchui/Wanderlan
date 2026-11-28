@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use super::diag::{ConfigFile, Diagnostic, FieldPath};
-use super::model::{Local, LocalVid, MAX_SITE_NAME_LEN, Network, Site};
+use super::model::{Local, LocalVid, MAX_SITE_NAME_LEN, Network, RpsMode, Site};
 use super::vlan::NATIVE_VID;
 use crate::identity::SiteId;
 use crate::topology::TUNNEL_PREFIX;
@@ -672,6 +672,12 @@ impl Validator {
             push(
                 "mss",
                 format!("mss must be between {MSS_MIN} and {MSS_MAX}, got {mss}"),
+            );
+        }
+        if local.rps_trunk == RpsMode::Auto {
+            push(
+                "rps_trunk",
+                "rps_trunk cannot be auto (a measurement between the boxes does not show the trunk's part): off or on".into(),
             );
         }
         if local.trunk.is_empty() {

@@ -1,6 +1,5 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 460
 expression: "render_size(&crowded(), 120, 40)"
 ---
 " wanderlan  1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Breakout  8 Settings                                "
@@ -42,4 +41,4 @@ expression: "render_size(&crowded(), 120, 40)"
 "│haus5   10.8.0.15 10-50                                                                 server         tunnel up      │"
 "└──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘"
 "                                                                                             draft: no changes  heim r7 "
-" Enter  details   o  on/offline   u  unblock   p  probe MTU   Up/Down  choose   1-8  views   ?  help   q  quit          "
+" Enter  details   o  on/offline   u  unblock   t  optimize   p  probe MTU   Up/Down  choose   ?  help   q  quit         "

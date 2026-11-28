@@ -25,4 +25,4 @@ expression: render(&app)
 "│buero   10.8.0.2  10-50                         server         tunnel up      ║"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "                                                     draft: no changes  heim r7 "
-" Enter  details   o  on/offline   u  unblock   1-8  views   ?  help   q  quit   "
+" Enter  details   o  on/offline   u  unblock   t  optimize   ?  help   q  quit  "

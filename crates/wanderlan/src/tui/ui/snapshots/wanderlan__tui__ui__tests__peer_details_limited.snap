@@ -1,6 +1,5 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 381
 expression: render(&app)
 ---
 " 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Breakout  8 Settings   "
@@ -11,16 +10,16 @@ expression: render(&app)
 "│ Identity     bueAb3dE   confirmed                                            │"
 "│ VXLAN        direct (the servers reach each other)   VNI 1193046             │"
 "│ Path MTU     1420   TCP MSS 1326   MACs behind it 12                         │"
+"│ Tuning       RPS transport off (setting)   (Settings 8: auto measures it with│"
 "│ VLANs        10-50 (limited on this tunnel)   trunk ens19                    │"
 "│ Received     1.2Mbit/s now, 1.2 GB in 1000000 pkts, 0 err, 0 drop            │"
 "│ Sent         345.6kbit/s now, 345.7 MB in 400000 pkts, 0 err, 0 drop         │"
 "│                                                                              │"
 "│┌ in 4.0 Mbit/s   out 462.5 kbit/s  10 min (z) ──┐┌ VLANs  Enter: open ──────┐│"
-"││  5.0M│     ⢀⣀⣄      ⣀⣠      ⣀⣠      ⢀⣠⡄     ⢀⣀⣤││ Loading ...              ││"
-"││      │⣀⣠⣤⣶⣾⣿⣿⣿⣀⣠⣤⣶⣾⣿⣿⣿⣄⣀⣤⣶⣾⣿⣿⣿⣇⣀⣤⣴⣶⣿⣿⣿⣇⣀⣤⣴⣶⣿⣿⣿⣿││                          ││"
-"││0     │⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤⣤││                          ││"
-"││      │⡟⣿⣿⡿⡿⢿⢿⣿⣿⢿⠿⡿⣿⡿⡿⣿⢿⢿⡿⢿⢿⡿⡿⣿⠿⡿⣿⢻⡿⡿⢿⢿⡿⣿⢿⠿⡿⣿⢿⡿⡟││                          ││"
-"││  1.0M│    ⠁    ⠈ ⠁      ⠁    ⠈     ⠁    ⠈ ⠁   ⠁││                          ││"
+"││  5.0M│    ⢀⣀⣤⣄    ⢀⣀⣠⣤    ⢀⣀⣠⣤⡀    ⣀⣀⣤⡄    ⣀⣀⣤⣤││ Loading ...              ││"
+"││      │⣴⣶⣾⣿⣿⣿⣿⣿⣤⣶⣾⣿⣿⣿⣿⣿⣦⣶⣶⣿⣿⣿⣿⣿⣧⣴⣶⣿⣿⣿⣿⣿⣧⣴⣶⣾⣿⣿⣿⣿⣿││                          ││"
+"││0     │⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿││                          ││"
+"││  1.0M│⠁⠉⠉ ⠁⠈⠈⠉⠁⠘ ⠁⠉⠁⠁⠉⠈⠈⠁⠈⠈⠁⠁⠉ ⠁⠉⠈⠁⠁⠈⠈⠁⠉⠘ ⠁⠉ ⠁⠃││                          ││"
 "││      └─────────────────────────────────────────││                          ││"
 "││   -10m                  -5m                 now││                          ││"
 "│└────────────────────────────────────────────────┘└──────────────────────────┘│"

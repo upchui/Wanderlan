@@ -13,8 +13,8 @@ use std::time::Duration;
 use crossterm::event::{KeyCode, KeyEvent};
 use wanderlan_core::api::{Interface, SiteRules, Translation};
 use wanderlan_core::config::{
-    Changes, Diagnostic, FieldPath, LocalVid, Network, Severity, Site, VID_MAX, VID_MIN, VlanMap,
-    VlanSet, site_name_error,
+    Changes, ConntrackSkip, Diagnostic, FieldPath, LocalVid, Network, RpsMode, Severity, Site,
+    VID_MAX, VID_MIN, VlanMap, VlanSet, site_name_error,
 };
 use wanderlan_core::identity::SiteId;
 use wanderlan_core::policy;
@@ -655,6 +655,36 @@ impl Form {
                 "empty: derive from the measured path MTU; or 536-1460",
                 l.mss.map(|v| v.to_string()).unwrap_or_default(),
             ),
+            Field::choice(
+                "rps_transport",
+                "RPS transport",
+                "receive work of the transport interface over the cores: off, on, auto (measured)",
+                RpsMode::ALL
+                    .iter()
+                    .map(|m| m.as_str().to_string())
+                    .collect(),
+                l.rps_transport.as_str(),
+            ),
+            Field::choice(
+                "rps_trunk",
+                "RPS trunk",
+                "receive work of the trunk ports over the cores: off or on",
+                [RpsMode::Off, RpsMode::On]
+                    .iter()
+                    .map(|m| m.as_str().to_string())
+                    .collect(),
+                l.rps_trunk.as_str(),
+            ),
+            Field::choice(
+                "skip_conntrack",
+                "Skip conntrack",
+                "tunnel packets past connection tracking: clients, all (a server), off",
+                ConntrackSkip::ALL
+                    .iter()
+                    .map(|m| m.as_str().to_string())
+                    .collect(),
+                l.skip_conntrack.as_str(),
+            ),
         ];
         Self::new(FormKind::Local, "This host (local.toml)", fields, draft)
     }
@@ -1143,10 +1173,16 @@ impl Form {
                 let timeout = self.parse_opt_duration("commit_timeout");
                 let interval = self.parse_opt_duration("mtu_probe_interval");
                 let mss = self.parse_mss();
+                let rps_transport = self.value("rps_transport").parse::<RpsMode>();
+                let rps_trunk = self.value("rps_trunk").parse::<RpsMode>();
+                let skip_conntrack = self.value("skip_conntrack").parse::<ConntrackSkip>();
                 let local = &mut candidate.local;
                 local.commit_timeout = timeout?;
                 local.mtu_probe_interval = interval?;
                 local.mss = mss?;
+                local.rps_transport = rps_transport.unwrap_or_default();
+                local.rps_trunk = rps_trunk.unwrap_or_default();
+                local.skip_conntrack = skip_conntrack.unwrap_or_default();
             }
             FormKind::Breakout(old) => {
                 if let Some((site, vid)) = &old {
@@ -1873,7 +1909,14 @@ mod tests {
         let form = Form::local(&d, "commit_timeout");
         assert_eq!(
             form.fields.iter().map(|f| f.key).collect::<Vec<_>>(),
-            ["commit_timeout", "mtu_probe_interval", "mss"]
+            [
+                "commit_timeout",
+                "mtu_probe_interval",
+                "mss",
+                "rps_transport",
+                "rps_trunk",
+                "skip_conntrack"
+            ]
         );
     }
 }

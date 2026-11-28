@@ -154,6 +154,80 @@ fn probes_line(app: &App, peer: &PeerStatus) -> Line<'static> {
     Line::from(spans)
 }
 
+/// The optimization of the tunnel (RPS measured with the peer, setting
+/// `rps_transport = auto`): running, or what it kept; `t` starts it again.
+/// With another setting: that.
+fn tuning_line(peer: &PeerStatus, mode: wanderlan_core::config::RpsMode) -> Line<'static> {
+    use wanderlan_core::api::TuningState;
+    use wanderlan_core::config::RpsMode;
+    let again = Span::styled("   (t: optimize again)", theme::dim());
+    // Fixed by the setting: nothing is measured.
+    if mode != RpsMode::Auto && peer.tuning.is_none() {
+        return Line::from(vec![
+            label("Tuning"),
+            Span::raw(format!("RPS transport {} (setting)", mode.as_str())),
+            Span::styled(
+                "   (Settings 8: auto measures it with the peers)",
+                theme::dim(),
+            ),
+        ]);
+    }
+    let Some(t) = &peer.tuning else {
+        return Line::from(vec![
+            label("Tuning"),
+            Span::styled("not measured yet", theme::dim()),
+            Span::styled("   (t: optimize now)", theme::dim()),
+        ]);
+    };
+    let ago = format::age(t.age_secs);
+    let mut spans = vec![label("Tuning")];
+    match t.state {
+        TuningState::Running => {
+            let who = if t.by_peer {
+                format!("{} is measuring", peer.name)
+            } else {
+                "measuring".to_string()
+            };
+            spans.push(Span::styled(
+                format!(
+                    "⟳ {who}: RPS off/on, both ways, {} s of ~{} s",
+                    t.age_secs,
+                    wanderlan_core::api::TUNING_SECONDS
+                ),
+                theme::title().patch(theme::bold()),
+            ));
+            return Line::from(spans);
+        }
+        TuningState::Done => {
+            let mut kept = Vec::new();
+            if let Some(here) = &t.here {
+                kept.push(format!("here {here}"));
+            }
+            if let Some(there) = &t.there {
+                kept.push(format!("there {there}"));
+            }
+            spans.push(Span::styled(format!("{ago} ago: "), theme::dim()));
+            spans.push(Span::styled(kept.join("; "), theme::ok()));
+        }
+        TuningState::Unchangeable => {
+            spans.push(Span::styled(format!("{ago} ago: "), theme::dim()));
+            spans.push(Span::raw(format!(
+                "nothing to change ({})",
+                t.error.as_deref().unwrap_or("-")
+            )));
+        }
+        TuningState::Failed => {
+            spans.push(Span::styled(format!("{ago} ago: "), theme::dim()));
+            spans.push(Span::styled(
+                format!("failed: {}", t.error.as_deref().unwrap_or("-")),
+                theme::warn(),
+            ));
+        }
+    }
+    spans.push(again);
+    Line::from(spans)
+}
+
 /// The peer's identity.
 fn identity_line(peer: &PeerStatus) -> Line<'static> {
     use wanderlan_core::api::IdentityState;
@@ -266,6 +340,7 @@ pub fn peer(frame: &mut Frame, app: &App, name: &str, vlan: Option<u16>, area: R
                 peer.macs
             )),
         ]),
+        tuning_line(peer, app.rps_transport()),
         Line::from(vec![
             label("VLANs"),
             Span::raw(peer.vlans.clone()),

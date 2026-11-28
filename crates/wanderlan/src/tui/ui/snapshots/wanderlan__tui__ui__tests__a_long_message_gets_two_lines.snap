@@ -25,4 +25,4 @@ expression: render(&app)
 "└──────────────────────────────────────────────────────────────────────────────┘"
 " this site ("haus5") may not change site "buero":    draft: no changes  heim r7 "
 " its VLANs, mappings and online state are managed by only "heim"; … M shows all "
-" Enter  details   o  on/offline   u  unblock   1-8  views   ?  help   q  quit   "
+" Enter  details   o  on/offline   u  unblock   t  optimize   ?  help   q  quit  "

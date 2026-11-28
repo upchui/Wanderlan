@@ -460,6 +460,55 @@ fn overview_with_many_sites_scrolls() {
     insta::assert_snapshot!(render(&app));
 }
 
+/// The tunnel to buero is being optimized (12 s in), haus3 optimized the
+/// tunnel to this site before.
+fn optimizing() -> App {
+    use wanderlan_core::api::{TuningState, TuningStatus};
+    let mut app = connected();
+    let mut status = fixtures::status();
+    status.peers[0].tuning = Some(TuningStatus {
+        state: TuningState::Running,
+        by_peer: false,
+        since_ms: 0,
+        age_secs: 12,
+        here: None,
+        there: None,
+        error: None,
+    });
+    status.peers[2].tuning = Some(TuningStatus {
+        state: TuningState::Done,
+        by_peer: true,
+        since_ms: 0,
+        age_secs: 180,
+        here: Some("ens18 RPS off (off 1.40 Gbit/s, on 900 Mbit/s)".into()),
+        there: None,
+        error: None,
+    });
+    reply(&mut app, Request::Status, Reply::Status(Box::new(status)));
+    app
+}
+
+#[test]
+fn overview_while_a_tunnel_is_optimized() {
+    insta::assert_snapshot!(render_size(&optimizing(), 120, 30));
+}
+
+#[test]
+fn peer_details_while_optimized_and_after() {
+    let mut app = optimizing();
+    key(&mut app, KeyCode::Enter);
+    let running = render_size(&app, 120, 30);
+    key(&mut app, KeyCode::Esc);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Enter);
+    insta::assert_snapshot!(format!("{running}\n{}", render_size(&app, 120, 30)));
+    // Elsewhere the status line says it.
+    key(&mut app, KeyCode::Esc);
+    key(&mut app, KeyCode::Char('2'));
+    assert!(render_size(&app, 120, 30).contains("⟳ optimizing buero"));
+}
+
 #[test]
 fn overview_on_a_wide_terminal() {
     insta::assert_snapshot!(render_size(&crowded(), 120, 40));

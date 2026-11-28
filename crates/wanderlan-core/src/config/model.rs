@@ -444,6 +444,114 @@ impl std::str::FromStr for Changes {
     }
 }
 
+/// Whether a network card spreads the work of what it receives over the
+/// cores (RPS): helps a card with one receive queue on real hardware, costs
+/// in a VM (every hand-off between cores is an expensive interrupt there).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum RpsMode {
+    /// Not changed (as the system has it).
+    #[default]
+    Off,
+    /// On the cards with one receive queue.
+    On,
+    /// Measured with each peer when its tunnel comes up; the card keeps
+    /// what all its tunnels speak for.
+    Auto,
+}
+
+impl RpsMode {
+    /// All options, in the order they are offered.
+    pub const ALL: [Self; 3] = [Self::Off, Self::On, Self::Auto];
+
+    /// Its value in `local.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Auto => "auto",
+        }
+    }
+
+    /// For displays.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Auto => "auto (measured with the peers)",
+        }
+    }
+}
+
+impl std::str::FromStr for RpsMode {
+    type Err = String;
+
+    /// `off`, `on` or `auto`.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let text = text.trim();
+        Self::ALL
+            .into_iter()
+            .find(|m| m.as_str() == text || m.label() == text)
+            .ok_or_else(|| format!("\"{text}\" is not off, on or auto"))
+    }
+}
+
+/// Which tunnel packets skip connection tracking where it is loaded (it
+/// would look at every one of them; a stateful firewall must then accept
+/// the tunnel port by its port).
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ConntrackSkip {
+    /// On a site with clients: the packets of its tunnels (as always).
+    #[default]
+    Clients,
+    /// On a server: all its tunnel packets, both ways (also those to
+    /// other servers); on a site with clients as `clients`.
+    All,
+    /// None: every tunnel packet is tracked.
+    Off,
+}
+
+impl ConntrackSkip {
+    /// All options, in the order they are offered.
+    pub const ALL: [Self; 3] = [Self::Clients, Self::All, Self::Off];
+
+    /// Its value in `local.toml`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Clients => "clients",
+            Self::All => "all",
+            Self::Off => "off",
+        }
+    }
+
+    /// For displays.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Clients => "client tunnels",
+            Self::All => "all tunnels (a server)",
+            Self::Off => "off (all tracked)",
+        }
+    }
+}
+
+impl std::str::FromStr for ConntrackSkip {
+    type Err = String;
+
+    /// `clients`, `all` or `off`.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let text = text.trim();
+        Self::ALL
+            .into_iter()
+            .find(|m| m.as_str() == text || m.label() == text)
+            .ok_or_else(|| format!("\"{text}\" is not clients, all or off"))
+    }
+}
+
 /// The ports of one site; `None`: the default of the network.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct SitePorts {
@@ -621,6 +729,13 @@ pub struct Local {
     /// A fixed TCP MSS on this site's tunnels; `None`: the network's (by
     /// default measured).
     pub mss: Option<u16>,
+    /// RPS on the interfaces the tunnel packets come in by.
+    pub rps_transport: RpsMode,
+    /// RPS on the trunk ports (`auto` is not possible: a measurement
+    /// between the boxes does not show their part).
+    pub rps_trunk: RpsMode,
+    /// Which tunnel packets skip connection tracking.
+    pub skip_conntrack: ConntrackSkip,
 }
 
 impl Local {

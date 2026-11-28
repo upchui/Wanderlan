@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 use crate::BRIDGE_NAME;
-use crate::config::{Config, LocalVid, NATIVE_VID, Network, TunnelMode};
+use crate::config::{Config, ConntrackSkip, LocalVid, NATIVE_VID, Network, TunnelMode};
 use crate::forwarding;
 use crate::identity::{PeerIdentity, SiteId};
 use crate::mtu;
@@ -461,12 +461,33 @@ pub fn derive_in(scope: &Scope, cfg: &Config, runtime: &Runtime) -> Desired {
         }
     }
 
-    // The packets of the client tunnels skip connection tracking on their
-    // server (a client may need it: its firewall lets the answers in).
-    let notrack = (runtime.conntrack && has_clients)
+    // Where connection tracking is loaded, tunnel packets skip it as the
+    // site says (`skip_conntrack`): those of the clients on a site with
+    // clients (the default), or on a server all of them, both ways (its
+    // firewall accepts the tunnel port by port anyway), or none. A client
+    // keeps it for its uplink (its firewall may let the answers in by it).
+    let skip = cfg.local.skip_conntrack;
+    let server = cfg.self_site().is_some_and(topology::is_server);
+    let skips = match skip {
+        ConntrackSkip::Clients => has_clients,
+        ConntrackSkip::All => has_clients || server,
+        ConntrackSkip::Off => false,
+    };
+    let notrack = (runtime.conntrack && skips)
         .then_some(tunnel_port)
         .into_iter()
         .collect();
+    // A server sends to the tunnel port of each direct peer from a port per
+    // flow (through NAT from its own: the rule above).
+    let notrack_out = if runtime.conntrack && server && skip == ConntrackSkip::All {
+        tunnels
+            .iter()
+            .filter(|t| t.params.source_port.is_none())
+            .filter_map(|t| t.remote.map(|r| r.port()))
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
     let breakout = breakouts(cfg, runtime, &trunks, &tunnels, &trunk_vlans);
     let fixed = tunnels
         .iter()
@@ -495,6 +516,7 @@ pub fn derive_in(scope: &Scope, cfg: &Config, runtime: &Runtime) -> Desired {
         learn: LearnTable {
             rules: learn,
             notrack,
+            notrack_out,
             fixed,
         },
         bridge_options: BRIDGE_OPTIONS,
@@ -1047,6 +1069,53 @@ mod tests {
         let d = derive(&cfg, &runtime);
         let other = d.tunnels.iter().find(|t| t.peer_name == "haus3").unwrap();
         assert_eq!(other.remote.map(|r| r.port()), Some(53001));
+    }
+
+    #[test]
+    fn tunnel_packets_skip_connection_tracking_as_the_site_says() {
+        let tracked = Runtime {
+            conntrack: true,
+            ..Runtime::default()
+        };
+        // By default (`clients`) a server without clients tracks them.
+        assert!(derive(&config("heim"), &tracked).learn.is_empty());
+        // `all`: servers among each other, in and out.
+        let mut all = config("heim");
+        all.local.skip_conntrack = ConntrackSkip::All;
+        let d = derive(&all, &tracked);
+        assert_eq!(d.learn.notrack, BTreeSet::from([51822]));
+        assert_eq!(d.learn.notrack_out, BTreeSet::from([51822]));
+        assert!(
+            derive(&config("heim"), &Runtime::default())
+                .learn
+                .is_empty()
+        );
+        // A client keeps it for its uplink.
+        let cfg = match load(NETWORK_CLIENTS, "self = \"nat1\"\ntrunk = \"ens19\"\n")
+            .unwrap()
+            .loaded
+        {
+            Loaded::Configured(cfg) => cfg,
+            Loaded::Unconfigured { .. } => panic!("configured"),
+        };
+        let mut cfg = cfg;
+        cfg.local.skip_conntrack = ConntrackSkip::All;
+        let d = derive(&cfg, &tracked);
+        assert!(d.learn.notrack.is_empty() && d.learn.notrack_out.is_empty());
+        // A site with clients: their tunnels by default, none with `off`.
+        let mut heim = match load(NETWORK_CLIENTS, "self = \"heim\"\ntrunk = \"ens19\"\n")
+            .unwrap()
+            .loaded
+        {
+            Loaded::Configured(cfg) => cfg,
+            Loaded::Unconfigured { .. } => panic!("configured"),
+        };
+        assert_eq!(
+            derive(&heim, &tracked).learn.notrack,
+            BTreeSet::from([51822])
+        );
+        heim.local.skip_conntrack = ConntrackSkip::Off;
+        assert!(derive(&heim, &tracked).learn.notrack.is_empty());
     }
 
     #[test]

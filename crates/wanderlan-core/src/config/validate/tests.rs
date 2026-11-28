@@ -83,6 +83,48 @@ fn render_roundtrip_is_identical() {
 }
 
 #[test]
+fn the_tuning_of_the_box_reads_back_and_rejects_what_it_does_not_know() {
+    use crate::config::{ConntrackSkip, RpsMode};
+    let network = parse_network(EXAMPLE_NETWORK).unwrap().network.unwrap();
+    let mut local = crate::config::parse_local(EXAMPLE_LOCAL, Some(&network))
+        .unwrap()
+        .local;
+    // The defaults are not written.
+    let text = render_local(&local, Some(&network));
+    assert!(
+        !text.contains("rps_") && !text.contains("skip_conntrack"),
+        "{text}"
+    );
+    local.rps_transport = RpsMode::Auto;
+    local.rps_trunk = RpsMode::On;
+    local.skip_conntrack = ConntrackSkip::All;
+    let text = render_local(&local, Some(&network));
+    for line in [
+        "rps_transport = \"auto\"",
+        "rps_trunk = \"on\"",
+        "skip_conntrack = \"all\"",
+    ] {
+        assert!(text.contains(line), "{line} in {text}");
+    }
+    assert_eq!(
+        crate::config::parse_local(&text, Some(&network))
+            .unwrap()
+            .local,
+        local
+    );
+    let wrong = format!("{EXAMPLE_LOCAL}rps_transport = \"sometimes\"\n");
+    let Err(diags) = crate::config::parse_local(&wrong, Some(&network)) else {
+        panic!("an unknown value is an error");
+    };
+    assert!(
+        diags.iter().any(|d| d
+            .message
+            .contains("rps_transport: \"sometimes\" is not off, on or auto")),
+        "{diags:?}"
+    );
+}
+
+#[test]
 fn fingerprint_ignores_revision_and_formatting() {
     let network = parse_network(EXAMPLE_NETWORK).unwrap().network.unwrap();
     let mut bumped = network.clone();

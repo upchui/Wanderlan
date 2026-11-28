@@ -214,6 +214,9 @@ impl Draft {
             local_setting!(commit_timeout);
             local_setting!(mtu_probe_interval);
             local_setting!(mss);
+            local_setting!(rps_transport);
+            local_setting!(rps_trunk);
+            local_setting!(skip_conntrack);
             self.local = local;
         }
         self.rebase(running);
@@ -370,6 +373,9 @@ impl Draft {
                 + usize::from(l.commit_timeout != self.local.commit_timeout)
                 + usize::from(l.mtu_probe_interval != self.local.mtu_probe_interval)
                 + usize::from(l.mss != self.local.mss)
+                + usize::from(l.rps_transport != self.local.rps_transport)
+                + usize::from(l.rps_trunk != self.local.rps_trunk)
+                + usize::from(l.skip_conntrack != self.local.skip_conntrack)
                 + l.tunnel_trunks
                     .keys()
                     .chain(self.local.tunnel_trunks.keys())

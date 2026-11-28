@@ -429,6 +429,8 @@ pub enum Reply {
     Reset(ResetReport),
     /// Answer to `networks`.
     Networks(Vec<wanderlan_core::api::NetworkInfo>),
+    /// Answer to `tune`: the optimization of a tunnel ended.
+    Tuned(wanderlan_core::api::Tune),
     /// An empty answer.
     Done,
 }
@@ -1031,6 +1033,22 @@ impl App {
                 self.invite_pending = None;
                 self.on_invitation(inv, fx);
             }
+            (_, Ok(Reply::Tuned(tune))) => {
+                let side = |s: &wanderlan_core::api::TuneSide| match s.rps {
+                    Some(true) => "RPS on".to_string(),
+                    Some(false) => "RPS off".to_string(),
+                    None => "unchanged".to_string(),
+                };
+                self.say(
+                    MessageKind::Info,
+                    format!(
+                        "Tunnel to {} optimized: here {}, there {} (details: Enter on the peer)",
+                        tune.peer,
+                        side(&tune.here),
+                        side(&tune.there)
+                    ),
+                );
+            }
             (_, Ok(Reply::Networks(list))) => {
                 self.networks = list;
                 // The window opened before the list came: on the network
@@ -1149,6 +1167,8 @@ impl App {
             Request::Subscribe => "log subscription",
             Request::Unblock(_) => "unblock",
             Request::ProbeNow => "MTU probe",
+            Request::Perf(_) | Request::Speedtest(_) => "measurement",
+            Request::Tune(_) => "optimizing the tunnel",
             Request::Validate(_) | Request::Apply(_) | Request::ApplyFiles(_) => "apply",
             Request::Invite(_) => {
                 if let Some(mut form) = self.invite_pending.take() {
@@ -1668,6 +1688,58 @@ impl App {
     }
 
     /// Opens the details of a peer and reads its VLANs.
+    /// Optimizes the tunnel to `name` again (RPS measured with the peer,
+    /// about 30 s); the status shows it while it runs.
+    fn tune(&mut self, name: String, fx: &mut Vec<Effect>) {
+        if !self.is_connected() {
+            return;
+        }
+        let mode = self.rps_transport();
+        if mode != wanderlan_core::config::RpsMode::Auto {
+            self.say(
+                MessageKind::Info,
+                format!(
+                    "RPS is fixed by the setting here (RPS transport: {}); Settings (8) → RPS transport auto measures it with the peers.",
+                    mode.as_str()
+                ),
+            );
+            return;
+        }
+        let running = self.status.as_ref().is_some_and(|s| {
+            s.peers.iter().any(|p| {
+                p.name == name
+                    && p.tuning
+                        .as_ref()
+                        .is_some_and(|t| t.state == wanderlan_core::api::TuningState::Running)
+            })
+        });
+        if running {
+            self.say(
+                MessageKind::Info,
+                format!("The tunnel to {name} is being optimized right now."),
+            );
+            return;
+        }
+        fx.push(Effect::Request(Request::Tune(
+            wanderlan_core::api::TuneParams { site: name.clone() },
+        )));
+        self.say(
+            MessageKind::Info,
+            format!(
+                "Optimizing the tunnel to {name}: RPS off and on, both ways (about {} s of full load)",
+                wanderlan_core::api::TUNING_SECONDS
+            ),
+        );
+    }
+
+    /// The setting `rps_transport` of this site, as it runs.
+    pub fn rps_transport(&self) -> wanderlan_core::config::RpsMode {
+        self.running
+            .as_ref()
+            .map(|r| r.local.rps_transport)
+            .unwrap_or_default()
+    }
+
     fn open_peer(&mut self, name: String, fx: &mut Vec<Effect>) {
         self.modal = Some(Modal::Peer { name, vlan: None });
         self.request_vlan_traffic(fx);
@@ -2715,6 +2787,10 @@ impl App {
                 self.next_range();
                 Some(Modal::Peer { name, vlan })
             }
+            KeyCode::Char('t') => {
+                self.tune(name.clone(), fx);
+                Some(Modal::Peer { name, vlan })
+            }
             KeyCode::Enter => match vids.get(at) {
                 Some(&vid) => {
                     self.request_vlan_traffic(fx);
@@ -3484,6 +3560,10 @@ impl App {
             KeyCode::Char('p') if self.is_connected() => {
                 fx.push(Effect::Request(Request::ProbeNow));
             }
+            KeyCode::Char('t') => match self.selected_peer().map(|p| p.name.clone()) {
+                Some(name) => self.tune(name, fx),
+                None => self.say(MessageKind::Info, "Select a peer (a tunnel) to optimize."),
+            },
             KeyCode::Enter => {
                 if let Some(peer) = self.selected_peer() {
                     let name = peer.name.clone();

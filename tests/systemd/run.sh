@@ -187,6 +187,43 @@ expect_output "alpha takes beta online right after the join" 'beta is online' "$
 wait_for 30 "VLAN 20: the clients reach each other again" ping_ok
 healthy
 
+begin "RPS as set under the hardened unit: on and off, auto measured with the peer"
+rps_off_of() { grep -Eq '^[0,]+$' <<<"$(x beta "cat /sys/class/net/$1/queues/rx-0/rps_cpus")"; }
+check "beta: RPS of trunk0 is off by default" rps_off_of trunk0
+check "beta: rps-trunk on" x beta "wanderlan settings rps-trunk on --confirm"
+wait_for 20 "beta: RPS of trunk0 is on, as set (ReadWritePaths=/sys/devices)" eval '! rps_off_of trunk0'
+check "beta: rps-trunk off" x beta "wanderlan settings rps-trunk off --confirm"
+wait_for 20 "beta: RPS of trunk0 is off again (its value before)" rps_off_of trunk0
+for s in alpha beta; do
+  check "$s: rps-transport auto" x "$s" "wanderlan settings rps-transport auto --confirm"
+done
+x beta "wanderlan tune alpha" 2>&1 | sed 's/^/  info  /'
+line=$(x beta "journalctl -u wanderland -o cat | grep 'Calibrated the receive work with' | tail -1")
+echo "  info  $line"
+# " here …" (not "there …").
+nic=$(grep -o ' here [^ ]* RPS o[nf]*' <<<"$line" | head -1 | awk '{print $2}')
+kept=$(grep -o ' here [^ ]* RPS o[nf]*' <<<"$line" | head -1 | awk '{print $4}')
+check "beta calibrated RPS of its transport interface with alpha: ${nic:-none}" test -n "$nic"
+if [ "$kept" = on ]; then
+  check "beta: RPS of $nic is on, as measured" eval '! rps_off_of $nic'
+else
+  check "beta: RPS of $nic is off, as measured" rps_off_of "$nic"
+fi
+check "alpha logged its side" \
+  x alpha "journalctl -u wanderland -o cat | grep -q 'Calibrated the receive work with \"beta\"'"
+# The optimization of the tunnel in the status (terminal UI): "<state> <by_peer>".
+tuning_of() { x "$1" "wanderlan status --json" | jq -r --arg p "$2" '.peers[] | select(.name == $p) | .tuning | "\(.state) \(.by_peer)"'; }
+check "the status shows it on beta (it measured) and on alpha (it was measured)" \
+  eval '[ "$(tuning_of beta alpha)" = "done false" ] && [ "$(tuning_of alpha beta)" = "done true" ]'
+x beta "systemctl stop wanderland"
+check "beta: after a stop RPS of $nic has its value before again" rps_off_of "$nic"
+x beta "systemctl start wanderland"
+wait_for 30 "VLAN 20: the clients reach each other again" ping_ok
+for s in alpha beta; do
+  check "$s: rps-transport off again" x "$s" "wanderlan settings rps-transport default --confirm"
+done
+healthy
+
 begin "Local breakout under the hardened unit: sysctls written and put back"
 uplink=$(x beta "ip -o -4 addr show | awk '/ 10\\.8\\.0\\.2\\// {print \$2}'")
 forwarding() { x beta "cat /proc/sys/net/ipv4/conf/$uplink/forwarding"; }

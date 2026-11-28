@@ -7,6 +7,31 @@ All notable changes to wanderlan are documented in this file.
 Simpler: the sites behave like one switch, and a new site joins with a
 single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
+### Throughput: settings, perf and speedtest
+
+- Spreading the receive work over the cores (RPS) is a setting of each
+  site, no longer switched on by itself: `rps_transport` (`off`, `on`,
+  `auto`) for the interfaces the tunnel packets come in by, `rps_trunk`
+  (`off`, `on`) for the trunk ports, both `off` by default. Switched on
+  automatically (as for a short while) it doubled the throughput on bare
+  metal but cost a third in VMs with two vCPUs. `auto` measures it with each
+  peer when its tunnel comes up (about 30 s, each tunnel at most every 10
+  minutes; `wanderlan tune <site>` or `t` in the terminal UI by hand): each
+  box keeps per network card what all its tunnels speak for (at least 10 %
+  more in total, no tunnel more than 10 % less). The old values come back
+  when wanderlan stops or resets, or the setting goes back to `off`.
+- `skip_conntrack` (`clients`, `all`, `off`): which tunnel packets skip
+  connection tracking; `all` spares it on a server for every tunnel, both
+  ways (before: only for the tunnels of its clients, still the default).
+- `wanderlan perf` names what limits the throughput of the box (the load of
+  the cores, receive queues and the RPS settings, split packets, connection
+  tracking) and what helps; `wanderlan speedtest <site>` measures TCP over
+  the transport and frames through the tunnel (in 64 flows, like real
+  traffic), both ways.
+- The terminal UI shows the optimization of a tunnel while it runs (a line
+  above the peers, `tuning…` in its row, the status line of every view) and
+  in the peer details what was measured and kept, or the setting.
+
 ### Both sites in one switch network
 
 - A site with VLAN mappings checks every 30 s whether its trunk and the

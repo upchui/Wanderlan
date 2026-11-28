@@ -68,6 +68,15 @@ pub enum Request {
     Unblock(UnblockParams),
     /// Measures the path MTU to all peers again → [`Done`].
     ProbeNow,
+    /// Looks at what limits the throughput of this box, for a few seconds
+    /// → [`Perf`].
+    Perf(PerfParams),
+    /// Measures the throughput to a peer: the transport and the tunnel, in
+    /// both directions → [`Speedtest`].
+    Speedtest(SpeedtestParams),
+    /// Measures with a peer whether spreading the receive work over the
+    /// cores (RPS) helps, and keeps the better setting on both → [`Tune`].
+    Tune(TuneParams),
     /// Creates an invitation for a new site with rules for it →
     /// [`Invitation`].
     Invite(SiteRules),
@@ -371,6 +380,140 @@ pub enum ServerMessage {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Done {}
 
+/// Parameters of [`Request::Perf`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfParams {
+    /// How long to watch (default [`PERF_SECONDS`]).
+    #[serde(default)]
+    pub seconds: Option<u32>,
+}
+
+/// How long `perf` watches by default.
+pub const PERF_SECONDS: u32 = 3;
+
+/// Result of [`Request::Perf`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Perf {
+    /// How long it watched.
+    pub seconds: u32,
+    /// What it found, the problems first.
+    pub findings: Vec<Finding>,
+}
+
+/// One thing `perf` found.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Finding {
+    /// How bad.
+    pub level: FindingLevel,
+    /// What it is.
+    pub text: String,
+    /// What helps.
+    #[serde(default)]
+    pub fix: Option<String>,
+}
+
+/// How bad a [`Finding`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FindingLevel {
+    /// It costs throughput.
+    Problem,
+    /// It may cost throughput, or something to know.
+    Hint,
+    /// Fine.
+    Ok,
+}
+
+/// Parameters of [`Request::Speedtest`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpeedtestParams {
+    /// The peer (name or identity).
+    pub site: String,
+    /// Seconds per measurement (default [`SPEEDTEST_SECONDS`]).
+    #[serde(default)]
+    pub seconds: Option<u32>,
+}
+
+/// Seconds per measurement of a speed test by default.
+pub const SPEEDTEST_SECONDS: u32 = 5;
+/// The longest measurement of a speed test.
+pub const SPEEDTEST_MAX_SECONDS: u32 = 10;
+
+/// Result of [`Request::Speedtest`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Speedtest {
+    /// The peer.
+    pub peer: String,
+    /// Its address in the network.
+    pub address: String,
+    /// Seconds per measurement.
+    pub seconds: u32,
+    /// The measured path MTU to it.
+    #[serde(default)]
+    pub pmtu: Option<u16>,
+    /// The measurements.
+    pub runs: Vec<SpeedRun>,
+}
+
+/// Parameters of [`Request::Tune`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuneParams {
+    /// The peer (name or identity).
+    pub site: String,
+}
+
+/// Result of [`Request::Tune`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tune {
+    /// The peer.
+    pub peer: String,
+    /// This box.
+    pub here: TuneSide,
+    /// The peer.
+    pub there: TuneSide,
+}
+
+/// What a calibration measured for one box.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuneSide {
+    /// The interface its tunnel packets come in by.
+    pub nic: Option<String>,
+    /// RPS on (none: it could not be changed there).
+    pub rps: Option<bool>,
+    /// What it received with RPS off (median, bit/s).
+    pub off_bps: u64,
+    /// What it received with RPS on (median, bit/s).
+    pub on_bps: u64,
+    /// Why RPS could not be changed there.
+    pub why_not: Option<String>,
+}
+
+/// One measurement of a speed test.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpeedRun {
+    /// TCP between the boxes over the transport network, or frames of
+    /// `frame` bytes through the tunnel.
+    pub frame: Option<u16>,
+    /// From this site to the peer (else back).
+    pub up: bool,
+    /// What arrived, in bit/s (of the frames: their size).
+    pub bits_per_second: u64,
+    /// Frames sent and arrived (tunnel only): the rest was lost on the way,
+    /// or the sender was faster than the way.
+    #[serde(default)]
+    pub sent: Option<u64>,
+    /// Frames that arrived (tunnel only).
+    #[serde(default)]
+    pub arrived: Option<u64>,
+    /// The busiest core of the receiving box: its number and its share of
+    /// network work (softirq) in percent.
+    #[serde(default)]
+    pub busiest_core: Option<(u32, u32)>,
+    /// Why it failed.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 /// Result of [`Request::Reset`]. Every step runs even if an earlier one
 /// failed; afterwards the daemon checks that nothing is left.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -602,7 +745,55 @@ pub struct PeerStatus {
     /// For a client (behind NAT): where its tunnel packets come from.
     #[serde(default)]
     pub endpoint: Option<String>,
+    /// The optimization of the tunnel (whether spreading the receive work
+    /// over the cores helps), the last or the running one.
+    #[serde(default)]
+    pub tuning: Option<TuningStatus>,
 }
+
+/// The optimization of a tunnel: the receive rate through it measured with
+/// RPS off and on, on both boxes (`wanderlan tune`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuningStatus {
+    /// Where it is.
+    pub state: TuningState,
+    /// The peer measures (this box is measured).
+    #[serde(default)]
+    pub by_peer: bool,
+    /// When it started (running) or ended (ms since the Unix epoch).
+    pub since_ms: u64,
+    /// How long ago that was, in seconds (as the daemon saw it).
+    #[serde(default)]
+    pub age_secs: u64,
+    /// What this box keeps, e.g. "ens18 RPS off (off 1.40 Gbit/s, on 900
+    /// Mbit/s)".
+    #[serde(default)]
+    pub here: Option<String>,
+    /// What the peer keeps.
+    #[serde(default)]
+    pub there: Option<String>,
+    /// Why it failed or changed nothing.
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Where an optimization is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TuningState {
+    /// Measuring now (about 30 s of full load on the transport).
+    Running,
+    /// Measured; each box keeps the better setting.
+    Done,
+    /// It did not work (e.g. the peer did not answer).
+    Failed,
+    /// RPS cannot be changed on either box (several receive queues, `/sys`
+    /// read-only, set by someone else).
+    Unchangeable,
+}
+
+/// How long an optimization takes, about.
+pub const TUNING_SECONDS: u64 = 30;
 
 /// Whether a peer proved its identity (tunnels with a key).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

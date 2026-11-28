@@ -372,9 +372,34 @@ fn problems(app: &App) -> Option<(String, Style)> {
     Some((format!("{} (see 1)", bad.join(", ")), style))
 }
 
+/// The tunnels being optimized now, for the status line of every view (the
+/// overview says it in full).
+fn optimizing(app: &App) -> Option<String> {
+    if app.view == View::Overview && app.modal.is_none() {
+        return None;
+    }
+    let names: Vec<&str> = app
+        .status
+        .as_ref()?
+        .peers
+        .iter()
+        .filter(|p| {
+            p.tuning
+                .as_ref()
+                .is_some_and(|t| t.state == wanderlan_core::api::TuningState::Running)
+        })
+        .map(|p| p.name.as_str())
+        .collect();
+    (!names.is_empty()).then(|| format!("⟳ optimizing {}", names.join(", ")))
+}
+
 /// Draft and connection state for the right end of the status line.
 fn status_badge(app: &App) -> Line<'static> {
     let mut spans = Vec::new();
+    if let Some(text) = optimizing(app) {
+        spans.push(Span::styled(text, theme::title().patch(theme::bold())));
+        spans.push(Span::raw("  "));
+    }
     if let Some((text, style)) = problems(app) {
         spans.push(Span::styled(text, style));
         spans.push(Span::raw("  "));

@@ -281,6 +281,69 @@ fn a_change_that_was_rolled_back_comes_back_into_the_draft() {
 }
 
 #[test]
+fn t_optimizes_the_tunnel_to_the_selected_peer() {
+    let mut app = connected();
+    // Fixed by the setting (off, the default): it says so, nothing is asked.
+    let fx = app.update(ch('t'));
+    assert!(requests(&fx).is_empty());
+    assert!(
+        app.message
+            .as_ref()
+            .is_some_and(|m| m.text.contains("RPS is fixed by the setting here")),
+        "{:?}",
+        app.message
+    );
+    // auto: measured with the peer.
+    if let Some(running) = app.running.as_mut() {
+        running.local.rps_transport = wanderlan_core::config::RpsMode::Auto;
+    }
+    let fx = app.update(ch('t'));
+    assert_eq!(
+        requests(&fx),
+        [&Request::Tune(wanderlan_core::api::TuneParams {
+            site: "buero".into()
+        })]
+    );
+    assert!(
+        app.message
+            .as_ref()
+            .is_some_and(|m| m.text.contains("Optimizing the tunnel to buero")),
+        "{:?}",
+        app.message
+    );
+    // The answer says what was kept.
+    app.update(reply(
+        Request::Tune(wanderlan_core::api::TuneParams {
+            site: "buero".into(),
+        }),
+        Reply::Tuned(wanderlan_core::api::Tune {
+            peer: "buero".into(),
+            here: wanderlan_core::api::TuneSide {
+                nic: Some("ens18".into()),
+                rps: Some(false),
+                off_bps: 1_400_000_000,
+                on_bps: 900_000_000,
+                why_not: None,
+            },
+            there: wanderlan_core::api::TuneSide {
+                nic: Some("ens18".into()),
+                rps: Some(true),
+                off_bps: 1_000_000_000,
+                on_bps: 1_300_000_000,
+                why_not: None,
+            },
+        }),
+    ));
+    assert!(
+        app.message.as_ref().is_some_and(|m| m
+            .text
+            .contains("Tunnel to buero optimized: here RPS off, there RPS on")),
+        "{:?}",
+        app.message
+    );
+}
+
+#[test]
 fn edits_made_during_the_countdown_survive_a_rollback() {
     let mut app = connected();
     let mut applied = fixtures::config_texts();
@@ -703,9 +766,9 @@ fn settings_open_the_form_at_the_chosen_setting() {
         }
         other => panic!("expected the form of this host, got {other:?}"),
     }
-    // The ports: the own entry of this site.
+    // The ports (after the tuning of this host): the own entry of this site.
     app.update(key(KeyCode::Esc));
-    app.settings_selected = 5;
+    app.settings_selected = 8;
     app.update(key(KeyCode::Enter));
     assert!(
         matches!(&app.modal, Some(Modal::Form(f)) if f.kind == FormKind::OwnPorts(id("heim"))),

@@ -31,9 +31,9 @@ use serde_spanned::Spanned;
 
 use super::diag::{ConfigFile, Diagnostic, FieldPath, SpanMap};
 use super::model::{
-    Breakout, Breakouts, Changes, DEFAULT_COMMIT_TIMEOUT, DEFAULT_CONTROL_PORT,
-    DEFAULT_MTU_PROBE_INTERVAL, Local, LocalVid, Network, Site, SitePorts, TunnelVlans, VlanMap,
-    site_pair,
+    Breakout, Breakouts, Changes, ConntrackSkip, DEFAULT_COMMIT_TIMEOUT, DEFAULT_CONTROL_PORT,
+    DEFAULT_MTU_PROBE_INTERVAL, Local, LocalVid, Network, RpsMode, Site, SitePorts, TunnelVlans,
+    VlanMap, site_pair,
 };
 use super::vlan::{VID_MAX, VID_MIN, VlanSet};
 use crate::identity::SiteId;
@@ -212,6 +212,9 @@ struct RawLocal {
     commit_timeout: Option<Spanned<String>>,
     mtu_probe_interval: Option<Spanned<String>>,
     mss: Option<Spanned<i64>>,
+    rps_transport: Option<Spanned<String>>,
+    rps_trunk: Option<Spanned<String>>,
+    skip_conntrack: Option<Spanned<String>>,
 }
 
 /// `[tunnels.<site>]` in `local.toml`.
@@ -1437,6 +1440,26 @@ pub fn parse_local(text: &str, network: Option<&Network>) -> Result<ParsedLocal,
         lw.int_in_range(&path, v, 1, 65535)
             .and_then(|v| u16::try_from(v).ok())
     });
+    // The tuning of the box: words of a few options.
+    fn choice<T: std::str::FromStr<Err = String> + Default>(
+        lw: &mut Lowering,
+        key: &str,
+        value: Option<Spanned<String>>,
+    ) -> T {
+        let path = FieldPath::local(key);
+        lw.take(&path, value)
+            .and_then(|text| match text.parse::<T>() {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    lw.error(path, format!("{key}: {e}"));
+                    None
+                }
+            })
+            .unwrap_or_default()
+    }
+    let rps_transport: RpsMode = choice(&mut lw, "rps_transport", raw.rps_transport);
+    let rps_trunk: RpsMode = choice(&mut lw, "rps_trunk", raw.rps_trunk);
+    let skip_conntrack: ConntrackSkip = choice(&mut lw, "skip_conntrack", raw.skip_conntrack);
     let local = Local {
         self_id,
         trunk,
@@ -1444,6 +1467,9 @@ pub fn parse_local(text: &str, network: Option<&Network>) -> Result<ParsedLocal,
         commit_timeout,
         mtu_probe_interval,
         mss,
+        rps_transport,
+        rps_trunk,
+        skip_conntrack,
     };
     if lw.diags.is_empty() {
         Ok(ParsedLocal {

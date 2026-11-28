@@ -40,7 +40,7 @@ pub struct SettingRow {
 
 /// The settings of this host, in display order. Every one changes this
 /// host only: what other sites do they decide themselves.
-pub const ROWS: [SettingRow; 7] = [
+pub const ROWS: [SettingRow; 10] = [
     SettingRow {
         key: "self",
         label: "This site",
@@ -70,6 +70,24 @@ pub const ROWS: [SettingRow; 7] = [
         label: "TCP MSS",
         scope: Scope::Local,
         help: "Empty: clamp TCP on this site's tunnels to the MSS that fits the measured path MTU (path MTU - 94). A fixed value (536-1460) replaces the measurement, e.g. if probes are filtered.",
+    },
+    SettingRow {
+        key: "rps_transport",
+        label: "RPS transport",
+        scope: Scope::Local,
+        help: "Spread the receive work of the interface the tunnel packets come in by over the cores (RPS; only a card with one receive queue). off: as the system has it. on: always. auto: measured with each peer when its tunnel comes up (about 30 s of full load on the transport), the card keeps what all its tunnels speak for. On real hardware it can double the throughput, in a VM with few cores it cost a third: Multiqueue on the VM's network device is better.",
+    },
+    SettingRow {
+        key: "rps_trunk",
+        label: "RPS trunk",
+        scope: Scope::Local,
+        help: "The same for the trunk ports (off or on; a measurement between the boxes cannot show their part). Compare with `wanderlan speedtest` before keeping it on.",
+    },
+    SettingRow {
+        key: "skip_conntrack",
+        label: "Skip conntrack",
+        scope: Scope::Local,
+        help: "Which tunnel packets skip connection tracking where it is loaded (it would look at every one of them). clients: those of the client tunnels of a site with clients. all: on a server every tunnel packet, both ways. off: all are tracked. A stateful firewall must accept the tunnel port by its port for those that skip it.",
     },
     SettingRow {
         key: "control_port",
@@ -124,6 +142,9 @@ fn value(draft: &Draft, key: &str) -> String {
                 (None, None, Some(_)) => "  (network default)",
             }
         ),
+        "rps_transport" => l.rps_transport.label().to_string(),
+        "rps_trunk" => l.rps_trunk.label().to_string(),
+        "skip_conntrack" => l.skip_conntrack.label().to_string(),
         "self" => draft
             .local
             .self_id

@@ -89,6 +89,59 @@ pub fn send(ifname: &str, frame: &[u8]) -> io::Result<()> {
 /// `setsockopt(2)` option of a packet socket: no copies of the frames this
 /// box sends (`linux/if_packet.h`).
 const PACKET_IGNORE_OUTGOING: libc::c_int = 23;
+/// `getsockopt(2)` option of a packet socket: the frames its filter took
+/// since the last call, including those it had no room for.
+const PACKET_STATISTICS: libc::c_int = 6;
+
+/// `struct tpacket_stats` (`linux/if_packet.h`).
+#[repr(C)]
+#[derive(Default)]
+struct TpacketStats {
+    packets: u32,
+    drops: u32,
+}
+
+/// Sends many frames out of one interface (a speed test): one socket for
+/// all of them.
+pub struct Sender {
+    socket: OwnedFd,
+    addr: libc::sockaddr_ll,
+}
+
+impl Sender {
+    /// A sender for interface `ifname`; the frames go to `dst`.
+    pub fn open(ifname: &str, dst: [u8; 6]) -> io::Result<Self> {
+        let index = index_of(ifname)?;
+        let socket = packet_socket()?;
+        let mut addr = link_addr(index, 0);
+        addr.sll_halen = 6;
+        addr.sll_addr[..6].copy_from_slice(&dst);
+        Ok(Self { socket, addr })
+    }
+
+    /// Sends `frame` up to `count` times with one call: how many went.
+    #[allow(unsafe_code)]
+    pub fn send_many(&self, frame: &[u8], count: usize) -> io::Result<usize> {
+        let len = addr_len()?;
+        let mut iov = libc::iovec {
+            iov_base: frame.as_ptr().cast_mut().cast::<libc::c_void>(),
+            iov_len: frame.len(),
+        };
+        // SAFETY: mmsghdr is plain old data; all-zero is a valid value.
+        let mut header: libc::mmsghdr = unsafe { std::mem::zeroed() };
+        header.msg_hdr.msg_name = (&raw const self.addr).cast_mut().cast::<libc::c_void>();
+        header.msg_hdr.msg_namelen = len;
+        header.msg_hdr.msg_iov = &raw mut iov;
+        header.msg_hdr.msg_iovlen = 1;
+        let mut headers = vec![header; count];
+        let n = libc::c_uint::try_from(count).map_err(invalid)?;
+        // SAFETY: every header points to `iov` (the frame) and to the
+        // address, which live for the duration of the call; the kernel only
+        // reads them (and writes `msg_len`).
+        let sent = unsafe { libc::sendmmsg(self.socket.as_raw_fd(), headers.as_mut_ptr(), n, 0) };
+        usize::try_from(sent).map_err(|_| io::Error::last_os_error())
+    }
+}
 
 /// Classic BPF: the VLAN tag of the frame (`SKF_AD_OFF + SKF_AD_VLAN_TAG`).
 /// The kernel moves the tag out of a received frame before a tap sees it,
@@ -177,6 +230,26 @@ fn dhcp_program(vid: Option<u16>) -> Vec<libc::sock_filter> {
     with_reject(program)
 }
 
+/// The UDP port of the test frames of a speed test (discard).
+pub const TEST_PORT: u16 = 9;
+
+/// The test frames of a speed test: IPv4 (header of 20 bytes, as built),
+/// UDP to [`TEST_PORT`], `magic` at the start of the payload; the first 64
+/// bytes.
+fn test_program(magic: [u8; 4]) -> Vec<libc::sock_filter> {
+    with_reject(vec![
+        op(bpf::LD_H_ABS, 12),
+        op(bpf::JEQ_K, 0x0800),
+        op(bpf::LD_B_ABS, 23),
+        op(bpf::JEQ_K, 17),
+        op(bpf::LD_H_ABS, 36),
+        op(bpf::JEQ_K, u32::from(TEST_PORT)),
+        op(bpf::LD_W_ABS, 42),
+        op(bpf::JEQ_K, u32::from_be_bytes(magic)),
+        op(bpf::RET_K, 64),
+    ])
+}
+
 /// `ldh [12]; jeq ethertype; ld [14]; jeq magic;` with `vid` also
 /// `ld vlan_tag; and 0xfff; jeq vid;` then `ret 256; ret 0`.
 fn filter_program(ethertype: u16, magic: [u8; 4], vid: Option<u16>) -> Vec<libc::sock_filter> {
@@ -214,6 +287,12 @@ impl Tap {
         vid: Option<u16>,
     ) -> io::Result<Self> {
         Self::open_with(ifname, filter_program(ethertype, magic, vid))
+    }
+
+    /// Opens the tap on `ifname` for the test frames of a speed test with
+    /// `magic`.
+    pub fn open_test(ifname: &str, magic: [u8; 4]) -> io::Result<Self> {
+        Self::open_with(ifname, test_program(magic))
     }
 
     /// Opens the tap on `ifname` for the DHCP frames (IPv4) that arrive in
@@ -276,6 +355,29 @@ impl Tap {
             return Err(io::Error::last_os_error());
         }
         Ok(Self { socket })
+    }
+
+    /// The frames the filter took since the last call (also those the
+    /// socket had no room for: they arrived all the same).
+    #[allow(unsafe_code)]
+    pub fn taken(&self) -> io::Result<u64> {
+        let mut stats = TpacketStats::default();
+        let mut len =
+            libc::socklen_t::try_from(std::mem::size_of::<TpacketStats>()).map_err(invalid)?;
+        // SAFETY: `stats` and `len` live for the call; `len` is its size.
+        if unsafe {
+            libc::getsockopt(
+                self.socket.as_raw_fd(),
+                libc::SOL_PACKET,
+                PACKET_STATISTICS,
+                (&raw mut stats).cast::<libc::c_void>(),
+                &raw mut len,
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(u64::from(stats.packets))
     }
 
     /// A frame that is waiting, without blocking: its length in `buf`.

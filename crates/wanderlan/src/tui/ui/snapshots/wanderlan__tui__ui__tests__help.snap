@@ -1,6 +1,5 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 120
 expression: render(&app)
 ---
 " 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Breakout  8 Settings   "
@@ -12,18 +11,18 @@ expression: render(&app)
 "│   u                   unblock the port of the peer (loop guard)              ║"
 "│   U                   unblock a trunk port (loop guard)                      ║"
 "│   p                   measure the path MTU to all peers now                  ║"
+"│   t                   optimize the selected tunnel (RPS transport auto)      ║"
 "│   z                   the graphs: the last 2 min, 10 min or 1 h              ║"
 "│   Green: reachable and up. Yellow: degraded (port down or offline, config    ║"
 "│   differs, late replies). Red: unreachable or blocked by the loop guard. The ║"
 "│   graphs show what came in above the line (green) and what went out below it ║"
 "│   (magenta), each on its own scale; the daemon records the last hour, LOAD   ║"
-"│   compares the tunnels.                                                      ║"
+"│   compares the tunnels. With RPS transport auto (Settings 8), optimizing a   ║"
+"│   tunnel (by itself when it comes up, or t) measures for about 30 s with the ║"
+"│   peer whether spreading the receive work over the cores (RPS) helps, with   ║"
+"│   full load on the transport meanwhile: a line above the peers, "tuning…" in ║"
+"│   its row and the status line show it; its details (Enter) what was kept.    ║"
 "│                                                                              ║"
-"│ 2 Sites                                                                      ║"
-"│   Up/Down             select a site                                          ║"
-"│   /                   search (name, address, VLANs, role, changes)           ║"
-"│   i                   invite a new site with its own rules (code + command)  ║"
-"│   I                   open invitations: show, delete                         ║"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "                          1 blocked, 1 down (see 1)  draft: no changes  heim r7 "
 " Up/Down  scroll   Esc  close                                                   "

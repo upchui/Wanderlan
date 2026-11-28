@@ -1,14 +1,13 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 654
 expression: render(&app)
 ---
 " 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Breakout  8 Settings   "
 "┌ Settings (Enter: change, Up/Down: more) ─────────────────────────────────────┐"
-"│  Trunk                ens19                                                  ║"
-"│  Commit timeout       1m  (network default)                                  █"
-"│  Path MTU check       every 5m  (network default)                            █"
-"│  TCP MSS              from the path MTU                                      █"
+"│  TCP MSS              from the path MTU                                      ║"
+"│  RPS transport        off                                                    ║"
+"│  RPS trunk            off                                                    ║"
+"│  Skip conntrack       client tunnels                                         █"
 "│                                                                              █"
 "│ ┌ Trunk ports of the tunnel to haus2 ──────────────────────────────────────┐ █"
 "│ │    #  INTERFACE       KIND      STATE MTU   NOTE                         │ █"
@@ -16,7 +15,7 @@ expression: render(&app)
 "│ │[ ]    ens18           physical  up    1500  tunnels to buero             │ █"
 "│ │[ ]    ens19           physical  up    1500  in the default trunk         │ █"
 "│ │[ ]    eth1            physical  down  1500  in br-lan                    │ █"
-"│ │ other:                   an interface that is not there yet              │ ║"
+"│ │ other:                   an interface that is not there yet              │ █"
 "│ │                                                                          │ ║"
 "│ │ Nothing chosen: the tunnel to haus2 uses the default trunk (ens19).      │ ║"
 "└ └──────────────────────────────────────────────────────────────────────────┘ ┘"

@@ -1,6 +1,5 @@
 ---
 source: crates/wanderlan/src/tui/ui/tests.rs
-assertion_line: 172
 expression: render(&app)
 ---
 " 1 Overview  2 Sites  3 VLANs  4 MACs  5 Log  6 Setup  7 Breakout  8 Settings   "
@@ -11,14 +10,14 @@ expression: render(&app)
 "│  Commit timeout       1m  (network default)                                  █"
 "│  Path MTU check       every 5m  (network default)                            █"
 "│  TCP MSS              from the path MTU                                      █"
-"│  Control port         51821 (UDP, TCP)  (network default)                    █"
-"│  Tunnel port          51822 (UDP)  (follows the control port)                █"
-"│Role and rights        read only here; Sites (2), e on a site changes them    █"
-"│  Role                 server (connected with the other servers)              █"
+"│  RPS transport        off                                                    █"
+"│  RPS trunk            off                                                    █"
+"│  Skip conntrack       client tunnels                                         █"
+"│  Control port         51821 (UDP, TCP)  (network default)                    ║"
+"│  Tunnel port          51822 (UDP)  (follows the control port)                ║"
+"│Role and rights        read only here; Sites (2), e on a site changes them    ║"
+"│  Role                 server (connected with the other servers)              ║"
 "│  Clients              haus6                                                  ║"
-"│  Changed by           every server                                           ║"
-"│  Changes              haus6                                                  ║"
-"│Trunk per tunnel       this host only; another trunk = own segment            ║"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 " The interfaces that carry the VLANs to the switch or hypervisor (ports of br0; "
 " Enter lists those of this host). Several act like switch ports, the first is   "

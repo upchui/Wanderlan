@@ -12,7 +12,9 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use super::model::{Breakouts, Local, LocalVid, Network, SitePorts, TunnelVlans};
+use super::model::{
+    Breakouts, ConntrackSkip, Local, LocalVid, Network, RpsMode, SitePorts, TunnelVlans,
+};
 use crate::identity::SiteId;
 
 const NETWORK_HEADER: &str = "\
@@ -279,6 +281,19 @@ pub fn render_local(local: &Local, network: Option<&Network>) -> String {
     }
     if let Some(mss) = local.mss {
         let _ = writeln!(out, "mss = {mss}");
+    }
+    if local.rps_transport != RpsMode::default() {
+        let _ = writeln!(out, "rps_transport = \"{}\"", local.rps_transport.as_str());
+    }
+    if local.rps_trunk != RpsMode::default() {
+        let _ = writeln!(out, "rps_trunk = \"{}\"", local.rps_trunk.as_str());
+    }
+    if local.skip_conntrack != ConntrackSkip::default() {
+        let _ = writeln!(
+            out,
+            "skip_conntrack = \"{}\"",
+            local.skip_conntrack.as_str()
+        );
     }
     for (site, trunk) in &local.tunnel_trunks {
         let _ = write!(

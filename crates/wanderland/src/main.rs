@@ -16,13 +16,16 @@ mod host;
 mod invites;
 mod keepalive;
 mod logging;
+mod perf;
 mod probe;
 mod random;
 mod rawframe;
 mod shared_switch;
 mod sockopt;
+mod speedtest;
 mod stats;
 mod sync_net;
+mod tuning;
 
 use std::fs::File;
 use std::io::IsTerminal as _;

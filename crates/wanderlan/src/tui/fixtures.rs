@@ -133,6 +133,7 @@ fn peer(name: &str, address: &str) -> PeerStatus {
         identity_state: Some(wanderlan_core::api::IdentityState::Confirmed),
         down_reason: None,
         tunnel: wanderlan_core::config::TunnelMode::Direct,
+        tuning: None,
         tunnel_reason: "direct: the servers reach each other".into(),
         vni: Some(0x12_3456),
         endpoint: None,

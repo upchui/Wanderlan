@@ -25,4 +25,4 @@ expression: render(&app)
 "│haus2   10.8.0.11 20,30                         server         tunnel BLOCKED ║"
 "└──────────────────────────────────────────────────────────────────────────────┘"
 "                                                     draft: no changes  heim r7 "
-" Enter  details   o  on/offline   u  unblock   1-8  views   ?  help   q  quit   "
+" Enter  details   o  on/offline   u  unblock   t  optimize   ?  help   q  quit  "

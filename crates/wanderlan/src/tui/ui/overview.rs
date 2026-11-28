@@ -5,7 +5,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Cell, Paragraph, Row, Table, Wrap};
-use wanderlan_core::api::{PeerStatus, PortState, SiteState, SiteSummary, Status};
+use wanderlan_core::api::{PeerStatus, PortState, SiteState, SiteSummary, Status, TuningState};
 use wanderlan_core::topology;
 
 use super::{health_style, list, port_state, titled};
@@ -244,6 +244,33 @@ fn header_lines(app: &App, status: &Status) -> Vec<Line<'static>> {
             Span::styled("  (Sites: I)", theme::dim()),
         ])),
     }
+    // Optimizations that run now: about 30 s of full load on the transport.
+    for peer in &status.peers {
+        let Some(t) = peer
+            .tuning
+            .as_ref()
+            .filter(|t| t.state == TuningState::Running)
+        else {
+            continue;
+        };
+        let who = if t.by_peer {
+            format!(" ⟳ {} is optimizing the tunnel to this site", peer.name)
+        } else {
+            format!(" ⟳ Optimizing the tunnel to {}", peer.name)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(who, theme::title().patch(theme::bold())),
+            Span::styled(
+                format!(
+                    ": RPS off/on, both ways, {} s of ~{} s",
+                    t.age_secs,
+                    wanderlan_core::api::TUNING_SECONDS
+                ),
+                theme::title(),
+            ),
+            Span::styled("  (full load on the transport meanwhile)", theme::dim()),
+        ]));
+    }
     // Tunnel ports are unblocked at their peer row, trunk ports with U.
     let (tunnels, trunks): (Vec<&String>, Vec<&String>) = status
         .blocked
@@ -322,7 +349,18 @@ fn peer_row(peer: &PeerStatus, wide: bool, load: Option<String>) -> Row<'static>
     if let Some(load) = load {
         cells.push(Cell::from(Span::styled(load, theme::title())));
     }
-    cells.push(Cell::from(config_cell(peer)));
+    if peer
+        .tuning
+        .as_ref()
+        .is_some_and(|t| t.state == TuningState::Running)
+    {
+        cells.push(Cell::from(Span::styled(
+            "tuning…",
+            theme::title().patch(theme::bold()),
+        )));
+    } else {
+        cells.push(Cell::from(config_cell(peer)));
+    }
     if wide {
         cells.push(Cell::from(peer.vlans.clone()));
         cells.push(Cell::from(peer.trunk.clone()));
