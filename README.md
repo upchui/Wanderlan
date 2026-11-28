@@ -293,11 +293,10 @@ tests: its tunnels stay `nat`. The mode and why show in `wanderlan status`
 terminal UI and in the log.
 
 Between servers the tunnels always run `direct`. Where connection tracking
-is loaded (a firewall), every server, and every site with clients, exempts
-the tunnel packets from it (`notrack`, table `ip wanderlan`): tracking them
-would cost every packet. A stateful firewall on such a site must therefore
-accept UDP to the tunnel port by its port, not only as an established
-connection. A client keeps tracking for its uplink.
+is loaded (a firewall), a server with clients exempts the tunnel packets
+from it (`notrack`, table `ip wanderlan`): tracking them would cost every
+packet. A stateful firewall on such a server must therefore accept UDP to
+the tunnel port by its port, not only as an established connection.
 
 A site with clients of its own must be reachable for them, so it cannot sit
 behind NAT itself. A carrier-grade NAT that gives the control traffic and the
@@ -967,47 +966,6 @@ tunnel port are clamped to
 path). Larger packets still arrive, also with DF set: the tunnel packets are
 fragmented on the way (no DF outside) and put together at the other end.
 
-### Performance
-
-What limits the throughput is mostly the box, not the tunnel:
-
-* **One core for all the network work.** A NIC with one receive queue (a
-  Proxmox VM without "Multiqueue", many small boxes) unpacks the tunnel
-  packets, bridges and filters on one core. Spreading that work over the
-  cores (RPS) helps on real hardware, but in a VM every hand-off is an
-  expensive interrupt: with two vCPUs it cost a third of the throughput.
-  So wanderlan measures it: whenever a tunnel comes up (the client towards
-  its uplink, between servers the one with the smaller identity starts),
-  both boxes measure their receive rate through the tunnel with RPS off and
-  on on the interface the tunnel packets come in by, three times each, and
-  keep RPS on only where it received at least 10 % more. That is about 30 s
-  of full load on the transport, at most every 10 minutes per interface;
-  `wanderlan tune <site>` measures again. Without a measurement RPS stays
-  off; the trunk ports are never changed (a measurement between the boxes
-  does not show their part); the old values come back when wanderlan stops
-  or resets. More queues are the better fix: in a Proxmox VM "Multiqueue" =
-  number of vCPUs on the network devices.
-* **Packets split outside.** A full Ethernet frame needs a path MTU of 1554
-  bytes (1500 + 18 Ethernet and VLAN + 8 VXLAN + 8 UDP + 20 IP); on a
-  smaller path every such frame becomes two packets. TCP is clamped below
-  that, UDP (streaming, games) is not. Where the transport can take it (a
-  LAN: jumbo frames on the switch, the Proxmox bridge and the VM network
-  device), an MTU of at least 1554 avoids it.
-* **Connection tracking** of the tunnel packets: skipped (see "Clients
-  behind NAT").
-* **The transport** itself: a VPN encrypts every packet (WireGuard spreads
-  that over the cores, OpenVPN does not; a VM needs the CPU type `host` for
-  fast crypto).
-
-`wanderlan perf` watches the box for a few seconds (best during a transfer)
-and names what limits it, with what helps. `wanderlan speedtest <site>`
-measures the throughput to a peer both ways: TCP between the boxes over the
-transport network, and frames through the tunnel (full ones and, where they
-are split, ones that fit), with the busiest core of the receiver. The frames
-are untagged IPv4/UDP in 64 flows, like real traffic: the bridge of the peer
-drops them at the tunnel port, they never reach a LAN. Towards a client
-behind NAT, start it on the client.
-
 ### Loops
 
 The network itself is loop-free: split horizon between the servers, a tree
@@ -1111,9 +1069,6 @@ and keeps trying.
 | `wanderlan confirm` / `wanderlan rollback` | Confirm or revert the pending change |
 | `wanderlan validate <network.toml> [--local <local.toml>]` | Check files without applying them |
 | `wanderlan init [--dir D]` / `wanderlan export` | Print or write the example configuration / print the running `network.toml` |
-| `wanderlan perf [--seconds N] [--json]` | What limits the throughput of this box: the load of the cores, receive queues, split packets, connection tracking, with what helps |
-| `wanderlan speedtest <site> [--seconds N] [--json]` | Throughput to a peer both ways: TCP over the transport network and frames through the tunnel |
-| `wanderlan tune <site> [--json]` | Measure with a peer whether spreading the receive work over the cores (RPS) helps, and keep the better setting on both (about 30 s; also done by itself whenever a tunnel comes up) |
 | `wanderlan probe` / `wanderlan unblock <site\|port>` | Measure the path MTU now / re-enable a port the loop guard shut down (the tunnel to a site, or a trunk port) |
 | `wanderlan reset [--yes]` | Remove everything wanderlan set up on this site |
 | `wanderlan networks [list\|add <name>\|remove <name> [--yes]]` | The [networks of this box](#several-networks-on-one-box) |
@@ -1182,9 +1137,6 @@ or `WANDERLAN_SOCKET`, the network of the box with `--net` or
   Two segments of one box with a breakout must not use the same addresses.
 * **Large transfers stall**: compare the path MTU in `wanderlan status` with
   the MTU of the VPN; set `mss` if probes are filtered.
-* **Slower than expected**: `wanderlan speedtest <site>` compares the
-  transport with the tunnel; `wanderlan perf` during a transfer names what
-  limits the box (see "Performance").
 * **DHCP replies get lost** (`WARNING: DHCP replies for VLAN 114 … get
   lost`): the trunk of this site and that of a peer hang in one switch
   network (the status notes that much: `Note: Trunk ens19 is in one switch

@@ -187,30 +187,6 @@ expect_output "alpha takes beta online right after the join" 'beta is online' "$
 wait_for 30 "VLAN 20: the clients reach each other again" ping_ok
 healthy
 
-begin "Calibration under the hardened unit: RPS measured with the peer, kept or not"
-calibration() { x beta "journalctl -u wanderland -o cat | grep 'Calibrated the receive work with' | tail -1"; }
-wait_for 200 "beta (a client) calibrated the receive work with alpha after its tunnel came up" \
-  eval '[ -n "$(calibration)" ]'
-line=$(calibration)
-echo "  info  $line"
-# " here …" (not "there …").
-nic=$(grep -o ' here [^ ]* RPS o[nf]*' <<<"$line" | head -1 | awk '{print $2}')
-kept=$(grep -o ' here [^ ]* RPS o[nf]*' <<<"$line" | head -1 | awk '{print $4}')
-rps_off() { grep -Eq '^[0,]+$' <<<"$(x beta "cat /sys/class/net/$nic/queues/rx-0/rps_cpus")"; }
-check "beta changed RPS of its transport interface (ReadWritePaths=/sys/devices): ${nic:-none}" test -n "$nic"
-if [ "$kept" = on ]; then
-  check "beta: RPS of $nic is on, as measured" eval '! rps_off'
-else
-  check "beta: RPS of $nic is off, as measured" rps_off
-fi
-check "alpha logged its side" \
-  x alpha "journalctl -u wanderland -o cat | grep -q 'Calibrated the receive work with \"beta\"'"
-x beta "systemctl stop wanderland"
-check "beta: after a stop RPS of $nic has its value before again" rps_off
-x beta "systemctl start wanderland"
-wait_for 30 "VLAN 20: the clients reach each other again" ping_ok
-healthy
-
 begin "Local breakout under the hardened unit: sysctls written and put back"
 uplink=$(x beta "ip -o -4 addr show | awk '/ 10\\.8\\.0\\.2\\// {print \$2}'")
 forwarding() { x beta "cat /proc/sys/net/ipv4/conf/$uplink/forwarding"; }

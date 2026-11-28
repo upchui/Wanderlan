@@ -11,11 +11,8 @@
 //! (`0x8100`), so the inner ethertype compare stops it after one look; only
 //! the keepalives (one per client every 15 s) reach the set update. The
 //! sets survive a rewrite of the rules (only the chains are flushed). Where
-//! connection tracking is loaded, the tunnel packets of a server (and of a
-//! site with clients) skip it (`notrack`): tracking them would cost every
-//! packet and gain nothing (its firewall accepts the tunnel port by port).
-//! A client keeps it for its uplink: its firewall may let the answers in by
-//! it.
+//! connection tracking is loaded, the tunnel packets skip it (`notrack`):
+//! tracking them would cost every packet and gain nothing.
 //!
 //! Through NAT both ends of a tunnel must send from the tunnel port: a NAT
 //! keeps one mapping per source port, and the answers must reach the port
@@ -54,9 +51,6 @@ const OUT_CHAIN: &str = "out";
 /// tracking (forwarded ones, of a local breakout, keep it: they are
 /// masqueraded).
 const NOTRACK: &str = "wl notrack local";
-/// Comment of the rules that exempt the tunnel packets a server sends to
-/// the tunnel port of a peer (from a port per flow), and the port.
-const NOTRACK_OUT: &str = "wl notrack out ";
 /// Comment prefix of the rules that set the source port: port and VNI.
 const FIXED_PREFIX: &str = "wl fixed ";
 /// Prefix of the set of one client.
@@ -131,9 +125,6 @@ pub struct LearnTable {
     /// The tunnel ports whose packets skip connection tracking (0: a rule
     /// of a version without the port, rewritten).
     pub notrack: BTreeSet<u16>,
-    /// The tunnel ports of peers whose packets from here (from a port per
-    /// flow) skip connection tracking.
-    pub notrack_out: BTreeSet<u16>,
     /// The tunnels through NAT.
     pub fixed: BTreeSet<FixedRule>,
 }
@@ -141,10 +132,7 @@ pub struct LearnTable {
 impl LearnTable {
     /// Nothing to hold: no table.
     pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
-            && self.notrack.is_empty()
-            && self.notrack_out.is_empty()
-            && self.fixed.is_empty()
+        self.rules.is_empty() && self.notrack.is_empty() && self.fixed.is_empty()
     }
 
     /// The ports that need a gate: those of the learned clients.
@@ -161,7 +149,6 @@ impl LearnTable {
     pub fn extend(&mut self, other: &LearnTable) {
         self.rules.extend(other.rules.iter().cloned());
         self.notrack.extend(other.notrack.iter().copied());
-        self.notrack_out.extend(other.notrack_out.iter().copied());
         self.fixed.extend(other.fixed.iter().copied());
     }
 }
@@ -261,12 +248,6 @@ pub fn learn_script(table: &LearnTable, stale_sets: &BTreeSet<String>) -> String
             "add rule {t} {OUT_CHAIN} udp sport {port} notrack comment \"{NOTRACK} {port}\""
         );
     }
-    for port in &table.notrack_out {
-        let _ = writeln!(
-            out,
-            "add rule {t} {OUT_CHAIN} udp dport {port} notrack comment \"{NOTRACK_OUT}{port}\""
-        );
-    }
     // The gates: tunnel packets to a port whose inner frame is a keepalive.
     for port in table.gates() {
         let _ = writeln!(
@@ -334,11 +315,6 @@ pub fn parse_state(json: &str) -> Option<LearnState> {
             let comment = rule.get("comment").and_then(|c| c.as_str()).unwrap_or("");
             if let Some(port) = comment.strip_prefix("wl learn gate ") {
                 state.gates.extend(port.trim().parse::<u16>().ok());
-            } else if let Some(port) = comment.strip_prefix(NOTRACK_OUT) {
-                state
-                    .table
-                    .notrack_out
-                    .extend(port.trim().parse::<u16>().ok());
             } else if let Some(rest) = comment.strip_prefix(NOTRACK) {
                 // Without a port: written by a version before networks.
                 state.table.notrack.insert(rest.trim().parse().unwrap_or(0));
@@ -532,7 +508,6 @@ mod tests {
         LearnTable {
             rules: rules(),
             notrack: [51822].into(),
-            notrack_out: [51822, 51900].into(),
             fixed: [FixedRule {
                 port: 51822,
                 vni: 0x12_3456,
@@ -554,8 +529,6 @@ mod tests {
             "add set ip wanderlan ep-lab { type ipv4_addr . inet_service; flags dynamic,timeout; timeout 90s; size 8; }",
             "add rule ip wanderlan pre udp dport 51822 fib daddr type local notrack comment \"wl notrack local 51822\"",
             "add rule ip wanderlan out udp sport 51822 notrack comment \"wl notrack local 51822\"",
-            // To the tunnel ports of the peers (a server's own flows).
-            "add rule ip wanderlan out udp dport 51900 notrack comment \"wl notrack out 51900\"",
             "add rule ip wanderlan pre udp dport 51822 @th,224,16 0x88b5 jump wl-learn comment \"wl learn gate 51822\"",
             "add rule ip wanderlan wl-learn udp dport 51822 @th,64,8 0x08 @th,96,24 1193046 update @ep-lab { ip saddr . udp sport } comment \"wl learn lab 1193046 51822\"",
             // The tunnel port as source port again.
@@ -569,7 +542,6 @@ mod tests {
         let no_sets = BTreeSet::new();
         let tracked = LearnTable {
             notrack: BTreeSet::new(),
-            notrack_out: BTreeSet::new(),
             ..table()
         };
         assert!(!learn_script(&tracked, &no_sets).contains("notrack"));
@@ -616,9 +588,7 @@ mod tests {
             {"rule": {"family": "ip", "table": "wanderlan", "chain": "pre", "handle": 5, "comment": "wl learn gate 51822", "expr": []}},
             {"rule": {"family": "ip", "table": "wanderlan", "chain": "wl-learn", "handle": 6, "comment": "wl learn lab 1193046 51822", "expr": []}},
             {"rule": {"family": "ip", "table": "wanderlan", "chain": "pre", "handle": 7, "comment": "wl notrack local 51822", "expr": []}},
-            {"rule": {"family": "ip", "table": "wanderlan", "chain": "out", "handle": 8, "comment": "wl fixed 51822 1193046", "expr": []}},
-            {"rule": {"family": "ip", "table": "wanderlan", "chain": "out", "handle": 9, "comment": "wl notrack out 51822", "expr": []}},
-            {"rule": {"family": "ip", "table": "wanderlan", "chain": "out", "handle": 10, "comment": "wl notrack out 51900", "expr": []}}
+            {"rule": {"family": "ip", "table": "wanderlan", "chain": "out", "handle": 8, "comment": "wl fixed 51822 1193046", "expr": []}}
         ]}"#;
         let state = parse_state(json).unwrap();
         assert!(state.holds(&table()), "{state:?}");

@@ -283,13 +283,6 @@ pub enum Input {
         /// What happened.
         event: shared_switch::DhcpEvent,
     },
-    /// A calibration of the receive work with a peer ended.
-    Calibrated {
-        /// The peer.
-        peer: String,
-        /// What came out, or why not.
-        result: Result<crate::speedtest::Calibration, String>,
-    },
     /// SIGHUP: the files were changed by hand.
     Reload,
     /// The inviting site answered our join request.
@@ -531,15 +524,6 @@ struct Controller {
     keepalive: watch::Sender<keepalive::Keepalives>,
     /// What the switch check looks at.
     switch_check: watch::Sender<shared_switch::Targets>,
-    /// The interfaces the tunnel packets leave and come in by.
-    underlay_nics: BTreeSet<String>,
-    /// The interface the tunnel to each peer runs by.
-    underlay_by_peer: BTreeMap<SiteId, String>,
-    /// The peers whose tunnel was up at the last reconcile: one that comes
-    /// up is calibrated with.
-    tunnels_up: BTreeSet<SiteId>,
-    /// When the receive work of an interface was calibrated (or tried) last.
-    calibration_tried: BTreeMap<String, Instant>,
     /// The trunks in one switch network with a peer, by mapped VLAN (see
     /// [`shared_switch`]).
     shared: BTreeMap<(String, u16), SharedState>,
@@ -681,16 +665,13 @@ pub async fn run(args: Args) -> Result<()> {
         if let Err(e) = host.teardown(STOP_TEARDOWN).await {
             warn!("{e:#}");
         }
-        crate::tuning::restore_all();
         if let Some(task) = connection {
             task.abort();
         }
         anyhow::bail!("internal error: {why}; exiting so that systemd restarts wanderland");
     }
     info!("Stopping; removing everything wanderlan created");
-    let removed = host.teardown(STOP_TEARDOWN).await;
-    crate::tuning::restore_all();
-    let removed = removed?;
+    let removed = host.teardown(STOP_TEARDOWN).await?;
     if let Some(task) = connection {
         task.abort();
     }
@@ -804,10 +785,6 @@ impl Controller {
             push_refused: None,
             keepalive: keepalive_tx,
             switch_check: switch_tx,
-            underlay_nics: BTreeSet::new(),
-            underlay_by_peer: BTreeMap::new(),
-            tunnels_up: BTreeSet::new(),
-            calibration_tried: BTreeMap::new(),
             shared: BTreeMap::new(),
             former_binds: Vec::new(),
             last_bind: None,
@@ -1079,27 +1056,6 @@ pub async fn cleanup(args: &Args) -> Result<()> {
 /// loads it with `bridge-nf-call-iptables = 1`): the bridge option of
 /// wanderlan can only add to that, not switch it off, so untagged frames of
 /// the trunk then pass iptables and conntrack.
-/// How long after a tunnel came up its receive work is calibrated (both
-/// ends of the tunnel up).
-const CALIBRATE_DELAY: Duration = Duration::from_secs(10);
-/// An interface is calibrated (or tried) at most this often by itself.
-const CALIBRATE_AGAIN: Duration = Duration::from_secs(600);
-/// Tries of a calibration by itself (the peer may be busy for a moment).
-const CALIBRATE_ATTEMPTS: u32 = 3;
-/// The pause between two tries.
-const CALIBRATE_RETRY: Duration = Duration::from_secs(30);
-
-/// One side of a calibration for the API.
-fn tune_side(s: crate::speedtest::Side) -> api::TuneSide {
-    api::TuneSide {
-        nic: s.nic,
-        rps: s.rps,
-        off_bps: s.off_bps,
-        on_bps: s.on_bps,
-        why_not: s.why_not,
-    }
-}
-
 fn bridge_netfilter_warning() -> Option<String> {
     let on = |name: &str| {
         std::fs::read_to_string(format!("/proc/sys/net/bridge/{name}"))
@@ -1984,14 +1940,6 @@ impl Controller {
                 .map(|t| t.peer.id)
                 .collect()
         });
-        // The tunnel interface to each peer (for a speed test).
-        let tunnels: BTreeMap<SiteId, String> =
-            self.config.as_ref().map_or_else(BTreeMap::new, |cfg| {
-                topology::tunnels_for(&cfg.network, cfg.self_id())
-                    .into_iter()
-                    .map(|t| (t.peer.id, t.ifname(self.tag)))
-                    .collect()
-            });
         let keyed = self
             .peer_keys
             .iter()
@@ -2005,8 +1953,6 @@ impl Controller {
                         client: clients.contains(name),
                         view: Arc::from(texts.get(name)?.as_str()),
                         keys: k.keys.clone(),
-                        tunnel: tunnels.get(name).cloned(),
-                        underlay: self.underlay_by_peer.get(name).cloned(),
                     },
                 ))
             })
@@ -2022,8 +1968,6 @@ impl Controller {
                         client: true,
                         view: Arc::from(texts.get(name)?.as_str()),
                         keys: k.keys.clone(),
-                        tunnel: None,
-                        underlay: None,
                     },
                 ))
             }))
@@ -2061,19 +2005,6 @@ impl Controller {
                 request: Request::Join(params),
                 reply,
             } => self.start_join(params, reply),
-            Input::Api {
-                request: Request::Speedtest(params),
-                reply,
-            } => self.start_speedtest(&params, reply),
-            Input::Api {
-                request: Request::Perf(params),
-                reply,
-            } => self.start_perf(&params, reply),
-            Input::Api {
-                request: Request::Tune(params),
-                reply,
-            } => self.start_tune(&params, reply),
-            Input::Calibrated { peer, result } => self.calibrated(&peer, result),
             Input::Api { request, reply } => {
                 let result = self.api(request).await;
                 let _ = reply.send(result);
@@ -2517,8 +2448,6 @@ impl Controller {
 
     /// Housekeeping: automatic confirmation of synced changes, sync retries.
     async fn every_second(&mut self) {
-        // Settings of RPS for a measurement that ran out.
-        crate::tuning::expire_leases();
         if self.reload_wanted && self.pending.is_none() {
             self.reload_wanted = false;
             self.reload_files().await;
@@ -3624,9 +3553,7 @@ impl Controller {
                     ))),
                 }
             }
-            Request::Join(_) | Request::Speedtest(_) | Request::Perf(_) | Request::Tune(_) => {
-                Err(ApiError::new("handled separately"))
-            }
+            Request::Join(_) => Err(ApiError::new("join requests are handled separately")),
             Request::Reset => to_value(&self.reset().await?),
             Request::Networks | Request::AddNetwork(_) | Request::RemoveNetwork(_) => Err(
                 ApiError::new("the networks of the box are handled by the daemon itself"),
@@ -3955,178 +3882,6 @@ impl Controller {
 
     /// Starts joining a network. The connection to the inviting site runs in
     /// the background; its answer comes back as [`Input::JoinAnswer`].
-    /// A speed test with a peer, in a task of its own (it takes a while).
-    fn start_speedtest(
-        &self,
-        params: &api::SpeedtestParams,
-        reply: oneshot::Sender<Result<serde_json::Value, ApiError>>,
-    ) {
-        let peer = self.speedtest_peer(&params.site);
-        let seconds = params
-            .seconds
-            .unwrap_or(api::SPEEDTEST_SECONDS)
-            .clamp(1, api::SPEEDTEST_MAX_SECONDS);
-        tokio::spawn(async move {
-            let result = match peer {
-                Ok(peer) => crate::speedtest::run(peer, seconds)
-                    .await
-                    .map_err(ApiError::new)
-                    .and_then(|r| to_value(&r)),
-                Err(e) => Err(e),
-            };
-            let _ = reply.send(result);
-        });
-    }
-
-    /// Who a speed test with `site` is with.
-    fn speedtest_peer(&self, site: &str) -> Result<crate::speedtest::Peer, ApiError> {
-        let cfg = self
-            .config
-            .as_ref()
-            .ok_or_else(|| ApiError::new("this site is not part of a network yet"))?;
-        let target = cfg.network.find(site).map_err(ApiError::new)?;
-        let label = cfg.network.label(target.id);
-        let tunnel = topology::tunnels_for(&cfg.network, cfg.self_id())
-            .into_iter()
-            .find(|t| t.peer.id == target.id)
-            .ok_or_else(|| {
-                ApiError::new(format!(
-                    "\"{label}\" is no direct peer of this site (no tunnel to it)"
-                ))
-            })?;
-        if tunnel.kind == TunnelKind::Client
-            && self.runtime.mode(&tunnel) == config::TunnelMode::Nat
-        {
-            return Err(ApiError::new(format!(
-                "\"{label}\" is a client behind NAT: its control port cannot be reached from here; start the speed test there (`wanderlan speedtest {}`)",
-                cfg.self_name()
-            )));
-        }
-        let me = self
-            .own_id()
-            .ok_or_else(|| ApiError::new("this box has no identity yet"))?;
-        let keys = self.peer_keys.get(&target.id).ok_or_else(|| {
-            ApiError::new(format!(
-                "the identity of \"{label}\" is not confirmed yet (see `wanderlan status`)"
-            ))
-        })?;
-        Ok(crate::speedtest::Peer {
-            name: label,
-            control: SocketAddrV4::new(
-                target.address,
-                self.runtime.control_port_of(&cfg.network, target.id),
-            ),
-            me,
-            id: target.id,
-            keys: keys.keys.clone(),
-            tunnel: tunnel.ifname(self.tag),
-            pmtu: self.runtime.pmtu.get(&target.id).copied(),
-        })
-    }
-
-    /// A calibration with a peer on request, in a task of its own.
-    fn start_tune(
-        &self,
-        params: &api::TuneParams,
-        reply: oneshot::Sender<Result<serde_json::Value, ApiError>>,
-    ) {
-        let peer = self.speedtest_peer(&params.site);
-        let nic = peer
-            .as_ref()
-            .ok()
-            .and_then(|p| self.underlay_by_peer.get(&p.id).cloned());
-        let inputs = self.inputs.clone();
-        tokio::spawn(async move {
-            let result = match peer {
-                Ok(peer) => {
-                    let name = peer.name.clone();
-                    let result = crate::speedtest::calibrate(peer, nic).await;
-                    let _ = inputs
-                        .send(Input::Calibrated {
-                            peer: name.clone(),
-                            result: result.clone(),
-                        })
-                        .await;
-                    result.map_err(ApiError::new).and_then(|c| {
-                        to_value(&api::Tune {
-                            peer: name,
-                            here: tune_side(c.here),
-                            there: tune_side(c.there),
-                        })
-                    })
-                }
-                Err(e) => Err(e),
-            };
-            let _ = reply.send(result);
-        });
-    }
-
-    /// A calibration ended: logged (an interface that cannot be changed
-    /// on either side only in the debug log).
-    fn calibrated(&mut self, peer: &str, result: Result<crate::speedtest::Calibration, String>) {
-        let side = |s: &crate::speedtest::Side| {
-            let nic = s.nic.as_deref().unwrap_or("?");
-            let measured = crate::speedtest::summary(s.off_bps, s.on_bps);
-            match (s.rps, &s.why_not) {
-                (Some(on), _) => {
-                    format!("{nic} RPS {} ({measured})", if on { "on" } else { "off" })
-                }
-                (None, Some(why)) => format!("{nic} unchanged: {why} ({measured})"),
-                (None, None) => format!("{nic} unchanged ({measured})"),
-            }
-        };
-        match result {
-            Ok(c) => self.events.info(format!(
-                "Calibrated the receive work with \"{peer}\": here {}; there {}",
-                side(&c.here),
-                side(&c.there)
-            )),
-            Err(why) if why.contains("cannot be changed here") => {
-                debug!("No calibration with \"{peer}\": {why}");
-            }
-            Err(why) => self
-                .events
-                .info(format!("No calibration with \"{peer}\": {why}")),
-        }
-    }
-
-    /// What limits the throughput of this box, in a task of its own (it
-    /// watches for a few seconds).
-    fn start_perf(
-        &self,
-        params: &api::PerfParams,
-        reply: oneshot::Sender<Result<serde_json::Value, ApiError>>,
-    ) {
-        let seconds = params.seconds.unwrap_or(api::PERF_SECONDS).clamp(1, 30);
-        let mut input = crate::perf::Input {
-            underlay: self.underlay_nics.iter().cloned().collect(),
-            conntrack: self.runtime.conntrack,
-            bridge_netfilter: bridge_netfilter_warning(),
-            ..crate::perf::Input::default()
-        };
-        if let Some(cfg) = &self.config {
-            let desired = desired::derive_in(&self.scope(), cfg, &self.runtime);
-            input.trunks = desired
-                .trunks
-                .iter()
-                .filter(|t| self.bridges.contains(&t.bridge))
-                .map(|t| t.name.clone())
-                .collect();
-            input.tunnels = desired.tunnels.iter().map(|t| t.name.clone()).collect();
-            input.notrack = !desired.learn.notrack.is_empty();
-            input.pmtu = self
-                .runtime
-                .pmtu
-                .iter()
-                .map(|(id, pmtu)| (cfg.network.label(*id), *pmtu))
-                .collect();
-        }
-        tokio::spawn(async move {
-            let perf = crate::perf::run(input, seconds).await;
-            let _ = reply.send(to_value(&perf));
-        });
-    }
-
     fn start_join(
         &mut self,
         params: JoinParams,
@@ -4410,12 +4165,6 @@ impl Controller {
         }
         // What other networks of the box have stays.
         let alone = !self.host.others_configured(&self.network).await;
-        if alone {
-            // RPS as it was before wanderlan measured.
-            crate::tuning::restore_all();
-            self.tunnels_up.clear();
-            self.calibration_tried.clear();
-        }
         match reconcile::Actual::observe(&self.sys).await {
             Ok(_) if !alone => {}
             Ok(actual) => {
@@ -4953,14 +4702,7 @@ impl Controller {
                 .await?;
             return Ok(Vec::new());
         };
-        let (mtus, underlay) = self.underlay(&cfg).await;
-        self.runtime.underlay_mtu = mtus;
-        self.underlay_nics = underlay.values().cloned().collect();
-        if self.underlay_by_peer != underlay {
-            self.underlay_by_peer = underlay;
-            // The peers learn which interface a calibration changes.
-            self.publish();
-        }
+        self.runtime.underlay_mtu = self.underlay_mtus(&cfg).await;
         self.refresh_breakout(&cfg).await;
         let desired = Arc::new(desired::derive_in(&self.scope(), &cfg, &self.runtime));
         for (peer, reason) in &desired.unbuilt {
@@ -5031,70 +4773,7 @@ impl Controller {
         }
         self.update_port_map().await;
         self.update_switch_check(&desired);
-        self.calibrate_new_tunnels(&cfg, &desired);
         Ok(changes)
-    }
-
-    /// A tunnel that came up: the receive work is calibrated with its peer
-    /// (see `speedtest::calibrate`), by the side that can reach the other
-    /// (a client towards its uplink; between servers the smaller identity),
-    /// at most every [`CALIBRATE_AGAIN`] per interface.
-    fn calibrate_new_tunnels(&mut self, cfg: &Config, desired: &desired::Desired) {
-        let up: BTreeSet<SiteId> = desired
-            .tunnels
-            .iter()
-            .filter(|t| t.enabled)
-            .map(|t| t.peer)
-            .collect();
-        let new: Vec<SiteId> = up.difference(&self.tunnels_up).copied().collect();
-        self.tunnels_up = up;
-        let me = self.own_id();
-        for tunnel in topology::tunnels_for(&cfg.network, cfg.self_id()) {
-            let peer = tunnel.peer.id;
-            let starts = match tunnel.kind {
-                TunnelKind::Uplink => true,
-                TunnelKind::Client => false,
-                TunnelKind::Server => me.is_some_and(|me| me < peer),
-            };
-            if !starts || !new.contains(&peer) {
-                continue;
-            }
-            let Some(nic) = self.underlay_by_peer.get(&peer).cloned() else {
-                continue;
-            };
-            if self
-                .calibration_tried
-                .get(&nic)
-                .is_some_and(|at| at.elapsed() < CALIBRATE_AGAIN)
-            {
-                continue;
-            }
-            let Ok(target) = self.speedtest_peer(&peer.to_string()) else {
-                continue;
-            };
-            self.calibration_tried.insert(nic.clone(), Instant::now());
-            let inputs = self.inputs.clone();
-            tokio::spawn(async move {
-                // Both ends of the tunnel up first; the peer may be busy
-                // (starting too, a change, another test): a few tries.
-                tokio::time::sleep(CALIBRATE_DELAY).await;
-                let name = target.name.clone();
-                let mut result = Err(String::new());
-                for attempt in 0..CALIBRATE_ATTEMPTS {
-                    if attempt > 0 {
-                        tokio::time::sleep(CALIBRATE_RETRY).await;
-                    }
-                    result = crate::speedtest::calibrate(target.clone(), Some(nic.clone())).await;
-                    match &result {
-                        Err(why) if !why.contains("cannot be changed") => {
-                            debug!("Calibration with \"{name}\" failed ({why}); trying again");
-                        }
-                        _ => break,
-                    }
-                }
-                let _ = inputs.send(Input::Calibrated { peer: name, result }).await;
-            });
-        }
     }
 
     /// Tells the switch check which mapped VLANs of the trunks to look at,
@@ -5418,33 +5097,31 @@ impl Controller {
     }
 
     /// Peer → MTU of the interface its tunnel leaves by (an upper bound of the
-    /// path MTU, for the MSS until the path is measured), and the names of
-    /// these interfaces (the tunnel packets come in by them too).
-    async fn underlay(&self, cfg: &Config) -> (BTreeMap<SiteId, u16>, BTreeMap<SiteId, String>) {
-        let mut mtus = BTreeMap::new();
-        let mut names = BTreeMap::new();
+    /// path MTU, for the MSS until the path is measured).
+    async fn underlay_mtus(&self, cfg: &Config) -> BTreeMap<SiteId, u16> {
         let by_index = self.tunnel_interfaces().await;
         if by_index.is_empty() {
-            return (mtus, names);
+            return BTreeMap::new();
         }
         let Ok(links) = self.sys.links().await else {
-            return (mtus, names);
+            return BTreeMap::new();
         };
+        let mut out = BTreeMap::new();
         for (index, peers) in by_index {
-            let Some(link) = links.iter().find(|l| l.index == index) else {
+            let Some(mtu) = links
+                .iter()
+                .find(|l| l.index == index)
+                .and_then(|l| u16::try_from(l.mtu).ok())
+            else {
                 continue;
             };
             for peer in peers {
-                if cfg.network.site(peer).is_none() {
-                    continue;
-                }
-                names.insert(peer, link.name.clone());
-                if let Ok(mtu) = u16::try_from(link.mtu) {
-                    mtus.insert(peer, mtu);
+                if cfg.network.site(peer).is_some() {
+                    out.insert(peer, mtu);
                 }
             }
         }
-        (mtus, names)
+        out
     }
 
     /// Interface index → the peers whose tunnel leaves through it, as the
