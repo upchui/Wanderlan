@@ -1,0 +1,491 @@
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.34
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 10765
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.34_arm64.deb
+Size: 2913808
+MD5sum: f67e71f1f3139f0dd1e2fa48492a8dc6
+SHA1: d8e174cd5b582df8030e81dab66eb781be3404e7
+SHA256: 7e5ebc3fe72fe60f22b115eb16240286c3505e051759477d26478e62618db5e0
+SHA512: 4af2e974c23fa4645bf19fd6da04065ab813b282a1b2a843e1309bcb353fd26190b3422ecec546941ea275a013990d6b2cd27d56c7069f5718bc8bee70225401
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (GRETAP, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One GRETAP tunnel per peer site, a Linux bridge with VLAN filtering,
+ VLAN mappings, MSS clamping and loop protection. It builds no VPN; the sites
+ must already reach each other through an existing transport network such as a
+ VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.35
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 10785
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.35_arm64.deb
+Size: 2920832
+MD5sum: 150f4d8a73be768b30af103627850910
+SHA1: 7ee0871f21e34193c580dce1a71b427e3b6f6404
+SHA256: 7b2df5e6205f2f63610748222a6cc1b80a494c09a0dc0748abd899c241c2837e
+SHA512: 18801c21a772eff43fe170de7b7218779e8646b9e57821b48aee7ef6223bb9db1c72b023f4ea0ae1cdd74037f13811c342013c858afa8d5cc5bd547af7467cd4
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (GRETAP, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One GRETAP tunnel per peer site, a Linux bridge with VLAN filtering,
+ VLAN mappings, MSS clamping and loop protection. It builds no VPN; the sites
+ must already reach each other through an existing transport network such as a
+ VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.36
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 10907
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.36_arm64.deb
+Size: 2961428
+MD5sum: a2fccfa51a055fbd5cd73b9747652570
+SHA1: 9498f0cc486498f9870e55f3f9489fef7a4733df
+SHA256: 2c81e136872340c02d78f3fbc0fc15a7f5f891ab6eb4dc0709b2edfcf150936a
+SHA512: 330db83ce21e3fd7b6851f719b83f6cc241193279f5937d1180ff35d3d456b367d4d0683844ff41c30781c1dfe8c3a5624dc746d36a5f0d4fbd9b4c879854129
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (GRETAP, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One GRETAP tunnel per peer site, a Linux bridge with VLAN filtering,
+ VLAN mappings, MSS clamping and loop protection. It builds no VPN; the sites
+ must already reach each other through an existing transport network such as a
+ VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.37
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 10907
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.37_arm64.deb
+Size: 2961016
+MD5sum: 6a3d3b02816440edf51d89b173101b28
+SHA1: 430cd2f697f677edba927c89ca7c42c6e3c484c1
+SHA256: 3879be53a183f214ceeea449771eb5e7c1d15d6689ef45c748c947e80012d7e8
+SHA512: 8c25012a8e3098c75cbda474d7df919ab7663c8384aede5a413cdea3fb7ddfe850c9dde27054b6ca1e20c7d73260a730aa3d1fb3766cf0982f186c42d172b172
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (GRETAP, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One GRETAP tunnel per peer site, a Linux bridge with VLAN filtering,
+ VLAN mappings, MSS clamping and loop protection. It builds no VPN; the sites
+ must already reach each other through an existing transport network such as a
+ VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.38
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 10965
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.38_arm64.deb
+Size: 2985284
+MD5sum: 1d5e6abff9b64ff83775fd3dddce3265
+SHA1: 3b4e5536f3f0304314612c75d4bc2abb68725db1
+SHA256: 4fdb0d4031835d957196146efad8c94de469c05843e117920dca9bfa525c46d7
+SHA512: f9c049eb55a2dda9e58ebb74ca64eeab6bbb031954e1cdb9496c8f1ce46990dea7f92e6ebbc2c357011dbc383c348d6c4df5f831d061522f5ee0a6896d50b94c
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (GRETAP, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One GRETAP tunnel per peer site, a Linux bridge with VLAN filtering,
+ VLAN mappings, MSS clamping and loop protection. It builds no VPN; the sites
+ must already reach each other through an existing transport network such as a
+ VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.39
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 10970
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.39_arm64.deb
+Size: 2986516
+MD5sum: 8ebf0f7ea11e0b2c8201c00334d65af0
+SHA1: b613591090f62bac085125d469336da3a0769cff
+SHA256: 012fdd458e02897cce960b95d62a796ca812d1359d4dcf5aca6f84021d8e2826
+SHA512: cdf77ea305c16d4f6d8fa8ae9187cc522586db21553a25c35d928f14675d3c20cb5382c9be28549082271806ed5e9a14f2f3512b857ec277365221dc4fa1f647
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (GRETAP, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One GRETAP tunnel per peer site, a Linux bridge with VLAN filtering,
+ VLAN mappings, MSS clamping and loop protection. It builds no VPN; the sites
+ must already reach each other through an existing transport network such as a
+ VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.40
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 11212
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.40_arm64.deb
+Size: 3029288
+MD5sum: 1e54ddd4d82049ca81b224c43f6cc8ad
+SHA1: e775995df561ee4f63dd539e9ec78cd01d3e7c06
+SHA256: 3c8bb53907c6bc9dfa70ed4bfa33776014de45c24b2f9fbb525c94b7a87a88fa
+SHA512: 743d24dc090093dd1da23b18ae645838e669117d6bc2a9c68f1096c88e175c2af5632b12e00bb1ca5e5dc2bd76f494330e250c4fcb8737082b2a0ed645db3e56
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (GRETAP, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One GRETAP tunnel per peer site, a Linux bridge with VLAN filtering,
+ VLAN mappings, MSS clamping and loop protection. It builds no VPN; the sites
+ must already reach each other through an existing transport network such as a
+ VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.41
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 11227
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.41_arm64.deb
+Size: 3032412
+MD5sum: ddf0098360155d0855d87e49807e45d9
+SHA1: b20ea1609dbeaf3d4025dccedb67e9da2491a3a7
+SHA256: 456566874c3f6ad4c0549260b0436959495045b88f42ee2bffe159a39e2a27a0
+SHA512: c0577d004f43def9b86a1e21bcf75d3391569bd28d40e087c06e441d4cc2cdfd2983b33eba048195c88ca533a8eccbe80f2e1711fe4370b476954b06257ebe29
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (GRETAP, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One GRETAP tunnel per peer site, a Linux bridge with VLAN filtering,
+ VLAN mappings, MSS clamping and loop protection. It builds no VPN; the sites
+ must already reach each other through an existing transport network such as a
+ VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.42
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 11547
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.42_arm64.deb
+Size: 3133968
+MD5sum: 5fcaa372c6d99f045d1d55185d8bd42b
+SHA1: c572b7a5524af1b50ac48a97c9e0b06d896205da
+SHA256: 4250aa62ef5c1f049dd4b5949f7d52b45e6d5c359160390928817238fc1f0842
+SHA512: 243a3179519d3d9b2e19124e1fe463a75465952a73e75c8b1563aa2e181245731da6b4892959bb791cd12d42321fb30669d7b108fa4b4ec8b032fd22d9087ec0
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (GRETAP, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One GRETAP tunnel per peer site, a Linux bridge with VLAN filtering,
+ VLAN mappings, MSS clamping and loop protection. It builds no VPN; the sites
+ must already reach each other through an existing transport network such as a
+ VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.43
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 11529
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.43_arm64.deb
+Size: 3127376
+MD5sum: a918e87a49ebc9b55a6a5c875f00d55b
+SHA1: 33f66b8470e2ae08ba735abc7e1991a18fdec4c5
+SHA256: e1fa1f3ad2df92e53d314fb04e29090b3532d8a8c0883004631ec9af9d7e0d42
+SHA512: ff8db11dcc1e0977cfd458bb5d1362e92a01af4decc80fe9ce759d2388a0422ac21bbd1bb47c8ff2a42c361c7ffdf486c5e914a7fe5113c292e3670bf12c559c
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (GRETAP, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One GRETAP tunnel per peer site, a Linux bridge with VLAN filtering,
+ VLAN mappings, MSS clamping and loop protection. It builds no VPN; the sites
+ must already reach each other through an existing transport network such as a
+ VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.45
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 11562
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.45_arm64.deb
+Size: 3139544
+MD5sum: e5ec1948870548f41e8dfcadadc5ce77
+SHA1: 3465feef3ac221c09ea1f23901597d9baceea6a1
+SHA256: 4f47080396ae7d4e66d023b6c0cf9beddb5c080e1c5c31ddda132f46629b39c2
+SHA512: e2e6d4d7296e8ade3e4d4ddae22c2b7afc86d7bb518ec9e494b5e413269ea35d06b6c711b86c8b204f1395f98dfc9aa6290482cfdde6340f2245a777ae1d15ae
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (GRETAP, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One GRETAP tunnel per peer site, a Linux bridge with VLAN filtering,
+ VLAN mappings, MSS clamping and loop protection. It builds no VPN; the sites
+ must already reach each other through an existing transport network such as a
+ VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.50
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 11910
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.50_arm64.deb
+Size: 3238988
+MD5sum: 307c248263d8409663fa457a8976dfa8
+SHA1: 260cb684edd8d81755fb200d9fd1adc0ae45419c
+SHA256: 0d5fc0447d097b25d00ef2e1b78cac8a158d80d9ad5844a477ce3f5e38ecf6b3
+SHA512: c41f9a4c756e507693af4d818ce7b0ade05041c7387f42fa9942267cfa4027bb1d295d0e6b403b2a2210d0df2c566cb1dce87635c8044ca8b5ff2a7160aa6f50
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (VXLAN, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One VXLAN tunnel per peer site, a Linux bridge with VLAN filtering, VLAN
+ mappings, MSS clamping and loop protection. It builds no VPN; the sites must
+ already reach each other through an existing transport network such as a VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.51
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 11910
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.51_arm64.deb
+Size: 3239248
+MD5sum: a950b1e56ad9b070d8c2540db9f69b37
+SHA1: e303a38be104b2fea84ab0e69ae6c246b402b64e
+SHA256: 9171257b333f3061f948bc602312d9b90d27db9296dcdbf016bdb782d1650946
+SHA512: bba4d80970dbdd0bd1ae786a5bf0491171dca5bf9ee17f57a8b516c26c7aac1fb16b6206a7359265fd45f4fbcaac5705808a37a67285582a4ec571a7d3391a07
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (VXLAN, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One VXLAN tunnel per peer site, a Linux bridge with VLAN filtering, VLAN
+ mappings, MSS clamping and loop protection. It builds no VPN; the sites must
+ already reach each other through an existing transport network such as a VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.54
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 11964
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.54_arm64.deb
+Size: 3258592
+MD5sum: f923e6c04901484165fb3d97bdc1706b
+SHA1: 6a38d22ed00aa11c80d14aaa6be0cf536e0a46ca
+SHA256: d6261384bb30f5ac5496904a69d36b29779ca0589fdb7ae12a9e615ffa225e20
+SHA512: 82445f9fd1f2df4be3a4e2ed796483f31b2ab34a102d1ef55f9d60a3f370a9fc39c842d075a910312e9e6a9d918d85777cb8bea97e89a4fa22e3cb9802dde281
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (VXLAN, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One VXLAN tunnel per peer site, a Linux bridge with VLAN filtering, VLAN
+ mappings, MSS clamping and loop protection. It builds no VPN; the sites must
+ already reach each other through an existing transport network such as a VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.55
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 11964
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.55_arm64.deb
+Size: 3258892
+MD5sum: bba66138a33d837d106ed1715799c18e
+SHA1: 5863aeebacc04b42cf94bd5fe8befe682ebd1d42
+SHA256: 89f000ae77894222879af43757b61469383659abf7f718b434011e9e522c8729
+SHA512: 4af74216f23cb025050dcd0843e2ce0173a210efce125bdc14797e07c006e0cc1d40a28475ba5d8e62c06c263b062f0a7021604ae0bc861d093614d045389210
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (VXLAN, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One VXLAN tunnel per peer site, a Linux bridge with VLAN filtering, VLAN
+ mappings, MSS clamping and loop protection. It builds no VPN; the sites must
+ already reach each other through an existing transport network such as a VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.56
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 12065
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.56_arm64.deb
+Size: 3289532
+MD5sum: 2ff11af1486ef1535df184f525a02d4b
+SHA1: 6aba0a09d40318cc759a7567271354f753ccd9a2
+SHA256: 0ae558714dd535789ee8ce45be1200deea869c1895c9896f6233657de2dcf133
+SHA512: cac216ab60c9142a6de134d1d21451fec2157d231dd52eb07b7f538a10afe3821cf78ab5a5f715d0a725507a4d2976933cfd99fdb3ef695bc3d2cad14f2fb75f
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (VXLAN, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One VXLAN tunnel per peer site, a Linux bridge with VLAN filtering, VLAN
+ mappings, MSS clamping and loop protection. It builds no VPN; the sites must
+ already reach each other through an existing transport network such as a VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.57
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 12121
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.57_arm64.deb
+Size: 3307076
+MD5sum: 4f619d329cdb1f79cff98f5a3017f87c
+SHA1: 258a4f4c5503b8796077562b31338fc1e1a79461
+SHA256: bcbeb71bb20183a17a30d9b49acad7c058d92a80cee70abf2eeccf18b5707983
+SHA512: 9087eac98e14d7b7d16c39b52dc38238d097f9d0e9ea235104d3e4b7ca7b64b72400367259334d6837b1c342dad0b44fdd7711b435d4c3a416bdacae6aa3344d
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (VXLAN, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One VXLAN tunnel per peer site, a Linux bridge with VLAN filtering, VLAN
+ mappings, MSS clamping and loop protection. It builds no VPN; the sites must
+ already reach each other through an existing transport network such as a VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.58
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 12392
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.58_arm64.deb
+Size: 3391532
+MD5sum: 9d94ddcbb7d9ea18adedb0eb35a1a938
+SHA1: e4d9ca938bc30b452185a0ca39f7368f566b3c2d
+SHA256: dcd5a97650534da759ccdfd13b3371eb0e9c6865972f47ada90d2da988ead7f6
+SHA512: 38351f31dbfb010ade136d8aaa50f059032b82767b379c279da615d2c2e16a33cf9fa98bfd475ab21954919a8b5e98dfe4a954b208e5ab09c4a9c6dbd6c900b2
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (VXLAN, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One VXLAN tunnel per peer site, a Linux bridge with VLAN filtering, VLAN
+ mappings, MSS clamping and loop protection. It builds no VPN; the sites must
+ already reach each other through an existing transport network such as a VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.59
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 12477
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.59_arm64.deb
+Size: 3417792
+MD5sum: cdd1e8c544eb2a96417af0c706449105
+SHA1: f7edd47262fab6ebf55975ddaac64e341fb0eb0c
+SHA256: 61d8d5049dc5905fddc77c1fef8b96983b377cbc893417dd923a65e51302fcb0
+SHA512: f2ec94a15f0898a9a32b7727a3cde2045a49c108d673704e6037c7b53ae8fd7b018f607178840d36e206767af075588c815d46b47c502277cf9c50d58bc939d9
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (VXLAN, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One VXLAN tunnel per peer site, a Linux bridge with VLAN filtering, VLAN
+ mappings, MSS clamping and loop protection. It builds no VPN; the sites must
+ already reach each other through an existing transport network such as a VPN.
+
+Package: wanderlan
+Architecture: arm64
+Version: 1.0.61
+Priority: optional
+Section: net
+Maintainer: wanderlan maintainers <upchui@users.noreply.github.com>
+Installed-Size: 12562
+Depends: nftables
+Filename: pool/main/w/wanderlan/wanderlan_1.0.61_arm64.deb
+Size: 3449884
+MD5sum: c4bec525efd57e7ce8b58d8cb93944be
+SHA1: 801708f275fefa5bb901a048c0070035595eecff
+SHA256: 3ec742e6e488ece7dd2e590652f308b6e853745c0956e1b557ca1bbdcc0cd0f5
+SHA512: 4e3a7ee461faa332ea51022a5128cbe9ecfe89a21e7b40dea2f873670d5966331e9fd2ad8ad88c72165a217109ed6df0f57a3542fe88d3c3b76150b7a4d7ff01
+Homepage: https://github.com/upchui/Wanderlan
+Description: Your LAN at other sites, as if a long network cable ran there: layer 2 over an
+ existing connection (VXLAN, VLAN-aware bridge)
+ wanderlan puts other sites into your network, as if a long network cable ran
+ there: the devices at a second office, a second apartment or a holiday house
+ are in the LAN of the main office or of your home, with its DHCP, gateway and
+ VLANs. One VXLAN tunnel per peer site, a Linux bridge with VLAN filtering, VLAN
+ mappings, MSS clamping and loop protection. It builds no VPN; the sites must
+ already reach each other through an existing transport network such as a VPN.
+

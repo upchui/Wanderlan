@@ -1,0 +1,11 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>wanderlan APT repository</title>
+<h1>wanderlan APT repository</h1>
+<p>Debian 13 (also Debian 12, Ubuntu 24.04, Proxmox VE 9 and 8; amd64, arm64):</p>
+<pre>
+curl -fsSL https://upchui.github.io/Wanderlan/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/wanderlan.gpg
+echo "deb [signed-by=/usr/share/keyrings/wanderlan.gpg] https://upchui.github.io/Wanderlan/apt stable main" | sudo tee /etc/apt/sources.list.d/wanderlan.list
+sudo apt update &amp;&amp; sudo apt install wanderlan
+</pre>
+<p>See <a href="https://github.com/upchui/Wanderlan">github.com/upchui/Wanderlan</a>.</p>

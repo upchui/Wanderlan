@@ -1,0 +1,51 @@
+-----BEGIN PGP SIGNED MESSAGE-----
+Hash: SHA512
+
+Architectures: amd64 arm64
+Codename: stable
+Components: main
+Date: Sat, 28 Nov 2026 14:44:37 +0000
+Description: wanderlan APT repository
+Label: wanderlan
+Origin: wanderlan
+Suite: stable
+MD5Sum:
+ 5affabab65d83c3f77c46085fa31d84d             2404 Release
+ 5a37d73a53a8faafde71b4a0eebb6050            24553 main/binary-amd64/Packages
+ 7136915d1049f8ed8fc0683bb6c0e9af             4510 main/binary-amd64/Packages.gz
+ 7988eac085c5636ec066e50bd7697003            24553 main/binary-arm64/Packages
+ e458bd0d3af0e734c07c8c7d9180aa17             4481 main/binary-arm64/Packages.gz
+SHA1:
+ 5ea8774b312cd0ae80a92362d2eaa35d4fc98b7d             2404 Release
+ 547486ba3dff5d2106afbb349717e2853467573c            24553 main/binary-amd64/Packages
+ fca1e3657e455aade69cc96a553634ef2ea66e7c             4510 main/binary-amd64/Packages.gz
+ 2cc1240482bcbb87eea53d7cc7ac1125cac24d2b            24553 main/binary-arm64/Packages
+ 4d5ec1ec4388f3057e9838a379a9b610bcea74b1             4481 main/binary-arm64/Packages.gz
+SHA256:
+ 4a63ef95d18908b73dbacfd758948bcda705d2a823d821eece456871c27c00de             2404 Release
+ e7949aa7ecebd4ff7ea067b84d4b1e75866b1397bae39fd3b72e3ef3f887d3d0            24553 main/binary-amd64/Packages
+ 98505c6c25a2e9d32698dc95646b8fdac75b1e6a05d5ca4d574414e2ce836bdb             4510 main/binary-amd64/Packages.gz
+ 34c5935808498f3e592e4034b8f1003a278bdfcde71545cc74abf1d407b48884            24553 main/binary-arm64/Packages
+ 7db77503c536fbd33b4ec00d1d626f20ce4913bf6c0a39ca814177a82ffefd99             4481 main/binary-arm64/Packages.gz
+SHA512:
+ e46063a47ea87f672f01320821e9e58c6995cd88f0646b4ad3471391fa68ad8dbcb2c90597026eba0b2485bcc2563de16879c64c7e482f63bd6b382359ddec5d             2404 Release
+ bb462f2eb0e29bbf72c0de0895396806c7d158494d6e4f9881b61e1920769e03718ab1f4bd256deca50e0174359cd26d12a1827e167bd6fa28ceb7aeb8fc51c1            24553 main/binary-amd64/Packages
+ e22a16e9941f5f46b9cd5bcaf1e4eec2dcc3492cd305305ad20924ec58a6351def8074dff76cfa32bd23b36f2251016c7ca51c074c9229aa0ce74afb34e83a16             4510 main/binary-amd64/Packages.gz
+ 56754cb2b6b232bc02d38c4a2ef57f53632d64e065c1cd0c54a099679c5b4a27cabced15450ad043be4b580b03c7dd3c62b5e1dc766aae90b14a552edc70cbc0            24553 main/binary-arm64/Packages
+ 2af6a816d41de54c25b1350d85008b00d5777a51b55a91e33ced5b3519ef5f4fc0eadb1ece8c261b747dfd1293174f0f03549e105152ba2cfab562c5ac575f54             4481 main/binary-arm64/Packages.gz
+-----BEGIN PGP SIGNATURE-----
+
+iQIzBAEBCgAdFiEE9sQAzzGL/Ufjprine8LXrmaZgtQFAmsK6NUACgkQe8LXrmaZ
+gtSctg/+MaqmLyTBye8pIT+2vo207YyNtGwTw9xj14BdhTw1BkRgMN1DLo9grAUb
+9BJL+FZmgsjxqFG9wCuSrqPgCA6wjI/HzLFzgbDora7QgLRFboeSN9MYXSzijQ0t
+Nw7ShsHONWFz/srdb8HOBGCk843049KHRsQSQuWH34CJrYSoSJ2oN8BbTr4n6CBK
+GfQvtFNexZvNyeHpNBbaeJaYTDIym+MYDFM7rR1HBa7nJV/2ib5/FUwuvUc/XgrM
+fbJ0A5xTGfpneK5IpjtBKl5gBdT+daneirIzcpd5dpgHplG2Sw9hdPQS89TezZlx
+Ooa4oSaXtffVoKl7bXUyB83RFKLRbZ7VlHWJO4MHbRBK+jLhSBCuwWMNo6+rU6zJ
+g43l7stXAinwKkI1Y3EG2uFMCxyhxgYKTbTsbWv1cUyfH2yBnehp1vTFtk4Dabso
+XJopQfA7vdeNXpXUX0Z0Qel1Teii6kSuuMUki36+loQ+uu6Tdl97iFJ//h8cez01
+hKIxyQ6nUMv7f31R46XsmqDYpDLv4wCJj+wUJQCUlMWBArD7/4nnZTjemztYAbDY
+hehbu9NgbKHRXWoeelGvNPccISpcbWVkZHaJ1ClL5IFtQ4rY0JHnOru4wyvDWfmY
+rwQUNnCi+u7fNQPWHnEHlaZL8gw3Yd81QTpmffxFwFgw0Mz9kvU=
+=Abbq
+-----END PGP SIGNATURE-----
