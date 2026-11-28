@@ -9,18 +9,22 @@ single command. Update all sites; 0.1 and 1.0 do not sync with each other.
 
 ### Throughput
 
-- NICs with one receive queue (a VM without multiqueue) no longer do all
-  the network work on one core: wanderlan spreads the receive work of its
-  trunk ports and of the interfaces the tunnel packets come in by over all
-  cores (RPS, only where nobody set it; the old value comes back when it
-  stops).
+- NICs with one receive queue (a VM without multiqueue) do all the network
+  work on one core. Spreading it over the cores (RPS) is measured, not
+  guessed: whenever a tunnel comes up, both boxes measure their receive
+  rate through it with RPS off and on (about 30 s, at most every 10 minutes
+  per interface; `wanderlan tune <site>` by hand) and keep RPS on only where
+  it brought at least 10 % more. Switched on blindly it doubled the
+  throughput on bare metal and cost a third in VMs with two vCPUs. The old
+  values come back when wanderlan stops or resets.
 - Where connection tracking is loaded, every server skips it for its
   tunnel packets (before: only a server with clients), also for those it
   sends to other servers.
 - `wanderlan perf` names what limits the throughput of the box (the load
-  of the cores, receive queues, split packets, connection tracking) and
-  what helps; `wanderlan speedtest <site>` measures TCP over the transport
-  and frames through the tunnel, both ways.
+  of the cores, receive queues and what the calibration found, split
+  packets, connection tracking) and what helps; `wanderlan speedtest
+  <site>` measures TCP over the transport and frames through the tunnel
+  (in 64 flows, like real traffic), both ways.
 
 ### Both sites in one switch network
 

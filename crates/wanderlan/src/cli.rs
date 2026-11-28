@@ -149,6 +149,16 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Measure with a peer whether spreading the receive work over the cores
+    /// (RPS) helps, on both boxes, and keep the better setting (about 30 s
+    /// of full load; done by itself whenever a tunnel comes up).
+    Tune {
+        /// The peer.
+        site: String,
+        /// Print JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Measure the throughput to a peer: TCP between the boxes over the
     /// transport network, and frames through the tunnel, both ways. Towards
     /// a client behind NAT, start it on the client.
@@ -681,6 +691,7 @@ pub async fn run(args: Args) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Some(Command::Perf { seconds, json }) => perf(&socket, seconds, json).await,
+        Some(Command::Tune { site, json }) => tune(&socket, &site, json).await,
         Some(Command::Speedtest {
             site,
             seconds,
@@ -2369,6 +2380,48 @@ async fn perf(socket: &Path, seconds: u32, json: bool) -> Result<ExitCode> {
             println!("        → {fix}");
         }
     }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `wanderlan tune <site>`.
+async fn tune(socket: &Path, site: &str, json: bool) -> Result<ExitCode> {
+    use wanderlan_core::api::{Tune, TuneParams, TuneSide};
+    let client = connect(socket).await?;
+    if !json {
+        println!("Measuring with RPS off and on, both ways (about 30 s) …");
+    }
+    let tune: Tune = client
+        .call(Request::Tune(TuneParams {
+            site: site.to_string(),
+        }))
+        .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&tune)?);
+        return Ok(ExitCode::SUCCESS);
+    }
+    let line = |who: &str, side: &TuneSide| {
+        let nic = side.nic.as_deref().unwrap_or("?");
+        let measured = format!(
+            "received with RPS off {}, on {}",
+            format_rate(side.off_bps),
+            format_rate(side.on_bps)
+        );
+        match (side.rps, &side.why_not) {
+            (Some(on), _) => println!(
+                "  {who:<12} {nic}: RPS {} ({measured})",
+                if on { "on" } else { "off" }
+            ),
+            (None, why) => println!(
+                "  {who:<12} {nic}: unchanged{} ({measured})",
+                why.as_deref()
+                    .map_or_else(String::new, |w| format!(", {w}"))
+            ),
+        }
+    };
+    println!("Receive work calibrated with \"{}\":", tune.peer);
+    line("here", &tune.here);
+    line(&tune.peer, &tune.there);
+    println!("RPS stays on only where it received at least 10 % more than without.");
     Ok(ExitCode::SUCCESS)
 }
 

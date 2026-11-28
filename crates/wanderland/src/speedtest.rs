@@ -21,13 +21,24 @@
 //!   then `DONE`; S answers `<arrived> <core> <share>`.
 //! * `tunnel-down`: C has a tap open; S sends frames for `<seconds>` and
 //!   answers `<sent> <micros>`.
+//! * `rps-on`, `rps-off`: S sets RPS of the interface the tunnel to C comes
+//!   in by, for a measurement ([`LEASE`]); answers `OK <interface>` or
+//!   `ERR <why>`.
+//! * `keep-rps-on`, `keep-rps-off` (with `<off bit/s>/<on bit/s>` after the
+//!   magic): S keeps that setting, as measured; answers like `rps-on`.
 //!
-//! The frames are untagged, of [`ETHERTYPE`] with the magic of the test: the
-//! bridge of the receiver drops them at the tunnel port (no VLAN), the tap
-//! counts them before (in the kernel, also those it has no room for). They
-//! are sent as fast as the sender can: what arrives per second is what the
-//! way takes. `<core> <share>`: the busiest core of the receiver and its
-//! share of network work (softirq) in percent.
+//! The frames are untagged IPv4/UDP to port 9 with the magic of the test at
+//! the start of the payload, in [`FLOWS`] flows (source ports): the tunnel
+//! packets of a flow get a source port of their own, as those of real
+//! traffic do. The bridge of the receiver drops them at the tunnel port (no
+//! VLAN), the tap counts them before (in the kernel, also those it has no
+//! room for). They are sent as fast as the sender can: what arrives per
+//! second is what the way takes. `<core> <share>`: the busiest core of the
+//! receiver and its share of network work (softirq) in percent.
+//!
+//! A calibration ([`calibrate`]) measures both ways with RPS off and on, on
+//! both boxes, a few times each; each box keeps the setting it received
+//! more with (on only if clearly more).
 
 use std::net::SocketAddrV4;
 use std::sync::Arc;
@@ -41,21 +52,30 @@ use tokio::io::{
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::time::Instant;
+use tracing::info;
 use wanderlan_core::api::{SpeedRun, Speedtest};
 use wanderlan_core::identity::{PairKeys, SiteId};
 use wanderlan_core::mtu;
 
 use crate::perf::CpuTimes;
-use crate::rawframe::{Sender, Tap};
+use crate::rawframe::{Sender, TEST_PORT, Tap};
 use crate::sync_net::{
     LINE_TIMEOUT, NONCE_LEN, Offer, TIMEOUT, hex_decode, hex_encode, read_line, read_tagged,
 };
 
 const LABEL_REQUEST: &[u8] = b"wanderlan speed request";
 const LABEL_REPLY: &[u8] = b"wanderlan speed reply";
-/// Ethertype of the test frames (IEEE "local experimental 2"): not the one
-/// of the keepalives, so the learn gate of a server does not look at them.
-const ETHERTYPE: u16 = 0x88b6;
+/// The flows of the test frames.
+const FLOWS: u16 = 64;
+/// How long a setting for a measurement holds on the peer at most.
+const LEASE: Duration = Duration::from_secs(60);
+/// Measurements per setting and direction in a calibration.
+const RUNS: usize = 3;
+/// Seconds per measurement of a calibration.
+const RUN_SECONDS: u32 = 2;
+/// RPS stays on only if it got at least this share (percent) of what off
+/// got: clearly more, not noise.
+const CLEARLY_MORE: u64 = 110;
 /// Destination of the test frames: locally administered unicast nobody
 /// sends from.
 const FRAME_DST: [u8; 6] = [0x02, 0x77, 0x6c, 0x73, 0x74, 0x00];
@@ -69,6 +89,12 @@ const FRAME_MIN: u16 = 64;
 const SETTLE: Duration = Duration::from_millis(300);
 /// What TCP writes at a time.
 const CHUNK: usize = 64 * 1024;
+
+/// What a box answers while it runs another test.
+const BUSY_TEXT: &str = "another speed test is running";
+/// How often a client asks again while the peer is busy, and the pause.
+const BUSY_TRIES: u32 = 20;
+const BUSY_PAUSE: Duration = Duration::from_millis(250);
 
 /// One test at a time on a box (it would measure the other one too).
 static BUSY: AtomicBool = AtomicBool::new(false);
@@ -90,29 +116,44 @@ impl Drop for Busy {
     }
 }
 
-/// What is measured.
+/// What is measured (or set).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum What {
     TcpUp,
     TcpDown,
     TunnelUp,
     TunnelDown,
+    Rps(bool),
+    KeepRps(bool),
 }
 
 impl What {
+    const ALL: [Self; 8] = [
+        Self::TcpUp,
+        Self::TcpDown,
+        Self::TunnelUp,
+        Self::TunnelDown,
+        Self::Rps(true),
+        Self::Rps(false),
+        Self::KeepRps(true),
+        Self::KeepRps(false),
+    ];
+
     fn name(self) -> &'static str {
         match self {
             Self::TcpUp => "tcp-up",
             Self::TcpDown => "tcp-down",
             Self::TunnelUp => "tunnel-up",
             Self::TunnelDown => "tunnel-down",
+            Self::Rps(true) => "rps-on",
+            Self::Rps(false) => "rps-off",
+            Self::KeepRps(true) => "keep-rps-on",
+            Self::KeepRps(false) => "keep-rps-off",
         }
     }
 
     fn parse(text: &str) -> Option<Self> {
-        [Self::TcpUp, Self::TcpDown, Self::TunnelUp, Self::TunnelDown]
-            .into_iter()
-            .find(|w| w.name() == text)
+        Self::ALL.into_iter().find(|w| w.name() == text)
     }
 }
 
@@ -123,17 +164,34 @@ struct Ask {
     seconds: u32,
     size: u16,
     magic: [u8; 4],
+    /// What was measured (`<off bit/s>/<on bit/s>`, `keep-rps-*` only).
+    note: Option<(u64, u64)>,
 }
 
 impl Ask {
+    /// A setting of RPS (no measurement).
+    fn rps(what: What, note: Option<(u64, u64)>) -> Self {
+        Self {
+            what,
+            seconds: 1,
+            size: FRAME_MAX,
+            magic: [0; 4],
+            note,
+        }
+    }
+
     fn line(&self) -> String {
-        format!(
+        let mut line = format!(
             "{} {} {} {}",
             self.what.name(),
             self.seconds,
             self.size,
             hex_encode(&self.magic)
-        )
+        );
+        if let Some((off, on)) = self.note {
+            line.push_str(&format!(" {off}/{on}"));
+        }
+        line
     }
 
     fn parse<'a>(mut parts: impl Iterator<Item = &'a str>) -> Option<Self> {
@@ -141,6 +199,13 @@ impl Ask {
         let seconds: u32 = parts.next()?.parse().ok()?;
         let size: u16 = parts.next()?.parse().ok()?;
         let magic = hex_decode::<4>(parts.next()?)?;
+        let note = match parts.next() {
+            Some(note) => {
+                let (off, on) = note.split_once('/')?;
+                Some((off.parse().ok()?, on.parse().ok()?))
+            }
+            None => None,
+        };
         ((1..=wanderlan_core::api::SPEEDTEST_MAX_SECONDS).contains(&seconds)
             && (FRAME_MIN..=FRAME_MAX).contains(&size))
         .then_some(Self {
@@ -148,6 +213,7 @@ impl Ask {
             seconds,
             size,
             magic,
+            note,
         })
     }
 
@@ -156,13 +222,40 @@ impl Ask {
     }
 }
 
-/// A test frame of `size` bytes with `magic`.
-fn frame(size: u16, magic: [u8; 4]) -> Vec<u8> {
+/// The test frames of `size` bytes with `magic`: one per flow (source
+/// port), IPv4/UDP to [`TEST_PORT`] (addresses of the benchmark range,
+/// RFC 2544).
+fn frames(size: u16, magic: [u8; 4]) -> Vec<Vec<u8>> {
+    (0..FLOWS)
+        .map(|flow| frame(size, magic, 40_000 + flow))
+        .collect()
+}
+
+fn frame(size: u16, magic: [u8; 4], source_port: u16) -> Vec<u8> {
     let mut frame = vec![0u8; usize::from(size)];
     frame[..6].copy_from_slice(&FRAME_DST);
     frame[6..12].copy_from_slice(&FRAME_SRC);
-    frame[12..14].copy_from_slice(&ETHERTYPE.to_be_bytes());
-    frame[14..18].copy_from_slice(&magic);
+    frame[12..14].copy_from_slice(&0x0800u16.to_be_bytes());
+    // IPv4: no options, no fragment, TTL 64, UDP.
+    let ip_len = size - 14;
+    frame[14] = 0x45;
+    frame[16..18].copy_from_slice(&ip_len.to_be_bytes());
+    frame[22] = 64;
+    frame[23] = 17;
+    frame[26..30].copy_from_slice(&[198, 18, 0, 1]);
+    frame[30..34].copy_from_slice(&[198, 18, 0, 2]);
+    let sum = frame[14..34]
+        .chunks(2)
+        .map(|w| u32::from(u16::from_be_bytes([w[0], w[1]])))
+        .sum::<u32>();
+    let sum = (sum & 0xffff) + (sum >> 16);
+    let sum = (sum & 0xffff) + (sum >> 16);
+    frame[24..26].copy_from_slice(&(!u16::try_from(sum).unwrap_or(0)).to_be_bytes());
+    // UDP without checksum, the magic first.
+    frame[34..36].copy_from_slice(&source_port.to_be_bytes());
+    frame[36..38].copy_from_slice(&TEST_PORT.to_be_bytes());
+    frame[38..40].copy_from_slice(&(ip_len - 20).to_be_bytes());
+    frame[42..46].copy_from_slice(&magic);
     frame
 }
 
@@ -171,9 +264,10 @@ const BATCH: usize = 32;
 /// Threads that send at most.
 const SENDERS: usize = 4;
 
-/// Sends `frame` through `ifname` for `seconds`, as fast as it can, from up
-/// to [`SENDERS`] threads (blocks): how many, and how long it took.
-fn blast(ifname: &str, frame: &[u8], seconds: u32) -> std::io::Result<(u64, Duration)> {
+/// Sends `frames` through `ifname` for `seconds`, as fast as it can, from up
+/// to [`SENDERS`] threads, each going through the flows (blocks): how many,
+/// and how long it took.
+fn blast(ifname: &str, frames: &[Vec<u8>], seconds: u32) -> std::io::Result<(u64, Duration)> {
     let threads = crate::tuning::online_cpus().clamp(1, SENDERS);
     let senders = (0..threads)
         .map(|_| Sender::open(ifname, FRAME_DST))
@@ -183,7 +277,8 @@ fn blast(ifname: &str, frame: &[u8], seconds: u32) -> std::io::Result<(u64, Dura
     let results: Vec<std::io::Result<u64>> = std::thread::scope(|scope| {
         let handles: Vec<_> = senders
             .iter()
-            .map(|sender| scope.spawn(move || send_until(sender, frame, until)))
+            .enumerate()
+            .map(|(i, sender)| scope.spawn(move || send_until(sender, frames, i, until)))
             .collect();
         handles
             .into_iter()
@@ -201,10 +296,20 @@ fn blast(ifname: &str, frame: &[u8], seconds: u32) -> std::io::Result<(u64, Dura
     Ok((sent, took))
 }
 
-/// One sender of [`blast`].
-fn send_until(sender: &Sender, frame: &[u8], until: std::time::Instant) -> std::io::Result<u64> {
+/// One sender of [`blast`], starting with flow `first`.
+fn send_until(
+    sender: &Sender,
+    frames: &[Vec<u8>],
+    first: usize,
+    until: std::time::Instant,
+) -> std::io::Result<u64> {
     let mut sent = 0u64;
+    let mut flow = first;
     while std::time::Instant::now() < until {
+        flow = (flow + 1) % frames.len().max(1);
+        let Some(frame) = frames.get(flow) else {
+            break;
+        };
         match sender.send_many(frame, BATCH) {
             Ok(n) => sent += n as u64,
             // The queue is full: a moment.
@@ -295,9 +400,9 @@ where
             .await?;
         bail!("{from} asked for a speed test as {}", keyed.name);
     }
-    let Some(_busy) = Busy::take() else {
+    let Some(busy) = Busy::take() else {
         write
-            .write_all(b"NO another speed test is running\n")
+            .write_all(format!("NO {BUSY_TEXT}\n").as_bytes())
             .await?;
         return Ok(());
     };
@@ -322,21 +427,23 @@ where
         let tag = keys.sync_tag(&[LABEL_REPLY, &client_nonce, &server_nonce, text.as_bytes()]);
         format!("{} {}\n{text}", hex_encode(&tag), text.len())
     };
-    match ask.what {
+    // The last answer, given after this box is free again: the client asks
+    // for the next measurement as soon as it has it.
+    let last = match ask.what {
         What::TcpUp => {
             let before = CpuTimes::now();
             let (bytes, took) = receive(reader, ask.duration() + TIMEOUT).await?;
             let core = CpuTimes::now().busiest_since(&before);
-            let text = format!("{bytes} {} {}", took.as_micros(), core_text(core));
-            write.write_all(reply(text).as_bytes()).await?;
+            Some(format!("{bytes} {} {}", took.as_micros(), core_text(core)))
         }
-        What::TcpDown => send_for(write, ask.duration()).await?,
+        What::TcpDown => {
+            send_for(write, ask.duration()).await?;
+            None
+        }
         What::TunnelUp => {
             let tunnel = keyed.tunnel.clone().context("no tunnel to that site")?;
             let magic = ask.magic;
-            let tap =
-                tokio::task::spawn_blocking(move || Tap::open(&tunnel, ETHERTYPE, magic, None))
-                    .await??;
+            let tap = tokio::task::spawn_blocking(move || Tap::open_test(&tunnel, magic)).await??;
             tap.taken()?;
             let before = CpuTimes::now();
             write.write_all(reply("READY".into()).as_bytes()).await?;
@@ -347,19 +454,44 @@ where
             tokio::time::sleep(SETTLE).await;
             let arrived = tap.taken()?;
             let core = CpuTimes::now().busiest_since(&before);
-            write
-                .write_all(reply(format!("{arrived} {}", core_text(core))).as_bytes())
-                .await?;
+            Some(format!("{arrived} {}", core_text(core)))
         }
         What::TunnelDown => {
             let tunnel = keyed.tunnel.clone().context("no tunnel to that site")?;
-            let (frame, seconds) = (frame(ask.size, ask.magic), ask.seconds);
+            let (frames, seconds) = (frames(ask.size, ask.magic), ask.seconds);
             let (sent, took) =
-                tokio::task::spawn_blocking(move || blast(&tunnel, &frame, seconds)).await??;
-            write
-                .write_all(reply(format!("{sent} {}", took.as_micros())).as_bytes())
-                .await?;
+                tokio::task::spawn_blocking(move || blast(&tunnel, &frames, seconds)).await??;
+            Some(format!("{sent} {}", took.as_micros()))
         }
+        What::Rps(on) | What::KeepRps(on) => {
+            let result = match &keyed.underlay {
+                None => Err("no transport interface to that site known".to_string()),
+                Some(nic) if matches!(ask.what, What::Rps(_)) => {
+                    crate::tuning::try_setting(nic, on, LEASE).map(|()| nic.clone())
+                }
+                Some(nic) => {
+                    let (off_bps, on_bps) = ask.note.unwrap_or_default();
+                    let text = summary(off_bps, on_bps);
+                    let kept = crate::tuning::decide(nic, on, text.clone());
+                    if kept.is_ok() {
+                        info!(
+                            "Calibrated the receive work with \"{}\": here {nic} RPS {} ({text})",
+                            keyed.name,
+                            if on { "on" } else { "off" }
+                        );
+                    }
+                    kept.map(|()| nic.clone())
+                }
+            };
+            Some(match result {
+                Ok(nic) => format!("OK {nic}"),
+                Err(why) => format!("ERR {why}"),
+            })
+        }
+    };
+    drop(busy);
+    if let Some(text) = last {
+        write.write_all(reply(text).as_bytes()).await?;
     }
     write.shutdown().await?;
     Ok(())
@@ -395,7 +527,22 @@ struct Conn {
 }
 
 impl Peer {
+    /// [`Peer::connect_once`], again for a moment while the peer still
+    /// finishes the measurement before.
     async fn connect(&self, ask: &Ask) -> Result<Conn> {
+        let mut tries = 0;
+        loop {
+            match self.connect_once(ask).await {
+                Err(e) if tries < BUSY_TRIES && format!("{e}").contains(BUSY_TEXT) => {
+                    tries += 1;
+                    tokio::time::sleep(BUSY_PAUSE).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn connect_once(&self, ask: &Ask) -> Result<Conn> {
         let stream = tokio::time::timeout(TIMEOUT, TcpStream::connect(self.control))
             .await
             .context("timeout while connecting")?
@@ -468,12 +615,32 @@ impl Peer {
         String::from_utf8(text).context("the answer is not text")
     }
 
+    /// Sets RPS on the peer: for a measurement (`keep` none), or keeps it
+    /// with what was measured. The interface there, or why not.
+    async fn rps(&self, on: bool, keep: Option<(u64, u64)>) -> Result<Result<String, String>> {
+        let what = if keep.is_some() {
+            What::KeepRps(on)
+        } else {
+            What::Rps(on)
+        };
+        let mut conn = self.connect(&Ask::rps(what, keep)).await?;
+        let text = self.reply(&mut conn, TIMEOUT).await?;
+        Ok(
+            match (text.strip_prefix("OK "), text.strip_prefix("ERR ")) {
+                (Some(nic), _) => Ok(nic.to_string()),
+                (None, Some(why)) => Err(why.to_string()),
+                (None, None) => Err(text),
+            },
+        )
+    }
+
     async fn tcp(&self, up: bool, seconds: u32) -> Result<SpeedRun> {
         let ask = Ask {
             what: if up { What::TcpUp } else { What::TcpDown },
             seconds,
             size: FRAME_MAX,
             magic: [0; 4],
+            note: None,
         };
         let mut conn = self.connect(&ask).await?;
         let (bytes, took, core) = if up {
@@ -515,15 +682,16 @@ impl Peer {
             seconds,
             size,
             magic,
+            note: None,
         };
         let (sent, arrived, took, core) = if up {
             let mut conn = self.connect(&ask).await?;
             if self.reply(&mut conn, TIMEOUT).await? != "READY" {
                 bail!("\"{}\" is not ready", self.name);
             }
-            let (tunnel, frame) = (self.tunnel.clone(), frame(size, magic));
+            let (tunnel, frames) = (self.tunnel.clone(), frames(size, magic));
             let (sent, took) =
-                tokio::task::spawn_blocking(move || blast(&tunnel, &frame, seconds)).await??;
+                tokio::task::spawn_blocking(move || blast(&tunnel, &frames, seconds)).await??;
             conn.write.write_all(b"DONE\n").await?;
             let text = self.reply(&mut conn, TIMEOUT).await?;
             let mut parts = text.split_whitespace();
@@ -534,9 +702,7 @@ impl Peer {
             (sent, arrived, took, parse_core(parts))
         } else {
             let tunnel = self.tunnel.clone();
-            let tap =
-                tokio::task::spawn_blocking(move || Tap::open(&tunnel, ETHERTYPE, magic, None))
-                    .await??;
+            let tap = tokio::task::spawn_blocking(move || Tap::open_test(&tunnel, magic)).await??;
             tap.taken()?;
             let before = CpuTimes::now();
             let mut conn = self.connect(&ask).await?;
@@ -624,6 +790,150 @@ pub async fn run(peer: Peer, seconds: u32) -> Result<Speedtest, String> {
     })
 }
 
+/// One measurement of a calibration: what arrived (bit/s). Tried twice; a
+/// measurement that fails does not count as nothing arriving.
+async fn measure(peer: &Peer, up: bool) -> Result<u64, String> {
+    match peer.tunnel(up, RUN_SECONDS, FRAME_MAX).await {
+        Ok(run) => Ok(run.bits_per_second),
+        Err(_) => peer
+            .tunnel(up, RUN_SECONDS, FRAME_MAX)
+            .await
+            .map(|run| run.bits_per_second)
+            .map_err(|e| format!("a measurement failed: {e:#}")),
+    }
+}
+
+/// What was measured for one box in a calibration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Side {
+    /// The interface its tunnel packets come in by.
+    pub nic: Option<String>,
+    /// RPS on (none: it could not be changed there).
+    pub rps: Option<bool>,
+    /// What it received with RPS off and on (median, bit/s).
+    pub off_bps: u64,
+    /// See `off_bps`.
+    pub on_bps: u64,
+    /// Why RPS could not be changed there.
+    pub why_not: Option<String>,
+}
+
+/// The result of a calibration: this box and the peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Calibration {
+    /// This box.
+    pub here: Side,
+    /// The peer.
+    pub there: Side,
+}
+
+/// The middle of the measurements.
+fn median(values: &mut [u64]) -> u64 {
+    values.sort_unstable();
+    values.get(values.len() / 2).copied().unwrap_or(0)
+}
+
+/// RPS stays on only if it got clearly more ([`CLEARLY_MORE`]).
+fn keep_on(off_bps: u64, on_bps: u64) -> bool {
+    on_bps > 0 && u128::from(on_bps) * 100 >= u128::from(off_bps) * u128::from(CLEARLY_MORE)
+}
+
+/// What was measured, in words.
+pub fn summary(off_bps: u64, on_bps: u64) -> String {
+    let words = |bps: u64| {
+        #[allow(clippy::cast_precision_loss)]
+        let v = bps as f64;
+        if v >= 1e9 {
+            format!("{:.2} Gbit/s", v / 1e9)
+        } else {
+            format!("{:.0} Mbit/s", v / 1e6)
+        }
+    };
+    format!("off {}, on {}", words(off_bps), words(on_bps))
+}
+
+/// Measures RPS off and on on the interface the tunnel packets of `peer`
+/// come in by, here (`nic`) and there, both ways, [`RUNS`] times each
+/// (alternating, so that a change of the load hits both alike); each box
+/// keeps what it received more with. About 30 s of full load.
+pub async fn calibrate(peer: Peer, nic: Option<String>) -> Result<Calibration, String> {
+    let Some(_busy) = Busy::take() else {
+        return Err("another speed test is running on this box".into());
+    };
+    let here_why = match &nic {
+        Some(nic) => crate::tuning::cannot(nic),
+        None => Some("no transport interface to that site known".into()),
+    };
+    let there = peer.rps(false, None).await.map_err(|e| format!("{e:#}"))?;
+    let (there_nic, there_why) = match there {
+        Ok(nic) => (Some(nic), None),
+        Err(why) => (None, Some(why)),
+    };
+    if let (Some(here), Some(there)) = (&here_why, &there_why) {
+        return Err(format!(
+            "RPS cannot be changed here ({here}) nor at \"{}\" ({there})",
+            peer.name
+        ));
+    }
+    // [off, on] × runs: what this box received (down) and the peer (up).
+    let mut down = [[0u64; RUNS]; 2];
+    let mut up = [[0u64; RUNS]; 2];
+    for run in 0..RUNS {
+        for (i, on) in [false, true].into_iter().enumerate() {
+            if let (Some(nic), None) = (&nic, &here_why) {
+                crate::tuning::try_setting(nic, on, LEASE)?;
+            }
+            if there_why.is_none() {
+                match peer.rps(on, None).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(why)) => return Err(format!("\"{}\": {why}", peer.name)),
+                    Err(e) => return Err(format!("{e:#}")),
+                }
+            }
+            up[i][run] = measure(&peer, true).await?;
+            down[i][run] = measure(&peer, false).await?;
+        }
+    }
+    let [mut down_off, mut down_on] = down;
+    let [mut up_off, mut up_on] = up;
+    let (here_off, here_on) = (median(&mut down_off), median(&mut down_on));
+    let (there_off, there_on) = (median(&mut up_off), median(&mut up_on));
+    if here_off.max(here_on).max(there_off).max(there_on) == 0 {
+        return Err(format!(
+            "no test frames arrived: the tunnel to \"{}\" is not up at both ends yet",
+            peer.name
+        ));
+    }
+    let mut here = Side {
+        nic: nic.clone(),
+        rps: None,
+        off_bps: here_off,
+        on_bps: here_on,
+        why_not: here_why.clone(),
+    };
+    if let (Some(nic), None) = (&nic, &here_why) {
+        let on = keep_on(here_off, here_on);
+        crate::tuning::decide(nic, on, summary(here_off, here_on))?;
+        here.rps = Some(on);
+    }
+    let mut there = Side {
+        nic: there_nic,
+        rps: None,
+        off_bps: there_off,
+        on_bps: there_on,
+        why_not: there_why.clone(),
+    };
+    if there_why.is_none() {
+        let on = keep_on(there_off, there_on);
+        match peer.rps(on, Some((there_off, there_on))).await {
+            Ok(Ok(_)) => there.rps = Some(on),
+            Ok(Err(why)) => there.why_not = Some(why),
+            Err(e) => there.why_not = Some(format!("{e:#}")),
+        }
+    }
+    Ok(Calibration { here, there })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -635,9 +945,16 @@ mod tests {
             seconds: 5,
             size: 1464,
             magic: [1, 2, 3, 4],
+            note: None,
         };
         assert_eq!(ask.line(), "tunnel-up 5 1464 01020304");
         assert_eq!(Ask::parse(ask.line().split_whitespace()), Some(ask));
+        let keep = Ask::rps(What::KeepRps(false), Some((1_400_000_000, 900_000_000)));
+        assert_eq!(
+            keep.line(),
+            "keep-rps-off 1 1514 00000000 1400000000/900000000"
+        );
+        assert_eq!(Ask::parse(keep.line().split_whitespace()), Some(keep));
         assert_eq!(
             Ask::parse("tunnel-up 60 1464 01020304".split_whitespace()),
             None
@@ -646,9 +963,37 @@ mod tests {
             Ask::parse("tcp-up 5 9000 01020304".split_whitespace()),
             None
         );
-        let f = frame(1464, [1, 2, 3, 4]);
+        // One frame per flow, where the filter of the tap looks.
+        let all = frames(1464, [1, 2, 3, 4]);
+        assert_eq!(all.len(), usize::from(FLOWS));
+        let f = &all[5];
         assert_eq!(f.len(), 1464);
-        assert_eq!(&f[12..18], &[0x88, 0xb6, 1, 2, 3, 4]);
+        assert_eq!(&f[12..14], &[0x08, 0x00]);
+        assert_eq!(f[23], 17);
+        assert_eq!(u16::from_be_bytes([f[34], f[35]]), 40_005);
+        assert_eq!(u16::from_be_bytes([f[36], f[37]]), TEST_PORT);
+        assert_eq!(&f[42..46], &[1, 2, 3, 4]);
+        // A valid IPv4 header checksum: the sum over the header is 0xffff.
+        let sum: u32 = f[14..34]
+            .chunks(2)
+            .map(|w| u32::from(u16::from_be_bytes([w[0], w[1]])))
+            .sum();
+        let folded = (sum & 0xffff) + (sum >> 16);
+        assert_eq!((folded & 0xffff) + (folded >> 16), 0xffff);
+        assert_ne!(all[0][34..36], all[1][34..36]);
         assert_eq!(rate(1_000_000, Duration::from_secs(1)), 8_000_000);
+    }
+
+    #[test]
+    fn rps_stays_on_only_if_clearly_better() {
+        assert_eq!(median(&mut [5, 1, 3]), 3);
+        assert!(!keep_on(1_000, 1_050), "within the noise");
+        assert!(keep_on(1_000, 1_100));
+        assert!(!keep_on(1_000, 0));
+        assert!(!keep_on(1_400, 900));
+        assert_eq!(
+            summary(1_400_000_000, 900_000_000),
+            "off 1.40 Gbit/s, on 900 Mbit/s"
+        );
     }
 }

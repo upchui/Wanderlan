@@ -1,21 +1,22 @@
-//! Receive work spread over the CPUs (RPS) on the NICs wanderlan's traffic
-//! comes in at: its trunk ports and the interfaces its tunnel packets
-//! arrive by.
+//! Receive work spread over the CPUs (RPS) on the NIC the tunnel packets
+//! come in by, where a measurement showed that it helps.
 //!
 //! A NIC with one receive queue (a VM without multiqueue, many small boxes)
 //! does all the work of what it receives on one core: unpacking the tunnel
-//! packets, the bridge, tc, nftables. Then that core limits the throughput
-//! while the others are idle. RPS hands the packets to the cores by their
-//! flow (for tunnel packets: by the source port, one per inner flow between
-//! servers). Only where the NIC has one queue, the box more than one core
-//! and nobody set RPS before; the old value comes back when wanderlan stops
-//! or no longer uses the NIC.
+//! packets, the bridge, tc, nftables. RPS hands the packets to the other
+//! cores by their flow. On bare metal that can double the throughput; in a
+//! VM every hand-off is an expensive interrupt, and with two cores it cost a
+//! third. So it is measured (see `speedtest::calibrate`): both settings with
+//! the peer, the better one stays. Without a measurement RPS stays off; only
+//! where the NIC has one queue, the box more than one core and nobody set
+//! RPS before. The old value comes back when wanderlan stops.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
-use tracing::{debug, info, warn};
+use tracing::debug;
 
 /// Where the NICs are.
 const NET: &str = "/sys/class/net";
@@ -24,122 +25,169 @@ const CPUS_ONLINE: &str = "/sys/devices/system/cpu/online";
 /// The CPUs kept free for other work (`isolcpus`), the same form.
 const CPUS_ISOLATED: &str = "/sys/devices/system/cpu/isolated";
 
-/// What wanderlan set, and for whom.
-#[derive(Debug, Default)]
-struct State {
-    /// The NICs each network wants spread.
-    wanted: BTreeMap<String, BTreeSet<String>>,
-    /// The NICs with RPS set by wanderlan: their `rps_cpus` file and the
-    /// value before.
-    set: BTreeMap<String, (PathBuf, String)>,
-    /// NICs looked at and left alone (several queues, set by someone else,
-    /// an error): not looked at again until they drop out.
-    skipped: BTreeSet<String>,
-    /// `/sys` cannot be written (a container): said once.
-    read_only: bool,
+/// What wanderlan knows about one NIC whose RPS it may set.
+#[derive(Debug, Clone)]
+struct Nic {
+    /// The `rps_cpus` file of its one receive queue.
+    path: PathBuf,
+    /// Its value before wanderlan touched it (no CPU).
+    original: String,
+    /// The setting the last measurement chose (none: off).
+    decided: Option<bool>,
+    /// A setting for a measurement, until then.
+    lease: Option<(bool, Instant)>,
+    /// When it was measured last, and what came out (for the diagnosis).
+    calibrated: Option<(Instant, String)>,
 }
 
-static STATE: Mutex<Option<State>> = Mutex::new(None);
+static STATE: Mutex<BTreeMap<String, Nic>> = Mutex::new(BTreeMap::new());
 
-/// The NICs of network `network` that should spread their receive work;
-/// the union of all networks is applied.
-pub fn want(network: &str, nics: BTreeSet<String>) {
-    let Ok(mut guard) = STATE.lock() else {
+/// The calibration of a NIC as the diagnosis shows it.
+#[derive(Debug, Clone)]
+pub struct Calibrated {
+    /// RPS on.
+    pub on: bool,
+    /// What was measured.
+    pub summary: String,
+    /// How long ago.
+    pub ago: Duration,
+}
+
+/// Why RPS of `nic` cannot be set by wanderlan, if it cannot: several
+/// receive queues (no need), one core, set by someone else, `/sys`
+/// read-only.
+pub fn cannot(nic: &str) -> Option<String> {
+    if STATE.lock().is_ok_and(|s| s.contains_key(nic)) {
+        return None;
+    }
+    prepare(nic).err()
+}
+
+/// The NIC as wanderlan may change it, or why not.
+fn prepare(nic: &str) -> Result<Nic, String> {
+    if online_cpus() < 2 {
+        return Err("the box has one core".into());
+    }
+    let queues = rx_queues(nic).map_err(|e| format!("{nic}: {e}"))?;
+    let [queue] = queues.as_slice() else {
+        return Err(format!(
+            "{nic} has {} receive queues (no need)",
+            queues.len()
+        ));
+    };
+    let path = queue.join("rps_cpus");
+    let original = std::fs::read_to_string(&path).map_err(|e| format!("{nic}: {e}"))?;
+    if !is_zero(&original) {
+        return Err(format!(
+            "RPS of {nic} was set by someone else ({})",
+            original.trim()
+        ));
+    }
+    // Writing the same value back tells whether it can be written at all.
+    write(&path, &original)?;
+    Ok(Nic {
+        path,
+        original,
+        decided: None,
+        lease: None,
+        calibrated: None,
+    })
+}
+
+fn write(path: &PathBuf, value: &str) -> Result<(), String> {
+    std::fs::write(path, value).map_err(|e| {
+        if e.raw_os_error() == Some(libc::EROFS) {
+            "/sys cannot be written here (a container?)".to_string()
+        } else {
+            format!("{}: {e}", path.display())
+        }
+    })
+}
+
+/// The value of the file for `on`.
+fn value(nic: &Nic, on: bool) -> String {
+    if on {
+        usable_mask()
+    } else {
+        nic.original.clone()
+    }
+}
+
+/// Sets RPS of `nic` for a measurement, until `lease` ends (then back to
+/// what was decided).
+pub fn try_setting(nic: &str, on: bool, lease: Duration) -> Result<(), String> {
+    let mut state = STATE.lock().map_err(|_| "internal error".to_string())?;
+    let entry = match state.get(nic) {
+        Some(entry) => entry.clone(),
+        None => prepare(nic)?,
+    };
+    write(&entry.path, &value(&entry, on))?;
+    let entry = state.entry(nic.to_string()).or_insert(entry);
+    entry.lease = Some((on, Instant::now() + lease));
+    Ok(())
+}
+
+/// Keeps RPS of `nic` on or off, as measured (`summary`).
+pub fn decide(nic: &str, on: bool, summary: String) -> Result<(), String> {
+    let mut state = STATE.lock().map_err(|_| "internal error".to_string())?;
+    let entry = match state.get(nic) {
+        Some(entry) => entry.clone(),
+        None => prepare(nic)?,
+    };
+    write(&entry.path, &value(&entry, on))?;
+    let entry = state.entry(nic.to_string()).or_insert(entry);
+    entry.lease = None;
+    entry.decided = Some(on);
+    entry.calibrated = Some((Instant::now(), summary));
+    Ok(())
+}
+
+/// Ends the settings for measurements whose time is up (every second).
+pub fn expire_leases() {
+    let Ok(mut state) = STATE.lock() else {
         return;
     };
-    let state = guard.get_or_insert_with(State::default);
-    state.wanted.insert(network.to_string(), nics);
-    let all: BTreeSet<String> = state.wanted.values().flatten().cloned().collect();
-    apply(state, &all);
+    let now = Instant::now();
+    for (nic, entry) in state.iter_mut() {
+        if entry.lease.is_some_and(|(_, until)| until <= now) {
+            entry.lease = None;
+            let back = value(entry, entry.decided.unwrap_or(false));
+            if let Err(e) = write(&entry.path, &back) {
+                debug!("Cannot put back RPS of {nic}: {e}");
+            }
+        }
+    }
+}
+
+/// The calibration of `nic`, for the diagnosis.
+pub fn calibrated(nic: &str) -> Option<Calibrated> {
+    let state = STATE.lock().ok()?;
+    let entry = state.get(nic)?;
+    let (at, summary) = entry.calibrated.as_ref()?;
+    Some(Calibrated {
+        on: entry.decided.unwrap_or(false),
+        summary: summary.clone(),
+        ago: at.elapsed(),
+    })
 }
 
 /// Puts back what wanderlan changed (when it stops).
 pub fn restore_all() {
-    let Ok(mut guard) = STATE.lock() else {
+    let Ok(mut state) = STATE.lock() else {
         return;
     };
-    if let Some(state) = guard.as_mut() {
-        state.wanted.clear();
-        apply(state, &BTreeSet::new());
-    }
-}
-
-/// The NICs wanderlan spread, by name, with the number of CPUs (for the
-/// diagnosis).
-pub fn spread() -> BTreeSet<String> {
-    STATE
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|s| s.set.keys().cloned().collect()))
-        .unwrap_or_default()
-}
-
-fn apply(state: &mut State, all: &BTreeSet<String>) {
-    // Those no longer used get their old value back.
-    let gone: Vec<String> = state
-        .set
-        .keys()
-        .filter(|n| !all.contains(*n))
-        .cloned()
-        .collect();
-    for nic in gone {
-        if let Some((path, old)) = state.set.remove(&nic) {
-            match std::fs::write(&path, &old) {
-                Ok(()) => debug!("RPS of {nic} back to {}", old.trim()),
-                Err(e) => debug!("Cannot put back RPS of {nic}: {e}"),
-            }
-        }
-    }
-    state.skipped.retain(|n| all.contains(n));
-    if state.read_only {
-        return;
-    }
-    let usable = usable_cpus();
-    let cpus = usable.len();
-    if cpus < 2 {
-        return;
-    }
-    for nic in all {
-        if nic == "lo" || state.set.contains_key(nic) || state.skipped.contains(nic) {
-            continue;
-        }
-        match spread_nic(nic, &usable) {
-            Ok(Some(entry)) => {
-                info!(
-                    "Spreading the receive work of {nic} over {cpus} CPUs (RPS): it has one receive queue"
-                );
-                state.set.insert(nic.clone(), entry);
-            }
-            Ok(None) => {
-                state.skipped.insert(nic.clone());
-            }
-            Err(e) if e.raw_os_error() == Some(libc::EROFS) => {
-                debug!("Cannot spread the receive work of {nic}: /sys is read-only");
-                state.read_only = true;
-                return;
-            }
-            Err(e) => {
-                warn!("Cannot spread the receive work of {nic} over the CPUs (RPS): {e}");
-                state.skipped.insert(nic.clone());
-            }
+    for (nic, entry) in std::mem::take(&mut *state) {
+        match write(&entry.path, &entry.original) {
+            Ok(()) => debug!("RPS of {nic} back to {}", entry.original.trim()),
+            Err(e) => debug!("Cannot put back RPS of {nic}: {e}"),
         }
     }
 }
 
-/// Sets RPS of `nic` to `cpus` if it has one receive queue and no RPS:
-/// the file and the value before. `None` where it is left alone.
-fn spread_nic(nic: &str, cpus: &BTreeSet<usize>) -> std::io::Result<Option<(PathBuf, String)>> {
-    let queues = rx_queues(nic)?;
-    let [queue] = queues.as_slice() else {
-        return Ok(None);
-    };
-    let path = queue.join("rps_cpus");
-    let old = std::fs::read_to_string(&path)?;
-    if !is_zero(&old) {
-        return Ok(None);
-    }
-    std::fs::write(&path, mask(cpus))?;
-    Ok(Some((path, old)))
+/// True if RPS of `nic` is set (by anyone).
+pub fn rps_set(nic: &str) -> bool {
+    std::fs::read_to_string(PathBuf::from(NET).join(nic).join("queues/rx-0/rps_cpus"))
+        .is_ok_and(|v| !is_zero(&v))
 }
 
 /// The receive queues of `nic` (`queues/rx-*`).

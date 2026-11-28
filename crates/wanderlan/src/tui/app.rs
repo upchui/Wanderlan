@@ -1149,7 +1149,7 @@ impl App {
             Request::Subscribe => "log subscription",
             Request::Unblock(_) => "unblock",
             Request::ProbeNow => "MTU probe",
-            Request::Perf(_) | Request::Speedtest(_) => "measurement",
+            Request::Perf(_) | Request::Speedtest(_) | Request::Tune(_) => "measurement",
             Request::Validate(_) | Request::Apply(_) | Request::ApplyFiles(_) => "apply",
             Request::Invite(_) => {
                 if let Some(mut form) = self.invite_pending.take() {

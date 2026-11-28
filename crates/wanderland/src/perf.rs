@@ -184,8 +184,7 @@ pub async fn run(input: Input, seconds: u32) -> Perf {
         None => {}
     }
 
-    // The receive queues.
-    let spread = tuning::spread();
+    // The receive queues, and what the calibration with the peers found.
     let mut nics: Vec<&String> = input.trunks.iter().chain(&input.underlay).collect();
     nics.sort();
     nics.dedup();
@@ -194,30 +193,41 @@ pub async fn run(input: Input, seconds: u32) -> Perf {
             continue;
         };
         let n = queues.len();
+        let multiqueue =
+            format!("more queues: in a Proxmox VM \"Multiqueue\" = {cpus} on this network device");
         if n > 1 || cpus < 2 {
             findings.push(Finding {
                 level: FindingLevel::Ok,
                 text: format!("{nic}: {n} receive queues"),
                 fix: None,
             });
-        } else if spread.contains(nic) {
+        } else if let Some(c) = tuning::calibrated(nic) {
             findings.push(Finding {
                 level: FindingLevel::Hint,
                 text: format!(
-                    "{nic}: one receive queue; wanderlan spreads its work over the {cpus} cores (RPS)"
+                    "{nic}: one receive queue for {cpus} cores; RPS {} as measured with the peer {} min ago ({})",
+                    if c.on { "on" } else { "off" },
+                    c.ago.as_secs() / 60,
+                    c.summary
                 ),
+                fix: Some(multiqueue),
+            });
+        } else if tuning::rps_set(nic) {
+            findings.push(Finding {
+                level: FindingLevel::Hint,
+                text: format!("{nic}: one receive queue; RPS is set (not by wanderlan)"),
                 fix: Some(format!(
-                    "cheaper with more queues: in a Proxmox VM \"Multiqueue\" = {cpus} on this network device"
+                    "in a VM RPS often costs more than it gives: measure, e.g. off with `echo 0 > /sys/class/net/{nic}/queues/rx-0/rps_cpus`; {multiqueue}"
                 )),
             });
         } else {
             findings.push(Finding {
-                level: FindingLevel::Problem,
-                text: format!("{nic}: one receive queue for {cpus} cores"),
-                fix: Some(format!(
-                    "in a Proxmox VM \"Multiqueue\" = {cpus} on this network device, or RPS: `echo {} > /sys/class/net/{nic}/queues/rx-0/rps_cpus`",
-                    tuning::usable_mask()
-                )),
+                level: FindingLevel::Hint,
+                text: format!(
+                    "{nic}: one receive queue for {cpus} cores; RPS off (not calibrated with a peer{})",
+                    tuning::cannot(nic).map_or_else(String::new, |why| format!(": {why}"))
+                ),
+                fix: Some(format!("{multiqueue}; `wanderlan tune <site>` measures RPS")),
             });
         }
     }

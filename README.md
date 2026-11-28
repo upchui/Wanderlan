@@ -973,11 +973,20 @@ What limits the throughput is mostly the box, not the tunnel:
 
 * **One core for all the network work.** A NIC with one receive queue (a
   Proxmox VM without "Multiqueue", many small boxes) unpacks the tunnel
-  packets, bridges and filters on one core. wanderlan spreads the receive
-  work of such NICs, its trunk ports and the interfaces the tunnel packets
-  come in by, over all cores (RPS, only where nobody set it; the old value
-  comes back when it stops). More queues are cheaper still: in a Proxmox VM
-  "Multiqueue" = number of vCPUs on the network devices.
+  packets, bridges and filters on one core. Spreading that work over the
+  cores (RPS) helps on real hardware, but in a VM every hand-off is an
+  expensive interrupt: with two vCPUs it cost a third of the throughput.
+  So wanderlan measures it: whenever a tunnel comes up (the client towards
+  its uplink, between servers the one with the smaller identity starts),
+  both boxes measure their receive rate through the tunnel with RPS off and
+  on on the interface the tunnel packets come in by, three times each, and
+  keep RPS on only where it received at least 10 % more. That is about 30 s
+  of full load on the transport, at most every 10 minutes per interface;
+  `wanderlan tune <site>` measures again. Without a measurement RPS stays
+  off; the trunk ports are never changed (a measurement between the boxes
+  does not show their part); the old values come back when wanderlan stops
+  or resets. More queues are the better fix: in a Proxmox VM "Multiqueue" =
+  number of vCPUs on the network devices.
 * **Packets split outside.** A full Ethernet frame needs a path MTU of 1554
   bytes (1500 + 18 Ethernet and VLAN + 8 VXLAN + 8 UDP + 20 IP); on a
   smaller path every such frame becomes two packets. TCP is clamped below
@@ -995,8 +1004,9 @@ and names what limits it, with what helps. `wanderlan speedtest <site>`
 measures the throughput to a peer both ways: TCP between the boxes over the
 transport network, and frames through the tunnel (full ones and, where they
 are split, ones that fit), with the busiest core of the receiver. The frames
-are untagged: the bridge of the peer drops them at the tunnel port, they
-never reach a LAN. Towards a client behind NAT, start it on the client.
+are untagged IPv4/UDP in 64 flows, like real traffic: the bridge of the peer
+drops them at the tunnel port, they never reach a LAN. Towards a client
+behind NAT, start it on the client.
 
 ### Loops
 
@@ -1103,6 +1113,7 @@ and keeps trying.
 | `wanderlan init [--dir D]` / `wanderlan export` | Print or write the example configuration / print the running `network.toml` |
 | `wanderlan perf [--seconds N] [--json]` | What limits the throughput of this box: the load of the cores, receive queues, split packets, connection tracking, with what helps |
 | `wanderlan speedtest <site> [--seconds N] [--json]` | Throughput to a peer both ways: TCP over the transport network and frames through the tunnel |
+| `wanderlan tune <site> [--json]` | Measure with a peer whether spreading the receive work over the cores (RPS) helps, and keep the better setting on both (about 30 s; also done by itself whenever a tunnel comes up) |
 | `wanderlan probe` / `wanderlan unblock <site\|port>` | Measure the path MTU now / re-enable a port the loop guard shut down (the tunnel to a site, or a trunk port) |
 | `wanderlan reset [--yes]` | Remove everything wanderlan set up on this site |
 | `wanderlan networks [list\|add <name>\|remove <name> [--yes]]` | The [networks of this box](#several-networks-on-one-box) |

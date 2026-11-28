@@ -230,6 +230,26 @@ fn dhcp_program(vid: Option<u16>) -> Vec<libc::sock_filter> {
     with_reject(program)
 }
 
+/// The UDP port of the test frames of a speed test (discard).
+pub const TEST_PORT: u16 = 9;
+
+/// The test frames of a speed test: IPv4 (header of 20 bytes, as built),
+/// UDP to [`TEST_PORT`], `magic` at the start of the payload; the first 64
+/// bytes.
+fn test_program(magic: [u8; 4]) -> Vec<libc::sock_filter> {
+    with_reject(vec![
+        op(bpf::LD_H_ABS, 12),
+        op(bpf::JEQ_K, 0x0800),
+        op(bpf::LD_B_ABS, 23),
+        op(bpf::JEQ_K, 17),
+        op(bpf::LD_H_ABS, 36),
+        op(bpf::JEQ_K, u32::from(TEST_PORT)),
+        op(bpf::LD_W_ABS, 42),
+        op(bpf::JEQ_K, u32::from_be_bytes(magic)),
+        op(bpf::RET_K, 64),
+    ])
+}
+
 /// `ldh [12]; jeq ethertype; ld [14]; jeq magic;` with `vid` also
 /// `ld vlan_tag; and 0xfff; jeq vid;` then `ret 256; ret 0`.
 fn filter_program(ethertype: u16, magic: [u8; 4], vid: Option<u16>) -> Vec<libc::sock_filter> {
@@ -267,6 +287,12 @@ impl Tap {
         vid: Option<u16>,
     ) -> io::Result<Self> {
         Self::open_with(ifname, filter_program(ethertype, magic, vid))
+    }
+
+    /// Opens the tap on `ifname` for the test frames of a speed test with
+    /// `magic`.
+    pub fn open_test(ifname: &str, magic: [u8; 4]) -> io::Result<Self> {
+        Self::open_with(ifname, test_program(magic))
     }
 
     /// Opens the tap on `ifname` for the DHCP frames (IPv4) that arrive in

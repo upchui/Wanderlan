@@ -74,6 +74,9 @@ pub enum Request {
     /// Measures the throughput to a peer: the transport and the tunnel, in
     /// both directions → [`Speedtest`].
     Speedtest(SpeedtestParams),
+    /// Measures with a peer whether spreading the receive work over the
+    /// cores (RPS) helps, and keeps the better setting on both → [`Tune`].
+    Tune(TuneParams),
     /// Creates an invitation for a new site with rules for it →
     /// [`Invitation`].
     Invite(SiteRules),
@@ -450,6 +453,39 @@ pub struct Speedtest {
     pub pmtu: Option<u16>,
     /// The measurements.
     pub runs: Vec<SpeedRun>,
+}
+
+/// Parameters of [`Request::Tune`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuneParams {
+    /// The peer (name or identity).
+    pub site: String,
+}
+
+/// Result of [`Request::Tune`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tune {
+    /// The peer.
+    pub peer: String,
+    /// This box.
+    pub here: TuneSide,
+    /// The peer.
+    pub there: TuneSide,
+}
+
+/// What a calibration measured for one box.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TuneSide {
+    /// The interface its tunnel packets come in by.
+    pub nic: Option<String>,
+    /// RPS on (none: it could not be changed there).
+    pub rps: Option<bool>,
+    /// What it received with RPS off (median, bit/s).
+    pub off_bps: u64,
+    /// What it received with RPS on (median, bit/s).
+    pub on_bps: u64,
+    /// Why RPS could not be changed there.
+    pub why_not: Option<String>,
 }
 
 /// One measurement of a speed test.

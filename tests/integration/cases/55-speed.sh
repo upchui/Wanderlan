@@ -26,6 +26,11 @@ done
 text=$(x site1 "wanderlan speedtest site5 --seconds 1" 2>&1)
 check "the text names the split frames" grep -q "Path MTU 1400: full frames are split in two outside" <<<"$text"
 
+# /sys is read-only in these containers: the calibration says so and
+# changes nothing (the systemd test calibrates for real).
+tune=$(x site1 "wanderlan tune site5" 2>&1)
+check "tune: RPS cannot be changed here, and says why" grep -q 'RPS cannot be changed here (/sys cannot be written here' <<<"$tune"
+
 perf=$(x site5 "wanderlan perf --seconds 1" 2>&1)
 check "perf names the path MTU of site5" grep -q 'Path MTU to "site[0-9]" is 1400: packets over 1346 bytes are split in two outside' <<<"$perf"
 check "perf looks at the receive queues of the trunk" grep -q 'trunk0: ' <<<"$perf"

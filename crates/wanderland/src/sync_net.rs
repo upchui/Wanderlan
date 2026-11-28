@@ -100,6 +100,8 @@ pub struct Keyed {
     /// The tunnel interface to it (none for a former peer), for a speed
     /// test.
     pub tunnel: Option<String>,
+    /// The interface its tunnel packets come in by, for a calibration.
+    pub underlay: Option<String>,
 }
 
 impl PartialEq for Keyed {
@@ -110,6 +112,7 @@ impl PartialEq for Keyed {
             && self.client == other.client
             && self.view == other.view
             && self.tunnel == other.tunnel
+            && self.underlay == other.underlay
     }
 }
 
@@ -680,6 +683,7 @@ mod tests {
                         view: Arc::from("the network\n"),
                         keys: Arc::new(b.pair(&a.id()).unwrap()),
                         tunnel: None,
+                        underlay: None,
                     },
                 )]
                 .into(),
